@@ -19,6 +19,10 @@ static double   uint256_log_approx(const uint8_t h[32], int shift);
 static void     set_base_bn(const uint8_t h256[32], int shift);
 static int      bn_candidate_is_prime(uint64_t offset);
 #ifdef WITH_RPC
+static int      build_mining_pass(const char *gbt_json, int shift);
+static int      assemble_mining_block(uint64_t nadd_val, char out_hex[16384]);
+#endif
+#ifdef WITH_RPC
 #include <curl/curl.h>
 #endif
 
@@ -186,6 +190,24 @@ static pthread_mutex_t g_work_lock = PTHREAD_MUTEX_INITIALIZER;
 /* set to 1 by thread-0 when a new block is detected; all workers break their
    adder loop and the main thread restarts the pass with fresh work */
 static volatile int g_abort_pass = 0;
+
+#ifdef WITH_RPC
+/* Pre-built mining pass: set once per GBT fetch, read-only during a pass.
+   The prime base h256 = SHA256d(hdr84) byte-reversed matches what gapcoind
+   validates in CheckProofOfWork(block.GetHash(), nShift, nAdd, nDifficulty). */
+struct pass_state {
+    uint8_t  h256[32];         /* prime base: SHA256d(hdr84) bytes-reversed   */
+    uint8_t  hdr84[84];        /* 84-byte GetHash() header fragment (= first  */
+                               /* 84 bytes: version+prev+merkle+time+diff+nonce) */
+    uint16_t nshift;
+    uint32_t nonce;            /* nonce chosen so that h256[0] >= 0x80        */
+    unsigned char *coin_tx;    size_t coin_txlen;
+    unsigned char **other_txs; size_t *other_tx_lens; size_t other_tx_count;
+    char     prevhex[65];      /* previous block hash for change detection    */
+    uint64_t height;
+};
+static struct pass_state g_pass = {0};
+#endif
 
 /* Parse prevhash and height from a GBT JSON string, log a clear banner if
    the chain tip has moved, and update the shared globals. */
@@ -1189,6 +1211,182 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
 }
 #endif
 
+#ifdef WITH_RPC
+/* =========================================================================
+ * Mining pass state: build_mining_pass() + assemble_mining_block()
+ *
+ * Root cause fix: the prime base for Gapcoin PoW is block.GetHash(), which
+ * is SHA256d of the first 84 header bytes (version+prev+merkle+time+diff+nonce),
+ * NOT the previousblockhash from GBT.  Using prevhash directly as h256 gave
+ * cryptographically wrong primes that gapcoind rejected every time.
+ *
+ * build_mining_pass(): builds coinbase tx, computes merkle root, assembles
+ *   the 84-byte header, SHA256d's it, **reverses** the bytes (Bitcoin uint256
+ *   stores data[k]=SHA256d_byte[k]; ary_to_mpz(order=-1) treats data[31] as
+ *   MSB; BN_bin2bn/uint256_mod_small expect h256[0]=MSB → h256[k]=sha_raw[31-k]),
+ *   and tries nonce=0,1,... until h256[0]>=0x80 (Gapcoin requires this:
+ *   mpz_sizeinbase(hash,2)==256).  Stores everything in g_pass.
+ *
+ * assemble_mining_block(): builds the final block hex from stored g_pass state
+ *   + a found nAdd value.  Uses the SAME nTime/nNonce/merkle root as
+ *   build_mining_pass() so the submitted block's GetHash() == the h256 we sieved.
+ * ========================================================================= */
+
+static void pass_state_free_txs(struct pass_state *ps) {
+    free(ps->coin_tx); ps->coin_tx = NULL; ps->coin_txlen = 0;
+    if (ps->other_txs) {
+        for (size_t i = 0; i < ps->other_tx_count; i++) free(ps->other_txs[i]);
+        free(ps->other_txs);     ps->other_txs     = NULL;
+        free(ps->other_tx_lens); ps->other_tx_lens = NULL;
+    }
+    ps->other_tx_count = 0;
+}
+
+static int build_mining_pass(const char *gbt_json, int shift) {
+    if (!gbt_json) return 0;
+    /* --- parse GBT fields --- */
+    char prevhex[65] = {0};
+    uint32_t curtime = (uint32_t)time(NULL);
+    uint32_t version = 2;
+    uint64_t ndifficulty = 0x0014d29966377819ULL;
+    uint64_t coinbasevalue = 0, block_height = 0;
+    const char *px;
+    if ((px = strstr(gbt_json, "\"previousblockhash\""))) {
+        const char *q = strchr(px,'"'); if (q) q = strchr(q+1,'"');
+        if (q) { const char *r=strchr(q+1,'"'); if (r) { const char *s=strchr(r+1,'"');
+            if (s && s-r-1 < 65) strncpy(prevhex, r+1, (size_t)(s-(r+1))); } } }
+    if ((px = strstr(gbt_json, "\"curtime\"")))       { const char *c=strchr(px,':'); if(c) curtime=(uint32_t)atoi(c+1); }
+    if ((px = strstr(gbt_json, "\"version\"")))       { const char *c=strchr(px,':'); if(c) version=(uint32_t)atoi(c+1); }
+    if ((px = strstr(gbt_json, "\"height\"")))        { const char *c=strchr(px,':'); if(c) block_height=(uint64_t)strtoull(c+1,NULL,10); }
+    if ((px = strstr(gbt_json, "\"coinbasevalue\""))) { const char *c=strchr(px,':'); if(c) coinbasevalue=(uint64_t)strtoull(c+1,NULL,10); }
+    if ((px = strstr(gbt_json, "\"difficulty\""))) {
+        const char *c=strchr(px,':'); if (c) { const char *q=strchr(c,'"'); if (q) {
+            const char *q2=strchr(q+1,'"'); if (q2 && q2-(q+1)<32) {
+                uint64_t v=0; for (const char *ch=q+1; ch<q2; ch++) {
+                    int val = (*ch>='0'&&*ch<='9') ? *ch-'0' :
+                              (*ch>='a'&&*ch<='f') ? 10+*ch-'a' :
+                              (*ch>='A'&&*ch<='F') ? 10+*ch-'A' : -1;
+                    if (val>=0) v=(v<<4)|(uint64_t)val; }
+                ndifficulty=v; } } } }
+    /* --- build coinbase tx --- */
+    size_t coin_txlen = 0; unsigned char *coin_tx = NULL;
+    const char *cbtxn = strstr(gbt_json, "\"coinbasetxn\"");
+    if (cbtxn) {
+        const char *d=strstr(cbtxn,"\"data\""); if (d) { const char *col=strchr(d,':'); if (col) {
+            const char *q=strchr(col,'"'); if (q) { const char *q2=strchr(q+1,'"'); if (q2) {
+                size_t hlen=q2-(q+1); coin_txlen=hlen/2; coin_tx=malloc(coin_txlen);
+                if (coin_tx) for (size_t i=0;i<coin_txlen;i++) {
+                    unsigned int bv=0; sscanf(q+1+2*i,"%2x",&bv); coin_tx[i]=(unsigned char)bv; }
+            } } } } }
+    if (!coin_tx)
+        coin_tx = build_coinbase_tx_minimal(coinbasevalue, block_height, &coin_txlen);
+    if (!coin_tx) return 0;
+    /* --- gather other TXs from GBT --- */
+    unsigned char **other_txs = NULL; size_t *other_tx_lens = NULL, other_tx_count = 0;
+    const char *txs_start = strstr(gbt_json, "\"transactions\"");
+    if (txs_start) {
+        const char *arr=strchr(txs_start,'['); if (arr) {
+            const char *end=strchr(arr,']'); if (!end) end=gbt_json+strlen(gbt_json);
+            const char *cur=arr;
+            while (cur && cur<end) {
+                const char *d=strstr(cur,"\"data\""); if (!d||d>end) break;
+                const char *col=strchr(d,':'); if (!col) break;
+                const char *q=strchr(col,'"'); if (!q) break;
+                const char *q2=strchr(q+1,'"'); if (!q2) break;
+                size_t hlen=q2-(q+1); unsigned char *b=malloc(hlen/2); if (!b) break;
+                for (size_t i=0;i<hlen/2;i++) {
+                    unsigned int bv=0; sscanf(q+1+2*i,"%2x",&bv); b[i]=(unsigned char)bv; }
+                other_txs = realloc(other_txs,(other_tx_count+1)*sizeof(unsigned char*));
+                other_tx_lens = realloc(other_tx_lens,(other_tx_count+1)*sizeof(size_t));
+                other_txs[other_tx_count]=b; other_tx_lens[other_tx_count]=hlen/2;
+                other_tx_count++; cur=q2+1; } } }
+    /* --- compute merkle root --- */
+    size_t total_txs = 1 + other_tx_count;
+    unsigned char **txraws2    = malloc(total_txs*sizeof(unsigned char*));
+    size_t         *txraw_lens2 = malloc(total_txs*sizeof(size_t));
+    txraws2[0]=coin_tx; txraw_lens2[0]=coin_txlen;
+    for (size_t i=0;i<other_tx_count;i++) { txraws2[1+i]=other_txs[i]; txraw_lens2[1+i]=other_tx_lens[i]; }
+    unsigned char **hashes2 = malloc(total_txs*sizeof(unsigned char*));
+    for (size_t i=0;i<total_txs;i++) { hashes2[i]=malloc(32); double_sha256(txraws2[i],txraw_lens2[i],hashes2[i]); }
+    free(txraws2); free(txraw_lens2);
+    { size_t m2=total_txs; unsigned char **layer2=hashes2;
+      while (m2>1) {
+        size_t pairs=(m2+1)/2; unsigned char **next2=malloc(pairs*sizeof(unsigned char*));
+        for (size_t i2=0;i2<pairs;i2++) next2[i2]=malloc(32);
+        for (size_t i2=0;i2<pairs;i2++) {
+            unsigned char buf2[64];
+            memcpy(buf2,layer2[2*i2],32);
+            memcpy(buf2+32,(2*i2+1<m2)?layer2[2*i2+1]:layer2[2*i2],32);
+            double_sha256(buf2,64,next2[i2]); }
+        for (size_t i2=0;i2<m2;i2++) { free(layer2[i2]); } free(layer2); layer2=next2; m2=pairs; }
+      unsigned char merkle_root2[32]; memcpy(merkle_root2,layer2[0],32); free(layer2[0]); free(layer2);
+    /* --- build 84-byte header; find nonce so h256[0]>=0x80 ---
+     * Bitcoin uint256 stores SHA256d_byte[k] at data[k].
+     * ary_to_mpz(order=-1) treats data[31] as MSB.
+     * BN_bin2bn/uint256_mod_small expect h256[0]=MSB.
+     * Therefore h256[k] = sha_raw[31-k].
+     * Gapcoin requires mpz_sizeinbase(hash,2)==256 → sha_raw[31] >= 0x80. */
+    unsigned char prevbin2[32]; memset(prevbin2,0,32);
+    if (prevhex[0])
+        for (int i=0;i<32;i++) { unsigned int bv=0; sscanf(prevhex+i*2,"%2x",&bv); prevbin2[31-i]=(unsigned char)bv; }
+    uint8_t hdr84[84], sha_raw[32], h256[32];
+    uint32_t nonce = 0;
+    for (;;) {
+        uint8_t *hp = hdr84;
+        memcpy(hp,&version,4); hp+=4;
+        memcpy(hp,prevbin2,32); hp+=32;
+        for (int i=0;i<32;i++) { hp[i]=merkle_root2[31-i]; } hp+=32;
+        memcpy(hp,&curtime,4); hp+=4;
+        uint64_t d64=ndifficulty;
+        for (int i=0;i<8;i++) { hp[i]=(unsigned char)(d64&0xff); d64>>=8; } hp+=8;
+        memcpy(hp,&nonce,4); hp+=4;
+        double_sha256(hdr84,84,sha_raw);
+        for (int k=0;k<32;k++) h256[k]=sha_raw[31-k];
+        if (h256[0]>=0x80) break;
+        if (++nonce==0) break; }
+    /* --- store in g_pass --- */
+    pass_state_free_txs(&g_pass);
+    memcpy(g_pass.h256,h256,32); memcpy(g_pass.hdr84,hdr84,84);
+    g_pass.nshift=(uint16_t)shift; g_pass.nonce=nonce;
+    g_pass.coin_tx=coin_tx; g_pass.coin_txlen=coin_txlen;
+    g_pass.other_txs=other_txs; g_pass.other_tx_lens=other_tx_lens; g_pass.other_tx_count=other_tx_count;
+    strncpy(g_pass.prevhex,prevhex,64); g_pass.prevhex[64]='\0';
+    g_pass.height=block_height;
+    log_file_only("build_mining_pass: height=%llu nonce=%u h256[0..3]=%02x%02x%02x%02x\n",
+                  (unsigned long long)block_height, nonce,
+                  h256[0],h256[1],h256[2],h256[3]);
+    } /* end merkle/nonce block */
+    return 1;
+}
+
+static int assemble_mining_block(uint64_t nadd_val, char out_hex[16384]) {
+    if (!g_pass.coin_tx) return 0;
+    size_t txdata = g_pass.coin_txlen;
+    for (size_t i=0; i<g_pass.other_tx_count; i++) txdata += g_pass.other_tx_lens[i];
+    unsigned char *buf = malloc(84 + 2 + 10 + 9 + txdata + 64);
+    if (!buf) return 0;
+    unsigned char *p = buf;
+    memcpy(p, g_pass.hdr84, 84); p += 84;
+    uint16_t ns = g_pass.nshift; memcpy(p, &ns, 2); p += 2;
+    /* nAdd: compact-size prefix + big-endian minimal bytes */
+    { unsigned char nb[8]; int nl;
+      if (nadd_val==0) { nb[0]=0; nl=1; }
+      else { nl=0; uint64_t tmp=nadd_val;
+             while (tmp>0) { nb[nl++]=(unsigned char)(tmp&0xff); tmp>>=8; }
+             for (int i=0;i<nl/2;i++) { unsigned char t=nb[i]; nb[i]=nb[nl-1-i]; nb[nl-1-i]=t; } }
+      write_compact_size(&p,(uint64_t)nl); memcpy(p,nb,nl); p+=nl; }
+    size_t total=1+g_pass.other_tx_count;
+    write_compact_size(&p,total);
+    memcpy(p,g_pass.coin_tx,g_pass.coin_txlen); p+=g_pass.coin_txlen;
+    for (size_t i=0;i<g_pass.other_tx_count;i++) {
+        memcpy(p,g_pass.other_txs[i],g_pass.other_tx_lens[i]);
+        p+=g_pass.other_tx_lens[i]; }
+    bytes_to_hex(buf,(size_t)(p-buf),out_hex);
+    free(buf);
+    return 1;
+}
+#endif /* WITH_RPC — build_mining_pass / assemble_mining_block */
+
 /* check whether the block should be forwarded to the node for PoW validation.
    Gapcoin uses prime-gap proof-of-work, not hash-based PoW; the real PoW check
    is performed by gapcoind on submitblock, so we always forward the block.
@@ -1407,6 +1605,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
                            const char *rpc_pass_local,
                            const char *rpc_method_local,
                            const char *rpc_sign_key_local) {
+    (void)header_local;  /* param kept for API compat; abort uses g_abort_pass */
     for (size_t i = 0; i + 1 < cnt; i++) {
         uint64_t prev  = pr[i];       /* nAdd of gap start prime */
         uint64_t q     = pr[i + 1];   /* nAdd of gap end prime   */
@@ -1448,8 +1647,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
                     if (sq_busy) { free(gbt); continue; }
                     char diff_str[64]; gbt_difficulty_str(gbt, diff_str);
                     log_msg("    network difficulty = %s\n", diff_str);
-                    char payload_hex[65];  encode_pow_header_binary(header_local, payload_hex);
-                    if (build_block_from_gbt_and_payload(gbt, payload_hex, shift_sc, nadd_sc, blockhex)) {
+                    if (assemble_mining_block(nadd_sc, blockhex)) {
                         __sync_fetch_and_add(&stats_blocks,1);
                         log_file_only("Built blockhex: %s\n", blockhex);
                         if (header_meets_target_hex(blockhex)) {
@@ -1910,6 +2108,20 @@ int main(int argc, char **argv) {
     }
     uint8_t h256[32];
     hash_to_256(header, is_hex, h256);
+#ifdef WITH_RPC
+    /* Correct the prime base: use SHA256d(84-byte block header) not prevhash.
+       Without this, nAdd is prime for base=prevhash but NOT for base=block.GetHash(),
+       so gapcoind rejects every submission.  build_mining_pass() assembles the
+       84-byte header, double-SHA256s it, and byte-reverses to match Gapcoin's
+       ary_to_mpz(order=-1) convention (data[31]=MSB → h256[0]=MSB). */
+    if (rpc_url) {
+        char *_gbt0 = rpc_getblocktemplate(rpc_url, rpc_user, rpc_pass);
+        if (_gbt0) {
+            if (build_mining_pass(_gbt0, shift)) memcpy(h256, g_pass.h256, 32);
+            free(_gbt0);
+        }
+    }
+#endif
     atexit(print_stats);
     /* free thread-local sieve buffers when the process exits */
     atexit(free_sieve_buffers);
@@ -2026,13 +2238,15 @@ int main(int argc, char **argv) {
                                 char *newhdr = malloc(len+1);
                                 memcpy(newhdr, start, len);
                                 newhdr[len] = '\0';
-                                if (newhdr[0] && strcmp(newhdr, header) != 0) {
-                                    free((char*)header);
-                                    header = newhdr;
-                                    hash_to_256(header, is_hex, h256);
-                                } else {
-                                    free(newhdr);
+                                if (newhdr[0]) {
+                                    if (strcmp(newhdr, header) != 0) {
+                                        free((char*)header);
+                                        header = newhdr;
+                                    } else { free(newhdr); }
                                 }
+                                /* Rebuild pass for fresh nTime each cycle */
+                                if (build_mining_pass(gbt, shift))
+                                    memcpy(h256, g_pass.h256, 32);
                             }
                         }
                     }
@@ -2094,13 +2308,15 @@ int main(int argc, char **argv) {
                                 char *newhdr = malloc(len+1);
                                 memcpy(newhdr, start, len);
                                 newhdr[len] = '\0';
-                                if (newhdr[0] && strcmp(newhdr, header) != 0) {
-                                    free((char*)header);
-                                    header = newhdr;
-                                    hash_to_256(header, is_hex, h256);
-                                } else {
-                                    free(newhdr);
+                                if (newhdr[0]) {
+                                    if (strcmp(newhdr, header) != 0) {
+                                        free((char*)header);
+                                        header = newhdr;
+                                    } else { free(newhdr); }
                                 }
+                                /* Rebuild pass for fresh nTime each cycle */
+                                if (build_mining_pass(gbt, shift))
+                                    memcpy(h256, g_pass.h256, 32);
                             }
                         }
                     }
