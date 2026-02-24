@@ -2245,8 +2245,10 @@ int main(int argc, char **argv) {
                                     } else { free(newhdr); }
                                 }
                                 /* Rebuild pass for fresh nTime each cycle */
+#ifdef WITH_RPC
                                 if (build_mining_pass(gbt, shift))
                                     memcpy(h256, g_pass.h256, 32);
+#endif
                             }
                         }
                     }
@@ -2315,8 +2317,10 @@ int main(int argc, char **argv) {
                                     } else { free(newhdr); }
                                 }
                                 /* Rebuild pass for fresh nTime each cycle */
+#ifdef WITH_RPC
                                 if (build_mining_pass(gbt, shift))
                                     memcpy(h256, g_pass.h256, 32);
+#endif
                             }
                         }
                     }
