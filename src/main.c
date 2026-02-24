@@ -1335,7 +1335,7 @@ static int build_mining_pass(const char *gbt_json, int shift) {
         uint8_t *hp = hdr84;
         memcpy(hp,&version,4); hp+=4;
         memcpy(hp,prevbin2,32); hp+=32;
-        for (int i=0;i<32;i++) { hp[i]=merkle_root2[31-i]; } hp+=32;
+        memcpy(hp,merkle_root2,32); hp+=32; /* raw SHA256d bytes, no reversal */
         memcpy(hp,&curtime,4); hp+=4;
         uint64_t d64=ndifficulty;
         for (int i=0;i<8;i++) { hp[i]=(unsigned char)(d64&0xff); d64>>=8; } hp+=8;
@@ -1368,12 +1368,12 @@ static int assemble_mining_block(uint64_t nadd_val, char out_hex[16384]) {
     unsigned char *p = buf;
     memcpy(p, g_pass.hdr84, 84); p += 84;
     uint16_t ns = g_pass.nshift; memcpy(p, &ns, 2); p += 2;
-    /* nAdd: compact-size prefix + big-endian minimal bytes */
+    /* nAdd: compact-size prefix + little-endian minimal bytes (LSB first).
+     * Gapcoin ary_to_mpz uses mpz_import(order=-1,endian=-1) so nAdd[0]=LSB. */
     { unsigned char nb[8]; int nl;
       if (nadd_val==0) { nb[0]=0; nl=1; }
       else { nl=0; uint64_t tmp=nadd_val;
-             while (tmp>0) { nb[nl++]=(unsigned char)(tmp&0xff); tmp>>=8; }
-             for (int i=0;i<nl/2;i++) { unsigned char t=nb[i]; nb[i]=nb[nl-1-i]; nb[nl-1-i]=t; } }
+             while (tmp>0) { nb[nl++]=(unsigned char)(tmp&0xff); tmp>>=8; } }
       write_compact_size(&p,(uint64_t)nl); memcpy(p,nb,nl); p+=nl; }
     size_t total=1+g_pass.other_tx_count;
     write_compact_size(&p,total);
