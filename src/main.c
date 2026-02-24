@@ -572,7 +572,9 @@ static void *submit_thread_fn(void *arg) {
                             job.pass[0] ? job.pass : NULL,
                             job.method[0] ? job.method : "submitblock",
                             job.hex);
-            if (ok == 0) break;
+            if (ok == 0) break;  /* accepted */
+            if (ok > 0) break;   /* definitive rejection — no point retrying */
+            /* ok < 0: transient network/connection error — retry with backoff */
             int backoff_ms = 250 * (1 << attempt);
             if (backoff_ms > 10000) backoff_ms = 10000;
             struct timespec ts; ts.tv_sec = backoff_ms / 1000; ts.tv_nsec = (backoff_ms % 1000) * 1000000;
@@ -583,8 +585,17 @@ static void *submit_thread_fn(void *arg) {
         if (ok == 0) {
             __sync_fetch_and_add(&stats_success, 1);
             log_msg(">>> ACCEPTED (async submit)\n");
+        } else if (ok > 0) {
+            /* Definitive rejection (result=false/string): the block is stale.
+               Abort the current mining pass immediately and drain the queue
+               so we don't keep retrying the same dead block. */
+            log_msg(">>> REJECTED (stale block — aborting pass, fetching new template)\n");
+            g_abort_pass = 1;
+            pthread_mutex_lock(&sq_lock);
+            sq_head = sq_tail = sq_count = 0;
+            pthread_mutex_unlock(&sq_lock);
         } else {
-            log_msg(">>> REJECTED after %d attempts (async submit)\n", attempt);
+            log_msg(">>> FAILED after %d attempts (connection error, async submit)\n", attempt);
         }
     }
     return NULL;
@@ -1286,6 +1297,19 @@ static int scan_candidates(uint64_t *pr, double *pr_log, size_t cnt, double targ
                 char *gbt = rpc_getblocktemplate(rpc_url_local, rpc_user_local, rpc_pass_local);
                 char blockhex[16384]; memset(blockhex,0,sizeof(blockhex));
                 if (gbt) {
+                    /* Piggyback new-block detection on the GBT we just fetched.
+                       This updates g_prevhash and sets g_abort_pass when the
+                       chain tip has advanced, without waiting for the 5-second
+                       poll in worker_fn thread 0. */
+                    check_and_log_new_work(gbt);
+                    if (g_abort_pass) { free(gbt); continue; }
+                    /* Only one submission per block round: if there is already
+                       a job in the queue this gap will almost certainly be stale
+                       by the time the submit thread gets to it. */
+                    pthread_mutex_lock(&sq_lock);
+                    int sq_busy = (sq_count > 0);
+                    pthread_mutex_unlock(&sq_lock);
+                    if (sq_busy) { free(gbt); continue; }
                     char diff_str[64]; gbt_difficulty_str(gbt, diff_str);
                     log_msg("    network difficulty = %s\n", diff_str);
                     char payload_hex[197]; encode_pow_header_binary(header_local, prev, q, payload_hex);

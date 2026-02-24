@@ -80,15 +80,15 @@ int rpc_submit(const char *url, const char *user, const char *pass, const char *
                     ret = 0;
                 } else if (json_is_false(jres)) {
                     fprintf(stderr, ">>> submitblock: REJECTED (result=false) — stale or already known\n");
-                    ret = -1;
+                    ret = 1;  /* definitive rejection — caller should abort current pass, no retry */
                 } else if (json_is_string(jres)) {
                     fprintf(stderr, ">>> submitblock: REJECTED (reason=\"%s\")\n", json_string_value(jres));
-                    ret = -1;
+                    ret = 1;  /* definitive rejection */
                 } else {
                     char *resdump = json_dumps(jres, JSON_COMPACT);
                     fprintf(stderr, ">>> submitblock: REJECTED (result=%s)\n", resdump ? resdump : "?");
                     free(resdump);
-                    ret = -1;
+                    ret = 1;  /* definitive rejection */
                 }
             } else {
                 /* extract code/message where available */
