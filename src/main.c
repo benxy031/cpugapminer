@@ -90,6 +90,51 @@ static size_t small_primes_count = 0;
 static size_t small_primes_cap = 0;
 static pthread_once_t small_primes_once = PTHREAD_ONCE_INIT;
 
+/* Trial-division pre-filter: primes just above SIEVE_SMALL_PRIME_LIMIT.
+   The sieve already eliminates factors <= SIEVE_SMALL_PRIME_LIMIT; these extra
+   primes catch remaining small-factor composites cheaply, before the expensive
+   Miller-Rabin test.  Cost per candidate: ~TD_EXTRA_CNT × 5 ns. */
+#define TD_EXTRA_CNT 1024
+static uint32_t td_extra_primes[TD_EXTRA_CNT];
+static int      td_extra_count = 0;
+static pthread_once_t td_extra_once = PTHREAD_ONCE_INIT;
+/* forward declaration — populate_small_primes_cache defined below */
+static void populate_small_primes_cache(void);
+
+/* Populate td_extra_primes[] with the first TD_EXTRA_CNT primes above
+   SIEVE_SMALL_PRIME_LIMIT.  Called once (via pthread_once); requires
+   small_primes_cache to already be populated. */
+static void populate_td_extra_primes(void) {
+    /* Ensure the main sieve cache is ready. */
+    pthread_once(&small_primes_once, populate_small_primes_cache);
+    if (!small_primes_cache) return;
+
+    /* Segmented sieve over [lo, hi) to find primes just above the sieve limit. */
+    uint64_t lo = (uint64_t)SIEVE_SMALL_PRIME_LIMIT + 1;
+    if ((lo & 1) == 0) lo++; /* start on odd */
+    /* A window of 200 000 odd numbers (~11 000 primes) is more than enough. */
+    uint64_t hi = lo + 400000ULL; /* covers ~22 000 primes */
+    size_t   sz = (hi - lo) / 2 + 1;
+    uint8_t *sieve = (uint8_t *)calloc(sz, 1);
+    if (!sieve) return;
+
+    for (size_t idx = 1; idx < small_primes_count; idx++) {
+        uint64_t p = small_primes_cache[idx];
+        if (p * p > hi) break;
+        /* first odd multiple of p >= lo */
+        uint64_t rem = lo % p;
+        uint64_t start = rem ? lo + (p - rem) : lo;
+        if ((start & 1) == 0) start += p;
+        for (uint64_t j = start; j < hi; j += 2 * p)
+            sieve[(j - lo) / 2] = 1;
+    }
+    td_extra_count = 0;
+    for (uint64_t n = lo; n < hi && td_extra_count < TD_EXTRA_CNT; n += 2)
+        if (!sieve[(n - lo) / 2])
+            td_extra_primes[td_extra_count++] = (uint32_t)n;
+    free(sieve);
+}
+
 static void populate_small_primes_cache(void) {
     size_t maxp = SIEVE_SMALL_PRIME_LIMIT + 1;
     unsigned char *is_small = calloc(maxp, 1);
@@ -1246,19 +1291,59 @@ static void ensure_bn_tls(void) {
     if (!tls_cand_bn) tls_cand_bn = BN_new();
 }
 
-/* Compute tls_base_bn = h256 << shift  (called once per worker pass). */
+/* Thread-local TD residues: tls_td_residues[i] = (base << shift) % td_extra_primes[i].         Precomputed once per mining pass in set_base_bn(); used for cheap pre-filtering. */
+static __thread uint32_t tls_td_residues[TD_EXTRA_CNT];
+
+/* Compute tls_base_bn = h256 << shift  (called once per worker pass).
+   Also precomputes the TD residues for the extended trial-division table. */
 static void set_base_bn(const uint8_t h256[32], int shift) {
     ensure_bn_tls();
     BN_bin2bn(h256, 32, tls_base_bn);
     BN_lshift(tls_base_bn, tls_base_bn, shift);
+
+    /* Precompute (base << shift) % p for each extra TD prime — O(TD_EXTRA_CNT)
+       arithmetic operations here, amortised over every candidate in this pass. */
+    pthread_once(&td_extra_once, populate_td_extra_primes);
+    for (int i = 0; i < td_extra_count; i++)
+        tls_td_residues[i] = (uint32_t)uint256_mod_small(h256, shift,
+                                                          (uint64_t)td_extra_primes[i]);
 }
 
-/* Return 1 if (tls_base_bn + offset) is probably prime. */
+/* Return 1 if (tls_base_bn + offset) is probably prime.
+ *
+ * Three-stage pipeline:
+ *  1. Trial-division against TD_EXTRA_CNT primes above the sieve limit.
+ *     Cost: ~TD_EXTRA_CNT × 5 ns ≈ 5 µs; eliminates composites with a small
+ *     factor not caught by the main sieve.
+ *  2. Single Miller-Rabin round (no internal trial division — sieve + stage 1
+ *     already cover small primes).  Eliminates ~75 % of remaining composites
+ *     at roughly 1/6 the cost of the full 6-round test.
+ *  3. Full probable-prime test (BN_prime_checks rounds, no trial division).
+ */
 static int bn_candidate_is_prime(uint64_t offset) {
+    /* --- Stage 1: fast trial-division pre-filter --- */
+    for (int i = 0; i < td_extra_count; i++) {
+        uint32_t p   = td_extra_primes[i];
+        uint32_t rem = (uint32_t)(((uint64_t)tls_td_residues[i]
+                                   + (uint64_t)(offset % p)) % p);
+        if (rem == 0) return 0;
+    }
+
     ensure_bn_tls();
     BN_copy(tls_cand_bn, tls_base_bn);
     BN_add_word(tls_cand_bn, (BN_ULONG)offset);
-    return BN_check_prime(tls_cand_bn, tls_bn_ctx, NULL);
+
+    /* --- Stage 2: single MR round pre-filter (no trial division) --- */
+    /* BN_is_prime_fasttest_ex is deprecated in OpenSSL 3 but remains the only
+       API that lets us (a) skip trial division and (b) control the round count. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    if (!BN_is_prime_fasttest_ex(tls_cand_bn, 1, tls_bn_ctx, 0, NULL))
+        return 0;
+
+    /* --- Stage 3: full probable-prime test (no trial division) --- */
+    return BN_is_prime_fasttest_ex(tls_cand_bn, BN_prime_checks, tls_bn_ctx, 0, NULL);
+#pragma GCC diagnostic pop
 }
 
 // Produce hex of SHA256(header) (useful as a simple header encoding)
