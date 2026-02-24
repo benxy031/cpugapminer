@@ -191,6 +191,35 @@ static void print_stats(void) {
             (unsigned long long)stats_success);
 }
 
+/* ---------- periodic stats thread ----------
+   Wakes every `stats_interval_ms` milliseconds and calls print_stats() so
+   the user always sees fresh rates regardless of how long a single sieve
+   call takes (which can be several seconds for large --sieve-size values). */
+#define STATS_INTERVAL_MS 5000
+static volatile int stats_thread_running = 0;
+static pthread_t stats_thread;
+
+static void *stats_thread_fn(void *arg) {
+    (void)arg;
+    while (stats_thread_running) {
+        struct timespec ts = { STATS_INTERVAL_MS / 1000,
+                               (long)(STATS_INTERVAL_MS % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+        if (stats_thread_running) print_stats();
+    }
+    return NULL;
+}
+
+static void start_stats_thread(void) {
+    stats_thread_running = 1;
+    pthread_create(&stats_thread, NULL, stats_thread_fn, NULL);
+}
+
+static void stop_stats_thread(void) {
+    stats_thread_running = 0;
+    pthread_join(stats_thread, NULL);
+}
+
 // ------------------------------------------------------------------------------------------------
 // Modular arithmetic
 // ------------------------------------------------------------------------------------------------
@@ -1434,6 +1463,7 @@ int main(int argc, char **argv) {
         if (!log_fp) fprintf(stderr, "Failed to open log file %s\n", log_file);
     }
     stats_start_ms = now_ms();
+    start_stats_thread();
     log_msg("C miner starting (shift=%d sieve=%llu)\n", shift, (unsigned long long)sieve_size);
     if (keep_going)
         log_msg("default behaviour: will continue mining after finding a valid block\n");
@@ -1459,14 +1489,15 @@ int main(int argc, char **argv) {
     if (build_only) {
         if (!rpc_url) {
             log_msg("--build-only requires --rpc-url to fetch GBT and (optionally) submit\n");
+            stop_stats_thread();
             return 2;
         }
         char *gbt = rpc_getblocktemplate(rpc_url, rpc_user, rpc_pass);
-        if (!gbt) { log_msg("Failed to fetch GBT\n"); return 2; }
+        if (!gbt) { log_msg("Failed to fetch GBT\n"); stop_stats_thread(); return 2; }
         char blockhex[16384]; memset(blockhex,0,sizeof(blockhex));
         char payload_hex[197] = {0};
         if (!no_opreturn) {
-            if (build_p == 0 && build_q == 0) { log_msg("--build-only requires --p and --q when not using --no-opreturn\n"); free(gbt); return 2; }
+            if (build_p == 0 && build_q == 0) { log_msg("--build-only requires --p and --q when not using --no-opreturn\n"); free(gbt); stop_stats_thread(); return 2; }
             encode_pow_header_binary(header, build_p, build_q, payload_hex);
         }
         /* nAdd = p - (hash << shift), or 0 if no p given */
@@ -1482,6 +1513,7 @@ int main(int argc, char **argv) {
             log_msg("Failed to build block from GBT\n");
         }
         free(gbt);
+        stop_stats_thread();
         return 0;
     }
 #endif
@@ -1645,6 +1677,7 @@ int main(int argc, char **argv) {
 #ifdef WITH_RPC
     if (rpc_url) stop_submit_thread();
 #endif
+    stop_stats_thread();
     if (!keep_going) {
         printf("Done, no qualifying gaps found in tried adders.\n");
         return 0;
