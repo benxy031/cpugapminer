@@ -1264,7 +1264,13 @@ static void *worker_fn(void *arg) {
     rpc_sign_key_local = wa->rpc_sign_key;
 #endif
 
-    for (int64_t adder = (int64_t)tid; adder < adder_max_local; adder += nthreads) {
+    /* Divide the adder space into non-overlapping windows of sieve_size each.
+       Previously the loop incremented adder by 1 (then nthreads), meaning every
+       consecutive iteration sieve'd an almost identical range (overlap ~99.99%).
+       Striding by sieve_size means each thread iteration covers a fresh block. */
+    int64_t num_windows = ((int64_t)adder_max_local + (int64_t)sieve_size_local - 1)
+                          / (int64_t)sieve_size_local;
+    for (int64_t adder = (int64_t)tid; adder < num_windows; adder += nthreads) {
         /* All threads: if thread-0 detected a new block, abort this pass so
            the main thread can re-launch with the updated header/h_int. */
         if (g_abort_pass) break;
@@ -1291,16 +1297,19 @@ static void *worker_fn(void *arg) {
             }
         }
 #endif
-        uint64_t p_start = (h_int_local << shift_local) + (uint64_t)(int64_t)adder;
-        uint64_t start_index = p_start - (p_start % 2);
-        uint64_t max_index = (h_int_local << shift_local) + ((uint64_t)1<<shift_local);
-        uint64_t max_capacity = max_index - start_index;
-        uint64_t desired = sieve_size_local + 1024;
-        uint64_t actual = (max_capacity>0) ? (desired < max_capacity ? desired : max_capacity) : 0;
-        if (actual == 0) continue;
-        uint64_t L = start_index;
-        uint64_t R = L + actual;
-        log_file_only("Adder=%lld(tid=%d) sieving [%llu,%llu)\n", (long long)adder, tid, (unsigned long long)L, (unsigned long long)R);
+        /* Window adder covers [base + adder*sieve_size, base + (adder+1)*sieve_size).
+           Cap at base+adder_max so nAdd = prime-base stays in [0, 2^shift). */
+        uint64_t base = h_int_local << shift_local;
+        uint64_t L = base + (uint64_t)adder * sieve_size_local;
+        if ((L & 1) == 0) L++;
+        uint64_t R = L + sieve_size_local;
+        uint64_t max_valid = base + (uint64_t)adder_max_local;
+        if (R > max_valid) R = max_valid;
+        if (R <= L) continue;
+        log_file_only("Win=%lld(tid=%d) offset=%llu sieving [%llu,%llu)\n",
+                      (long long)adder, tid,
+                      (unsigned long long)((uint64_t)adder * sieve_size_local),
+                      (unsigned long long)L, (unsigned long long)R);
         size_t cnt=0;
         double *pr_log = NULL;
         clock_t t0 = clock();
@@ -1567,17 +1576,16 @@ int main(int argc, char **argv) {
 #endif
     if (num_threads <= 1) {
         do {
-            for (int64_t adder=0; adder<adder_max; ++adder) {
-                uint64_t p_start = (h_int << shift) + (uint64_t)adder;
-                uint64_t start_index = p_start - (p_start % 2);
-                uint64_t max_index = (h_int << shift) + ((uint64_t)1<<shift);
-                uint64_t max_capacity = max_index - start_index;
-                uint64_t desired = sieve_size + 1024;
-                uint64_t actual = (max_capacity>0) ? (desired < max_capacity ? desired : max_capacity) : 0;
-                if (actual == 0) continue;
-                uint64_t L = start_index;
-                uint64_t R = L + actual;
-                log_file_only("Adder=%lld sieving [%llu,%llu)\n", (long long)adder, (unsigned long long)L, (unsigned long long)R);
+            int64_t num_windows = ((int64_t)adder_max + (int64_t)sieve_size - 1) / (int64_t)sieve_size;
+            for (int64_t adder=0; adder<num_windows; ++adder) {
+                uint64_t base = h_int << shift;
+                uint64_t L = base + (uint64_t)adder * sieve_size;
+                if ((L & 1) == 0) L++;
+                uint64_t R = L + sieve_size;
+                uint64_t max_valid = base + (uint64_t)adder_max;
+                if (R > max_valid) R = max_valid;
+                if (R <= L) continue;
+                log_file_only("Win=%lld offset=%llu sieving [%llu,%llu)\n", (long long)adder, (unsigned long long)((uint64_t)adder * sieve_size), (unsigned long long)L, (unsigned long long)R);
                 size_t cnt=0;
                 double *pr_log = NULL;
                 clock_t t0 = clock();
