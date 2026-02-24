@@ -123,6 +123,42 @@ static volatile uint64_t stats_blocks = 0;         /* blocks built */
 static volatile uint64_t stats_submits = 0;        /* shares submitted */
 static volatile uint64_t stats_success = 0;        /* shares accepted */
 static uint64_t stats_start_ms = 0;                /* time mining started */
+
+/* shared current-work state so any thread can detect a new block */
+static char     g_prevhash[65]  = {0};
+static uint64_t g_height        = 0;
+static pthread_mutex_t g_work_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Parse prevhash and height from a GBT JSON string, log a clear banner if
+   the chain tip has moved, and update the shared globals. */
+static void check_and_log_new_work(const char *gbt_json) {
+    if (!gbt_json) return;
+    char prevhash[65] = {0};
+    uint64_t height = 0;
+    const char *p = strstr(gbt_json, "\"previousblockhash\"");
+    if (p) {
+        const char *c = strchr(p, ':'); if (c) {
+            const char *q = strchr(c, '"'); if (q) {
+                const char *e = strchr(q+1, '"');
+                if (e && (size_t)(e-q-1) < sizeof(prevhash))
+                    { memcpy(prevhash, q+1, e-q-1); prevhash[e-q-1] = '\0'; }
+            }
+        }
+    }
+    const char *h = strstr(gbt_json, "\"height\"");
+    if (h) { const char *c = strchr(h, ':'); if (c) height = (uint64_t)strtoull(c+1, NULL, 10); }
+    if (!prevhash[0]) return;
+    pthread_mutex_lock(&g_work_lock);
+    if (strcmp(prevhash, g_prevhash) != 0) {
+        memcpy(g_prevhash, prevhash, sizeof(g_prevhash));
+        g_height = height;
+        pthread_mutex_unlock(&g_work_lock);
+        log_msg("\n*** NEW BLOCK  height=%llu  prevhash=%.16s...  mining on top ***\n\n",
+                (unsigned long long)height, prevhash);
+    } else {
+        pthread_mutex_unlock(&g_work_lock);
+    }
+}
 /* by default the miner continues searching even after a valid block is
    submitted.  Historically `--keep-going` enabled this behavior, but it is now
    the default; use --stop-after-block to request the old behaviour. */
@@ -637,7 +673,7 @@ static unsigned char *build_coinbase_tx_opreturn(const char *opdata_hex, uint64_
     write_u32_le(&p, 0);
 
     *out_len = p - tx;
-    log_msg("DEBUG coinbase details: scriptsig_len=%zu extranonce_len=%zu pk_script_len=%zu datalen=%zu tx_len=%zu\n",
+    log_file_only("DEBUG coinbase details: scriptsig_len=%zu extranonce_len=%zu pk_script_len=%zu datalen=%zu tx_len=%zu\n",
             scriptsig_len, extranonce_len, pk_script_len, datalen, *out_len);
     free(data);
     return tx;
@@ -689,7 +725,7 @@ static unsigned char *build_coinbase_tx_minimal(uint64_t value_satoshis, uint64_
     write_u32_le(&p, 0);
 
     *out_len = p - tx;
-    log_msg("DEBUG coinbase minimal: scriptsig_len=%zu extranonce_len=%zu pk_script_len=%zu tx_len=%zu\n",
+    log_file_only("DEBUG coinbase minimal: scriptsig_len=%zu extranonce_len=%zu pk_script_len=%zu tx_len=%zu\n",
             scriptsig_len, extranonce_len, pk_script_len, *out_len);
     return tx;
 }
@@ -785,9 +821,9 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
         log_msg("ERROR: failed to build coinbase tx (OOM?)\n");
         return 0;
     }
-    log_msg("GBT: version=%u curtime=%u prev=%s txlen=%zu coinbase_value=%llu height=%llu\n", version, curtime, prevhex[0]?prevhex:"(none)", coin_txlen, (unsigned long long)coinbase_value, (unsigned long long)block_height);
+    log_file_only("GBT: version=%u curtime=%u prev=%s txlen=%zu coinbase_value=%llu height=%llu\n", version, curtime, prevhex[0]?prevhex:"(none)", coin_txlen, (unsigned long long)coinbase_value, (unsigned long long)block_height);
     // debug coinbase tx bytes
-    char coin_hex_dbg[2048]; if (coin_txlen < 1024) { bytes_to_hex(coin_tx, coin_txlen, coin_hex_dbg); log_msg("DEBUG coin_tx hex: %s\n", coin_hex_dbg); }
+    char coin_hex_dbg[2048]; if (coin_txlen < 1024) { bytes_to_hex(coin_tx, coin_txlen, coin_hex_dbg); log_file_only("DEBUG coin_tx hex: %s\n", coin_hex_dbg); }
 
     // gather transactions listed in GBT (their raw "data" fields)
     const char *txs_start = strstr(gbt_json, "\"transactions\"");
@@ -881,7 +917,7 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
     write_byte(&hp, 0);
     /* Gapcoin header is 88 bytes: 4+32+32+4+8+4+2+(1+1) */
     size_t header_size = (size_t)(hp - headerbin);
-    log_msg("DEBUG header_size=%zu (expected 88)\n", header_size);
+    log_file_only("DEBUG header_size=%zu (expected 88)\n", header_size);
 
     // serialize full block: header + varint txcount + tx raw bytes
     size_t full_len = header_size + 1;
@@ -930,8 +966,8 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
     // Detailed debug: log header, txcount and first tx prefix for byte-for-byte comparison
     char tmphex[1024*4]; size_t dbg_len = full_len < 200 ? full_len : 200; bytes_to_hex(full, dbg_len, tmphex);
     char headerhex[200]; bytes_to_hex(headerbin, header_size, headerhex); headerhex[header_size*2]='\0';
-    log_msg("DEBUG block header hex: %s\n", headerhex);
-    log_msg("DEBUG txcount=%zu first_bytes=%s\n", (size_t)total_txs, tmphex + 160);
+    log_file_only("DEBUG block header hex: %s\n", headerhex);
+    log_file_only("DEBUG txcount=%zu first_bytes=%s\n", (size_t)total_txs, tmphex + 160);
 
     // Verify that the coinbase tx bytes appear immediately after header + txcount varint
     if (txraw_lens[0] > 0) {
@@ -968,7 +1004,7 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
         if (bf) {
             fwrite(full, 1, full_len, bf);
             fclose(bf);
-            log_msg("WROTE raw block binary: %s (len=%zu)\n", binpath, full_len);
+            log_file_only("WROTE raw block binary: %s (len=%zu)\n", binpath, full_len);
         } else {
             log_msg("FAILED to write raw block binary: %s\n", binpath);
         }
@@ -976,7 +1012,7 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
         if (hf) {
             fprintf(hf, "%s", outhex);
             fclose(hf);
-            log_msg("WROTE raw block hex: %s (chars=%zu)\n", hexpath, strlen(outhex));
+            log_file_only("WROTE raw block hex: %s (chars=%zu)\n", hexpath, strlen(outhex));
         } else {
             log_msg("FAILED to write raw block hex: %s\n", hexpath);
         }
@@ -1091,7 +1127,7 @@ static int scan_candidates(uint64_t *pr, double *pr_log, size_t cnt, double targ
             continue;
 
         __sync_fetch_and_add(&stats_gaps, 1);
-        log_msg("FOUND gap: p=%llu q=%llu gap=%llu merit=%.4f (target=%.2f)\n",
+        log_msg("\n>>> GAP FOUND  p=%llu  q=%llu  gap=%llu  merit=%.4f  (need %.2f)\n",
                 (unsigned long long)prev,
                 (unsigned long long)q,
                 (unsigned long long)gap,
@@ -1104,24 +1140,27 @@ static int scan_candidates(uint64_t *pr, double *pr_log, size_t cnt, double targ
                     char payload_hex[197]; encode_pow_header_binary(header_local, prev, q, payload_hex);
                     if (build_block_from_gbt_and_payload(gbt, payload_hex, blockhex)) {
                         __sync_fetch_and_add(&stats_blocks,1);
-                        log_msg("Built blockhex: %s\n", blockhex);
+                        log_file_only("Built blockhex: %s\n", blockhex);
                         if (header_meets_target_hex(blockhex)) {
-                            log_msg("== valid proof-of-work found ==\n");
+                            log_msg(">>> BLOCK CANDIDATE ready, submitting...\n");
                             if (rpc_sign_key_local) {
                                 char sig[65];
                                 hmac_sha256_hex(rpc_sign_key_local, blockhex, sig);
-                                log_msg("signature %s\n", sig);
+                                log_msg("    signature: %s\n", sig);
                             }
                             if (rpc_url_local) {
                                 __sync_fetch_and_add(&stats_submits,1);
-                                log_msg("submitting share (block candidate) to node\n");
                                 int rc = rpc_submit(rpc_url_local,
                                                     rpc_user_local,
                                                     rpc_pass_local,
                                                     rpc_method_local,
                                                     blockhex);
-                                if (rc == 0) __sync_fetch_and_add(&stats_success,1);
-                                log_msg("rpc_submit returned %d\n", rc);
+                                if (rc == 0) {
+                                    __sync_fetch_and_add(&stats_success,1);
+                                    log_msg(">>> ACCEPTED\n");
+                                } else {
+                                    log_msg(">>> REJECTED (see error above)\n");
+                                }
                             }
                             print_stats();
                             if (!keep_going) {
@@ -1175,7 +1214,7 @@ static void *worker_fn(void *arg) {
 #ifdef WITH_RPC
         if (tid == 0 && rpc_url_local) {
             char *gbt = rpc_getblocktemplate(rpc_url_local, rpc_user_local, rpc_pass_local);
-            free(gbt);
+            if (gbt) { check_and_log_new_work(gbt); free(gbt); }
         }
 #endif
         uint64_t p_start = (h_int_local << shift_local) + (uint64_t)adder;
@@ -1187,7 +1226,7 @@ static void *worker_fn(void *arg) {
         if (actual == 0) continue;
         uint64_t L = start_index;
         uint64_t R = L + actual;
-        log_msg("Adder=%d(tid=%d) sieving [%llu,%llu)\n", adder, tid, (unsigned long long)L, (unsigned long long)R);
+        log_file_only("Adder=%d(tid=%d) sieving [%llu,%llu)\n", adder, tid, (unsigned long long)L, (unsigned long long)R);
         size_t cnt=0;
         double *pr_log = NULL;
         clock_t t0 = clock();
@@ -1467,7 +1506,7 @@ int main(int argc, char **argv) {
                 if (actual == 0) continue;
                 uint64_t L = start_index;
                 uint64_t R = L + actual;
-                log_msg("Adder=%d sieving [%llu,%llu)\n", adder, (unsigned long long)L, (unsigned long long)R);
+                log_file_only("Adder=%d sieving [%llu,%llu)\n", adder, (unsigned long long)L, (unsigned long long)R);
                 size_t cnt=0;
                 double *pr_log = NULL;
                 clock_t t0 = clock();
@@ -1521,6 +1560,7 @@ int main(int argc, char **argv) {
                 /* refresh header if node has new template */
                 char *gbt = rpc_getblocktemplate(rpc_url, rpc_user, rpc_pass);
                 if (gbt) {
+                    check_and_log_new_work(gbt);
                     const char *p = strstr(gbt, "\"previousblockhash\"");
                     if (p) {
                         const char *colon = strchr(p, ':');
@@ -1534,7 +1574,6 @@ int main(int argc, char **argv) {
                                 memcpy(newhdr, start, len);
                                 newhdr[len] = '\0';
                                 if (newhdr[0] && strcmp(newhdr, header) != 0) {
-                                    log_msg("new work header %s\n", newhdr);
                                     free((char*)header);
                                     header = newhdr;
                                     h_int = hash_to_int(header, is_hex);
@@ -1576,6 +1615,7 @@ int main(int argc, char **argv) {
                 /* refresh header for next pass */
                 char *gbt = rpc_getblocktemplate(rpc_url, rpc_user, rpc_pass);
                 if (gbt) {
+                    check_and_log_new_work(gbt);
                     const char *p = strstr(gbt, "\"previousblockhash\"");
                     if (p) {
                         const char *colon = strchr(p, ':');
@@ -1589,7 +1629,6 @@ int main(int argc, char **argv) {
                                 memcpy(newhdr, start, len);
                                 newhdr[len] = '\0';
                                 if (newhdr[0] && strcmp(newhdr, header) != 0) {
-                                    log_msg("new work header %s\n", newhdr);
                                     free((char*)header);
                                     header = newhdr;
                                     h_int = hash_to_int(header, is_hex);

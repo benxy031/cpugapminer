@@ -60,7 +60,6 @@ int rpc_submit(const char *url, const char *user, const char *pass, const char *
     CURLcode rc = curl_easy_perform(c);
     int ret = -1;
     if (rc == CURLE_OK) {
-        printf("RPC response: %s\n", s.ptr);
         /* Properly parse JSON-RPC response and surface detailed errors. */
         json_error_t jerr;
         json_t *root = json_loads(s.ptr, 0, &jerr);
@@ -70,7 +69,21 @@ int rpc_submit(const char *url, const char *user, const char *pass, const char *
         } else {
             json_t *jerrobj = json_object_get(root, "error");
             if (!jerrobj || json_is_null(jerrobj)) {
-                /* success */
+                /* no error — show the result field */
+                json_t *jres = json_object_get(root, "result");
+                if (!jres || json_is_null(jres)) {
+                    printf(">>> submitblock: ACCEPTED (result=null)\n");
+                } else if (json_is_false(jres)) {
+                    printf(">>> submitblock result: false\n");
+                } else if (json_is_true(jres)) {
+                    printf(">>> submitblock result: true\n");
+                } else if (json_is_string(jres)) {
+                    printf(">>> submitblock result: \"%s\"\n", json_string_value(jres));
+                } else {
+                    char *resdump = json_dumps(jres, JSON_COMPACT);
+                    printf(">>> submitblock result: %s\n", resdump ? resdump : "?");
+                    free(resdump);
+                }
                 ret = 0;
             } else {
                 /* extract code/message where available */
