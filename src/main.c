@@ -492,28 +492,7 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
 }
 
 #ifdef WITH_RPC
-struct string {
-    char *ptr;
-    size_t len;
-};
-
-static void init_string(struct string *s) {
-    s->len = 0;
-    s->ptr = malloc(1);
-    s->ptr[0] = '\0';
-}
-
-static size_t writefunc(void *ptr, size_t size, size_t nmemb, struct string *s) {
-    size_t newlen = s->len + size * nmemb;
-    s->ptr = realloc(s->ptr, newlen + 1);
-    memcpy(s->ptr + s->len, ptr, size * nmemb);
-    s->ptr[newlen] = '\0';
-    s->len = newlen;
-    return size * nmemb;
-}
-
 // rpc_submit/rpc_call are provided by the C++ wrapper in `src/rpc_cwrap.cpp`
-#ifdef WITH_RPC
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -524,6 +503,7 @@ char *rpc_getblocktemplate(const char *url, const char *user, const char *pass);
 }
 #endif
 #endif
+#ifdef WITH_RPC
 static void enqueue_job(const struct submit_job *job) {
     pthread_mutex_lock(&sq_lock);
     if (sq_count >= SUBMIT_QUEUE_MAX) {
@@ -566,8 +546,8 @@ static void *submit_thread_fn(void *arg) {
 
         // rate limiting
         uint64_t now = now_ms();
-        if (last_submit_ms && now - last_submit_ms < rpc_rate_ms) {
-            uint64_t wait = rpc_rate_ms - (now - last_submit_ms);
+        if (last_submit_ms && now - last_submit_ms < (uint64_t)rpc_rate_ms) {
+            uint64_t wait = (uint64_t)rpc_rate_ms - (now - last_submit_ms);
             struct timespec tsw; tsw.tv_sec = wait / 1000; tsw.tv_nsec = (wait % 1000) * 1000000;
             nanosleep(&tsw, NULL);
         }
