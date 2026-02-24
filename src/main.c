@@ -1056,6 +1056,38 @@ static int header_meets_target_hex(const char *blockhex) {
     return 1;
 }
 
+/* Extract and format the difficulty field from a GBT JSON string.
+   Gapcoin stores difficulty as a quoted 8-byte hex value; we parse it and
+   return a human-readable string "0x<hex> (~merit N.NN)" where the second
+   byte of the value is the approximate integer minimum-merit encoded in the
+   compact difficulty format.  Falls back to "(unknown)" if not found. */
+static void gbt_difficulty_str(const char *gbt_json, char out[64]) {
+    out[0] = '\0';
+    if (!gbt_json) { snprintf(out, 64, "(unknown)"); return; }
+    const char *bts = strstr(gbt_json, "\"difficulty\"");
+    if (!bts) { snprintf(out, 64, "(unknown)"); return; }
+    const char *c = strchr(bts, ':'); if (!c) { snprintf(out, 64, "(unknown)"); return; }
+    const char *q1 = strchr(c, '"'); if (!q1) { snprintf(out, 64, "(unknown)"); return; }
+    const char *q2 = strchr(q1+1, '"'); if (!q2) { snprintf(out, 64, "(unknown)"); return; }
+    size_t hlen = (size_t)(q2 - (q1+1));
+    if (hlen == 0 || hlen > 16) { snprintf(out, 64, "(unknown)"); return; }
+    char hbuf[17]; memcpy(hbuf, q1+1, hlen); hbuf[hlen] = '\0';
+    /* parse as big-endian uint64 */
+    uint64_t v = 0;
+    for (size_t i = 0; i < hlen; i++) {
+        char ch = hbuf[i]; int val = 0;
+        if (ch>='0'&&ch<='9') val=ch-'0';
+        else if (ch>='a'&&ch<='f') val=10+ch-'a';
+        else if (ch>='A'&&ch<='F') val=10+ch-'A';
+        v = (v<<4)|(uint64_t)val;
+    }
+    /* second byte encodes the integer part of minimum merit in Gapcoin compact format */
+    unsigned int merit_int = (unsigned int)((v >> 48) & 0xFF);
+    unsigned int frac = (unsigned int)((v >> 32) & 0xFFFF);
+    double merit_f = merit_int + (double)frac / 65536.0;
+    snprintf(out, 64, "0x%016llx (~min-merit %.2f)", (unsigned long long)v, merit_f);
+}
+
 static uint64_t hash_to_int(const char *s, int is_hex) {
     if (is_hex) {
         uint64_t v = 0;
@@ -1134,24 +1166,39 @@ static int scan_candidates(uint64_t *pr, double *pr_log, size_t cnt, double targ
             continue;
 
         __sync_fetch_and_add(&stats_gaps, 1);
-        log_msg("\n>>> GAP FOUND  p=%llu  q=%llu  gap=%llu  merit=%.4f  (need %.2f)\n",
+        /* Compute nAdd here so we can log it alongside the gap */
+        uint64_t nadd_sc = prev - (h_int_sc << shift_sc);
+        log_msg("\n>>> GAP FOUND\n"
+                "    p       = %llu\n"
+                "    q       = %llu\n"
+                "    gap     = %llu\n"
+                "    merit   = %.6f  (need >= %.2f)\n"
+                "    nShift  = %d\n"
+                "    nAdd    = %llu (0x%llx)\n",
                 (unsigned long long)prev,
                 (unsigned long long)q,
                 (unsigned long long)gap,
-                merit, target_local);
+                merit, target_local,
+                shift_sc,
+                (unsigned long long)nadd_sc,
+                (unsigned long long)nadd_sc);
 #ifdef WITH_RPC
             if (rpc_url_local) {
                 char *gbt = rpc_getblocktemplate(rpc_url_local, rpc_user_local, rpc_pass_local);
                 char blockhex[16384]; memset(blockhex,0,sizeof(blockhex));
                 if (gbt) {
+                    char diff_str[64]; gbt_difficulty_str(gbt, diff_str);
+                    log_msg("    network difficulty = %s\n", diff_str);
                     char payload_hex[197]; encode_pow_header_binary(header_local, prev, q, payload_hex);
-                    /* nAdd = prime - (hash << shift): the adder identifying this prime to the node */
-                    uint64_t nadd_sc = prev - (h_int_sc << shift_sc);
                     if (build_block_from_gbt_and_payload(gbt, payload_hex, shift_sc, nadd_sc, blockhex)) {
                         __sync_fetch_and_add(&stats_blocks,1);
                         log_file_only("Built blockhex: %s\n", blockhex);
                         if (header_meets_target_hex(blockhex)) {
-                            log_msg(">>> BLOCK CANDIDATE ready, submitting...\n");
+                            log_msg(">>> SUBMITTING to node\n"
+                                    "    merit=%.6f  gap=%llu  p=%llu  nShift=%d  nAdd=%llu\n"
+                                    "    network difficulty = %s\n",
+                                    merit, (unsigned long long)gap, (unsigned long long)prev,
+                                    shift_sc, (unsigned long long)nadd_sc, diff_str);
                             if (rpc_sign_key_local) {
                                 char sig[65];
                                 hmac_sha256_hex(rpc_sign_key_local, blockhex, sig);
