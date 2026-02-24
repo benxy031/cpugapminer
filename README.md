@@ -216,6 +216,57 @@ written above into a human-readable transaction/block dump:
 python3 scripts/inspect_tx.py /tmp/gap_miner_block_<timestamp>.hex
 ```
 
+## Reading the stats output
+
+Every ~0.3 s the miner prints a line like:
+
+```
+STATS: elapsed=706.1s  sieved=27447191618 (38873903/s)  tested=1116185791 (1580872/s)  gaps=0 (0.000/s)  built=0  submitted=0  accepted=0
+```
+
+| Field | Meaning |
+|-------|---------|
+| `sieved` | Odd candidates eliminated by the segmented sieve |
+| `tested` | Primality tests (Fermat / Miller-Rabin) actually run |
+| `gaps` | Gaps found whose merit ≥ `--target` |
+| `built` | Full blocks assembled from a GBT template after a qualifying gap |
+| `submitted` | Blocks whose header hash also met the network `bits` difficulty and were sent to the node |
+| `accepted` | Node confirmed the block |
+
+### Why `gaps=0` and `submitted=0` are normal early on
+
+Getting to `submitted=0` requires clearing **two independent gates**:
+
+1. **Merit gate** – `gap / log(p) >= target` (default `--target 20.0`).  For a
+   prime `p` around 2^281 (shift=25), `log(p) ≈ 195`, so a merit-20 gap requires
+   a prime gap of ~3 900.  Such gaps exist but are rare; finding one is a
+   Poisson process and can easily take many minutes or hours.
+
+2. **Difficulty gate** – the double-SHA256 of the assembled block header must be
+   below the network target encoded in `bits`.  A gap can pass the merit gate
+   but still fail this check; in that case `built` increments but `submitted`
+   does not.
+
+`gaps=0` after ~10 minutes at ~1.6 M tests/s and ~39 M sieved/s is completely
+normal.  The miner is working correctly if sieve and test rates are non-zero.
+
+### Troubleshooting low rates
+
+| Symptom | Likely cause | Fix |
+|---------|-------------|-----|
+| `sieved/s` very low | `--sieve-primes` too high | Reduce to 100 000–500 000 |
+| `tested/s` dominates CPU | `--sieve-primes` too low | Increase (sieve does more, primality less) |
+| `gaps=0` for hours | `--target` too high for your shift | Lower `--target` (e.g. 15) or verify shift |
+| `built=0` despite gaps | No RPC / GBT not returning a template | Check `--rpc-url` / node connectivity |
+| `submitted=0` despite built | Block hash not meeting difficulty | Normal on mainnet; use `--force-solution` to test submission path |
+
+To verify the **submission path** end-to-end without waiting for a real gap use `--force-solution`:
+
+```sh
+bin/gap_miner --rpc-url http://127.0.0.1:31397/ --rpc-user USER --rpc-pass PASS \
+  --force-solution --build-only
+```
+
 ## Notes
 
 * A share (`submitblock`) is sent **only** when:
