@@ -173,7 +173,6 @@ static volatile int debug_force = 0;    /* if nonzero, pretend any header meets 
 static volatile int use_fast_fermat = 0;
 static volatile int no_primality = 0;   /* skip all probable‑prime filtering */
 static volatile int selftest = 0;        /* run a quick internal test then exit */
-static volatile int debug_candidates = 0;   /* dump first few survivors when sieving */
 
 static void print_stats(void) {
     uint64_t now = now_ms();
@@ -1411,8 +1410,6 @@ static void *worker_fn(void *arg) {
 
             int cur_slot = psc.fill_slot;
             size_t cnt   = psc.bufs[cur_slot].cnt;
-            uint64_t L   = psc.bufs[cur_slot].L;
-            uint64_t R   = psc.bufs[cur_slot].R;
 
             /* Kick off NEXT window before primality so they overlap         */
             int64_t next_win = adder + 1;
@@ -1437,11 +1434,6 @@ static void *worker_fn(void *arg) {
             uint64_t *pr     = psc.bufs[cur_slot].pr;
             double   *pr_log = psc.bufs[cur_slot].pr_log;
             pthread_mutex_unlock(&psc.mu);
-
-            log_file_only("Win=%lld(off=%llu) [%llu,%llu) survivors=%zu\n",
-                          (long long)adder,
-                          (unsigned long long)adder_base_offset_local,
-                          (unsigned long long)L, (unsigned long long)R, cnt);
 
             /* Primality test in-place (runs while helper sieves next window) */
             size_t orig_cnt = cnt;
@@ -1518,7 +1510,6 @@ int main(int argc, char **argv) {
         printf("           --fast-fermat (use fast Fermat primality check)\n");
         printf("           --no-primality    skip probabilistic tests entirely\n");
         printf("           --selftest       run a few primality checks and exit\n");
-        printf("           --debug-candidates   print some sieve survivors before testing\n");
         printf("           --threads N --p P --q Q --log-file FILE\n");
         return 1;
     }
@@ -1564,7 +1555,6 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--fast-fermat")) use_fast_fermat = 1;
         else if (!strcmp(argv[i],"--no-primality")) no_primality = 1;
         else if (!strcmp(argv[i],"--selftest")) selftest = 1;
-        else if (!strcmp(argv[i],"--debug-candidates")) debug_candidates = 1;
         else if (!strcmp(argv[i],"--threads") && i+1<argc) num_threads = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--p") && i+1<argc) build_p = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i],"--q") && i+1<argc) build_q = strtoull(argv[++i], NULL, 10);
@@ -1706,31 +1696,14 @@ int main(int argc, char **argv) {
                 uint64_t max_valid = base + (uint64_t)adder_max;
                 if (R > max_valid) R = max_valid;
                 if (R <= L) continue;
-                log_file_only("Win=%lld offset=%llu sieving [%llu,%llu)\n", (long long)adder, (unsigned long long)((uint64_t)adder * sieve_size), (unsigned long long)L, (unsigned long long)R);
                 size_t cnt=0;
                 double *pr_log = NULL;
-                clock_t t0 = clock();
                 uint64_t *pr = sieve_range(L,R,&cnt,&pr_log);
-                clock_t t1 = clock();
-                double s_time = (double)(t1-t0)/CLOCKS_PER_SEC;
                 __sync_fetch_and_add(&stats_sieved, (uint64_t)(R - L));
-                double sieve_rate = (s_time > 1e-9) ? (double)(R - L) / s_time : 0.0;
-                log_file_only("  sieve: %zu candidates in %.3fs (%.0f nums/s)\n", cnt, s_time, sieve_rate);
-                if (debug_candidates && cnt>0) {
-                    size_t show = cnt < 10 ? cnt : 10;
-                    log_file_only("  sample survivors:\n");
-                    for (size_t k = 0; k < show; ++k)
-                        log_file_only("    %llu -> fast=%d mr=%d\n",
-                               (unsigned long long)pr[k],
-                               fast_fermat_test(pr[k]),
-                               miller_rabin(pr[k]));
-                }
-                // primality – compact pr[]/pr_log[] in-place, keeping only probable primes
-                size_t orig_cnt = cnt;
+                /* primality – compact pr[]/pr_log[] in-place */
                 size_t pf = 0;
-                double p_time = 0.0;
                 if (!no_primality) {
-                    clock_t tp0 = clock();
+                    size_t orig_cnt = cnt;
                     for (size_t i = 0; i < cnt; i++) {
                         if (use_fast_fermat ? fast_fermat_test(pr[i]) : miller_rabin(pr[i])) {
                             pr[pf]     = pr[i];
@@ -1738,19 +1711,12 @@ int main(int argc, char **argv) {
                             pf++;
                         }
                     }
-                    clock_t tp1 = clock();
-                    p_time = (double)(tp1-tp0)/CLOCKS_PER_SEC;
                     __sync_fetch_and_add(&stats_tested, (uint64_t)orig_cnt);
                     cnt = pf;
                 } else {
                     pf = cnt;
                     __sync_fetch_and_add(&stats_tested, (uint64_t)cnt);
                 }
-                double test_rate = (p_time > 1e-9) ? (double)orig_cnt / p_time : 0.0;
-                log_file_only("  primality: %zu/%zu probable primes in %.3fs (%.0f tests/s, %s)\n",
-                        pf, orig_cnt, p_time, test_rate,
-                        no_primality ? "skipped" : (use_fast_fermat ? "fast-Fermat" : "miller-rabin"));
-                print_stats();
                 if (cnt>=2) {
                     if (scan_candidates(pr, pr_log, cnt, target,
                                        h_int, shift,
