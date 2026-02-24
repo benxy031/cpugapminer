@@ -28,6 +28,16 @@ static void log_msg(const char *fmt, ...) {
     fflush(stdout);
     va_end(ap);
 }
+/* write only to the log file (silent on console); no-op when no log file is open */
+static void log_file_only(const char *fmt, ...) __attribute__((format(printf,1,2)));
+static void log_file_only(const char *fmt, ...) {
+    if (!log_fp) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(log_fp, fmt, ap);
+    fflush(log_fp);
+    va_end(ap);
+}
 #include <openssl/hmac.h>
 #include <pthread.h>
 #include <sys/time.h>
@@ -1203,12 +1213,12 @@ static void *worker_fn(void *arg) {
         double s_time = (double)(t1-t0)/CLOCKS_PER_SEC;
         __sync_fetch_and_add(&stats_sieved, (uint64_t)(R - L));
         double sieve_rate = (s_time > 1e-9) ? (double)(R - L) / s_time : 0.0;
-        log_msg("  sieve: %zu candidates in %.3fs (%.0f nums/s)\n", cnt, s_time, sieve_rate);
+        log_file_only("  sieve: %zu candidates in %.3fs (%.0f nums/s)\n", cnt, s_time, sieve_rate);
         if (debug_candidates && cnt>0) {
             size_t show = cnt < 10 ? cnt : 10;
-            log_msg("  sample survivors:\n");
+            log_file_only("  sample survivors:\n");
             for (size_t k = 0; k < show; ++k)
-                log_msg("    %llu -> fast=%d mr=%d\n",
+                log_file_only("    %llu -> fast=%d mr=%d\n",
                         (unsigned long long)pr[k],
                         fast_fermat_test(pr[k]),
                         miller_rabin(pr[k]));
@@ -1230,7 +1240,7 @@ static void *worker_fn(void *arg) {
             __sync_fetch_and_add(&stats_tested, (uint64_t)cnt);
         }
         double test_rate = (p_time > 1e-9) ? (double)cnt / p_time : 0.0;
-        log_msg("  primality: %zu/%zu probable primes in %.3fs (%.0f tests/s, %s)\n",
+        log_file_only("  primality: %zu/%zu probable primes in %.3fs (%.0f tests/s, %s)\n",
                 pf, cnt, p_time, test_rate,
                 no_primality ? "skipped" : (use_fast_fermat ? "fast-Fermat" : "miller-rabin"));
         print_stats();
@@ -1483,12 +1493,12 @@ int main(int argc, char **argv) {
                 double s_time = (double)(t1-t0)/CLOCKS_PER_SEC;
                 __sync_fetch_and_add(&stats_sieved, (uint64_t)(R - L));
                 double sieve_rate = (s_time > 1e-9) ? (double)(R - L) / s_time : 0.0;
-                log_msg("  sieve: %zu candidates in %.3fs (%.0f nums/s)\n", cnt, s_time, sieve_rate);
+                log_file_only("  sieve: %zu candidates in %.3fs (%.0f nums/s)\n", cnt, s_time, sieve_rate);
                 if (debug_candidates && cnt>0) {
                     size_t show = cnt < 10 ? cnt : 10;
-                    log_msg("  sample survivors:\n");
+                    log_file_only("  sample survivors:\n");
                     for (size_t k = 0; k < show; ++k)
-                        log_msg("    %llu -> fast=%d mr=%d\n",
+                        log_file_only("    %llu -> fast=%d mr=%d\n",
                                (unsigned long long)pr[k],
                                fast_fermat_test(pr[k]),
                                miller_rabin(pr[k]));
@@ -1510,7 +1520,7 @@ int main(int argc, char **argv) {
                     __sync_fetch_and_add(&stats_tested, (uint64_t)cnt);
                 }
                 double test_rate = (p_time > 1e-9) ? (double)cnt / p_time : 0.0;
-                log_msg("  primality: %zu/%zu probable primes in %.3fs (%.0f tests/s, %s)\n",
+                log_file_only("  primality: %zu/%zu probable primes in %.3fs (%.0f tests/s, %s)\n",
                         pf, cnt, p_time, test_rate,
                         no_primality ? "skipped" : (use_fast_fermat ? "fast-Fermat" : "miller-rabin"));
                 print_stats();
