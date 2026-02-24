@@ -1812,15 +1812,25 @@ static int fast_fermat_test(uint64_t n) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        printf("Usage: %s --header <text> [options]\n", argv[0]);
-        printf("  options: --hash-hex --shift N --adder-max M --sieve-size S --sieve-primes P --target T\n");
-        printf("           --rpc-url URL --rpc-user U --rpc-pass P --rpc-method METH\n");
-        printf("           --rpc-rate MS --rpc-retries N --rpc-sign-key KEY\n");
-        printf("           --build-only --no-opreturn --keep-going --stop-after-block\n");
-        printf("           --fast-fermat (use fast Fermat primality check)\n");
-        printf("           --no-primality    skip probabilistic tests entirely\n");
-        printf("           --selftest       run a few primality checks and exit\n");
-        printf("           --threads N --p P --q Q --log-file FILE\n");
+        printf("Usage: %s [options]\n", argv[0]);
+        printf("  -o, --host HOST       node hostname or IP  (default: 127.0.0.1)\n");
+        printf("  -p, --port PORT       node RPC port        (default: 31397)\n");
+        printf("      --rpc-url URL     full RPC URL (overrides --host/--port)\n");
+        printf("      --rpc-user U      RPC username\n");
+        printf("      --rpc-pass P      RPC password\n");
+        printf("  -s, --shift N         prime size shift      (default: 20)\n");
+        printf("      --sieve-size S    sieve size            (default: 32768)\n");
+        printf("      --sieve-primes P  small prime limit for sieve\n");
+        printf("      --target T        minimum merit         (default: 20.0)\n");
+        printf("      --threads N       worker threads        (default: 1)\n");
+        printf("      --adder-max M     adder upper bound     (default: 2^shift)\n");
+        printf("      --fast-fermat     fast primality (fewer Miller-Rabin rounds)\n");
+        printf("      --keep-going      continue after block found (default on)\n");
+        printf("      --stop-after-block  exit after first valid block\n");
+        printf("      --log-file FILE   append messages to FILE\n");
+        printf("      --header TEXT     override prime base (rarely needed)\n");
+        printf("      --rpc-rate MS     getwork poll interval ms  (default: 5000)\n");
+        printf("      --rpc-retries N   submit retries\n");
         return 1;
     }
     const char *header = NULL;
@@ -1836,6 +1846,8 @@ int main(int argc, char **argv) {
     double target = 20.0;
     const char *rpc_url = NULL, *rpc_user = NULL, *rpc_pass = NULL, *rpc_method = "getwork";
     const char *rpc_sign_key = NULL;
+    const char *rpc_host = NULL;
+    int rpc_port = 0;
     const char *log_file = NULL;
     unsigned int cli_rpc_rate = 0;
     int cli_rpc_retries = -1;
@@ -1847,10 +1859,13 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i],"--header") && i+1<argc) header = argv[++i];
         else if (!strcmp(argv[i],"--hash-hex")) is_hex = 1;
         else if (!strcmp(argv[i],"--shift") && i+1<argc) shift = atoi(argv[++i]);
+        else if (!strcmp(argv[i],"-s") && i+1<argc) shift = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--adder-max") && i+1<argc) adder_max = (int64_t)atoll(argv[++i]);
         else if (!strcmp(argv[i],"--sieve-size") && i+1<argc) sieve_size = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i],"--sieve-primes") && i+1<argc) cli_sieve_prime_limit = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i],"--target") && i+1<argc) target = atof(argv[++i]);
+        else if ((!strcmp(argv[i],"-o") || !strcmp(argv[i],"--host")) && i+1<argc) rpc_host = argv[++i];
+        else if ((!strcmp(argv[i],"-p") || !strcmp(argv[i],"--port")) && i+1<argc) rpc_port = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--rpc-url") && i+1<argc) rpc_url = argv[++i];
         else if (!strcmp(argv[i],"--rpc-user") && i+1<argc) rpc_user = argv[++i];
         else if (!strcmp(argv[i],"--rpc-pass") && i+1<argc) rpc_pass = argv[++i];
@@ -1877,6 +1892,15 @@ int main(int argc, char **argv) {
                found */
             keep_going = 0;
         }
+    }
+    /* Build rpc_url from --host / --port if not given explicitly.
+       Defaults: host=127.0.0.1, port=31397 (Gapcoin mainnet). */
+    static char rpc_url_buf[256];
+    if (!rpc_url && (rpc_host || rpc_port)) {
+        const char *h = rpc_host ? rpc_host : "127.0.0.1";
+        int         p = rpc_port ? rpc_port : 31397;
+        snprintf(rpc_url_buf, sizeof(rpc_url_buf), "http://%s:%d/", h, p);
+        rpc_url = rpc_url_buf;
     }
     if (adder_max < 0) {
         /* no explicit value supplied – use full allowed range */
