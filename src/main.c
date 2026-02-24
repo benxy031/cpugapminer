@@ -1813,9 +1813,10 @@ int main(int argc, char **argv) {
                             header = malloc(len+1);
                             memcpy((char*)header, start, len);
                             ((char*)header)[len] = '\0';
-                            if (header[0])
+                            if (header[0]) {
+                                is_hex = 1; /* GBT prevhash is always a 64-char hex string */
                                 log_msg("auto-header from GBT = %s\n", header);
-                            else
+                            } else
                                 log_msg("auto-header from GBT came back empty\n");
                         }
                     }
@@ -1827,6 +1828,15 @@ int main(int argc, char **argv) {
             fprintf(stderr, "--header required (or provide --rpc-url for automatic header)\n");
             return 2;
         }
+    }
+    /* Auto-detect hex header: 64 hex chars → raw 256-bit prevhash, not a SHA-256 seed */
+    if (!is_hex && header && strlen(header) == 64) {
+        int all_hex = 1;
+        for (int _i = 0; _i < 64 && all_hex; _i++) {
+            char _c = header[_i];
+            if (!((_c>='0'&&_c<='9')||(_c>='a'&&_c<='f')||(_c>='A'&&_c<='F'))) all_hex = 0;
+        }
+        if (all_hex) is_hex = 1;
     }
     uint8_t h256[32];
     hash_to_256(header, is_hex, h256);
