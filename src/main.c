@@ -1081,34 +1081,21 @@ static int scan_candidates(uint64_t *pr, double *pr_log, size_t cnt, double targ
                            const char *rpc_pass_local,
                            const char *rpc_method_local,
                            const char *rpc_sign_key_local) {
-    size_t i = 0;
-    while (i + 1 < cnt) {
-        uint64_t prev = pr[i];
-        double logp = pr_log[i];
-        double needed = target_local * logp;
-        uint64_t maxlen = (uint64_t)ceil(needed);
-        uint64_t limit = prev + maxlen;
-        /* fast-skip: find first index >= limit */
-        size_t hi = i + 1;
-        while (hi < cnt && pr[hi] < limit) hi++;
-        if (hi == i + 1) { /* no candidate within window */
-            i = hi;
+    for (size_t i = 0; i + 1 < cnt; i++) {
+        uint64_t prev  = pr[i];
+        uint64_t q     = pr[i + 1];
+        uint64_t gap   = q - prev;
+        double logp    = pr_log[i];
+        double merit   = (double)gap / logp;
+        if (merit < target_local)
             continue;
-        }
-        size_t found = SIZE_MAX;
-        /* scan forward within the window */
-        for (size_t j = i + 1; j < hi; j++) {
-            uint64_t gap = pr[j] - prev;
-            if (gap >= maxlen) { found = j; break; }
-        }
-        if (found != SIZE_MAX) {
-            uint64_t q = pr[found];
-            __sync_fetch_and_add(&stats_gaps,1);
-            log_msg("FOUND gap: p=%llu q=%llu gap=%llu merit=%.3f\n",
-                    (unsigned long long)prev,
-                    (unsigned long long)q,
-                    (unsigned long long)(q - prev),
-                    (double)(q - prev) / logp);
+
+        __sync_fetch_and_add(&stats_gaps, 1);
+        log_msg("FOUND gap: p=%llu q=%llu gap=%llu merit=%.4f (target=%.2f)\n",
+                (unsigned long long)prev,
+                (unsigned long long)q,
+                (unsigned long long)gap,
+                merit, target_local);
 #ifdef WITH_RPC
             if (rpc_url_local) {
                 char *gbt = rpc_getblocktemplate(rpc_url_local, rpc_user_local, rpc_pass_local);
@@ -1151,11 +1138,7 @@ static int scan_candidates(uint64_t *pr, double *pr_log, size_t cnt, double targ
                 }
             }
 #endif
-            i = found;
-        } else {
-            i = hi;
-        }
-    }
+    }   /* end for */
     return 0;
 }
 
