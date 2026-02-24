@@ -8,6 +8,16 @@
 #include <time.h>
 #include <unistd.h>
 #include <openssl/sha.h>
+#include <openssl/bn.h>
+#ifndef M_LN2
+#define M_LN2 0.693147180559945309417232121458
+#endif
+/* Forward declarations for 256-bit arithmetic helpers defined later */
+static void     hash_to_256(const char *s, int is_hex, uint8_t out[32]);
+static uint64_t uint256_mod_small(const uint8_t h[32], int shift, uint64_t p);
+static double   uint256_log_approx(const uint8_t h[32], int shift);
+static void     set_base_bn(const uint8_t h256[32], int shift);
+static int      bn_candidate_is_prime(uint64_t offset);
 #ifdef WITH_RPC
 #include <curl/curl.h>
 #endif
@@ -376,7 +386,6 @@ static int miller_rabin(uint64_t n) {
    by sieve_range and must **not** be freed by the caller; they will be
    released at program exit. */
 static __thread uint64_t *tls_pr   = NULL;
-static __thread double   *tls_log  = NULL;
 static __thread size_t    tls_cap  = 0;
 /* Reusable composite-bits bitmap per thread – avoids calloc/free on every sieve call */
 static __thread uint8_t  *tls_bits     = NULL;
@@ -384,19 +393,21 @@ static __thread size_t    tls_bits_cap = 0;
 
 static void free_sieve_buffers(void) {
     free(tls_pr);
-    free(tls_log);
     free(tls_bits);
     tls_pr       = NULL;
-    tls_log      = NULL;
     tls_bits     = NULL;
     tls_cap      = 0;
     tls_bits_cap = 0;
 }
 
+/* sieve_range: segmented odd-only sieve over RELATIVE offsets [L, R) from
+   the big base = h256 << shift.  L and R are uint64_t nAdd offsets; the
+   actual prime candidates are (h256<<shift)+L ..  (h256<<shift)+R.
+   The returned pr[] array holds those same relative offsets. */
 static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
-                             double **out_logs) {
-    if (L >= R) { *out_count = 0; if (out_logs) *out_logs = NULL; return NULL; }
-    if (L < 3) L = 3;
+                             const uint8_t *h256, int shift) {
+    if (L >= R) { *out_count = 0; return NULL; }
+    /* L must be odd so that (even_base + L) is odd */
     if ((L & 1) == 0) L++;
     if ((R & 1) == 0) R++;
     uint64_t seg_size = (R - L) / 2 + 1;
@@ -405,16 +416,16 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
     if (tls_bits_cap < bit_size) {
         free(tls_bits);
         tls_bits = malloc(bit_size + 64); /* +64 for safe 8-byte word reads at tail */
-        if (!tls_bits) { tls_bits_cap = 0; *out_count = 0; if (out_logs) *out_logs = NULL; return NULL; }
+        if (!tls_bits) { tls_bits_cap = 0; *out_count = 0; return NULL; }
         tls_bits_cap = bit_size + 64;
     }
     memset(tls_bits, 0, bit_size);
     uint8_t *bits = tls_bits;
 
-    uint64_t limit = (uint64_t)floor(sqrt((double)R)) + 1;
-    uint64_t use_limit = limit;
-    if (use_limit > cli_sieve_prime_limit) use_limit = cli_sieve_prime_limit;
-    if (use_limit > SIEVE_SMALL_PRIME_LIMIT) use_limit = SIEVE_SMALL_PRIME_LIMIT;  /* safety */
+    /* For big primes (256+shift bits), the sieve trial-division limit is
+       bounded by the user-configured --sieve-prime-limit (or default).    */
+    uint64_t use_limit = (uint64_t)cli_sieve_prime_limit;
+    if (use_limit > SIEVE_SMALL_PRIME_LIMIT) use_limit = SIEVE_SMALL_PRIME_LIMIT;
     pthread_once(&small_primes_once, populate_small_primes_cache);
 
     /* Start marking at idx=1 to skip p=2: L is always odd, so even multiples
@@ -423,7 +434,11 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
         for (size_t idx = 1; idx < small_primes_count; ++idx) {
             uint64_t p = small_primes_cache[idx];
             if (p > use_limit) break;
-            uint64_t start = (L + p - 1) / p * p;
+            /* Find first relative offset >= L where (base + offset) ≡ 0 (mod p).
+               base_mod_p = (h256 << shift) % p, computed on demand. */
+            uint64_t base_mod_p = h256 ? uint256_mod_small(h256, shift, p) : (L % p);
+            uint64_t lrem = (base_mod_p + L % p) % p;
+            uint64_t start = L + (lrem == 0 ? 0 : p - lrem);
             if ((start & 1) == 0) start += p;
             for (uint64_t m = start; m < R; m += 2 * p) {
                 uint64_t pos = (m - L) / 2;
@@ -432,15 +447,12 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
         }
     }
 
-    /* ensure the tls buffers are large enough */
+    /* ensure the tls_pr buffer is large enough */
     if (tls_cap < seg_size) {
         size_t newcap = seg_size;
         tls_pr = realloc(tls_pr, newcap * sizeof(uint64_t));
-        tls_log = realloc(tls_log, newcap * sizeof(double));
-        if (!tls_pr || !tls_log) {
-            free(bits);
+        if (!tls_pr) {
             *out_count = 0;
-            if (out_logs) *out_logs = NULL;
             return NULL;
         }
         tls_cap = newcap;
@@ -464,21 +476,18 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
     else if (r0 < 30 && mod30_start[r0] >= 0) { w = mod30_start[r0]; }
     else {
         do { x += 2; } while (x < R && (x % 30 == 0 || mod30_start[x % 30] < 0));
-        if (x >= R) { *out_count = 0; if (out_logs) *out_logs = NULL; return NULL; }
+        if (x >= R) { *out_count = 0; return NULL; }
         w = (x % 30 == 1) ? 0 : mod30_start[x % 30];
     }
     while (x < R) {
         uint64_t pos = (x - L) >> 1;
         if (pos < seg_size && !(bits[pos>>3] & (uint8_t)(1u << (pos & 7)))) {
-            tls_pr[out_cnt]  = x;
-            tls_log[out_cnt] = log((double)x);
-            out_cnt++;
+            tls_pr[out_cnt++] = x;
         }
         x += wheel30[w];
         w = (w + 1) & 7;
     }
     *out_count = out_cnt;
-    if (out_logs) *out_logs = tls_log;
     return tls_pr;
 }
 
@@ -638,14 +647,15 @@ static void bytes_to_hex(const unsigned char *bytes, size_t len, char *out) {
 
 // RPC-only helpers
 #ifdef WITH_RPC
-static void encode_pow_header_binary(const char *header, uint64_t p, uint64_t q, char outhex[197]) {
+/* Produce a 32-byte OP_RETURN commitment for the coinbase: SHA256 of the
+   hex-decoded prevhash bytes.  The actual Gapcoin PoW is validated via
+   nShift/nAdd in the block header, not this field. */
+static void encode_pow_header_binary(const char *prevhash_hex, char outhex[65]) {
+    uint8_t prevbytes[32] = {0};
+    hash_to_256(prevhash_hex, 1, prevbytes);
     unsigned char md[SHA256_DIGEST_LENGTH];
-    SHA256((const unsigned char*)header, strlen(header), md);
-    unsigned char buf[32 + 8 + 8];
-    memcpy(buf, md, 32);
-    u64_to_le(p, buf+32);
-    u64_to_le(q, buf+40);
-    bytes_to_hex(buf, sizeof(buf), outhex);
+    SHA256(prevbytes, 32, md);
+    bytes_to_hex(md, 32, outhex);
 }
 
 // HMAC-SHA256 of data with key, hex output (64 chars + NUL)
@@ -1195,22 +1205,80 @@ static void gbt_difficulty_str(const char *gbt_json, char out[64]) {
     snprintf(out, 64, "0x%016llx (~min-merit %.2f)", (unsigned long long)v, merit_f);
 }
 
-static uint64_t hash_to_int(const char *s, int is_hex) {
+/* Convert a header string to a 256-bit (32-byte) big-endian integer.
+   is_hex=1: decode up to 64 hex chars directly (prevhash from GBT).
+   is_hex=0: SHA-256 the string and use the digest. */
+static void hash_to_256(const char *s, int is_hex, uint8_t out[32]) {
+    memset(out, 0, 32);
     if (is_hex) {
-        uint64_t v = 0;
-        for (size_t i=0;i<16 && s[i];++i) {
-            char c = s[i];
-            int val = 0;
-            if (c>='0'&&c<='9') val=c-'0'; else if (c>='a'&&c<='f') val=10+c-'a'; else if (c>='A'&&c<='F') val=10+c-'A';
-            v = (v<<4) | (val & 0xf);
+        size_t len = strlen(s);
+        if (len > 64) len = 64;
+        for (size_t i = 0; i < len / 2; i++) {
+            char hi = s[2*i], lo = s[2*i+1];
+            int vh = (hi>='0'&&hi<='9')?(hi-'0'):(hi>='a'&&hi<='f')?(10+hi-'a'):(10+hi-'A');
+            int vl = (lo>='0'&&lo<='9')?(lo-'0'):(lo>='a'&&lo<='f')?(10+lo-'a'):(10+lo-'A');
+            out[i] = (uint8_t)((vh << 4) | vl);
         }
-        return v;
+    } else {
+        unsigned char md[SHA256_DIGEST_LENGTH];
+        SHA256((const unsigned char*)s, strlen(s), md);
+        memcpy(out, md, 32);
     }
-    unsigned char md[SHA256_DIGEST_LENGTH];
-    SHA256((const unsigned char*)s, strlen(s), md);
-    uint64_t v = 0;
-    for (int i=0;i<8;i++) v = (v<<8) | md[i];
-    return v;
+}
+
+/* Compute (h << shift) % p  where h is a 32-byte big-endian integer and p
+   fits in uint64_t.  Uses __uint128_t for intermediate reductions. */
+static uint64_t uint256_mod_small(const uint8_t h[32], int shift, uint64_t p) {
+    if (p <= 1) return 0;
+    /* Step 1: h % p via schoolbook big-endian byte reduction */
+    __uint128_t rem = 0;
+    for (int i = 0; i < 32; i++)
+        rem = (rem * 256 + h[i]) % p;
+    /* Step 2: 2^shift % p via repeated doubling */
+    __uint128_t pow2 = 1 % p;
+    for (int i = 0; i < shift; i++)
+        pow2 = pow2 * 2 % p;
+    return (uint64_t)((__uint128_t)rem * pow2 % p);
+}
+
+/* Approximate log(h << shift) for merit calculation.
+   h is big-endian 32 bytes (256-bit hash), prime = h*2^shift + nAdd.
+   Since nAdd << h*2^shift, log(prime) ≈ log(h) + shift*log(2).
+   We approximate log(h) using its 8 most-significant bytes. */
+static double uint256_log_approx(const uint8_t h[32], int shift) {
+    uint64_t leading = 0;
+    for (int i = 0; i < 8; i++) leading = (leading << 8) | h[i];
+    if (leading == 0) return (double)(192 + shift) * M_LN2;
+    /* h ≈ leading * 2^192, so log(h<<shift) ≈ log(leading) + (192+shift)*ln2 */
+    return log((double)leading) + (double)(192 + shift) * M_LN2;
+}
+
+/* Thread-local OpenSSL BIGNUM state for 256+shift-bit primality testing.
+   set_base_bn() precomputes base = h256 << shift once per mining pass.
+   bn_candidate_is_prime() tests base + offset. */
+static __thread BIGNUM *tls_base_bn = NULL;
+static __thread BIGNUM *tls_cand_bn = NULL;
+static __thread BN_CTX *tls_bn_ctx  = NULL;
+
+static void ensure_bn_tls(void) {
+    if (!tls_bn_ctx)  tls_bn_ctx  = BN_CTX_new();
+    if (!tls_base_bn) tls_base_bn = BN_new();
+    if (!tls_cand_bn) tls_cand_bn = BN_new();
+}
+
+/* Compute tls_base_bn = h256 << shift  (called once per worker pass). */
+static void set_base_bn(const uint8_t h256[32], int shift) {
+    ensure_bn_tls();
+    BN_bin2bn(h256, 32, tls_base_bn);
+    BN_lshift(tls_base_bn, tls_base_bn, shift);
+}
+
+/* Return 1 if (tls_base_bn + offset) is probably prime. */
+static int bn_candidate_is_prime(uint64_t offset) {
+    ensure_bn_tls();
+    BN_copy(tls_cand_bn, tls_base_bn);
+    BN_add_word(tls_cand_bn, (BN_ULONG)offset);
+    return BN_check_prime(tls_cand_bn, tls_bn_ctx, NULL);
 }
 
 // Produce hex of SHA256(header) (useful as a simple header encoding)
@@ -1229,7 +1297,7 @@ static void sha256_hex(const char *s, char out[65]) {
 struct worker_args {
     int tid;
     int nthreads;
-    uint64_t h_int;
+    uint8_t  h256[32];  /* 256-bit base hash (big-endian) */
     int shift;
     int64_t adder_max;
     uint64_t sieve_size;
@@ -1258,8 +1326,11 @@ struct worker_args {
 // construction/submission here exactly as the old code did.  The function
 // returns 1 to signal the caller (single-thread mode or a worker) that a
 // valid block has been found and `!keep_going` should cause termination.
-static int scan_candidates(uint64_t *pr, double *pr_log, size_t cnt, double target_local,
-                           uint64_t h_int_sc, int shift_sc,
+/* scan_candidates: pr[] holds relative offsets (nAdd values) from the big
+   base = h256<<shift.  logbase = log(base) (precomputed, constant across
+   all candidates in this window).  nAdd = pr[i] directly. */
+static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
+                           double logbase, int shift_sc,
                            const char *header_local,
                            const char *rpc_url_local,
                            const char *rpc_user_local,
@@ -1267,26 +1338,21 @@ static int scan_candidates(uint64_t *pr, double *pr_log, size_t cnt, double targ
                            const char *rpc_method_local,
                            const char *rpc_sign_key_local) {
     for (size_t i = 0; i + 1 < cnt; i++) {
-        uint64_t prev  = pr[i];
-        uint64_t q     = pr[i + 1];
+        uint64_t prev  = pr[i];       /* nAdd of gap start prime */
+        uint64_t q     = pr[i + 1];   /* nAdd of gap end prime   */
         uint64_t gap   = q - prev;
-        double logp    = pr_log[i];
-        double merit   = (double)gap / logp;
+        double merit   = (double)gap / logbase;
         if (merit < target_local)
             continue;
 
         __sync_fetch_and_add(&stats_gaps, 1);
-        /* Compute nAdd here so we can log it alongside the gap */
-        uint64_t nadd_sc = prev - (h_int_sc << shift_sc);
+        /* nAdd = relative offset = prev (prime = base + nAdd). */
+        uint64_t nadd_sc = prev;
         log_msg("\n>>> GAP FOUND\n"
-                "    p       = %llu\n"
-                "    q       = %llu\n"
                 "    gap     = %llu\n"
                 "    merit   = %.6f  (need >= %.2f)\n"
                 "    nShift  = %d\n"
                 "    nAdd    = %llu (0x%llx)\n",
-                (unsigned long long)prev,
-                (unsigned long long)q,
                 (unsigned long long)gap,
                 merit, target_local,
                 shift_sc,
@@ -1312,15 +1378,15 @@ static int scan_candidates(uint64_t *pr, double *pr_log, size_t cnt, double targ
                     if (sq_busy) { free(gbt); continue; }
                     char diff_str[64]; gbt_difficulty_str(gbt, diff_str);
                     log_msg("    network difficulty = %s\n", diff_str);
-                    char payload_hex[197]; encode_pow_header_binary(header_local, prev, q, payload_hex);
+                    char payload_hex[65];  encode_pow_header_binary(header_local, payload_hex);
                     if (build_block_from_gbt_and_payload(gbt, payload_hex, shift_sc, nadd_sc, blockhex)) {
                         __sync_fetch_and_add(&stats_blocks,1);
                         log_file_only("Built blockhex: %s\n", blockhex);
                         if (header_meets_target_hex(blockhex)) {
                             log_msg(">>> SUBMITTING to node\n"
-                                    "    merit=%.6f  gap=%llu  p=%llu  nShift=%d  nAdd=%llu\n"
+                                    "    merit=%.6f  gap=%llu  nShift=%d  nAdd=%llu\n"
                                     "    network difficulty = %s\n",
-                                    merit, (unsigned long long)gap, (unsigned long long)prev,
+                                    merit, (unsigned long long)gap,
                                     shift_sc, (unsigned long long)nadd_sc, diff_str);
                             if (rpc_sign_key_local) {
                                 char sig[65];
@@ -1374,7 +1440,6 @@ static int scan_candidates(uint64_t *pr, double *pr_log, size_t cnt, double targ
 
 struct presieve_buf {
     uint64_t *pr;
-    double   *pr_log;
     size_t    cap;
     size_t    cnt;
     uint64_t  L, R;
@@ -1388,14 +1453,15 @@ struct presieve_ctx {
     pthread_cond_t  cv_go;       /* worker -> helper: new window ready  */
     pthread_cond_t  cv_done;     /* helper -> worker: result ready      */
     pthread_t thread;
+    const uint8_t *h256;         /* 256-bit base hash (for sieve_range) */
+    int            shift;        /* bit shift for prime size             */
 };
 
 static void presieve_buf_ensure(struct presieve_buf *b, size_t need) {
     if (b->cap >= need) return;
     size_t nc = need + (need >> 1) + 64;
-    b->pr     = realloc(b->pr,     nc * sizeof(uint64_t));
-    b->pr_log = realloc(b->pr_log, nc * sizeof(double));
-    b->cap    = nc;
+    b->pr  = realloc(b->pr, nc * sizeof(uint64_t));
+    b->cap = nc;
 }
 
 static void *presieve_helper_fn(void *arg) {
@@ -1412,16 +1478,13 @@ static void *presieve_helper_fn(void *arg) {
 
         /* sieve using this helper's own TLS (independent from worker's TLS) */
         size_t cnt = 0;
-        double *log_tls = NULL;
-        uint64_t *pr_tls = sieve_range(L, R, &cnt, &log_tls);
+        uint64_t *pr_tls = sieve_range(L, R, &cnt, ctx->h256, ctx->shift);
 
         pthread_mutex_lock(&ctx->mu);
         struct presieve_buf *b = &ctx->bufs[slot];
         presieve_buf_ensure(b, cnt);
-        if (cnt && pr_tls) {
-            memcpy(b->pr,     pr_tls,  cnt * sizeof(uint64_t));
-            memcpy(b->pr_log, log_tls, cnt * sizeof(double));
-        }
+        if (cnt && pr_tls)
+            memcpy(b->pr, pr_tls, cnt * sizeof(uint64_t));
         b->cnt = cnt;
         __sync_fetch_and_add(&stats_sieved, (uint64_t)(R - L));
         ctx->state = 2;
@@ -1448,7 +1511,8 @@ static int presieve_window(int64_t widx, uint64_t base,
 
 static void *worker_fn(void *arg) {
     struct worker_args *wa          = (struct worker_args*)arg;
-    uint64_t h_int_local            = wa->h_int;
+    uint8_t  h256_local[32];
+    memcpy(h256_local, wa->h256, 32);
     int      shift_local            = wa->shift;
     int64_t  adder_max_local        = wa->adder_max;
     uint64_t sieve_size_local       = wa->sieve_size;
@@ -1466,9 +1530,13 @@ static void *worker_fn(void *arg) {
     rpc_sign_key_local = wa->rpc_sign_key;
 #endif
 
-    /* This thread covers [base, base+adder_max_local) where base already
-       embeds the per-thread offset into the global adder range.            */
-    uint64_t base       = (h_int_local << shift_local) + (uint64_t)adder_base_offset_local;
+    /* Precompute log(base) = log(h256 << shift) for merit calculation.      */
+    double logbase = uint256_log_approx(h256_local, shift_local);
+    /* Set thread-local base BIGNUM = h256 << shift for primality tests.     */
+    set_base_bn(h256_local, shift_local);
+
+    /* This thread covers adder offsets [rel_base, rel_base+adder_max_local) */
+    uint64_t base       = (uint64_t)adder_base_offset_local;  /* relative from big base */
     int64_t  num_windows = ((int64_t)adder_max_local + (int64_t)sieve_size_local - 1)
                            / (int64_t)sieve_size_local;
     if (num_windows == 0) return NULL;
@@ -1481,6 +1549,8 @@ static void *worker_fn(void *arg) {
     pthread_cond_init(&psc.cv_go,   NULL);
     pthread_cond_init(&psc.cv_done, NULL);
     psc.state = 0; psc.fill_slot = 0;
+    psc.h256  = h256_local;  /* helper needs h256/shift for sieve_range */
+    psc.shift = shift_local;
     pthread_create(&psc.thread, NULL, presieve_helper_fn, &psc);
 
     /* Outer loop: mine continuously (same slice, same header) until either
@@ -1553,7 +1623,6 @@ static void *worker_fn(void *arg) {
 
             /* cur_slot is exclusively ours; helper works on next_slot      */
             uint64_t *pr     = psc.bufs[cur_slot].pr;
-            double   *pr_log = psc.bufs[cur_slot].pr_log;
             pthread_mutex_unlock(&psc.mu);
 
             /* Primality test in-place (runs while helper sieves next window) */
@@ -1561,10 +1630,8 @@ static void *worker_fn(void *arg) {
             size_t pf = 0;
             if (!no_primality) {
                 for (size_t i = 0; i < cnt; i++) {
-                    if (use_fast_fermat ? fast_fermat_test(pr[i]) : miller_rabin(pr[i])) {
-                        pr[pf]     = pr[i];
-                        pr_log[pf] = pr_log[i];
-                        pf++;
+                    if (bn_candidate_is_prime(pr[i])) {
+                        pr[pf++] = pr[i];
                     }
                 }
                 __sync_fetch_and_add(&stats_tested, (uint64_t)orig_cnt);
@@ -1575,8 +1642,8 @@ static void *worker_fn(void *arg) {
             }
 
             if (cnt >= 2) {
-                if (scan_candidates(pr, pr_log, cnt, target_local,
-                                    h_int_local, shift_local,
+                if (scan_candidates(pr, cnt, target_local, logbase,
+                                    shift_local,
                                     header_local,
                                     rpc_url_local, rpc_user_local, rpc_pass_local,
                                     rpc_method_local, rpc_sign_key_local))
@@ -1594,8 +1661,8 @@ worker_done:
     pthread_mutex_unlock(&psc.mu);
     pthread_join(psc.thread, NULL);
 
-    free(psc.bufs[0].pr); free(psc.bufs[0].pr_log);
-    free(psc.bufs[1].pr); free(psc.bufs[1].pr_log);
+    free(psc.bufs[0].pr);
+    free(psc.bufs[1].pr);
     pthread_mutex_destroy(&psc.mu);
     pthread_cond_destroy(&psc.cv_go);
     pthread_cond_destroy(&psc.cv_done);
@@ -1761,7 +1828,8 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
-    uint64_t h_int = hash_to_int(header, is_hex);
+    uint8_t h256[32];
+    hash_to_256(header, is_hex, h256);
     atexit(print_stats);
     /* free thread-local sieve buffers when the process exits */
     atexit(free_sieve_buffers);
@@ -1805,10 +1873,10 @@ int main(int argc, char **argv) {
         char payload_hex[197] = {0};
         if (!no_opreturn) {
             if (build_p == 0 && build_q == 0) { log_msg("--build-only requires --p and --q when not using --no-opreturn\n"); free(gbt); stop_stats_thread(); return 2; }
-            encode_pow_header_binary(header, build_p, build_q, payload_hex);
+            encode_pow_header_binary(header, payload_hex);
         }
-        /* nAdd = p - (hash << shift), or 0 if no p given */
-        uint64_t build_nadd = (build_p > 0) ? (build_p - (h_int << shift)) : 0;
+        /* --p is interpreted as nAdd directly (prime = h256<<shift + nAdd). */
+        uint64_t build_nadd = (uint64_t)build_p;
         if (build_block_from_gbt_and_payload(gbt, payload_hex, shift, build_nadd, blockhex)) {
             log_msg("Built blockhex: %s\n", blockhex);
             if (rpc_url) {
@@ -1828,28 +1896,24 @@ int main(int argc, char **argv) {
     if (num_threads <= 1) {
         do {
             int64_t num_windows = ((int64_t)adder_max + (int64_t)sieve_size - 1) / (int64_t)sieve_size;
+            double logbase = uint256_log_approx(h256, shift);
+            set_base_bn(h256, shift);
             for (int64_t adder=0; adder<num_windows; ++adder) {
-                uint64_t base = h_int << shift;
-                uint64_t L = base + (uint64_t)adder * sieve_size;
+                /* L, R are relative offsets from h256<<shift (= nAdd range) */
+                uint64_t L = (uint64_t)adder * sieve_size;
                 if ((L & 1) == 0) L++;
                 uint64_t R = L + sieve_size;
-                uint64_t max_valid = base + (uint64_t)adder_max;
-                if (R > max_valid) R = max_valid;
+                if (R > (uint64_t)adder_max) R = (uint64_t)adder_max;
                 if (R <= L) continue;
                 size_t cnt=0;
-                double *pr_log = NULL;
-                uint64_t *pr = sieve_range(L,R,&cnt,&pr_log);
+                uint64_t *pr = sieve_range(L, R, &cnt, h256, shift);
                 __sync_fetch_and_add(&stats_sieved, (uint64_t)(R - L));
-                /* primality – compact pr[]/pr_log[] in-place */
+                /* primality – compact pr[] in-place using big-prime BN test */
                 size_t pf = 0;
                 if (!no_primality) {
                     size_t orig_cnt = cnt;
                     for (size_t i = 0; i < cnt; i++) {
-                        if (use_fast_fermat ? fast_fermat_test(pr[i]) : miller_rabin(pr[i])) {
-                            pr[pf]     = pr[i];
-                            pr_log[pf] = pr_log[i];
-                            pf++;
-                        }
+                        if (bn_candidate_is_prime(pr[i])) pr[pf++] = pr[i];
                     }
                     __sync_fetch_and_add(&stats_tested, (uint64_t)orig_cnt);
                     cnt = pf;
@@ -1858,15 +1922,13 @@ int main(int argc, char **argv) {
                     __sync_fetch_and_add(&stats_tested, (uint64_t)cnt);
                 }
                 if (cnt>=2) {
-                    if (scan_candidates(pr, pr_log, cnt, target,
-                                       h_int, shift,
-                                       header,
+                    if (scan_candidates(pr, cnt, target, logbase,
+                                       shift, header,
                                        rpc_url, rpc_user, rpc_pass,
                                        rpc_method, rpc_sign_key)) {
                         return 0;
                     }
                 }
-                /* free nothing; buffers reused */
             }
             if (keep_going && rpc_url) {
                 /* refresh header if node has new template */
@@ -1888,7 +1950,7 @@ int main(int argc, char **argv) {
                                 if (newhdr[0] && strcmp(newhdr, header) != 0) {
                                     free((char*)header);
                                     header = newhdr;
-                                    h_int = hash_to_int(header, is_hex);
+                                    hash_to_256(header, is_hex, h256);
                                 } else {
                                     free(newhdr);
                                 }
@@ -1920,7 +1982,7 @@ int main(int argc, char **argv) {
                 wargs[t].rpc_thread        = (t == 0) ? 1 : 0;
                 wargs[t].adder_base_offset = off;
                 wargs[t].adder_max         = sz;
-                wargs[t].h_int             = h_int;
+                memcpy(wargs[t].h256, h256, 32);
                 wargs[t].shift             = shift;
                 wargs[t].sieve_size        = sieve_size;
                 wargs[t].target            = target;
@@ -1956,7 +2018,7 @@ int main(int argc, char **argv) {
                                 if (newhdr[0] && strcmp(newhdr, header) != 0) {
                                     free((char*)header);
                                     header = newhdr;
-                                    h_int = hash_to_int(header, is_hex);
+                                    hash_to_256(header, is_hex, h256);
                                 } else {
                                     free(newhdr);
                                 }
