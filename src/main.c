@@ -128,6 +128,9 @@ static uint64_t stats_start_ms = 0;                /* time mining started */
 static char     g_prevhash[65]  = {0};
 static uint64_t g_height        = 0;
 static pthread_mutex_t g_work_lock = PTHREAD_MUTEX_INITIALIZER;
+/* set to 1 by thread-0 when a new block is detected; all workers break their
+   adder loop and the main thread restarts the pass with fresh work */
+static volatile int g_abort_pass = 0;
 
 /* Parse prevhash and height from a GBT JSON string, log a clear banner if
    the chain tip has moved, and update the shared globals. */
@@ -452,7 +455,12 @@ static void *submit_thread_fn(void *arg) {
             attempt++;
         }
         last_submit_ms = now_ms();
-        if (ok == 0) log_msg("Job submitted successfully\n"); else log_msg("Job submission failed after %d attempts\n", attempt);
+        if (ok == 0) {
+            __sync_fetch_and_add(&stats_success, 1);
+            log_msg(">>> ACCEPTED (async submit)\n");
+        } else {
+            log_msg(">>> REJECTED after %d attempts (async submit)\n", attempt);
+        }
     }
     return NULL;
 }
@@ -1010,24 +1018,12 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
 }
 #endif
 
-/* check whether the block hex contains a header whose hash satisfies
-   the difficulty encoded in its nDifficulty field.
-   NOTE: Gapcoin uses prime-gap proof-of-work, not hash-based PoW.
-   The real PoW validation is performed by the node on submitblock.
-   This function performs a basic sanity-read of the 88-byte Gapcoin header
-   and always returns 1 so the block is forwarded to the node for validation. */
+/* check whether the block should be forwarded to the node for PoW validation.
+   Gapcoin uses prime-gap proof-of-work, not hash-based PoW; the real PoW check
+   is performed by gapcoind on submitblock, so we always forward the block.
+   debug_force is checked first for the --force-solution testing path. */
 static int header_meets_target_hex(const char *blockhex) {
-    if (debug_force) return 1;
-    /* Gapcoin header = 88+ bytes (variable due to nAdd length):
-       version(4)+prev(32)+merkle(32)+time(4)+nDifficulty(8)+nNonce(4)+nShift(2)+nAdd(variable) */
-    unsigned char hdr[88];
-    unsigned int v;
-    for (int i=0;i<88;i++) {
-        if (sscanf(blockhex+2*i, "%2x", &v) != 1) return 0;
-        hdr[i] = (unsigned char)v;
-    }
-    /* Gapcoin PoW is prime-based; always let the node decide. */
-    (void)hdr; /* suppress unused-variable warning */
+    (void)blockhex; /* the node decides; we never reject locally */
     return 1;
 }
 
@@ -1067,7 +1063,7 @@ struct worker_args {
     int nthreads;
     uint64_t h_int;
     int shift;
-    int adder_max;
+    int64_t adder_max;
     uint64_t sieve_size;
     double target;
     const char *header;
@@ -1133,18 +1129,18 @@ static int scan_candidates(uint64_t *pr, double *pr_log, size_t cnt, double targ
                                 log_msg("    signature: %s\n", sig);
                             }
                             if (rpc_url_local) {
-                                __sync_fetch_and_add(&stats_submits,1);
-                                int rc = rpc_submit(rpc_url_local,
-                                                    rpc_user_local,
-                                                    rpc_pass_local,
-                                                    rpc_method_local,
-                                                    blockhex);
-                                if (rc == 0) {
-                                    __sync_fetch_and_add(&stats_success,1);
-                                    log_msg(">>> ACCEPTED\n");
-                                } else {
-                                    log_msg(">>> REJECTED (see error above)\n");
-                                }
+                                struct submit_job _job;
+                                memset(&_job, 0, sizeof(_job));
+                                strncpy(_job.url,    rpc_url_local,                       sizeof(_job.url)-1);
+                                strncpy(_job.user,   rpc_user_local   ? rpc_user_local   : "", sizeof(_job.user)-1);
+                                strncpy(_job.pass,   rpc_pass_local   ? rpc_pass_local   : "", sizeof(_job.pass)-1);
+                                strncpy(_job.method, rpc_method_local ? rpc_method_local : "submitblock", sizeof(_job.method)-1);
+                                /* blockhex and _job.hex are both 16384 bytes; memcpy the full buffer */
+                                memcpy(_job.hex, blockhex, sizeof(_job.hex));
+                                _job.retries = rpc_default_retries;
+                                __sync_fetch_and_add(&stats_submits, 1);
+                                enqueue_job(&_job);
+                                log_msg(">>> QUEUED for async submit (mining continues)\n");
                             }
                             print_stats();
                             if (!keep_going) {
@@ -1171,7 +1167,7 @@ static void *worker_fn(void *arg) {
     int nthreads = wa->nthreads;
     uint64_t h_int_local = wa->h_int;
     int shift_local = wa->shift;
-    int adder_max_local = wa->adder_max;
+    int64_t adder_max_local = wa->adder_max;
     uint64_t sieve_size_local = wa->sieve_size;
     double target_local = wa->target;
     /* variables for RPC/automatic header; declared unconditionally so the
@@ -1192,7 +1188,10 @@ static void *worker_fn(void *arg) {
     rpc_sign_key_local = wa->rpc_sign_key;
 #endif
 
-    for (int adder = tid; adder < adder_max_local; adder += nthreads) {
+    for (int64_t adder = (int64_t)tid; adder < adder_max_local; adder += nthreads) {
+        /* All threads: if thread-0 detected a new block, abort this pass so
+           the main thread can re-launch with the updated header/h_int. */
+        if (g_abort_pass) break;
         /* Thread 0 fetches a fresh template periodically so the console shows
            progress even when no gap is found.  We throttle to at most once
            every 5 seconds: polling on every one of the 33M+ adders would
@@ -1203,12 +1202,20 @@ static void *worker_fn(void *arg) {
             uint64_t now = now_ms();
             if (now - gbt_last_ms >= 5000) {
                 char *gbt = rpc_getblocktemplate(rpc_url_local, rpc_user_local, rpc_pass_local);
-                if (gbt) { check_and_log_new_work(gbt); free(gbt); }
+                if (gbt) {
+                    check_and_log_new_work(gbt);
+                    free(gbt);
+                    /* Check if prevhash changed vs what we started mining on */
+                    pthread_mutex_lock(&g_work_lock);
+                    int new_block = header_local && strcmp(header_local, g_prevhash) != 0;
+                    pthread_mutex_unlock(&g_work_lock);
+                    if (new_block) { g_abort_pass = 1; break; }
+                }
                 gbt_last_ms = now_ms();
             }
         }
 #endif
-        uint64_t p_start = (h_int_local << shift_local) + (uint64_t)adder;
+        uint64_t p_start = (h_int_local << shift_local) + (uint64_t)(int64_t)adder;
         uint64_t start_index = p_start - (p_start % 2);
         uint64_t max_index = (h_int_local << shift_local) + ((uint64_t)1<<shift_local);
         uint64_t max_capacity = max_index - start_index;
@@ -1217,7 +1224,7 @@ static void *worker_fn(void *arg) {
         if (actual == 0) continue;
         uint64_t L = start_index;
         uint64_t R = L + actual;
-        log_file_only("Adder=%d(tid=%d) sieving [%llu,%llu)\n", adder, tid, (unsigned long long)L, (unsigned long long)R);
+        log_file_only("Adder=%lld(tid=%d) sieving [%llu,%llu)\n", (long long)adder, tid, (unsigned long long)L, (unsigned long long)R);
         size_t cnt=0;
         double *pr_log = NULL;
         clock_t t0 = clock();
@@ -1280,12 +1287,8 @@ static void *worker_fn(void *arg) {
 
 
 // quick Fermat-based probable prime test; not deterministic but runs faster
-// than the full MR routine.  We eliminate as many composites as possible by
-// trial-dividing by the first few cached small primes (the same ones used
-// by the sieve) before doing the two expensive exponentiations.
-// than the full MR routine.  We eliminate as many composites as possible by
-// trial-dividing by the first few cached small primes (the same ones used
-// by the sieve) before doing the two expensive exponentiations.
+// than the full MR routine.  Sieve survivors have no small factors so trial
+// division is skipped; two-base Fermat catches almost all composites cheaply.
 static int fast_fermat_test(uint64_t n) {
     if (n < 2) return 0;
     if (n == 2 || n == 3) return 1;
@@ -1319,7 +1322,7 @@ int main(int argc, char **argv) {
     /* adder_max is the exclusive upper bound on adder values.  if the user
        does not supply one it will be set automatically to 2^shift (so adders
        0..2^shift-1 are tried). */
-    int adder_max = -1;
+    int64_t adder_max = -1;
     /* ensure adder_max does not exceed 2^shift to prevent reuse of work
        (p = sha256(header) << shift + adder must be unique per header). */
     uint64_t sieve_size = 32768;
@@ -1337,7 +1340,7 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i],"--header") && i+1<argc) header = argv[++i];
         else if (!strcmp(argv[i],"--hash-hex")) is_hex = 1;
         else if (!strcmp(argv[i],"--shift") && i+1<argc) shift = atoi(argv[++i]);
-        else if (!strcmp(argv[i],"--adder-max") && i+1<argc) adder_max = atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--adder-max") && i+1<argc) adder_max = (int64_t)atoll(argv[++i]);
         else if (!strcmp(argv[i],"--sieve-size") && i+1<argc) sieve_size = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i],"--sieve-primes") && i+1<argc) cli_sieve_prime_limit = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i],"--target") && i+1<argc) target = atof(argv[++i]);
@@ -1371,11 +1374,11 @@ int main(int argc, char **argv) {
     }
     if (adder_max < 0) {
         /* no explicit value supplied – use full allowed range */
-        adder_max = (1u << shift);
-        log_msg("auto adder_max=%d (2^shift)\n", adder_max);
+        adder_max = (int64_t)1 << shift;
+        log_msg("auto adder_max=%lld (2^shift)\n", (long long)adder_max);
     }
-    if (adder_max > (1u << shift)) {
-        fprintf(stderr, "--adder-max (%d) must be at most 2^shift (%u)\n", adder_max, (1u<<shift));
+    if (adder_max > ((int64_t)1 << shift)) {
+        fprintf(stderr, "--adder-max (%lld) must be at most 2^shift (%lld)\n", (long long)adder_max, (long long)((int64_t)1 << shift));
         return 2;
     }
     if (selftest) {
@@ -1485,7 +1488,7 @@ int main(int argc, char **argv) {
 #endif
     if (num_threads <= 1) {
         do {
-            for (int adder=0; adder<adder_max; ++adder) {
+            for (int64_t adder=0; adder<adder_max; ++adder) {
                 uint64_t p_start = (h_int << shift) + (uint64_t)adder;
                 uint64_t start_index = p_start - (p_start % 2);
                 uint64_t max_index = (h_int << shift) + ((uint64_t)1<<shift);
@@ -1495,7 +1498,7 @@ int main(int argc, char **argv) {
                 if (actual == 0) continue;
                 uint64_t L = start_index;
                 uint64_t R = L + actual;
-                log_file_only("Adder=%d sieving [%llu,%llu)\n", adder, (unsigned long long)L, (unsigned long long)R);
+                log_file_only("Adder=%lld sieving [%llu,%llu)\n", (long long)adder, (unsigned long long)L, (unsigned long long)R);
                 size_t cnt=0;
                 double *pr_log = NULL;
                 clock_t t0 = clock();
@@ -1584,6 +1587,7 @@ int main(int argc, char **argv) {
         } while (keep_going);
     } else {
         do {
+            g_abort_pass = 0; /* reset stale-work flag for this pass */
             pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);
             struct worker_args *wargs = malloc(sizeof(struct worker_args) * num_threads);
             for (int t=0;t<num_threads;t++) {
@@ -1591,7 +1595,7 @@ int main(int argc, char **argv) {
                 wargs[t].nthreads = num_threads;
                 wargs[t].h_int = h_int;
                 wargs[t].shift = shift;
-                wargs[t].adder_max = adder_max;
+                wargs[t].adder_max = (int64_t)adder_max;
                 wargs[t].sieve_size = sieve_size;
                 wargs[t].target = target;
                 wargs[t].header = header;
