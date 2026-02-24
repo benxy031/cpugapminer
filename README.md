@@ -167,7 +167,7 @@ After sieving, each candidate undergoes a probabilistic primality test:
 | `--sieve-size S`      | 33554432      | Odd candidates per sieve segment |
 | `--sieve-primes P`    | 1000000       | Small primes used for pre-sieving |
 | `--target T`          | *(node bits)* | Minimum merit `gap/log(p)` to build a block |
-| `--threads N`         | 1             | Worker threads for the sieve |
+| `--threads N`         | 1             | Worker threads; each thread runs the full sieve + primality (Fermat/Miller-Rabin) + gap-scan pipeline over its own disjoint slice of the adder range (`tid, tid+N, tid+2N, …`) |
 | `--rpc-url URL`       | --            | JSON-RPC endpoint of `gapcoind` |
 | `--rpc-user USER`     | --            | RPC username |
 | `--rpc-pass PASS`     | --            | RPC password |
