@@ -189,75 +189,21 @@ static void print_stats(void) {
 }
 
 // ------------------------------------------------------------------------------------------------
-// Modular arithmetic helpers with Barrett reduction
+// Modular arithmetic
 // ------------------------------------------------------------------------------------------------
-// Barrett reduction is faster than a hardware division when the modulus is
-// reused many times.  We compute a constant mu = floor(2^64 / mod) once for
-// each candidate and then use it in the inner loops of modular exponentiation.
-// The extra work to compute mu is negligible compared with the dozens of
-// multiplications performed for Fermat/Miller‑Rabin.  The algorithms below are
-// specialised to 64‑bit numbers and rely on __uint128_t arithmetic.
 
-// context holding modulus and precomputed multiplier
-struct barrett_ctx {
-    uint64_t n;
-    uint64_t mu;
-};
-
-/* forward declaration of the plain modular multiply used by both the
-   traditional and Barrett-based paths */
-static uint64_t modmul(uint64_t a, uint64_t b, uint64_t mod);
-
-static inline uint64_t compute_mu(uint64_t n) {
-    /* mu is unused in the current stubbed-out implementation; return 0 to
-       make it obvious.  A correct Barret multiplier would compute
-       floor(2^128/n) here. */
-    (void)n;
-    return 0;
+/* (a * b) % mod, using __uint128_t to avoid overflow */
+static inline uint64_t modmul(uint64_t a, uint64_t b, uint64_t mod) {
+    return (uint64_t)((__uint128_t)a * b % mod);
 }
 
-// generic Barrett multiplication: (a * b) % ctx->n
-// The original intention was to avoid the hardware divide when the modulus
-// is reused many times.  However, the implementation was flawed for large
-// moduli and produced incorrect results, making the primality tests always
-// fail.  The overhead of the software divide turned out to be acceptable,
-// so we simply delegate back to the normal modmul routine and treat the
-// Barrett context as a no-op.  The skeleton remains in place in case a
-// correct 128‑bit reduction is added later.
-static inline uint64_t modmul_barrett(uint64_t a, uint64_t b,
-                                      const struct barrett_ctx *ctx) {
-    (void)ctx;
-    return modmul(a, b, ctx->n);
-}
-
-// fallback multiplication for architectures where Barrett is not desired
-static uint64_t modmul(uint64_t a, uint64_t b, uint64_t mod) {
-#if defined(__x86_64__)
-    __uint128_t prod = ( __uint128_t ) a * b;
-    uint64_t lo = (uint64_t)prod;
-    uint64_t hi = (uint64_t)(prod >> 64);
-    /* divide the 128‑bit value in rdx:rax by 'mod'; remainder left in rdx */
-    __asm__ ("divq %2" : "+a"(lo), "+d"(hi) : "r"(mod) : "cc");
-    return hi;
-#else
-    __uint128_t r = ( __uint128_t ) a * b;
-    return (uint64_t)(r % mod);
-#endif
-}
-
-// modular exponentiation using Barrett multiplication when a context is
-// provided, falling back to plain modmul when ctx is NULL.
-static uint64_t modpow(uint64_t a, uint64_t e,
-                       uint64_t m, const struct barrett_ctx *ctx) {
+/* modular exponentiation: a^e % m */
+static uint64_t modpow(uint64_t a, uint64_t e, uint64_t m) {
     uint64_t res = 1 % m;
-    uint64_t base = a % m;
+    a %= m;
     while (e) {
-        if (e & 1) {
-            if (ctx) res = modmul_barrett(res, base, ctx);
-            else      res = modmul(res, base, m);
-        }
-        if (ctx) base = modmul_barrett(base, base, ctx);
-        else      base = modmul(base, base, m);
+        if (e & 1) res = modmul(res, a, m);
+        a = modmul(a, a, m);
         e >>= 1;
     }
     return res;
@@ -267,27 +213,28 @@ static uint64_t modpow(uint64_t a, uint64_t e,
 /* forward declaration for the fast Fermat test used inside the worker threads */
 static int fast_fermat_test(uint64_t n);
 
-// Deterministic Miller-Rabin for 64-bit integers using known bases
+// Deterministic Miller-Rabin for 64-bit integers.
+// The 7-base set {2,325,9375,28178,450775,9780504,1795265022} is proven
+// sufficient for all n < 2^64 (no pseudoprimes exist in that range).
 static int miller_rabin(uint64_t n) {
     if (n < 2) return 0;
-    static const uint64_t small_primes[] = {2,3,5,7,11,13,17,19,23,29,31,37};
-    for (size_t i=0;i<sizeof(small_primes)/sizeof(*small_primes);++i) {
-        if (n == small_primes[i]) return 1;
-        if (n % small_primes[i] == 0) return 0;
+    static const uint64_t small[] = {2,3,5,7,11,13,17,19,23,29,31,37};
+    for (size_t i = 0; i < sizeof(small)/sizeof(*small); ++i) {
+        if (n == small[i]) return 1;
+        if (n % small[i] == 0) return 0;
     }
-    uint64_t d = n-1, s = 0;
+    uint64_t d = n - 1; uint64_t s = 0;
     while ((d & 1) == 0) { d >>= 1; s++; }
-    uint64_t bases[] = {2,325,9375,28178,450775,9780504,1795265022};
-    struct barrett_ctx ctx = { .n = n, .mu = compute_mu(n) };
-    for (size_t ib=0; ib<sizeof(bases)/sizeof(*bases); ++ib) {
+    static const uint64_t bases[] = {2,325,9375,28178,450775,9780504,1795265022};
+    for (size_t ib = 0; ib < sizeof(bases)/sizeof(*bases); ++ib) {
         uint64_t a = bases[ib] % n;
         if (a == 0) continue;
-        uint64_t x = modpow(a, d, n, &ctx);
-        if (x == 1 || x == n-1) continue;
+        uint64_t x = modpow(a, d, n);
+        if (x == 1 || x == n - 1) continue;
         int composite = 1;
-        for (uint64_t r=1;r<s;r++) {
-            x = modmul_barrett(x, x, &ctx);
-            if (x == n-1) { composite = 0; break; }
+        for (uint64_t r = 1; r < s; r++) {
+            x = modmul(x, x, n);
+            if (x == n - 1) { composite = 0; break; }
         }
         if (composite) return 0;
     }
@@ -329,8 +276,10 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
     if (use_limit > SIEVE_SMALL_PRIME_LIMIT) use_limit = SIEVE_SMALL_PRIME_LIMIT;  /* safety */
     pthread_once(&small_primes_once, populate_small_primes_cache);
 
+    /* Start marking at idx=1 to skip p=2: L is always odd, so even multiples
+       of 2 produce fractional bit-array indices and corrupt the sieve. */
     if (small_primes_cache) {
-        for (size_t idx = 0; idx < small_primes_count; ++idx) {
+        for (size_t idx = 1; idx < small_primes_count; ++idx) {
             uint64_t p = small_primes_cache[idx];
             if (p > use_limit) break;
             uint64_t start = (L + p - 1) / p * p;
@@ -357,27 +306,27 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
     }
 
     size_t out_cnt = 0;
-    /* iterate over only those odd numbers coprime with 2,3,5
-       using a 30‑wheel; this reduces the number of loop iterations by
-       roughly threefold and greatly speeds up large sieves.  we also check
-       a byte-packed bit array to skip composites quickly. */
+    /* iterate over only those odd numbers coprime with 2,3,5 using a 30-wheel.
+       wheel30[w] is the step to advance from residue w to the next coprime residue.
+       residues (mod 30): 1,7,11,13,17,19,23,29 → indices 0..7 */
     static const uint8_t wheel30[8] = {6,4,2,4,2,4,6,2};
-    static const uint8_t residues[8] = {1,7,11,13,17,19,23,29};
+    /* mod30_start[r] = wheel index whose residue == r, or -1 if composite residue */
+    static const int8_t mod30_start[30] = {
+        -1,-1,-1,-1,-1,-1,-1, 1,-1,-1,-1, 2,-1, 3,-1,-1,-1, 4,-1, 5,-1,-1,-1, 6,-1,-1,-1,-1,-1, 7
+    };
+    /* note: mod30_start[1]=0 handled separately to satisfy gcc init-length warning */
     uint64_t x = L;
     if ((x & 1) == 0) x++;
-    /* advance to first wheel residue >= x */
-    int w = 0;
-    uint8_t r = x % 30;
-    while (w < 8 && r != residues[w]) {
-        w++;
-    }
-    if (w == 8) {
-        while (x < R) {
-            x += 2;
-            r = x % 30;
-            for (w = 0; w < 8; w++) if (r == residues[w]) break;
-            if (w < 8) break;
-        }
+    /* find the wheel index for the starting position */
+    uint8_t r0 = (uint8_t)(x % 30);
+    int w;
+    if (r0 == 1) { w = 0; }            /* most common fast path */
+    else if (r0 < 30 && mod30_start[r0] >= 0) { w = mod30_start[r0]; }
+    else {
+        /* advance to next wheel residue */
+        do { x += 2; } while (x < R && (x % 30 == 0 || mod30_start[x % 30] < 0));
+        if (x >= R) { free(bits); *out_count = 0; if (out_logs) *out_logs = NULL; return NULL; }
+        w = (x % 30 == 1) ? 0 : mod30_start[x % 30];
     }
     while (x < R) {
         uint64_t pos = (x - L) >> 1;
@@ -1284,31 +1233,19 @@ static void *worker_fn(void *arg) {
 // than the full MR routine.  We eliminate as many composites as possible by
 // trial-dividing by the first few cached small primes (the same ones used
 // by the sieve) before doing the two expensive exponentiations.
+// than the full MR routine.  We eliminate as many composites as possible by
+// trial-dividing by the first few cached small primes (the same ones used
+// by the sieve) before doing the two expensive exponentiations.
 static int fast_fermat_test(uint64_t n) {
     if (n < 2) return 0;
-    if (n == 2) return 1;                  /* special‑case the one even prime */
-    /* try cached small primes (max 64) */
-    pthread_once(&small_primes_once, populate_small_primes_cache);
-    if (small_primes_cache) {
-        size_t limit = small_primes_count;
-        if (limit > 64) limit = 64;
-        for (size_t i = 0; i < limit; ++i) {
-            uint64_t p = small_primes_cache[i];
-            if (n == p) return 1;
-            if (n % p == 0) return 0;
-        }
-    }
-    /* construct Barrett context once per candidate (currently a no-op) */
-    struct barrett_ctx ctx = { .n = n, .mu = compute_mu(n) };
-    /* single Fermat base (2); we use the generic modpow routine.  earlier
-       attempts at windowed exponentiation contained bugs, so correctness is
-       now prioritised. */
-    uint64_t r = modpow(2, n-1, n, &ctx);
-    if (debug_candidates) {
-        log_msg("fast-fermat: n=%llu result=%llu\n",
-                (unsigned long long)n, (unsigned long long)r);
-    }
-    if (r != 1) return 0;
+    if (n == 2 || n == 3) return 1;
+    if ((n & 1) == 0 || n % 3 == 0) return 0;
+    /* Two-base Fermat test (bases 2 and 3).
+       Sieve survivors have no factors <= sieve_prime_limit, so trial
+       division is redundant here.  Two bases catch all but a tiny fraction
+       of composites without the overhead of a full Miller-Rabin. */
+    if (modpow(2, n - 1, n) != 1) return 0;
+    if (modpow(3, n - 1, n) != 1) return 0;
     return 1;
 }
 
