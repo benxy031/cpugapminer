@@ -695,7 +695,9 @@ static void double_sha256(const unsigned char *data, size_t len, unsigned char o
 // This is a minimal assembler: it extracts previousblockhash, curtime, version if present, builds coinbase tx,
 // computes merkle root and serializes header + tx count + txs, hex-encodes into outhex.
 #ifdef WITH_RPC
-static int build_block_from_gbt_and_payload(const char *gbt_json, const char *header_payload_hex, char outhex[16384]) {
+static int build_block_from_gbt_and_payload(const char *gbt_json, const char *header_payload_hex,
+                                             int nshift_val, uint64_t nadd_val,
+                                             char outhex[16384]) {
     char prevhex[65] = {0};
     uint32_t curtime = (uint32_t)time(NULL);
     uint32_t version = 2;
@@ -865,13 +867,35 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
     for (int i = 0; i < 8; ++i) { hp[i] = (unsigned char)(diff64 & 0xff); diff64 >>= 8; }
     hp += 8;
     uint32_t nonce = 0; memcpy(hp, &nonce, 4); hp += 4;
-    // nShift (uint16_t)
-    uint16_t nshift = 0;
+    // nShift (uint16_t) – must match the shift used to find the prime
+    uint16_t nshift = (uint16_t)nshift_val;
     memcpy(hp, &nshift, 2); hp += 2;
-    // nAdd vector: write CompactSize length (1) then one zero byte
-    write_byte(&hp, 1);
-    write_byte(&hp, 0);
-    /* Gapcoin header is 88 bytes: 4+32+32+4+8+4+2+(1+1) */
+    // nAdd: serialize as big-endian minimal byte array with CompactSize prefix.
+    // For nadd=0 write a single 0x00 byte (length 1).
+    {
+        unsigned char nadd_bytes[8];
+        int nadd_len;
+        if (nadd_val == 0) {
+            nadd_bytes[0] = 0;
+            nadd_len = 1;
+        } else {
+            /* write little-endian first, then reverse to big-endian */
+            nadd_len = 0;
+            uint64_t tmp = nadd_val;
+            while (tmp > 0) { nadd_bytes[nadd_len++] = (unsigned char)(tmp & 0xff); tmp >>= 8; }
+            /* reverse in-place to get big-endian (BN_bn2bin order) */
+            for (int _i = 0; _i < nadd_len / 2; _i++) {
+                unsigned char _t = nadd_bytes[_i];
+                nadd_bytes[_i] = nadd_bytes[nadd_len - 1 - _i];
+                nadd_bytes[nadd_len - 1 - _i] = _t;
+            }
+        }
+        write_compact_size(&hp, (uint64_t)nadd_len);
+        memcpy(hp, nadd_bytes, nadd_len); hp += nadd_len;
+    }
+    /* Gapcoin header is variable length: 4+32+32+4+8+4+2+(CompactSize+nAdd_bytes)
+       For nadd=0 that is 88 bytes (CompactSize=1 + 1 zero byte).
+       For larger adders the nAdd field grows (1 byte per 8 additional bits). */
     size_t header_size = (size_t)(hp - headerbin);
     log_file_only("DEBUG header_size=%zu (expected 88)\n", header_size);
 
@@ -994,7 +1018,8 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
    and always returns 1 so the block is forwarded to the node for validation. */
 static int header_meets_target_hex(const char *blockhex) {
     if (debug_force) return 1;
-    /* Gapcoin header = 88 bytes: version(4)+prev(32)+merkle(32)+time(4)+nDifficulty(8)+nNonce(4)+nShift(2)+nAdd(2) */
+    /* Gapcoin header = 88+ bytes (variable due to nAdd length):
+       version(4)+prev(32)+merkle(32)+time(4)+nDifficulty(8)+nNonce(4)+nShift(2)+nAdd(variable) */
     unsigned char hdr[88];
     unsigned int v;
     for (int i=0;i<88;i++) {
@@ -1067,6 +1092,7 @@ struct worker_args {
 // returns 1 to signal the caller (single-thread mode or a worker) that a
 // valid block has been found and `!keep_going` should cause termination.
 static int scan_candidates(uint64_t *pr, double *pr_log, size_t cnt, double target_local,
+                           uint64_t h_int_sc, int shift_sc,
                            const char *header_local,
                            const char *rpc_url_local,
                            const char *rpc_user_local,
@@ -1094,7 +1120,9 @@ static int scan_candidates(uint64_t *pr, double *pr_log, size_t cnt, double targ
                 char blockhex[16384]; memset(blockhex,0,sizeof(blockhex));
                 if (gbt) {
                     char payload_hex[197]; encode_pow_header_binary(header_local, prev, q, payload_hex);
-                    if (build_block_from_gbt_and_payload(gbt, payload_hex, blockhex)) {
+                    /* nAdd = prime - (hash << shift): the adder identifying this prime to the node */
+                    uint64_t nadd_sc = prev - (h_int_sc << shift_sc);
+                    if (build_block_from_gbt_and_payload(gbt, payload_hex, shift_sc, nadd_sc, blockhex)) {
                         __sync_fetch_and_add(&stats_blocks,1);
                         log_file_only("Built blockhex: %s\n", blockhex);
                         if (header_meets_target_hex(blockhex)) {
@@ -1238,6 +1266,7 @@ static void *worker_fn(void *arg) {
         print_stats();
         if (cnt>=2) {
             if (scan_candidates(pr, pr_log, cnt, target_local,
+                                h_int_local, shift_local,
                                 header_local,
                                 rpc_url_local, rpc_user_local, rpc_pass_local,
                                 rpc_method_local, rpc_sign_key_local)) {
@@ -1437,7 +1466,9 @@ int main(int argc, char **argv) {
             if (build_p == 0 && build_q == 0) { log_msg("--build-only requires --p and --q when not using --no-opreturn\n"); free(gbt); return 2; }
             encode_pow_header_binary(header, build_p, build_q, payload_hex);
         }
-        if (build_block_from_gbt_and_payload(gbt, payload_hex, blockhex)) {
+        /* nAdd = p - (hash << shift), or 0 if no p given */
+        uint64_t build_nadd = (build_p > 0) ? (build_p - (h_int << shift)) : 0;
+        if (build_block_from_gbt_and_payload(gbt, payload_hex, shift, build_nadd, blockhex)) {
             log_msg("Built blockhex: %s\n", blockhex);
             if (rpc_url) {
                 log_msg("Submitting built block via RPC...\n");
@@ -1511,6 +1542,7 @@ int main(int argc, char **argv) {
                 print_stats();
                 if (cnt>=2) {
                     if (scan_candidates(pr, pr_log, cnt, target,
+                                       h_int, shift,
                                        header,
                                        rpc_url, rpc_user, rpc_pass,
                                        rpc_method, rpc_sign_key)) {
