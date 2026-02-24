@@ -247,16 +247,22 @@ static int miller_rabin(uint64_t n) {
    does not need to call log() repeatedly.  The returned pointers are owned
    by sieve_range and must **not** be freed by the caller; they will be
    released at program exit. */
-static __thread uint64_t *tls_pr = NULL;
-static __thread double   *tls_log = NULL;
-static __thread size_t   tls_cap = 0;
+static __thread uint64_t *tls_pr   = NULL;
+static __thread double   *tls_log  = NULL;
+static __thread size_t    tls_cap  = 0;
+/* Reusable composite-bits bitmap per thread – avoids calloc/free on every sieve call */
+static __thread uint8_t  *tls_bits     = NULL;
+static __thread size_t    tls_bits_cap = 0;
 
 static void free_sieve_buffers(void) {
     free(tls_pr);
     free(tls_log);
-    tls_pr = NULL;
-    tls_log = NULL;
-    tls_cap = 0;
+    free(tls_bits);
+    tls_pr       = NULL;
+    tls_log      = NULL;
+    tls_bits     = NULL;
+    tls_cap      = 0;
+    tls_bits_cap = 0;
 }
 
 static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
@@ -267,8 +273,15 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
     if ((R & 1) == 0) R++;
     uint64_t seg_size = (R - L) / 2 + 1;
     size_t bit_size = (seg_size + 7) / 8;
-    uint8_t *bits = calloc(bit_size, 1);
-    if (!bits) { *out_count = 0; if (out_logs) *out_logs = NULL; return NULL; }
+    /* Reuse thread-local bits buffer; grow only when needed (memset << calloc) */
+    if (tls_bits_cap < bit_size) {
+        free(tls_bits);
+        tls_bits = malloc(bit_size + 64); /* +64 for safe 8-byte word reads at tail */
+        if (!tls_bits) { tls_bits_cap = 0; *out_count = 0; if (out_logs) *out_logs = NULL; return NULL; }
+        tls_bits_cap = bit_size + 64;
+    }
+    memset(tls_bits, 0, bit_size);
+    uint8_t *bits = tls_bits;
 
     uint64_t limit = (uint64_t)floor(sqrt((double)R)) + 1;
     uint64_t use_limit = limit;
@@ -305,43 +318,37 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
         tls_cap = newcap;
     }
 
-    size_t out_cnt = 0;
-    /* iterate over only those odd numbers coprime with 2,3,5 using a 30-wheel.
-       wheel30[w] is the step to advance from residue w to the next coprime residue.
-       residues (mod 30): 1,7,11,13,17,19,23,29 → indices 0..7 */
+    /* Extract surviving candidates.  Use a 30-wheel to skip numbers divisible
+       by 2, 3, or 5 – they were marked composite by the sieve but skipping them
+       here halves the number of bit-array accesses compared with a linear scan,
+       which matters when log() is called for every survivor.
+       wheel30[w] = step to next coprime-with-30 residue. */
     static const uint8_t wheel30[8] = {6,4,2,4,2,4,6,2};
-    /* mod30_start[r] = wheel index whose residue == r, or -1 if composite residue */
     static const int8_t mod30_start[30] = {
         -1,-1,-1,-1,-1,-1,-1, 1,-1,-1,-1, 2,-1, 3,-1,-1,-1, 4,-1, 5,-1,-1,-1, 6,-1,-1,-1,-1,-1, 7
     };
-    /* note: mod30_start[1]=0 handled separately to satisfy gcc init-length warning */
+    size_t out_cnt = 0;
     uint64_t x = L;
     if ((x & 1) == 0) x++;
-    /* find the wheel index for the starting position */
     uint8_t r0 = (uint8_t)(x % 30);
     int w;
-    if (r0 == 1) { w = 0; }            /* most common fast path */
+    if (r0 == 1) { w = 0; }
     else if (r0 < 30 && mod30_start[r0] >= 0) { w = mod30_start[r0]; }
     else {
-        /* advance to next wheel residue */
         do { x += 2; } while (x < R && (x % 30 == 0 || mod30_start[x % 30] < 0));
-        if (x >= R) { free(bits); *out_count = 0; if (out_logs) *out_logs = NULL; return NULL; }
+        if (x >= R) { *out_count = 0; if (out_logs) *out_logs = NULL; return NULL; }
         w = (x % 30 == 1) ? 0 : mod30_start[x % 30];
     }
     while (x < R) {
         uint64_t pos = (x - L) >> 1;
-        if (pos < seg_size) {
-            uint8_t b = bits[pos>>3] & (uint8_t)(1u << (pos & 7));
-            if (!b) {
-                tls_pr[out_cnt] = x;
-                tls_log[out_cnt] = log((double)x);
-                out_cnt++;
-            }
+        if (pos < seg_size && !(bits[pos>>3] & (uint8_t)(1u << (pos & 7)))) {
+            tls_pr[out_cnt]  = x;
+            tls_log[out_cnt] = log((double)x);
+            out_cnt++;
         }
         x += wheel30[w];
         w = (w + 1) & 7;
     }
-    free(bits);
     *out_count = out_cnt;
     if (out_logs) *out_logs = tls_log;
     return tls_pr;
@@ -1158,12 +1165,19 @@ static void *worker_fn(void *arg) {
 #endif
 
     for (int adder = tid; adder < adder_max_local; adder += nthreads) {
-        /* have only thread 0 perform a template fetch each iteration so user
-           sees periodic "work header" messages even if no gap is found */
+        /* Thread 0 fetches a fresh template periodically so the console shows
+           progress even when no gap is found.  We throttle to at most once
+           every 5 seconds: polling on every one of the 33M+ adders would
+           serialise all threads on the network round-trip. */
 #ifdef WITH_RPC
         if (tid == 0 && rpc_url_local) {
-            char *gbt = rpc_getblocktemplate(rpc_url_local, rpc_user_local, rpc_pass_local);
-            if (gbt) { check_and_log_new_work(gbt); free(gbt); }
+            static uint64_t gbt_last_ms = 0;
+            uint64_t now = now_ms();
+            if (now - gbt_last_ms >= 5000) {
+                char *gbt = rpc_getblocktemplate(rpc_url_local, rpc_user_local, rpc_pass_local);
+                if (gbt) { check_and_log_new_work(gbt); free(gbt); }
+                gbt_last_ms = now_ms();
+            }
         }
 #endif
         uint64_t p_start = (h_int_local << shift_local) + (uint64_t)adder;
@@ -1194,25 +1208,32 @@ static void *worker_fn(void *arg) {
                         fast_fermat_test(pr[k]),
                         miller_rabin(pr[k]));
         }
+        size_t orig_cnt = cnt;
         size_t pf = 0;
         double p_time = 0.0;
         if (!no_primality) {
             clock_t tp0 = clock();
-            for (size_t i=0;i<cnt;i++) {
-                if (use_fast_fermat ? fast_fermat_test(pr[i]) : miller_rabin(pr[i]))
+            /* Compact pr[]/pr_log[] in-place: keep only probable primes.
+               pf <= i always, so reads never overtake writes. */
+            for (size_t i = 0; i < cnt; i++) {
+                if (use_fast_fermat ? fast_fermat_test(pr[i]) : miller_rabin(pr[i])) {
+                    pr[pf]     = pr[i];
+                    pr_log[pf] = pr_log[i];
                     pf++;
+                }
             }
             clock_t tp1 = clock();
             p_time = (double)(tp1-tp0)/CLOCKS_PER_SEC;
-            __sync_fetch_and_add(&stats_tested, (uint64_t)cnt);
+            __sync_fetch_and_add(&stats_tested, (uint64_t)orig_cnt);
+            cnt = pf; /* scan_candidates now only sees actual probable primes */
         } else {
             /* pretend every candidate is prime for stats */
             pf = cnt;
             __sync_fetch_and_add(&stats_tested, (uint64_t)cnt);
         }
-        double test_rate = (p_time > 1e-9) ? (double)cnt / p_time : 0.0;
+        double test_rate = (p_time > 1e-9) ? (double)orig_cnt / p_time : 0.0;
         log_file_only("  primality: %zu/%zu probable primes in %.3fs (%.0f tests/s, %s)\n",
-                pf, cnt, p_time, test_rate,
+                pf, orig_cnt, p_time, test_rate,
                 no_primality ? "skipped" : (use_fast_fermat ? "fast-Fermat" : "miller-rabin"));
         print_stats();
         if (cnt>=2) {
@@ -1462,25 +1483,30 @@ int main(int argc, char **argv) {
                                fast_fermat_test(pr[k]),
                                miller_rabin(pr[k]));
                 }
-                // primality
+                // primality – compact pr[]/pr_log[] in-place, keeping only probable primes
+                size_t orig_cnt = cnt;
                 size_t pf = 0;
                 double p_time = 0.0;
                 if (!no_primality) {
                     clock_t tp0 = clock();
-                    for (size_t i=0;i<cnt;i++) {
-                        if (use_fast_fermat ? fast_fermat_test(pr[i]) : miller_rabin(pr[i]))
+                    for (size_t i = 0; i < cnt; i++) {
+                        if (use_fast_fermat ? fast_fermat_test(pr[i]) : miller_rabin(pr[i])) {
+                            pr[pf]     = pr[i];
+                            pr_log[pf] = pr_log[i];
                             pf++;
+                        }
                     }
                     clock_t tp1 = clock();
                     p_time = (double)(tp1-tp0)/CLOCKS_PER_SEC;
-                    __sync_fetch_and_add(&stats_tested, (uint64_t)cnt);
+                    __sync_fetch_and_add(&stats_tested, (uint64_t)orig_cnt);
+                    cnt = pf;
                 } else {
                     pf = cnt;
                     __sync_fetch_and_add(&stats_tested, (uint64_t)cnt);
                 }
-                double test_rate = (p_time > 1e-9) ? (double)cnt / p_time : 0.0;
+                double test_rate = (p_time > 1e-9) ? (double)orig_cnt / p_time : 0.0;
                 log_file_only("  primality: %zu/%zu probable primes in %.3fs (%.0f tests/s, %s)\n",
-                        pf, cnt, p_time, test_rate,
+                        pf, orig_cnt, p_time, test_rate,
                         no_primality ? "skipped" : (use_fast_fermat ? "fast-Fermat" : "miller-rabin"));
                 print_stats();
                 if (cnt>=2) {
