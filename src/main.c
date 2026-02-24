@@ -1237,6 +1237,92 @@ static int scan_candidates(uint64_t *pr, double *pr_log, size_t cnt, double targ
     return 0;
 }
 
+/* ---------- Pre-sieve pipeline (double-buffer) ----------
+   Each worker thread has a companion "sieve helper" thread.  While the
+   worker does primality tests + gap scan on window N, the helper is already
+   sieving window N+nthreads into the OTHER buffer slot.  When primality
+   finishes the next sieve result is ready immediately, eliminating the
+   idle stall where one stage waited for the other.
+
+   Two heap-allocated buffer slots ping-pong: helper always writes into
+   bufs[fill_slot] while the worker reads bufs[1-fill_slot].  The helper
+   uses its own thread-local sieve buffers (TLS is per-thread), so
+   sieve_range is safe to call concurrently from both threads. */
+
+struct presieve_buf {
+    uint64_t *pr;
+    double   *pr_log;
+    size_t    cap;
+    size_t    cnt;
+    uint64_t  L, R;
+};
+
+struct presieve_ctx {
+    struct presieve_buf bufs[2]; /* ping-pong slots                     */
+    int fill_slot;               /* helper writes into bufs[fill_slot]  */
+    int state;                   /* 0=idle 1=sieving 2=ready -1=exit   */
+    pthread_mutex_t mu;
+    pthread_cond_t  cv_go;       /* worker -> helper: new window ready  */
+    pthread_cond_t  cv_done;     /* helper -> worker: result ready      */
+    pthread_t thread;
+};
+
+static void presieve_buf_ensure(struct presieve_buf *b, size_t need) {
+    if (b->cap >= need) return;
+    size_t nc = need + (need >> 1) + 64;
+    b->pr     = realloc(b->pr,     nc * sizeof(uint64_t));
+    b->pr_log = realloc(b->pr_log, nc * sizeof(double));
+    b->cap    = nc;
+}
+
+static void *presieve_helper_fn(void *arg) {
+    struct presieve_ctx *ctx = arg;
+    for (;;) {
+        pthread_mutex_lock(&ctx->mu);
+        while (ctx->state != 1 && ctx->state != -1)
+            pthread_cond_wait(&ctx->cv_go, &ctx->mu);
+        if (ctx->state == -1) { pthread_mutex_unlock(&ctx->mu); break; }
+        int slot   = ctx->fill_slot;
+        uint64_t L = ctx->bufs[slot].L;
+        uint64_t R = ctx->bufs[slot].R;
+        pthread_mutex_unlock(&ctx->mu);
+
+        /* sieve using this helper's own TLS (independent from worker's TLS) */
+        size_t cnt = 0;
+        double *log_tls = NULL;
+        uint64_t *pr_tls = sieve_range(L, R, &cnt, &log_tls);
+
+        pthread_mutex_lock(&ctx->mu);
+        struct presieve_buf *b = &ctx->bufs[slot];
+        presieve_buf_ensure(b, cnt);
+        if (cnt && pr_tls) {
+            memcpy(b->pr,     pr_tls,  cnt * sizeof(uint64_t));
+            memcpy(b->pr_log, log_tls, cnt * sizeof(double));
+        }
+        b->cnt = cnt;
+        __sync_fetch_and_add(&stats_sieved, (uint64_t)(R - L));
+        ctx->state = 2;
+        pthread_cond_signal(&ctx->cv_done);
+        pthread_mutex_unlock(&ctx->mu);
+    }
+    free_sieve_buffers(); /* release helper's TLS */
+    return NULL;
+}
+
+/* Compute the L/R range for window index widx. Returns 0 if empty. */
+static int presieve_window(int64_t widx, uint64_t base,
+                           uint64_t sieve_size, uint64_t adder_max,
+                           uint64_t *out_L, uint64_t *out_R) {
+    uint64_t L = base + (uint64_t)widx * sieve_size;
+    if ((L & 1) == 0) L++;
+    uint64_t R = L + sieve_size;
+    uint64_t cap = base + adder_max;
+    if (R > cap) R = cap;
+    if (R <= L) return 0;
+    *out_L = L; *out_R = R;
+    return 1;
+}
+
 static void *worker_fn(void *arg) {
     struct worker_args *wa = (struct worker_args*)arg;
     int tid = wa->tid;
@@ -1246,9 +1332,6 @@ static void *worker_fn(void *arg) {
     int64_t adder_max_local = wa->adder_max;
     uint64_t sieve_size_local = wa->sieve_size;
     double target_local = wa->target;
-    /* variables for RPC/automatic header; declared unconditionally so the
-       call site later doesn’t trigger IntelliSense warnings when the macro
-       isn’t known.  They’ll be NULL if RPC support is disabled. */
     const char *header_local = NULL;
     const char *rpc_url_local = NULL;
     const char *rpc_user_local = NULL;
@@ -1264,20 +1347,35 @@ static void *worker_fn(void *arg) {
     rpc_sign_key_local = wa->rpc_sign_key;
 #endif
 
-    /* Divide the adder space into non-overlapping windows of sieve_size each.
-       Previously the loop incremented adder by 1 (then nthreads), meaning every
-       consecutive iteration sieve'd an almost identical range (overlap ~99.99%).
-       Striding by sieve_size means each thread iteration covers a fresh block. */
+    uint64_t base = h_int_local << shift_local;
     int64_t num_windows = ((int64_t)adder_max_local + (int64_t)sieve_size_local - 1)
                           / (int64_t)sieve_size_local;
+
+    /* Set up pre-sieve helper thread */
+    struct presieve_ctx psc;
+    memset(&psc, 0, sizeof(psc));
+    pthread_mutex_init(&psc.mu, NULL);
+    pthread_cond_init(&psc.cv_go,   NULL);
+    pthread_cond_init(&psc.cv_done, NULL);
+    psc.state = 0; psc.fill_slot = 0;
+    pthread_create(&psc.thread, NULL, presieve_helper_fn, &psc);
+
+    /* Prime the pipeline: kick off window 0 before entering the loop */
+    {
+        uint64_t L0, R0;
+        if (presieve_window((int64_t)tid, base, sieve_size_local,
+                            (uint64_t)adder_max_local, &L0, &R0)) {
+            pthread_mutex_lock(&psc.mu);
+            psc.bufs[0].L = L0; psc.bufs[0].R = R0;
+            psc.fill_slot = 0; psc.state = 1;
+            pthread_cond_signal(&psc.cv_go);
+            pthread_mutex_unlock(&psc.mu);
+        }
+    }
+
     for (int64_t adder = (int64_t)tid; adder < num_windows; adder += nthreads) {
-        /* All threads: if thread-0 detected a new block, abort this pass so
-           the main thread can re-launch with the updated header/h_int. */
         if (g_abort_pass) break;
-        /* Thread 0 fetches a fresh template periodically so the console shows
-           progress even when no gap is found.  We throttle to at most once
-           every 5 seconds: polling on every one of the 33M+ adders would
-           serialise all threads on the network round-trip. */
+
 #ifdef WITH_RPC
         if (tid == 0 && rpc_url_local) {
             static uint64_t gbt_last_ms = 0;
@@ -1287,7 +1385,6 @@ static void *worker_fn(void *arg) {
                 if (gbt) {
                     check_and_log_new_work(gbt);
                     free(gbt);
-                    /* Check if prevhash changed vs what we started mining on */
                     pthread_mutex_lock(&g_work_lock);
                     int new_block = header_local && strcmp(header_local, g_prevhash) != 0;
                     pthread_mutex_unlock(&g_work_lock);
@@ -1297,44 +1394,50 @@ static void *worker_fn(void *arg) {
             }
         }
 #endif
-        /* Window adder covers [base + adder*sieve_size, base + (adder+1)*sieve_size).
-           Cap at base+adder_max so nAdd = prime-base stays in [0, 2^shift). */
-        uint64_t base = h_int_local << shift_local;
-        uint64_t L = base + (uint64_t)adder * sieve_size_local;
-        if ((L & 1) == 0) L++;
-        uint64_t R = L + sieve_size_local;
-        uint64_t max_valid = base + (uint64_t)adder_max_local;
-        if (R > max_valid) R = max_valid;
-        if (R <= L) continue;
-        log_file_only("Win=%lld(tid=%d) offset=%llu sieving [%llu,%llu)\n",
-                      (long long)adder, tid,
-                      (unsigned long long)((uint64_t)adder * sieve_size_local),
-                      (unsigned long long)L, (unsigned long long)R);
-        size_t cnt=0;
-        double *pr_log = NULL;
-        clock_t t0 = clock();
-        uint64_t *pr = sieve_range(L,R,&cnt,&pr_log);
-        clock_t t1 = clock();
-        double s_time = (double)(t1-t0)/CLOCKS_PER_SEC;
-        __sync_fetch_and_add(&stats_sieved, (uint64_t)(R - L));
-        double sieve_rate = (s_time > 1e-9) ? (double)(R - L) / s_time : 0.0;
-        log_file_only("  sieve: %zu candidates in %.3fs (%.0f nums/s)\n", cnt, s_time, sieve_rate);
-        if (debug_candidates && cnt>0) {
-            size_t show = cnt < 10 ? cnt : 10;
-            log_file_only("  sample survivors:\n");
-            for (size_t k = 0; k < show; ++k)
-                log_file_only("    %llu -> fast=%d mr=%d\n",
-                        (unsigned long long)pr[k],
-                        fast_fermat_test(pr[k]),
-                        miller_rabin(pr[k]));
+
+        /* Wait for helper to finish the current window */
+        pthread_mutex_lock(&psc.mu);
+        while (psc.state == 1)
+            pthread_cond_wait(&psc.cv_done, &psc.mu);
+        if (psc.state != 2) { pthread_mutex_unlock(&psc.mu); break; }
+
+        int cur_slot = psc.fill_slot;
+        size_t cnt   = psc.bufs[cur_slot].cnt;
+        uint64_t L   = psc.bufs[cur_slot].L;
+        uint64_t R   = psc.bufs[cur_slot].R;
+
+        /* Kick off NEXT window before starting primality so they overlap */
+        int64_t next_win = adder + nthreads;
+        if (next_win < num_windows && !g_abort_pass) {
+            int next_slot = 1 - cur_slot;
+            uint64_t nL, nR;
+            if (presieve_window(next_win, base, sieve_size_local,
+                                (uint64_t)adder_max_local, &nL, &nR)) {
+                psc.bufs[next_slot].L = nL;
+                psc.bufs[next_slot].R = nR;
+                psc.fill_slot = next_slot;
+                psc.state = 1;
+                pthread_cond_signal(&psc.cv_go);
+            } else {
+                psc.state = 0;
+            }
+        } else {
+            psc.state = 0;
         }
+
+        /* cur_slot is solely ours now; helper is working on next_slot */
+        uint64_t *pr     = psc.bufs[cur_slot].pr;
+        double   *pr_log = psc.bufs[cur_slot].pr_log;
+        pthread_mutex_unlock(&psc.mu);
+
+        log_file_only("Win=%lld(tid=%d) [%llu,%llu) survivors=%zu\n",
+                      (long long)adder, tid,
+                      (unsigned long long)L, (unsigned long long)R, cnt);
+
+        /* Primality filter in-place (runs while helper sieves next window) */
         size_t orig_cnt = cnt;
         size_t pf = 0;
-        double p_time = 0.0;
         if (!no_primality) {
-            clock_t tp0 = clock();
-            /* Compact pr[]/pr_log[] in-place: keep only probable primes.
-               pf <= i always, so reads never overtake writes. */
             for (size_t i = 0; i < cnt; i++) {
                 if (use_fast_fermat ? fast_fermat_test(pr[i]) : miller_rabin(pr[i])) {
                     pr[pf]     = pr[i];
@@ -1342,33 +1445,38 @@ static void *worker_fn(void *arg) {
                     pf++;
                 }
             }
-            clock_t tp1 = clock();
-            p_time = (double)(tp1-tp0)/CLOCKS_PER_SEC;
             __sync_fetch_and_add(&stats_tested, (uint64_t)orig_cnt);
-            cnt = pf; /* scan_candidates now only sees actual probable primes */
+            cnt = pf;
         } else {
-            /* pretend every candidate is prime for stats */
             pf = cnt;
             __sync_fetch_and_add(&stats_tested, (uint64_t)cnt);
         }
-        double test_rate = (p_time > 1e-9) ? (double)orig_cnt / p_time : 0.0;
-        log_file_only("  primality: %zu/%zu probable primes in %.3fs (%.0f tests/s, %s)\n",
-                pf, orig_cnt, p_time, test_rate,
-                no_primality ? "skipped" : (use_fast_fermat ? "fast-Fermat" : "miller-rabin"));
-        print_stats();
-        if (cnt>=2) {
+
+        if (cnt >= 2) {
             if (scan_candidates(pr, pr_log, cnt, target_local,
                                 h_int_local, shift_local,
                                 header_local,
                                 rpc_url_local, rpc_user_local, rpc_pass_local,
-                                rpc_method_local, rpc_sign_key_local)) {
-                return NULL;
-            }
+                                rpc_method_local, rpc_sign_key_local))
+                break;
         }
-        /* buffers are thread-local; do not free here */
-    }
+    } /* end window loop */
+
+    /* Shut down helper */
+    pthread_mutex_lock(&psc.mu);
+    psc.state = -1;
+    pthread_cond_signal(&psc.cv_go);
+    pthread_mutex_unlock(&psc.mu);
+    pthread_join(psc.thread, NULL);
+
+    free(psc.bufs[0].pr); free(psc.bufs[0].pr_log);
+    free(psc.bufs[1].pr); free(psc.bufs[1].pr_log);
+    pthread_mutex_destroy(&psc.mu);
+    pthread_cond_destroy(&psc.cv_go);
+    pthread_cond_destroy(&psc.cv_done);
     return NULL;
 }
+
 
 
 // quick Fermat-based probable prime test; not deterministic but runs faster
