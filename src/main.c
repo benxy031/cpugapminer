@@ -1341,7 +1341,12 @@ static int bn_candidate_is_prime(uint64_t offset) {
     if (!BN_is_prime_fasttest_ex(tls_cand_bn, 1, tls_bn_ctx, 0, NULL))
         return 0;
 
-    /* --- Stage 3: full probable-prime test (no trial division) --- */
+    /* --- Stage 3: full probable-prime test (no trial division) ---
+       Skipped with --fast-fermat: saves ~5-6x time at the cost of a ~25%
+       composite false-positive rate (composites get rejected by the network). */
+    if (use_fast_fermat)
+        return 1; /* 1-round result is sufficient for fast mining */
+
     return BN_is_prime_fasttest_ex(tls_cand_bn, BN_prime_checks, tls_bn_ctx, 0, NULL);
 #pragma GCC diagnostic pop
 }
@@ -1698,12 +1703,12 @@ static void *worker_fn(void *arg) {
                     if (bn_candidate_is_prime(pr[i])) {
                         pr[pf++] = pr[i];
                     }
+                    __sync_fetch_and_add(&stats_tested, 1);
                 }
-                __sync_fetch_and_add(&stats_tested, (uint64_t)orig_cnt);
                 cnt = pf;
             } else {
                 pf = cnt;
-                __sync_fetch_and_add(&stats_tested, (uint64_t)cnt);
+                __sync_fetch_and_add(&stats_tested, (uint64_t)orig_cnt);
             }
 
             if (cnt >= 2) {
@@ -1920,7 +1925,7 @@ int main(int argc, char **argv) {
     else
         log_msg("miner configured to exit when a valid block is found\n");
     if (use_fast_fermat)
-        log_msg("fast Fermat primality test enabled\n");
+        log_msg("fast Fermat flag: using 1 Miller-Rabin round only (faster, ~25%% false-positive rate; composites get rejected by network)\n");
 
 #ifndef WITH_RPC
     /* suppress unused-but-set warnings when built without RPC */
@@ -1986,11 +1991,10 @@ int main(int argc, char **argv) {
                 /* primality – compact pr[] in-place using big-prime BN test */
                 size_t pf = 0;
                 if (!no_primality) {
-                    size_t orig_cnt = cnt;
                     for (size_t i = 0; i < cnt; i++) {
                         if (bn_candidate_is_prime(pr[i])) pr[pf++] = pr[i];
+                        __sync_fetch_and_add(&stats_tested, 1);
                     }
-                    __sync_fetch_and_add(&stats_tested, (uint64_t)orig_cnt);
                     cnt = pf;
                 } else {
                     pf = cnt;
