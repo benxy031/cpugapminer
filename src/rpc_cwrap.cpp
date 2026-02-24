@@ -1,5 +1,6 @@
 #include <cstdlib>
 #include <cstdio>
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <curl/curl.h>
@@ -11,6 +12,7 @@ extern "C" {
 int rpc_submit(const char *url, const char *user, const char *pass, const char *method, const char *hex);
 char *rpc_call(const char *url, const char *user, const char *pass, const char *method, const char *params_json);
 char *rpc_getblocktemplate(const char *url, const char *user, const char *pass);
+int rpc_getwork_data(const char *url, const char *user, const char *pass, char data_out[161], uint64_t *ndiff_out);
 }
 
 struct string_s { char *ptr; size_t len; };
@@ -168,4 +170,39 @@ char *rpc_getblocktemplate(const char *url, const char *user, const char *pass) 
         }
     }
     return res;
+}
+
+/* rpc_getwork_data: call getwork (no params), parse the 80-byte header hex
+   and nDifficulty integer into the caller's buffers.
+   data_out must be at least 161 bytes (160 hex + NUL).
+   Returns 1 on success, 0 on any failure. */
+int rpc_getwork_data(const char *url, const char *user, const char *pass,
+                     char data_out[161], uint64_t *ndiff_out) {
+    char *res = rpc_call(url, user, pass, "getwork", NULL);
+    if (!res) return 0;
+    int ok = 0;
+    json_error_t jerr;
+    json_t *root = json_loads(res, 0, &jerr);
+    if (root) {
+        json_t *result = json_object_get(root, "result");
+        if (result && json_is_object(result)) {
+            json_t *jdata = json_object_get(result, "data");
+            json_t *jdiff = json_object_get(result, "difficulty");
+            if (jdata && json_is_string(jdata) && jdiff && json_is_number(jdiff)) {
+                const char *ds = json_string_value(jdata);
+                size_t dlen = strlen(ds);
+                if (dlen >= 160) {
+                    strncpy(data_out, ds, 160);
+                    data_out[160] = '\0';
+                    *ndiff_out = json_is_integer(jdiff)
+                        ? (uint64_t)json_integer_value(jdiff)
+                        : (uint64_t)json_number_value(jdiff);
+                    ok = 1;
+                }
+            }
+        }
+        json_decref(root);
+    }
+    free(res);
+    return ok;
 }
