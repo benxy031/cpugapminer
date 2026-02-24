@@ -69,22 +69,27 @@ int rpc_submit(const char *url, const char *user, const char *pass, const char *
         } else {
             json_t *jerrobj = json_object_get(root, "error");
             if (!jerrobj || json_is_null(jerrobj)) {
-                /* no error — show the result field */
+                /* submitblock RPC convention (Bitcoin-derived coins):
+                   result=null  → accepted
+                   result=false → rejected (stale / already have it)
+                   result="..." → rejected with reason string
+                   result=true  → unusual, treat as accepted            */
                 json_t *jres = json_object_get(root, "result");
-                if (!jres || json_is_null(jres)) {
+                if (!jres || json_is_null(jres) || json_is_true(jres)) {
                     printf(">>> submitblock: ACCEPTED (result=null)\n");
+                    ret = 0;
                 } else if (json_is_false(jres)) {
-                    printf(">>> submitblock result: false\n");
-                } else if (json_is_true(jres)) {
-                    printf(">>> submitblock result: true\n");
+                    fprintf(stderr, ">>> submitblock: REJECTED (result=false) — stale or already known\n");
+                    ret = -1;
                 } else if (json_is_string(jres)) {
-                    printf(">>> submitblock result: \"%s\"\n", json_string_value(jres));
+                    fprintf(stderr, ">>> submitblock: REJECTED (reason=\"%s\")\n", json_string_value(jres));
+                    ret = -1;
                 } else {
                     char *resdump = json_dumps(jres, JSON_COMPACT);
-                    printf(">>> submitblock result: %s\n", resdump ? resdump : "?");
+                    fprintf(stderr, ">>> submitblock: REJECTED (result=%s)\n", resdump ? resdump : "?");
                     free(resdump);
+                    ret = -1;
                 }
-                ret = 0;
             } else {
                 /* extract code/message where available */
                 json_t *jcode = json_object_get(jerrobj, "code");
