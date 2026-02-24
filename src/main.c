@@ -1133,6 +1133,9 @@ struct worker_args {
     const char *rpc_pass;
     const char *rpc_method;
     const char *rpc_sign_key;
+    /* per-thread adder-space slice (set by main before spawning) */
+    int64_t adder_base_offset; /* offset into [0, global_adder_max) */
+    int     rpc_thread;        /* 1 for the thread that polls GBT   */
 };
 
 // process a list of primes searching for gaps meeting the local threshold.
@@ -1324,34 +1327,34 @@ static int presieve_window(int64_t widx, uint64_t base,
 }
 
 static void *worker_fn(void *arg) {
-    struct worker_args *wa = (struct worker_args*)arg;
-    int tid = wa->tid;
-    int nthreads = wa->nthreads;
-    uint64_t h_int_local = wa->h_int;
-    int shift_local = wa->shift;
-    int64_t adder_max_local = wa->adder_max;
-    uint64_t sieve_size_local = wa->sieve_size;
-    double target_local = wa->target;
-    const char *header_local = NULL;
-    const char *rpc_url_local = NULL;
-    const char *rpc_user_local = NULL;
-    const char *rpc_pass_local = NULL;
-    const char *rpc_method_local = NULL;
-    const char *rpc_sign_key_local = NULL;
+    struct worker_args *wa          = (struct worker_args*)arg;
+    uint64_t h_int_local            = wa->h_int;
+    int      shift_local            = wa->shift;
+    int64_t  adder_max_local        = wa->adder_max;
+    uint64_t sieve_size_local       = wa->sieve_size;
+    double   target_local           = wa->target;
+    int64_t  adder_base_offset_local = wa->adder_base_offset;
+    int      rpc_thread_local       = wa->rpc_thread;
+    const char *header_local = NULL, *rpc_url_local = NULL, *rpc_user_local = NULL;
+    const char *rpc_pass_local = NULL, *rpc_method_local = NULL, *rpc_sign_key_local = NULL;
 #ifdef WITH_RPC
-    header_local = wa->header;
-    rpc_url_local = wa->rpc_url;
-    rpc_user_local = wa->rpc_user;
-    rpc_pass_local = wa->rpc_pass;
-    rpc_method_local = wa->rpc_method;
+    header_local       = wa->header;
+    rpc_url_local      = wa->rpc_url;
+    rpc_user_local     = wa->rpc_user;
+    rpc_pass_local     = wa->rpc_pass;
+    rpc_method_local   = wa->rpc_method;
     rpc_sign_key_local = wa->rpc_sign_key;
 #endif
 
-    uint64_t base = h_int_local << shift_local;
-    int64_t num_windows = ((int64_t)adder_max_local + (int64_t)sieve_size_local - 1)
-                          / (int64_t)sieve_size_local;
+    /* This thread covers [base, base+adder_max_local) where base already
+       embeds the per-thread offset into the global adder range.            */
+    uint64_t base       = (h_int_local << shift_local) + (uint64_t)adder_base_offset_local;
+    int64_t  num_windows = ((int64_t)adder_max_local + (int64_t)sieve_size_local - 1)
+                           / (int64_t)sieve_size_local;
+    if (num_windows == 0) return NULL;
 
-    /* Set up pre-sieve helper thread */
+    /* Pre-sieve helper lives for the whole thread lifetime – no respawn
+       between passes, eliminating teardown overhead between cycles.        */
     struct presieve_ctx psc;
     memset(&psc, 0, sizeof(psc));
     pthread_mutex_init(&psc.mu, NULL);
@@ -1360,108 +1363,117 @@ static void *worker_fn(void *arg) {
     psc.state = 0; psc.fill_slot = 0;
     pthread_create(&psc.thread, NULL, presieve_helper_fn, &psc);
 
-    /* Prime the pipeline: kick off window 0 before entering the loop */
-    {
-        uint64_t L0, R0;
-        if (presieve_window((int64_t)tid, base, sieve_size_local,
-                            (uint64_t)adder_max_local, &L0, &R0)) {
-            pthread_mutex_lock(&psc.mu);
-            psc.bufs[0].L = L0; psc.bufs[0].R = R0;
-            psc.fill_slot = 0; psc.state = 1;
-            pthread_cond_signal(&psc.cv_go);
-            pthread_mutex_unlock(&psc.mu);
-        }
-    }
-
-    for (int64_t adder = (int64_t)tid; adder < num_windows; adder += nthreads) {
-        if (g_abort_pass) break;
-
-#ifdef WITH_RPC
-        if (tid == 0 && rpc_url_local) {
-            static uint64_t gbt_last_ms = 0;
-            uint64_t now = now_ms();
-            if (now - gbt_last_ms >= 5000) {
-                char *gbt = rpc_getblocktemplate(rpc_url_local, rpc_user_local, rpc_pass_local);
-                if (gbt) {
-                    check_and_log_new_work(gbt);
-                    free(gbt);
-                    pthread_mutex_lock(&g_work_lock);
-                    int new_block = header_local && strcmp(header_local, g_prevhash) != 0;
-                    pthread_mutex_unlock(&g_work_lock);
-                    if (new_block) { g_abort_pass = 1; break; }
-                }
-                gbt_last_ms = now_ms();
+    /* Outer loop: mine continuously (same slice, same header) until either
+       - a new block is detected by the RPC poller (g_abort_pass = 1), or
+       - SIGINT clears keep_going, or
+       - stop-after-block mode: scan_candidates returns 1.                  */
+    while (keep_going && !g_abort_pass) {
+        /* ---- prime the pipeline: kick off window 0 ---- */
+        {
+            uint64_t L0, R0;
+            if (presieve_window(0, base, sieve_size_local,
+                                (uint64_t)adder_max_local, &L0, &R0)) {
+                pthread_mutex_lock(&psc.mu);
+                psc.bufs[0].L = L0; psc.bufs[0].R = R0;
+                psc.fill_slot = 0; psc.state = 1;
+                pthread_cond_signal(&psc.cv_go);
+                pthread_mutex_unlock(&psc.mu);
             }
         }
+
+        for (int64_t adder = 0; adder < num_windows; adder++) {
+            if (g_abort_pass || !keep_going) break;
+
+#ifdef WITH_RPC
+            if (rpc_thread_local && rpc_url_local) {
+                static uint64_t gbt_last_ms = 0;
+                uint64_t now = now_ms();
+                if (now - gbt_last_ms >= 5000) {
+                    char *gbt = rpc_getblocktemplate(rpc_url_local, rpc_user_local, rpc_pass_local);
+                    if (gbt) {
+                        check_and_log_new_work(gbt);
+                        free(gbt);
+                        pthread_mutex_lock(&g_work_lock);
+                        int new_block = header_local && strcmp(header_local, g_prevhash) != 0;
+                        pthread_mutex_unlock(&g_work_lock);
+                        if (new_block) { g_abort_pass = 1; break; }
+                    }
+                    gbt_last_ms = now_ms();
+                }
+            }
 #endif
 
-        /* Wait for helper to finish the current window */
-        pthread_mutex_lock(&psc.mu);
-        while (psc.state == 1)
-            pthread_cond_wait(&psc.cv_done, &psc.mu);
-        if (psc.state != 2) { pthread_mutex_unlock(&psc.mu); break; }
+            /* Wait for helper to finish sieving the current window          */
+            pthread_mutex_lock(&psc.mu);
+            while (psc.state == 1)
+                pthread_cond_wait(&psc.cv_done, &psc.mu);
+            if (psc.state != 2) { pthread_mutex_unlock(&psc.mu); break; }
 
-        int cur_slot = psc.fill_slot;
-        size_t cnt   = psc.bufs[cur_slot].cnt;
-        uint64_t L   = psc.bufs[cur_slot].L;
-        uint64_t R   = psc.bufs[cur_slot].R;
+            int cur_slot = psc.fill_slot;
+            size_t cnt   = psc.bufs[cur_slot].cnt;
+            uint64_t L   = psc.bufs[cur_slot].L;
+            uint64_t R   = psc.bufs[cur_slot].R;
 
-        /* Kick off NEXT window before starting primality so they overlap */
-        int64_t next_win = adder + nthreads;
-        if (next_win < num_windows && !g_abort_pass) {
-            int next_slot = 1 - cur_slot;
-            uint64_t nL, nR;
-            if (presieve_window(next_win, base, sieve_size_local,
-                                (uint64_t)adder_max_local, &nL, &nR)) {
-                psc.bufs[next_slot].L = nL;
-                psc.bufs[next_slot].R = nR;
-                psc.fill_slot = next_slot;
-                psc.state = 1;
-                pthread_cond_signal(&psc.cv_go);
+            /* Kick off NEXT window before primality so they overlap         */
+            int64_t next_win = adder + 1;
+            if (next_win < num_windows && !g_abort_pass && keep_going) {
+                int next_slot = 1 - cur_slot;
+                uint64_t nL, nR;
+                if (presieve_window(next_win, base, sieve_size_local,
+                                    (uint64_t)adder_max_local, &nL, &nR)) {
+                    psc.bufs[next_slot].L = nL;
+                    psc.bufs[next_slot].R = nR;
+                    psc.fill_slot = next_slot;
+                    psc.state = 1;
+                    pthread_cond_signal(&psc.cv_go);
+                } else {
+                    psc.state = 0;
+                }
             } else {
                 psc.state = 0;
             }
-        } else {
-            psc.state = 0;
-        }
 
-        /* cur_slot is solely ours now; helper is working on next_slot */
-        uint64_t *pr     = psc.bufs[cur_slot].pr;
-        double   *pr_log = psc.bufs[cur_slot].pr_log;
-        pthread_mutex_unlock(&psc.mu);
+            /* cur_slot is exclusively ours; helper works on next_slot      */
+            uint64_t *pr     = psc.bufs[cur_slot].pr;
+            double   *pr_log = psc.bufs[cur_slot].pr_log;
+            pthread_mutex_unlock(&psc.mu);
 
-        log_file_only("Win=%lld(tid=%d) [%llu,%llu) survivors=%zu\n",
-                      (long long)adder, tid,
-                      (unsigned long long)L, (unsigned long long)R, cnt);
+            log_file_only("Win=%lld(off=%llu) [%llu,%llu) survivors=%zu\n",
+                          (long long)adder,
+                          (unsigned long long)adder_base_offset_local,
+                          (unsigned long long)L, (unsigned long long)R, cnt);
 
-        /* Primality filter in-place (runs while helper sieves next window) */
-        size_t orig_cnt = cnt;
-        size_t pf = 0;
-        if (!no_primality) {
-            for (size_t i = 0; i < cnt; i++) {
-                if (use_fast_fermat ? fast_fermat_test(pr[i]) : miller_rabin(pr[i])) {
-                    pr[pf]     = pr[i];
-                    pr_log[pf] = pr_log[i];
-                    pf++;
+            /* Primality test in-place (runs while helper sieves next window) */
+            size_t orig_cnt = cnt;
+            size_t pf = 0;
+            if (!no_primality) {
+                for (size_t i = 0; i < cnt; i++) {
+                    if (use_fast_fermat ? fast_fermat_test(pr[i]) : miller_rabin(pr[i])) {
+                        pr[pf]     = pr[i];
+                        pr_log[pf] = pr_log[i];
+                        pf++;
+                    }
                 }
+                __sync_fetch_and_add(&stats_tested, (uint64_t)orig_cnt);
+                cnt = pf;
+            } else {
+                pf = cnt;
+                __sync_fetch_and_add(&stats_tested, (uint64_t)cnt);
             }
-            __sync_fetch_and_add(&stats_tested, (uint64_t)orig_cnt);
-            cnt = pf;
-        } else {
-            pf = cnt;
-            __sync_fetch_and_add(&stats_tested, (uint64_t)cnt);
-        }
 
-        if (cnt >= 2) {
-            if (scan_candidates(pr, pr_log, cnt, target_local,
-                                h_int_local, shift_local,
-                                header_local,
-                                rpc_url_local, rpc_user_local, rpc_pass_local,
-                                rpc_method_local, rpc_sign_key_local))
-                break;
-        }
-    } /* end window loop */
+            if (cnt >= 2) {
+                if (scan_candidates(pr, pr_log, cnt, target_local,
+                                    h_int_local, shift_local,
+                                    header_local,
+                                    rpc_url_local, rpc_user_local, rpc_pass_local,
+                                    rpc_method_local, rpc_sign_key_local))
+                    goto worker_done; /* stop-after-block: exit immediately */
+            }
+        } /* end window loop */
+        /* Pass complete without abort: loop back and mine the same slice */
+    } /* end continuous mining outer loop */
 
+worker_done:
     /* Shut down helper */
     pthread_mutex_lock(&psc.mu);
     psc.state = -1;
@@ -1476,6 +1488,7 @@ static void *worker_fn(void *arg) {
     pthread_cond_destroy(&psc.cv_done);
     return NULL;
 }
+
 
 
 
@@ -1782,26 +1795,38 @@ int main(int argc, char **argv) {
         } while (keep_going);
     } else {
         do {
-            g_abort_pass = 0; /* reset stale-work flag for this pass */
+            g_abort_pass = 0;
             pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);
             struct worker_args *wargs = malloc(sizeof(struct worker_args) * num_threads);
-            for (int t=0;t<num_threads;t++) {
-                wargs[t].tid = t;
-                wargs[t].nthreads = num_threads;
-                wargs[t].h_int = h_int;
-                wargs[t].shift = shift;
-                wargs[t].adder_max = (int64_t)adder_max;
-                wargs[t].sieve_size = sieve_size;
-                wargs[t].target = target;
-                wargs[t].header = header;
-                wargs[t].rpc_url = rpc_url;
-                wargs[t].rpc_user = rpc_user;
-                wargs[t].rpc_pass = rpc_pass;
-                wargs[t].rpc_method = rpc_method;
-                wargs[t].rpc_sign_key = rpc_sign_key;
+            /* Partition the adder range evenly across threads so every core
+               has its own non-overlapping slice to search.  With the old
+               stride-by-nthreads design, thread i only touched windows
+               i, i+N, i+2N, ... so if num_windows < N most threads were idle.
+               Now thread t covers [(t*adder_max/N), ((t+1)*adder_max/N)) and
+               loops over those windows continuously until a new block arrives. */
+            int64_t slice = adder_max / (int64_t)num_threads;
+            if (slice < 1) slice = 1;
+            for (int t = 0; t < num_threads; t++) {
+                int64_t off  = (int64_t)t * slice;
+                int64_t sz   = (t == num_threads - 1) ? (adder_max - off) : slice;
+                wargs[t].tid               = 0;   /* stride handled internally */
+                wargs[t].nthreads          = 1;
+                wargs[t].rpc_thread        = (t == 0) ? 1 : 0;
+                wargs[t].adder_base_offset = off;
+                wargs[t].adder_max         = sz;
+                wargs[t].h_int             = h_int;
+                wargs[t].shift             = shift;
+                wargs[t].sieve_size        = sieve_size;
+                wargs[t].target            = target;
+                wargs[t].header            = header;
+                wargs[t].rpc_url           = rpc_url;
+                wargs[t].rpc_user          = rpc_user;
+                wargs[t].rpc_pass          = rpc_pass;
+                wargs[t].rpc_method        = rpc_method;
+                wargs[t].rpc_sign_key      = rpc_sign_key;
                 pthread_create(&threads[t], NULL, worker_fn, &wargs[t]);
             }
-            for (int t=0;t<num_threads;t++) pthread_join(threads[t], NULL);
+            for (int t = 0; t < num_threads; t++) pthread_join(threads[t], NULL);
             free(threads);
             free(wargs);
 
