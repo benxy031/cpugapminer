@@ -1,0 +1,28 @@
+# Gapcoin reference source (not part of this miner)
+gapcoin_src/
+
+# Build output
+bin/gap_miner
+src/*.o
+tests/test_rpc_json
+
+# Logs / runtime data
+miner.log
+perf.data
+*.log
+
+# Backup archives
+*.tar.gz
+*.tar.bz2
+*.zip
+
+# Temp / debug block dumps
+gbt.json
+/tmp/gap_miner_block_*.bin
+/tmp/gap_miner_block_*.hex
+
+# Editor / OS
+.vscode/
+*.swp
+*~
+.DS_Store
