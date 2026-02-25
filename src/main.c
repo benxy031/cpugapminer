@@ -2187,10 +2187,13 @@ int main(int argc, char **argv) {
     }
     if (adder_max < 0) {
         /* no explicit value supplied – use full allowed range */
-        adder_max = (int64_t)1 << shift;
-        log_msg("auto adder_max=%lld (2^shift)\n", (long long)adder_max);
+        if (shift <= 62)
+            adder_max = (int64_t)1 << shift;
+        else
+            adder_max = INT64_MAX; /* cap: 2^shift too large for int64_t */
+        log_msg("auto adder_max=%lld (2^shift=%d)\n", (long long)adder_max, shift);
     }
-    if (adder_max > ((int64_t)1 << shift)) {
+    if (shift <= 62 && adder_max > ((int64_t)1 << shift)) {
         fprintf(stderr, "--adder-max (%lld) must be at most 2^shift (%lld)\n", (long long)adder_max, (long long)((int64_t)1 << shift));
         return 2;
     }
