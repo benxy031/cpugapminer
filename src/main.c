@@ -1672,7 +1672,7 @@ struct coop_fermat {
 struct presieve_ctx {
     struct presieve_buf bufs[2]; /* ping-pong slots                     */
     int fill_slot;               /* helper writes into bufs[fill_slot]  */
-    int state;                   /* 0=idle 1=sieving 2=ready -1=exit   */
+    int state;                   /* 0=idle 1=sieving 2=ready 3=fermat-only -1=exit */
     pthread_mutex_t mu;
     pthread_cond_t  cv_go;       /* worker -> helper: new window ready  */
     pthread_cond_t  cv_done;     /* helper -> worker: result ready      */
@@ -1707,6 +1707,10 @@ static void coop_fermat_assist(struct presieve_ctx *ctx) {
             }
             co->out[co->out_cnt++] = co->pr[idx];
         }
+        /* Incremental stats: report every 4096 tests so the counter
+           moves smoothly even with large sieve windows (33M+).     */
+        if (((idx + 1) & 0xFFF) == 0)
+            __sync_fetch_and_add(&stats_tested, 4096);
     }
     /* Signal worker: all our Fermat work is done, out[] is final. */
     __sync_synchronize();
@@ -1721,35 +1725,42 @@ static void *presieve_helper_fn(void *arg) {
     set_base_bn(ctx->h256, ctx->shift);
     for (;;) {
         pthread_mutex_lock(&ctx->mu);
-        while (ctx->state != 1 && ctx->state != -1)
+        while (ctx->state != 1 && ctx->state != 3 && ctx->state != -1)
             pthread_cond_wait(&ctx->cv_go, &ctx->mu);
         if (ctx->state == -1) { pthread_mutex_unlock(&ctx->mu); break; }
-        int slot   = ctx->fill_slot;
-        uint64_t L = ctx->bufs[slot].L;
-        uint64_t R = ctx->bufs[slot].R;
-        pthread_mutex_unlock(&ctx->mu);
 
-        /* sieve using this helper's own TLS (independent from worker's TLS) */
-        size_t cnt = 0;
-        uint64_t *pr_tls = sieve_range(L, R, &cnt, ctx->h256, ctx->shift);
+        int need_sieve = (ctx->state == 1);
 
-        pthread_mutex_lock(&ctx->mu);
-        struct presieve_buf *b = &ctx->bufs[slot];
-        if (ctx->state != -1) {
-            presieve_buf_ensure(b, cnt);
-            if (cnt && pr_tls)
-                memcpy(b->pr, pr_tls, cnt * sizeof(uint64_t));
-            b->cnt = cnt;
-            ctx->state = 2;
-            pthread_cond_signal(&ctx->cv_done);
+        if (need_sieve) {
+            int slot   = ctx->fill_slot;
+            uint64_t L = ctx->bufs[slot].L;
+            uint64_t R = ctx->bufs[slot].R;
+            pthread_mutex_unlock(&ctx->mu);
+
+            /* sieve using this helper's own TLS */
+            size_t cnt = 0;
+            uint64_t *pr_tls = sieve_range(L, R, &cnt, ctx->h256, ctx->shift);
+
+            pthread_mutex_lock(&ctx->mu);
+            struct presieve_buf *b = &ctx->bufs[slot];
+            if (ctx->state != -1) {
+                presieve_buf_ensure(b, cnt);
+                if (cnt && pr_tls)
+                    memcpy(b->pr, pr_tls, cnt * sizeof(uint64_t));
+                b->cnt = cnt;
+                ctx->state = 2;
+                pthread_cond_signal(&ctx->cv_done);
+            }
+            __sync_fetch_and_add(&stats_sieved, (uint64_t)(R - L));
+            pthread_mutex_unlock(&ctx->mu);
+        } else {
+            /* state=3: no sieving needed, just assist with Fermat */
+            pthread_mutex_unlock(&ctx->mu);
         }
-        __sync_fetch_and_add(&stats_sieved, (uint64_t)(R - L));
-        pthread_mutex_unlock(&ctx->mu);
 
-        /* After sieving, help with Fermat testing on the current window.
-           This uses the helper's otherwise-idle CPU time (the worker is
-           doing its own Fermat tests in parallel on the same candidate
-           array via the shared atomic index). */
+        /* Assist with Fermat testing on the current window.
+           For state=1: helper finished sieving, now helps with Fermat.
+           For state=3: helper skipped sieving, goes straight to Fermat. */
         coop_fermat_assist(ctx);
     }
     free_sieve_buffers(); /* release helper's TLS */
@@ -1911,6 +1922,14 @@ static void *worker_fn(void *arg) {
                 } else {
                     psc.state = 0;
                 }
+            } else if (!g_abort_pass && keep_going) {
+                /* Last window of pass — no sieve work, but still enlist the
+                   helper for Fermat testing (state=3).  Without this, the
+                   helper would idle on every last window, which is 50% of all
+                   windows when sieve-size is large (e.g. 33M / 268M = 8 wins
+                   per pass, only 7 have cooperative Fermat otherwise).      */
+                psc.state = 3;
+                pthread_cond_signal(&psc.cv_go);
             } else {
                 psc.state = 0;
             }
@@ -1918,13 +1937,11 @@ static void *worker_fn(void *arg) {
             /* cur_slot is exclusively ours; helper works on next_slot      */
             uint64_t *pr     = psc.bufs[cur_slot].pr;
 
-            /* Cooperative Fermat: only enable when the helper is actively
-               sieving the next window (state==1).  After sieving, the helper
-               calls coop_fermat_assist before going back to its wait loop.
-               When state==0 (last window of pass, or empty window) the helper
-               is already back in its wait loop — enabling coop would deadlock
-               because helper_done would never be set.                       */
-            int helper_will_assist = (psc.state == 1);
+            /* Cooperative Fermat: enable when the helper has work — either
+               sieving next window (state=1) or fermat-only (state=3).
+               The helper always calls coop_fermat_assist() after its main
+               task, so it will pick up the shared atomic work queue.        */
+            int helper_will_assist = (psc.state == 1 || psc.state == 3);
             psc.coop.pr       = pr;
             psc.coop.cnt      = cnt;
             psc.coop.next_idx = 0;
@@ -1940,6 +1957,7 @@ static void *worker_fn(void *arg) {
                index after finishing its sieve.  Otherwise worker goes solo. */
             size_t orig_cnt = cnt;
             size_t pf = 0;
+            size_t worker_tested = 0; /* track tests for incremental stats */
             if (!no_primality) {
                 for (;;) {
                     size_t idx = __sync_fetch_and_add(&psc.coop.next_idx, 1);
@@ -1947,6 +1965,11 @@ static void *worker_fn(void *arg) {
                     if (bn_candidate_is_prime(pr[idx])) {
                         pr[pf++] = pr[idx];
                     }
+                    worker_tested++;
+                    /* Incremental stats: report every 4096 tests so the
+                       counter moves smoothly with large sieve windows. */
+                    if ((worker_tested & 0xFFF) == 0)
+                        __sync_fetch_and_add(&stats_tested, 4096);
                 }
                 psc.coop.active = 0;
                 __sync_synchronize();
@@ -1973,7 +1996,29 @@ static void *worker_fn(void *arg) {
                         }
                     }
                 }
-                __sync_fetch_and_add(&stats_tested, (uint64_t)orig_cnt);
+                /* Flush remaining stats not yet reported by the 4096-batched
+                   incremental updates (worker + helper combined).           */
+                {
+                    size_t reported = (worker_tested / 4096) * 4096;
+                    size_t remainder = worker_tested - reported;
+                    /* Helper's incremental reports are already flushed;
+                       only add the worker's tail + unreported portion.      */
+                    if (helper_will_assist) {
+                        /* orig_cnt = total candidates.
+                           Worker tested worker_tested (reported in 4096 chunks).
+                           Helper tested orig_cnt - worker_tested (also in 4096
+                           chunks).  Flush both remainders.                  */
+                        size_t helper_tested = orig_cnt > worker_tested ?
+                                               orig_cnt - worker_tested : 0;
+                        size_t helper_reported = (helper_tested / 4096) * 4096;
+                        remainder += (helper_tested - helper_reported);
+                    } else {
+                        /* No helper — worker tested everything.  Flush tail. */
+                        remainder = orig_cnt - reported;
+                    }
+                    if (remainder > 0)
+                        __sync_fetch_and_add(&stats_tested, (uint64_t)remainder);
+                }
                 cnt = pf;
             } else {
                 psc.coop.active = 0;
