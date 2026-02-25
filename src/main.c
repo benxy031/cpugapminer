@@ -232,6 +232,14 @@ static volatile int use_fast_fermat = 0;
 static volatile int no_primality = 0;   /* skip all probable‑prime filtering */
 static volatile int selftest = 0;        /* run a quick internal test then exit */
 
+/* Sampling stride for two-phase gap scanning.  In phase 1 only every Kth
+   sieve-survivor is Fermat-tested ("sampled"); candidate gap regions (where
+   consecutive sampled primes are ≥ target apart) are then fully verified
+   in phase 2.  K=8 gives ~5× fewer total Fermat tests per window.
+   K=1 disables sampling (test all survivors — the old behaviour).          */
+#define DEFAULT_SAMPLE_STRIDE 8
+static int cli_sample_stride = DEFAULT_SAMPLE_STRIDE;
+
 /* Comparator for qsort of uint64_t arrays (fallback sort path). */
 static int cmp_u64(const void *a, const void *b) {
     uint64_t va = *(const uint64_t *)a, vb = *(const uint64_t *)b;
@@ -1786,6 +1794,7 @@ struct coop_fermat {
     size_t          out_cap;     /* capacity of out[]                       */
     volatile int    active;      /* 1 = work available for helper           */
     volatile int    helper_done; /* 1 = helper finished its Fermat batch    */
+    volatile int    more_work;   /* 1 = worker will set up another phase    */
 };
 
 struct presieve_ctx {
@@ -1809,31 +1818,47 @@ static void presieve_buf_ensure(struct presieve_buf *b, size_t need) {
 }
 
 /* Helper: assist with Fermat testing from the shared cooperative work queue.
-   Called after the helper finishes sieving; runs until all candidates consumed. */
+   Called after the helper finishes sieving; runs until all candidates consumed.
+   When more_work is set, the helper loops: after finishing one batch it spins
+   on helper_done until the worker clears it (meaning a new batch is ready)
+   or sets active=0 (meaning no more work).                                  */
 static void coop_fermat_assist(struct presieve_ctx *ctx) {
     struct coop_fermat *co = &ctx->coop;
-    if (!co->active) return;   /* nothing to do — don't touch helper_done */
+    if (!co->active) return;
 
     for (;;) {
-        size_t idx = __sync_fetch_and_add(&co->next_idx, 1);
-        if (idx >= co->cnt) break;
-        if (bn_candidate_is_prime(co->pr[idx])) {
-            /* Store confirmed prime in helper's private output buffer */
-            if (co->out_cnt >= co->out_cap) {
-                size_t nc = co->out_cap ? co->out_cap * 2 : 256;
-                co->out = realloc(co->out, nc * sizeof(uint64_t));
-                co->out_cap = nc;
+        /* Process current batch of candidates */
+        for (;;) {
+            size_t idx = __sync_fetch_and_add(&co->next_idx, 1);
+            if (idx >= co->cnt) break;
+            if (bn_candidate_is_prime(co->pr[idx])) {
+                /* Store confirmed prime in helper's private output buffer */
+                if (co->out_cnt >= co->out_cap) {
+                    size_t nc = co->out_cap ? co->out_cap * 2 : 256;
+                    co->out = realloc(co->out, nc * sizeof(uint64_t));
+                    co->out_cap = nc;
+                }
+                co->out[co->out_cnt++] = co->pr[idx];
             }
-            co->out[co->out_cnt++] = co->pr[idx];
+            /* Incremental stats: report every 4096 tests so the counter
+               moves smoothly even with large sieve windows (33M+).     */
+            if (((idx + 1) & 0xFFF) == 0)
+                __sync_fetch_and_add(&stats_tested, 4096);
         }
-        /* Incremental stats: report every 4096 tests so the counter
-           moves smoothly even with large sieve windows (33M+).     */
-        if (((idx + 1) & 0xFFF) == 0)
-            __sync_fetch_and_add(&stats_tested, 4096);
+
+        /* Signal worker: this batch is done, out[] is up to date. */
+        __sync_synchronize();
+        co->helper_done = 1;
+
+        /* If no more phases expected, exit. */
+        if (!co->more_work) break;
+
+        /* Wait for worker to set up next phase (worker clears helper_done)
+           or to deactivate us (worker sets active=0 then clears helper_done). */
+        while (co->helper_done)
+            __asm__ volatile("pause" ::: "memory");
+        if (!co->active) break;
     }
-    /* Signal worker: all our Fermat work is done, out[] is final. */
-    __sync_synchronize();
-    co->helper_done = 1;
 }
 
 static void *presieve_helper_fn(void *arg) {
@@ -2069,49 +2094,280 @@ static void *worker_fn(void *arg) {
                The helper always calls coop_fermat_assist() after its main
                task, so it will pick up the shared atomic work queue.        */
             int helper_will_assist = (psc.state == 1 || psc.state == 3);
-            psc.coop.pr       = pr;
-            psc.coop.cnt      = cnt;
-            psc.coop.next_idx = 0;
-            psc.coop.out_cnt  = 0;
-            psc.coop.helper_done = helper_will_assist ? 0 : 1;
-            __sync_synchronize();
-            psc.coop.active   = (cnt > 0 && !no_primality && helper_will_assist) ? 1 : 0;
 
-            pthread_mutex_unlock(&psc.mu);
-
-            /* Primality test: worker pulls candidates via atomic index.
-               If helper_will_assist, the helper also pulls from the same
-               index after finishing its sieve.  Otherwise worker goes solo. */
             size_t orig_cnt = cnt;
             size_t pf = 0;
-            size_t worker_tested = 0; /* track tests for incremental stats */
-            if (!no_primality) {
+            size_t worker_tested = 0;
+
+            /* Decide up-front whether to use two-phase smart scanning.
+               Pre-allocate phase-1 buffers BEFORE unlocking the mutex so
+               the fallback path can still set up coop normally.             */
+            int smart_K = cli_sample_stride;
+            int use_smart = (smart_K > 1 && !no_primality
+                             && cnt > (size_t)(smart_K * 4));
+
+            size_t needed_gap = 0, p1_cnt = 0, p1_wcap = 0;
+            uint64_t *p1_cands = NULL, *p1_wbuf = NULL;
+
+
+
+            if (use_smart) {
+                needed_gap = (size_t)(target_local * logbase);
+                if (needed_gap < 2) needed_gap = 2;
+                p1_cnt  = (cnt + (size_t)smart_K - 1) / (size_t)smart_K;
+                p1_wcap = p1_cnt / 4 + 64;
+                p1_cands = (uint64_t *)malloc(p1_cnt * sizeof(uint64_t));
+                p1_wbuf  = (uint64_t *)malloc(p1_wcap * sizeof(uint64_t));
+                if (!p1_cands || !p1_wbuf) {
+                    free(p1_cands); free(p1_wbuf);
+                    p1_cands = p1_wbuf = NULL;
+                    use_smart = 0;               /* OOM → full test fallback */
+                } else {
+                    for (size_t s = 0, j = 0; j < cnt; j += (size_t)smart_K, s++)
+                        p1_cands[s] = pr[j];
+                }
+            }
+
+            /* --- set up cooperative Fermat and unlock mutex (once) ------- */
+            if (use_smart) {
+                psc.coop.pr        = p1_cands;
+                psc.coop.cnt       = p1_cnt;
+                psc.coop.next_idx  = 0;
+                psc.coop.out_cnt   = 0;
+                psc.coop.more_work = 1;          /* another batch follows   */
+                psc.coop.helper_done = helper_will_assist ? 0 : 1;
+                __sync_synchronize();
+                psc.coop.active = (p1_cnt > 0 && helper_will_assist) ? 1 : 0;
+            } else {
+                psc.coop.pr        = pr;
+                psc.coop.cnt       = cnt;
+                psc.coop.next_idx  = 0;
+                psc.coop.out_cnt   = 0;
+                psc.coop.more_work = 0;
+                psc.coop.helper_done = helper_will_assist ? 0 : 1;
+                __sync_synchronize();
+                psc.coop.active = (cnt > 0 && !no_primality
+                                   && helper_will_assist) ? 1 : 0;
+            }
+            pthread_mutex_unlock(&psc.mu);       /* exactly once per window */
+
+            /* ============================================================= */
+            if (use_smart) {
+            /* ======= TWO-PHASE SMART SCANNING =============================
+               Phase 1: sample every Kth sieve survivor (cooperative).
+               Gap analysis: find regions where consecutive sampled primes
+                             are ≥ target gap apart.
+               Phase 2: verify all un-sampled survivors inside those regions
+                        (cooperative).
+               Expected savings: ~5× fewer Fermat tests per window (K=8).
+               ==============================================================*/
+
+                /* --- Phase 1: worker tests sampled candidates ------------ */
+                size_t p1_wn = 0;
+                for (;;) {
+                    size_t idx = __sync_fetch_and_add(&psc.coop.next_idx, 1);
+                    if (idx >= p1_cnt) break;
+                    if (bn_candidate_is_prime(p1_cands[idx])) {
+                        if (p1_wn >= p1_wcap) {
+                            p1_wcap *= 2;
+                            p1_wbuf = (uint64_t *)realloc(p1_wbuf,
+                                        p1_wcap * sizeof(uint64_t));
+                        }
+                        p1_wbuf[p1_wn++] = p1_cands[idx];
+                    }
+                    worker_tested++;
+                    if ((worker_tested & 0xFFF) == 0)
+                        __sync_fetch_and_add(&stats_tested, 4096);
+                }
+                /* Wait for helper to finish phase 1                         */
+                if (helper_will_assist) {
+                    while (!psc.coop.helper_done)
+                        __asm__ volatile("pause" ::: "memory");
+                }
+
+                /* Merge phase-1 worker + helper primes → sampled_primes[]   */
+                size_t p1_hn  = psc.coop.out_cnt;
+                size_t sp_cnt = p1_wn + p1_hn;
+                uint64_t *sampled_primes = (uint64_t *)malloc(
+                        (sp_cnt ? sp_cnt : 1) * sizeof(uint64_t));
+                if (sampled_primes) {
+                    size_t wi = 0, hi = 0, mi = 0;
+                    while (wi < p1_wn && hi < p1_hn) {
+                        if (p1_wbuf[wi] <= psc.coop.out[hi])
+                            sampled_primes[mi++] = p1_wbuf[wi++];
+                        else
+                            sampled_primes[mi++] = psc.coop.out[hi++];
+                    }
+                    while (wi < p1_wn)  sampled_primes[mi++] = p1_wbuf[wi++];
+                    while (hi < p1_hn)  sampled_primes[mi++] = psc.coop.out[hi++];
+                    sp_cnt = mi;
+                } else {
+                    sp_cnt = 0;   /* OOM – skip gap analysis */
+                }
+                free(p1_wbuf);  p1_wbuf = NULL;
+                free(p1_cands); p1_cands = NULL;
+
+                /* --- Gap analysis: find candidate regions in pr[] -------- */
+                size_t v_alloc = cnt / 8 + 64;
+                uint64_t *verify = (uint64_t *)malloc(v_alloc * sizeof(uint64_t));
+                size_t v_cnt = 0;
+                if (verify && sp_cnt >= 1) {
+                    /* Collect un-sampled survivors in (lo_val, hi_val)       */
+                    #define COLLECT_REGION(lo_val, hi_val) do {                \
+                        size_t _lo = 0, _hi = cnt;                            \
+                        while (_lo < _hi) {                                   \
+                            size_t _m = _lo + (_hi - _lo) / 2;               \
+                            if (pr[_m] <= (lo_val)) _lo = _m + 1;            \
+                            else _hi = _m;                                    \
+                        }                                                     \
+                        for (size_t _j = _lo;                                 \
+                             _j < cnt && pr[_j] < (hi_val); _j++) {           \
+                            if (_j % (size_t)smart_K == 0) continue;          \
+                            if (v_cnt >= v_alloc) {                           \
+                                v_alloc *= 2;                                 \
+                                verify = (uint64_t *)realloc(verify,          \
+                                            v_alloc * sizeof(uint64_t));      \
+                            }                                                 \
+                            verify[v_cnt++] = pr[_j];                         \
+                        }                                                     \
+                    } while (0)
+
+                    /* Left edge */
+                    if (cnt > 0 && sampled_primes[0] - pr[0] >= needed_gap)
+                        COLLECT_REGION(pr[0] - 1, sampled_primes[0]);
+                    /* Interior gaps */
+                    for (size_t i = 0; i + 1 < sp_cnt; i++) {
+                        if (sampled_primes[i+1] - sampled_primes[i] >= needed_gap)
+                            COLLECT_REGION(sampled_primes[i], sampled_primes[i+1]);
+                    }
+                    /* Right edge */
+                    if (cnt > 0 &&
+                        pr[cnt-1] - sampled_primes[sp_cnt-1] >= needed_gap)
+                        COLLECT_REGION(sampled_primes[sp_cnt-1], pr[cnt-1] + 1);
+
+                    #undef COLLECT_REGION
+                }
+
+                if (adder == 0)
+                    log_msg("smart scan: K=%d  sampled=%zu  verified=%zu  total=%zu (%.0f%% skipped)\n",
+                            smart_K, p1_cnt, v_cnt, cnt,
+                            100.0 * (1.0 - (double)(p1_cnt + v_cnt) / (double)cnt));
+
+                /* --- Phase 2: verify survivors in candidate gaps --------- */
+                size_t p2_wn = 0;
+                uint64_t *p2_wbuf = NULL;
+
+                if (v_cnt > 0) {
+                    psc.coop.pr        = verify;
+                    psc.coop.cnt       = v_cnt;
+                    psc.coop.next_idx  = 0;
+                    /* don't reset out_cnt — helper appends to same buffer   */
+                    psc.coop.more_work = 0;          /* last phase           */
+                    psc.coop.helper_done = helper_will_assist ? 0 : 1;
+                    __sync_synchronize();
+                    /* Worker clears helper_done → wakes helper from spin    */
+
+                    size_t p2_wcap = v_cnt / 4 + 64;
+                    p2_wbuf = (uint64_t *)malloc(p2_wcap * sizeof(uint64_t));
+
+                    for (;;) {
+                        size_t idx = __sync_fetch_and_add(&psc.coop.next_idx, 1);
+                        if (idx >= v_cnt) break;
+                        if (bn_candidate_is_prime(verify[idx])) {
+                            if (p2_wbuf && p2_wn >= p2_wcap) {
+                                p2_wcap *= 2;
+                                p2_wbuf = (uint64_t *)realloc(p2_wbuf,
+                                            p2_wcap * sizeof(uint64_t));
+                            }
+                            if (p2_wbuf) p2_wbuf[p2_wn++] = verify[idx];
+                        }
+                        worker_tested++;
+                        if ((worker_tested & 0xFFF) == 0)
+                            __sync_fetch_and_add(&stats_tested, 4096);
+                    }
+                    if (helper_will_assist) {
+                        while (!psc.coop.helper_done)
+                            __asm__ volatile("pause" ::: "memory");
+                    }
+                } else {
+                    /* No candidate gaps — release helper now.               */
+                    psc.coop.more_work = 0;
+                    psc.coop.active    = 0;
+                    __sync_synchronize();
+                    if (helper_will_assist)
+                        psc.coop.helper_done = 0;    /* wake → sees active=0 */
+                }
+
+                psc.coop.active = 0;
+                __sync_synchronize();
+
+                /* --- Final merge: all confirmed primes → pr[], sort ------ */
+                pf = 0;
+                for (size_t i = 0; i < sp_cnt; i++) pr[pf++] = sampled_primes[i];
+                if (p2_wbuf)
+                    for (size_t i = 0; i < p2_wn; i++) pr[pf++] = p2_wbuf[i];
+                for (size_t i = p1_hn; i < psc.coop.out_cnt; i++)
+                    pr[pf++] = psc.coop.out[i];
+                if (pf > 1) qsort(pr, pf, sizeof(uint64_t), cmp_u64);
+                cnt = pf;
+
+                free(sampled_primes);
+                free(verify);
+                free(p2_wbuf);
+
+                /* Flush stats */
+                {
+                    size_t total_tested = p1_cnt + v_cnt;
+                    size_t reported = (worker_tested / 4096) * 4096;
+                    size_t remainder = worker_tested - reported;
+                    if (helper_will_assist) {
+                        size_t htested = total_tested > worker_tested
+                                         ? total_tested - worker_tested : 0;
+                        size_t hreported = (htested / 4096) * 4096;
+                        remainder += (htested - hreported);
+                    } else {
+                        remainder = total_tested - reported;
+                    }
+                    if (remainder > 0)
+                        __sync_fetch_and_add(&stats_tested, (uint64_t)remainder);
+                }
+
+                /* Compensate stats_pairs so the ETA formula (based on
+                   pairs/s × exp(-m)) reflects full-window throughput.
+                   Estimate how many primes a full scan would have found
+                   from the phase-1 sample rate, and add the "missing"
+                   pairs that smart scanning intentionally skipped.         */
+                if (sp_cnt > 0 && p1_cnt > 0 && cnt >= 2) {
+                    size_t est_full = (size_t)((double)orig_cnt
+                                    * (double)sp_cnt / (double)p1_cnt);
+                    if (est_full > cnt)
+                        __sync_fetch_and_add(&stats_pairs,
+                                             (uint64_t)(est_full - cnt));
+                }
+
+            /* ============================================================= */
+            } else if (!no_primality) {
+            /* ======= FULL TEST (original path) ============================
+               Test every sieve survivor cooperatively.  Used when
+               --sample-stride 1 or as OOM fallback.
+               ==============================================================*/
                 for (;;) {
                     size_t idx = __sync_fetch_and_add(&psc.coop.next_idx, 1);
                     if (idx >= cnt) break;
-                    if (bn_candidate_is_prime(pr[idx])) {
+                    if (bn_candidate_is_prime(pr[idx]))
                         pr[pf++] = pr[idx];
-                    }
                     worker_tested++;
-                    /* Incremental stats: report every 4096 tests so the
-                       counter moves smoothly with large sieve windows. */
                     if ((worker_tested & 0xFFF) == 0)
                         __sync_fetch_and_add(&stats_tested, 4096);
                 }
                 psc.coop.active = 0;
                 __sync_synchronize();
 
-                /* Wait for helper only if it was going to assist.            */
                 if (helper_will_assist) {
                     while (!psc.coop.helper_done)
                         __asm__ volatile("pause" ::: "memory");
 
-                    /* Merge helper's sorted primes with worker's sorted primes.
-                       Both runs are ascending (candidates came from a shared
-                       atomic index over the sorted sieve-survivor array).
-                       O(n) merge replaces the previous O(n²) insertion sort. */
-                    size_t wn = pf;
-                    size_t hn = psc.coop.out_cnt;
+                    size_t wn = pf, hn = psc.coop.out_cnt;
                     if (hn > 0) {
                         uint64_t *wtmp = (uint64_t *)malloc(wn * sizeof(uint64_t));
                         if (wtmp) {
@@ -2128,38 +2384,31 @@ static void *worker_fn(void *arg) {
                             pf = mi;
                             free(wtmp);
                         } else {
-                            /* OOM fallback: append + qsort */
                             for (size_t i = 0; i < hn; i++)
                                 pr[pf++] = psc.coop.out[i];
                             qsort(pr, pf, sizeof(uint64_t), cmp_u64);
                         }
                     }
                 }
-                /* Flush remaining stats not yet reported by the 4096-batched
-                   incremental updates (worker + helper combined).           */
-                {
+                {   /* Flush stats */
                     size_t reported = (worker_tested / 4096) * 4096;
                     size_t remainder = worker_tested - reported;
-                    /* Helper's incremental reports are already flushed;
-                       only add the worker's tail + unreported portion.      */
                     if (helper_will_assist) {
-                        /* orig_cnt = total candidates.
-                           Worker tested worker_tested (reported in 4096 chunks).
-                           Helper tested orig_cnt - worker_tested (also in 4096
-                           chunks).  Flush both remainders.                  */
-                        size_t helper_tested = orig_cnt > worker_tested ?
-                                               orig_cnt - worker_tested : 0;
-                        size_t helper_reported = (helper_tested / 4096) * 4096;
-                        remainder += (helper_tested - helper_reported);
+                        size_t htested = orig_cnt > worker_tested
+                                         ? orig_cnt - worker_tested : 0;
+                        size_t hreported = (htested / 4096) * 4096;
+                        remainder += (htested - hreported);
                     } else {
-                        /* No helper — worker tested everything.  Flush tail. */
                         remainder = orig_cnt - reported;
                     }
                     if (remainder > 0)
                         __sync_fetch_and_add(&stats_tested, (uint64_t)remainder);
                 }
                 cnt = pf;
+
+            /* ============================================================= */
             } else {
+                /* no_primality: skip all testing */
                 psc.coop.active = 0;
                 pf = cnt;
                 __sync_fetch_and_add(&stats_tested, (uint64_t)orig_cnt);
@@ -2261,6 +2510,7 @@ int main(int argc, char **argv) {
         printf("      --threads N       worker threads        (default: 1)\n");
         printf("      --adder-max M     adder upper bound     (default: 2^shift)\n");
         printf("      --fast-fermat     fast primality (fewer Miller-Rabin rounds)\n");
+        printf("      --sample-stride K smart scan: test every Kth survivor (default: 8, 1=off)\n");
         printf("      --keep-going      continue after block found (default on)\n");
         printf("      --stop-after-block  exit after first valid block\n");
         printf("      --log-file FILE   append messages to FILE\n");
@@ -2321,6 +2571,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--no-primality")) no_primality = 1;
         else if (!strcmp(argv[i],"--selftest")) selftest = 1;
         else if (!strcmp(argv[i],"--threads") && i+1<argc) num_threads = atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--sample-stride") && i+1<argc) {
+            cli_sample_stride = atoi(argv[++i]);
+            if (cli_sample_stride < 1) cli_sample_stride = 1;
+        }
         else if (!strcmp(argv[i],"--p") && i+1<argc) build_p = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i],"--q") && i+1<argc) build_q = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i],"--keep-going")) {
@@ -2539,16 +2793,101 @@ int main(int argc, char **argv) {
                 __sync_fetch_and_add(&stats_sieved, (uint64_t)(R - L));
                 /* primality – compact pr[] in-place using big-prime BN test */
                 size_t pf = 0;
-                if (!no_primality) {
-                    size_t test_cnt = cnt;
-                    for (size_t i = 0; i < cnt; i++) {
-                        if (bn_candidate_is_prime(pr[i])) pr[pf++] = pr[i];
+                size_t orig_cnt_st = cnt;
+                int smart_K_st = cli_sample_stride;
+                int use_smart_st = (smart_K_st > 1 && !no_primality
+                                    && cnt > (size_t)(smart_K_st * 4));
+
+                if (use_smart_st) {
+                    /* --- Phase 1: sample every Kth survivor --------------- */
+                    size_t p1n = (cnt + (size_t)smart_K_st - 1) / (size_t)smart_K_st;
+                    uint64_t *sampled = (uint64_t *)malloc(p1n * sizeof(uint64_t));
+                    if (!sampled) { use_smart_st = 0; goto st_full; }
+
+                    size_t sp = 0;
+                    for (size_t j = 0; j < cnt; j += (size_t)smart_K_st) {
+                        if (bn_candidate_is_prime(pr[j]))
+                            sampled[sp++] = pr[j];
                     }
-                    __sync_fetch_and_add(&stats_tested, (uint64_t)test_cnt);
+                    __sync_fetch_and_add(&stats_tested, (uint64_t)p1n);
+
+                    size_t needed = (size_t)(target * logbase);
+                    if (needed < 2) needed = 2;
+
+                    /* --- Collect verification candidates ------------------ */
+                    size_t v_alloc = cnt / 4 + 64, v_cnt = 0;
+                    uint64_t *verify = (uint64_t *)malloc(v_alloc * sizeof(uint64_t));
+                    if (!verify) { free(sampled); use_smart_st = 0; goto st_full; }
+
+                    #define COLLECT_ST(lo_val, hi_val) do {                      \
+                        size_t _lo = 0, _hi = cnt;                              \
+                        while (_lo < _hi) {                                     \
+                            size_t _m = _lo + (_hi - _lo) / 2;                  \
+                            if (pr[_m] <= (lo_val)) _lo = _m + 1;              \
+                            else _hi = _m;                                      \
+                        }                                                       \
+                        for (size_t _j = _lo;                                   \
+                             _j < cnt && pr[_j] < (hi_val); _j++) {             \
+                            if (_j % (size_t)smart_K_st == 0) continue;         \
+                            if (v_cnt >= v_alloc) {                             \
+                                v_alloc *= 2;                                   \
+                                verify = (uint64_t *)realloc(verify,            \
+                                            v_alloc * sizeof(uint64_t));        \
+                            }                                                   \
+                            verify[v_cnt++] = pr[_j];                           \
+                        }                                                       \
+                    } while (0)
+
+                    if (sp > 0 && cnt > 0 && sampled[0] - pr[0] >= needed)
+                        COLLECT_ST(pr[0] - 1, sampled[0]);
+                    for (size_t i = 0; i + 1 < sp; i++) {
+                        if (sampled[i+1] - sampled[i] >= needed)
+                            COLLECT_ST(sampled[i], sampled[i+1]);
+                    }
+                    if (sp > 0 && cnt > 0 &&
+                        pr[cnt-1] - sampled[sp-1] >= needed)
+                        COLLECT_ST(sampled[sp-1], pr[cnt-1] + 1);
+                    #undef COLLECT_ST
+
+                    if (adder == 0)
+                        log_msg("smart scan: K=%d  sampled=%zu  verified=%zu  total=%zu (%.0f%% skipped)\n",
+                                smart_K_st, p1n, v_cnt, cnt,
+                                100.0 * (1.0 - (double)(p1n + v_cnt) / (double)cnt));
+
+                    /* --- Phase 2: test verification candidates ------------ */
+                    pf = sp;
+                    memcpy(pr, sampled, sp * sizeof(uint64_t));
+                    for (size_t i = 0; i < v_cnt; i++) {
+                        if (bn_candidate_is_prime(verify[i]))
+                            pr[pf++] = verify[i];
+                    }
+                    __sync_fetch_and_add(&stats_tested, (uint64_t)v_cnt);
+                    if (pf > 1) qsort(pr, pf, sizeof(uint64_t), cmp_u64);
                     cnt = pf;
+
+                    /* ETA pair compensation */
+                    if (sp > 0 && p1n > 0 && cnt >= 2) {
+                        size_t est_full = (size_t)((double)orig_cnt_st
+                                        * (double)sp / (double)p1n);
+                        if (est_full > cnt)
+                            __sync_fetch_and_add(&stats_pairs,
+                                                 (uint64_t)(est_full - cnt));
+                    }
+                    free(sampled);
+                    free(verify);
                 } else {
-                    pf = cnt;
-                    __sync_fetch_and_add(&stats_tested, (uint64_t)cnt);
+                st_full:
+                    if (!no_primality) {
+                        size_t test_cnt = cnt;
+                        for (size_t i = 0; i < cnt; i++) {
+                            if (bn_candidate_is_prime(pr[i])) pr[pf++] = pr[i];
+                        }
+                        __sync_fetch_and_add(&stats_tested, (uint64_t)test_cnt);
+                        cnt = pf;
+                    } else {
+                        pf = cnt;
+                        __sync_fetch_and_add(&stats_tested, (uint64_t)cnt);
+                    }
                 }
                 if (cnt>=2) {
                     if (scan_candidates(pr, cnt, target, logbase,
