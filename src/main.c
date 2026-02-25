@@ -88,7 +88,7 @@ static int rpc_default_retries = 3;
 
 // tuned segmented-sieve helper: limit primes used to pre-sieve to this bound
 // (default; can be overridden at runtime via --sieve-primes)
-#define SIEVE_SMALL_PRIME_LIMIT 1000000
+#define SIEVE_SMALL_PRIME_LIMIT 900000
 static uint64_t cli_sieve_prime_limit = SIEVE_SMALL_PRIME_LIMIT;
 
 // cache of small primes used for segmented sieving (allocated once)
@@ -2056,7 +2056,7 @@ int main(int argc, char **argv) {
         printf("      --rpc-user U      RPC username\n");
         printf("      --rpc-pass P      RPC password\n");
         printf("  -s, --shift N         prime size shift      (default: 20)\n");
-        printf("      --sieve-size S    sieve size            (default: 32768)\n");
+        printf("      --sieve-size S    sieve size            (default: 33554432)\n");
         printf("      --sieve-primes P  small prime limit for sieve\n");
         printf("      --target T        minimum merit         (default: 20.0)\n");
         printf("      --threads N       worker threads        (default: 1)\n");
@@ -2079,7 +2079,7 @@ int main(int argc, char **argv) {
     int64_t adder_max = -1;
     /* ensure adder_max does not exceed 2^shift to prevent reuse of work
        (p = sha256(header) << shift + adder must be unique per header). */
-    uint64_t sieve_size = 32768;
+    uint64_t sieve_size = 33554432;
     double target = 20.0;
     int target_explicit = 0;  /* set to 1 if user passes --target */
     const char *rpc_url = NULL, *rpc_user = NULL, *rpc_pass = NULL, *rpc_method = "getwork";
