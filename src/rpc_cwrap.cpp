@@ -36,6 +36,10 @@ int rpc_submit(const char *url, const char *user, const char *pass, const char *
     if (user) curl_easy_setopt(c, CURLOPT_USERNAME, user);
     if (pass) curl_easy_setopt(c, CURLOPT_PASSWORD, pass);
 
+    /* A stuck submitblock cannot be allowed to block the miner indefinitely */
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 15L);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 5L);
+
     /* allocate exactly enough room for JSON payload plus some margin */
     size_t needed = strlen(method) + strlen(hex) + 128;
     char *payload = (char*)malloc(needed);
@@ -127,6 +131,8 @@ char *rpc_call(const char *url, const char *user, const char *pass, const char *
     h = curl_slist_append(h, "Content-Type: application/json");
     curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
     curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);        /* give up after 10s */
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 5L);  /* connect timeout 5s */
     if (user) curl_easy_setopt(c, CURLOPT_USERNAME, user);
     if (pass) curl_easy_setopt(c, CURLOPT_PASSWORD, pass);
     char payload[8192];

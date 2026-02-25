@@ -1607,13 +1607,21 @@ static void *presieve_helper_fn(void *arg) {
 
         pthread_mutex_lock(&ctx->mu);
         struct presieve_buf *b = &ctx->bufs[slot];
-        presieve_buf_ensure(b, cnt);
-        if (cnt && pr_tls)
-            memcpy(b->pr, pr_tls, cnt * sizeof(uint64_t));
-        b->cnt = cnt;
+        /* RACE: worker_done may have set state=-1 while we were in
+           sieve_range (mutex was not held during the sieve).  If so,
+           discard the result and do NOT overwrite state — the top-of-loop
+           check will see -1 on the next iteration and exit cleanly.
+           Without this guard, we'd overwrite -1 with 2 and then block
+           forever on cv_go waiting for a signal that never arrives. */
+        if (ctx->state != -1) {
+            presieve_buf_ensure(b, cnt);
+            if (cnt && pr_tls)
+                memcpy(b->pr, pr_tls, cnt * sizeof(uint64_t));
+            b->cnt = cnt;
+            ctx->state = 2;
+            pthread_cond_signal(&ctx->cv_done);
+        }
         __sync_fetch_and_add(&stats_sieved, (uint64_t)(R - L));
-        ctx->state = 2;
-        pthread_cond_signal(&ctx->cv_done);
         pthread_mutex_unlock(&ctx->mu);
     }
     free_sieve_buffers(); /* release helper's TLS */
