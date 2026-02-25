@@ -68,6 +68,19 @@ make
 
 The binary is placed at `bin/gap_miner`.
 
+### Custom GMP build (optional)
+
+To link against a custom GMP installation (e.g. built with `--enable-fat`
+for portable runtime CPU detection):
+
+```sh
+make clean
+make WITH_RPC=1 GMP_PREFIX=/path/to/gmp
+```
+
+This statically links `GMP_PREFIX/lib/libgmp.a` and uses headers from
+`GMP_PREFIX/include`.  Without `GMP_PREFIX`, the system `-lgmp` is used.
+
 ### Unit tests
 
 ```sh
@@ -85,8 +98,6 @@ bin/gap_miner \
   --rpc-user USER \
   --rpc-pass PASS \
   --shift 28 \
-  --sieve-size 262144 \
-  --sieve-primes 1000000 \
   --threads 6 \
   --fast-fermat
 ```
@@ -123,7 +134,7 @@ When `adder` reaches `adder-max` the loop wraps and continues (default
 ### Sieve and gap scan
 
 The segmented sieve pre-filters candidates using up to `--sieve-primes` small
-primes (default 1 000 000).  The sieve reuses a thread-local buffer for
+primes (default 900 000).  The sieve reuses a thread-local buffer for
 primes and their logarithms to avoid repeated allocation overhead.
 
 Qualifying candidates are passed to `scan_candidates()`, which:
@@ -176,10 +187,15 @@ helper stores its finds in a separate buffer.  Results are merged and sorted
 before gap scanning.  On hyperthreaded CPUs, this turns idle HT siblings
 into productive Fermat workers.
 
+For large sieve windows (e.g. 33 554 432), the helper enters a **fermat-only
+mode** (state=3) on the last window of each pass—skipping the sieve entirely
+and going straight to cooperative Fermat assist.  Without this, the helper
+would idle for the entire last window (~50% of total time with 2-window passes).
+
 ## Performance
 
 Benchmarked on an Intel i3-10100 (4 cores / 8 threads, 3.6 GHz) with
-`--shift 28 --sieve-size 262144 --sieve-primes 1000000 --threads 6 --fast-fermat`:
+`--shift 28 --sieve-size 33554432 --sieve-primes 900000 --threads 6 --fast-fermat`:
 
 ### Optimization progression
 
@@ -214,9 +230,10 @@ Benchmarked on an Intel i3-10100 (4 cores / 8 threads, 3.6 GHz) with
 6. **-O3 + LTO** -- Aggressive compiler optimization with link-time
    optimization enables cross-module inlining and auto-vectorization.
 
-7. **Batched atomic stats** -- `stats_tested` counter updated once per
-   window instead of once per candidate, reducing cross-core cache-line
-   contention from ~278K atomic ops/s to ~100/s per thread.
+7. **Incremental atomic stats** -- `stats_tested` counter updated every
+   4 096 candidates (not per-candidate, not per-window).  With large sieve
+   windows (33M) this keeps the display moving smoothly instead of freezing
+   for 20+ seconds between window boundaries.
 
 > **Historical note:** an earlier Barrett-reduction path for fast modular
 > exponentiation contained a correctness bug for large moduli and was
@@ -230,10 +247,10 @@ Benchmarked on an Intel i3-10100 (4 cores / 8 threads, 3.6 GHz) with
 |-----------------------|---------------|-------------|
 | `--header TEXT`       | *(from GBT)*  | Text whose SHA256 seeds the prime search |
 | `--hash-hex`          | off           | Treat `--header` as a hex string |
-| `--shift N`           | 20            | Left-shift exponent applied to the hash |
+| `--shift N`           | 20            | Left-shift exponent applied to the hash.  Minimum 14, practical limit 512–1024 (per network).  Shifts > 62 are supported (`adder_max` capped at `INT64_MAX`). |
 | `--adder-max M`       | `2^shift`     | Upper bound for the adder loop (`<= 2^shift`) |
 | `--sieve-size S`      | 33554432      | Odd candidates per sieve segment |
-| `--sieve-primes P`    | 1000000       | Small primes used for pre-sieving |
+| `--sieve-primes P`    | 900000        | Small primes used for pre-sieving |
 | `--target T`          | *(node bits)* | Minimum merit `gap/log(p)` to build a block |
 | `--threads N`         | 1             | Worker threads; each thread runs the full sieve + primality (Fermat/Miller-Rabin) + gap-scan pipeline over its own disjoint slice of the adder range (`tid, tid+N, tid+2N, …`) |
 | `--rpc-url URL`       | --            | JSON-RPC endpoint of `gapcoind` |
@@ -262,13 +279,13 @@ bin/gap_miner \
   --rpc-user USER \
   --rpc-pass PASS \
   --shift 28 \
-  --sieve-size 262144 \
-  --sieve-primes 1000000 \
   --threads 6 \
   --fast-fermat
 ```
 
 The header is selected automatically from `getblocktemplate`.
+Default `--sieve-size` (33 554 432) and `--sieve-primes` (900 000) match
+the original GapMiner and work well for most setups.
 
 ## Forensics and logging
 
