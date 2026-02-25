@@ -232,6 +232,12 @@ static volatile int use_fast_fermat = 0;
 static volatile int no_primality = 0;   /* skip all probable‑prime filtering */
 static volatile int selftest = 0;        /* run a quick internal test then exit */
 
+/* Comparator for qsort of uint64_t arrays (fallback sort path). */
+static int cmp_u64(const void *a, const void *b) {
+    uint64_t va = *(const uint64_t *)a, vb = *(const uint64_t *)b;
+    return (va > vb) - (va < vb);
+}
+
 static void print_stats(void) {
     uint64_t now = now_ms();
     double elapsed = stats_start_ms ? (double)(now - stats_start_ms) / 1000.0 : 0.0;
@@ -2082,20 +2088,32 @@ static void *worker_fn(void *arg) {
                     while (!psc.coop.helper_done)
                         __asm__ volatile("pause" ::: "memory");
 
-                    /* Merge helper's confirmed primes into our pr[] array.   */
-                    for (size_t i = 0; i < psc.coop.out_cnt; i++) {
-                        pr[pf++] = psc.coop.out[i];
-                    }
-                    /* Sort merged primes (gap scanning needs ascending order) */
-                    if (pf > 1) {
-                        for (size_t i = 1; i < pf; i++) {
-                            uint64_t key = pr[i];
-                            size_t j = i;
-                            while (j > 0 && pr[j-1] > key) {
-                                pr[j] = pr[j-1];
-                                j--;
+                    /* Merge helper's sorted primes with worker's sorted primes.
+                       Both runs are ascending (candidates came from a shared
+                       atomic index over the sorted sieve-survivor array).
+                       O(n) merge replaces the previous O(n²) insertion sort. */
+                    size_t wn = pf;
+                    size_t hn = psc.coop.out_cnt;
+                    if (hn > 0) {
+                        uint64_t *wtmp = (uint64_t *)malloc(wn * sizeof(uint64_t));
+                        if (wtmp) {
+                            memcpy(wtmp, pr, wn * sizeof(uint64_t));
+                            size_t wi = 0, hi = 0, mi = 0;
+                            while (wi < wn && hi < hn) {
+                                if (wtmp[wi] <= psc.coop.out[hi])
+                                    pr[mi++] = wtmp[wi++];
+                                else
+                                    pr[mi++] = psc.coop.out[hi++];
                             }
-                            pr[j] = key;
+                            while (wi < wn) pr[mi++] = wtmp[wi++];
+                            while (hi < hn) pr[mi++] = psc.coop.out[hi++];
+                            pf = mi;
+                            free(wtmp);
+                        } else {
+                            /* OOM fallback: append + qsort */
+                            for (size_t i = 0; i < hn; i++)
+                                pr[pf++] = psc.coop.out[i];
+                            qsort(pr, pf, sizeof(uint64_t), cmp_u64);
                         }
                     }
                 }
