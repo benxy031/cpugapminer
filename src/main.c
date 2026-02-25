@@ -469,6 +469,9 @@ static __thread size_t    tls_cap  = 0;
 /* Reusable composite-bits bitmap per thread – avoids calloc/free on every sieve call */
 static __thread uint8_t  *tls_bits     = NULL;
 static __thread size_t    tls_bits_cap = 0;
+/* Reusable sieve start-position array per thread */
+static __thread uint64_t *tls_sp_start     = NULL;
+static __thread size_t    tls_sp_start_cap = 0;
 
 /* ── Cached base_mod_p array ──
    base_mod_p[i] = (h256 << shift) % small_primes_cache[i], precomputed ONCE
@@ -486,12 +489,15 @@ static void free_sieve_buffers(void) {
     free(tls_pr);
     free(tls_bits);
     free(tls_base_mod_p);
+    free(tls_sp_start);
     tls_pr       = NULL;
     tls_bits     = NULL;
     tls_base_mod_p = NULL;
+    tls_sp_start = NULL;
     tls_cap      = 0;
     tls_bits_cap = 0;
     tls_base_mod_p_cap = 0;
+    tls_sp_start_cap = 0;
     tls_base_mod_p_ready = 0;
 }
 
@@ -557,11 +563,15 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
         }
 
         /* Precompute starting positions for small primes. */
-        /* Use VLA or heap for the start array. */
-        uint64_t *sp_start = NULL;
         size_t sp_count = split_idx > 1 ? split_idx - 1 : 0;
         if (sp_count > 0) {
-            sp_start = (uint64_t *)malloc(sp_count * sizeof(uint64_t));
+            /* Reuse TLS buffer to avoid malloc/free every sieve call */
+            if (tls_sp_start_cap < sp_count) {
+                free(tls_sp_start);
+                tls_sp_start = (uint64_t *)malloc(sp_count * sizeof(uint64_t));
+                tls_sp_start_cap = sp_count;
+            }
+            uint64_t *sp_start = tls_sp_start;
             for (size_t i = 0; i < sp_count; i++) {
                 size_t idx = i + 1;
                 uint64_t p = small_primes_cache[idx];
@@ -601,7 +611,7 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
                     sp_start[i] = m; /* carry into next block */
                 }
             }
-            free(sp_start);
+            /* sp_start is TLS-owned; no free needed */
         }
 
         /* --- Phase 2: large primes, single pass (no blocking needed) --- */
@@ -1873,6 +1883,14 @@ static void *presieve_helper_fn(void *arg) {
         coop_fermat_assist(ctx);
     }
     free_sieve_buffers(); /* release helper's TLS */
+    if (tls_gmp_inited) {
+        mpz_clear(tls_base_mpz);
+        mpz_clear(tls_cand_mpz);
+        mpz_clear(tls_two_mpz);
+        mpz_clear(tls_exp_mpz);
+        mpz_clear(tls_res_mpz);
+        tls_gmp_inited = 0;
+    }
     free(ctx->coop.out);  /* release coop output buffer */
     return NULL;
 }
@@ -2172,6 +2190,20 @@ worker_done:
     pthread_mutex_destroy(&psc.mu);
     pthread_cond_destroy(&psc.cv_go);
     pthread_cond_destroy(&psc.cv_done);
+
+    /* Release this worker's own TLS sieve buffers and GMP state.
+       Without this, every pass (new block) leaks ~103 MB per worker:
+       tls_pr (~80 MB) + tls_base_mod_p (~22 MB) + tls_bits (~1.25 MB).
+       With 14 threads that's ~1.45 GB leaked per block, causing OOM. */
+    free_sieve_buffers();
+    if (tls_gmp_inited) {
+        mpz_clear(tls_base_mpz);
+        mpz_clear(tls_cand_mpz);
+        mpz_clear(tls_two_mpz);
+        mpz_clear(tls_exp_mpz);
+        mpz_clear(tls_res_mpz);
+        tls_gmp_inited = 0;
+    }
     return NULL;
 }
 
