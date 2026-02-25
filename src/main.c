@@ -496,34 +496,28 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
         tls_cap = newcap;
     }
 
-    /* Extract surviving candidates.  Use a 30-wheel to skip numbers divisible
-       by 2, 3, or 5 – they were marked composite by the sieve but skipping them
-       here halves the number of bit-array accesses compared with a linear scan,
-       which matters when log() is called for every survivor.
-       wheel30[w] = step to next coprime-with-30 residue. */
-    static const uint8_t wheel30[8] = {6,4,2,4,2,4,6,2};
-    static const int8_t mod30_start[30] = {
-        -1,-1,-1,-1,-1,-1,-1, 1,-1,-1,-1, 2,-1, 3,-1,-1,-1, 4,-1, 5,-1,-1,-1, 6,-1,-1,-1,-1,-1, 7
-    };
+    /* Extract surviving candidates: scan ALL odd offsets in [L, R).
+     *
+     * BUG FIX: the old code used a wheel-30 to skip offsets divisible by
+     * 2, 3 or 5 on the assumption that such candidates are composite.
+     * That is WRONG: the candidates are (base + offset) where base =
+     * h256 << shift.  Whether (base + offset) is divisible by 3 or 5
+     * depends on base % 3 and base % 5, NOT on offset alone.  The sieve
+     * bit-array already correctly marks composites using the true
+     * (base + offset) % p residue, so we just need to check every
+     * unmarked odd position.  The cost is ~2× more bit-array reads in
+     * the extraction loop, but correctness is restored: previously the
+     * wheel was silently discarding valid primes, inflating gap sizes
+     * and producing PoW solutions that the network rejected. */
     size_t out_cnt = 0;
     uint64_t x = L;
     if ((x & 1) == 0) x++;
-    uint8_t r0 = (uint8_t)(x % 30);
-    int w;
-    if (r0 == 1) { w = 0; }
-    else if (r0 < 30 && mod30_start[r0] >= 0) { w = mod30_start[r0]; }
-    else {
-        do { x += 2; } while (x < R && (x % 30 == 0 || mod30_start[x % 30] < 0));
-        if (x >= R) { *out_count = 0; return NULL; }
-        w = (x % 30 == 1) ? 0 : mod30_start[x % 30];
-    }
     while (x < R) {
         uint64_t pos = (x - L) >> 1;
         if (pos < seg_size && !(bits[pos>>3] & (uint8_t)(1u << (pos & 7)))) {
             tls_pr[out_cnt++] = x;
         }
-        x += wheel30[w];
-        w = (w + 1) & 7;
+        x += 2;
     }
     *out_count = out_cnt;
     return tls_pr;
@@ -1219,22 +1213,15 @@ static int build_mining_pass(const char *url, const char *user, const char *pass
     char data_hex[161] = {0};
     uint64_t ndiff = 0;
     if (!rpc_getwork_data(url, user, pass, data_hex, &ndiff)) return 0;
-    /* decode 80-byte header from hex.
-       getwork "data" field stores each 4-byte word byte-swapped (little-endian
-       per word, standard Bitcoin getwork protocol).  We must un-swap each word
-       back to big-endian so that double_sha256(hdr80+nNonce) and the submitted
-       hdr80 bytes match what gapcoind wrote into mapNewBlock. */
+    /* decode 80-byte header from hex exactly as getwork returns it (wire
+       order: little-endian fields).  No per-word swapping is needed for
+       hashing or submission; gapcoind stores the raw wire header in
+       mapNewBlock and expects submissions in the same byte order. */
     uint8_t hdr80[80];
     for (int i = 0; i < 80; i++) {
         unsigned int bv = 0;
         sscanf(data_hex + i*2, "%2x", &bv);
         hdr80[i] = (uint8_t)bv;
-    }
-    /* un-swap: reverse byte order within each 4-byte word */
-    for (int w = 0; w < 80; w += 4) {
-        uint8_t t;
-        t = hdr80[w]; hdr80[w] = hdr80[w+3]; hdr80[w+3] = t;
-        t = hdr80[w+1]; hdr80[w+1] = hdr80[w+2]; hdr80[w+2] = t;
     }
     /* extract prevhex: bytes 4..35 of hdr80 are prevhash in LE wire order.
        Display as big-endian hex (byte-reversed) to match Bitcoin convention. */
@@ -1249,7 +1236,7 @@ static int build_mining_pass(const char *url, const char *user, const char *pass
     uint32_t nonce = 0;
     for (;;) {
         memcpy(hdr84, hdr80, 80);
-        memcpy(hdr84 + 80, &nonce, 4);
+        memcpy(hdr84 + 80, &nonce, 4);  /* nNonce appended after 80-byte header */
         double_sha256(hdr84, 84, sha_raw);
         if (sha_raw[31] >= 0x80) break;
         if (++nonce == 0) break;
@@ -1272,13 +1259,14 @@ static int build_mining_pass(const char *url, const char *user, const char *pass
 
 static int assemble_mining_block(uint64_t nadd_val, char out_hex[16384]) {
     /* getwork submit format: hdr80(80) + nNonce(4,LE) + nShift(2,LE) + nAdd(raw LE, ≥ 1 byte)
-     * gapcoind requires vchData.size() > 86 (total bytes > 86).
+     * gapcoind casts vchData to CBlock*; nNonce is at offset 80, nShift at 84,
+     * nAdd starts at byte 86.  gapcoind requires vchData.size() > 86.
      * nAdd is raw little-endian bytes, NO compact-size prefix. */
     unsigned char buf[512];
     unsigned char *p = buf;
-    memcpy(p, g_pass.hdr80,    80); p += 80;
-    memcpy(p, &g_pass.nonce,    4); p += 4;  /* nNonce LE */
-    memcpy(p, &g_pass.nshift,   2); p += 2;  /* nShift LE */
+    memcpy(p, g_pass.hdr80,    80); p += 80;  /* header unchanged */
+    memcpy(p, &g_pass.nonce,    4); p += 4;   /* nNonce LE (offset 80) */
+    memcpy(p, &g_pass.nshift,   2); p += 2;   /* nShift LE (offset 84) */
     /* nAdd raw LE bytes, minimum 1 byte */
     unsigned char nb[8];
     int nl;
@@ -1289,6 +1277,8 @@ static int assemble_mining_block(uint64_t nadd_val, char out_hex[16384]) {
         while (tmp > 0) { nb[nl++] = (unsigned char)(tmp & 0xff); tmp >>= 8; }
     }
     memcpy(p, nb, nl); p += nl;
+    /* gapcoind requires vchData.size() > 86; pad with one zero byte if too short */
+    if ((p - buf) <= 86) { *p++ = 0x00; }
     bytes_to_hex(buf, (size_t)(p - buf), out_hex);
     return 1;
 }
@@ -1906,6 +1896,7 @@ int main(int argc, char **argv) {
        (p = sha256(header) << shift + adder must be unique per header). */
     uint64_t sieve_size = 32768;
     double target = 20.0;
+    int target_explicit = 0;  /* set to 1 if user passes --target */
     const char *rpc_url = NULL, *rpc_user = NULL, *rpc_pass = NULL, *rpc_method = "getwork";
     const char *rpc_sign_key = NULL;
     const char *rpc_host = NULL;
@@ -1925,7 +1916,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--adder-max") && i+1<argc) adder_max = (int64_t)atoll(argv[++i]);
         else if (!strcmp(argv[i],"--sieve-size") && i+1<argc) sieve_size = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i],"--sieve-primes") && i+1<argc) cli_sieve_prime_limit = strtoull(argv[++i], NULL, 10);
-        else if (!strcmp(argv[i],"--target") && i+1<argc) target = atof(argv[++i]);
+        else if (!strcmp(argv[i],"--target") && i+1<argc) { target = atof(argv[++i]); target_explicit = 1; }
         else if ((!strcmp(argv[i],"-o") || !strcmp(argv[i],"--host")) && i+1<argc) rpc_host = argv[++i];
         else if ((!strcmp(argv[i],"-p") || !strcmp(argv[i],"--port")) && i+1<argc) rpc_port = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--rpc-url") && i+1<argc) rpc_url = argv[++i];
@@ -2043,6 +2034,17 @@ int main(int argc, char **argv) {
                 strncpy(g_prevhash, g_pass.prevhex, 64);
                 g_prevhash[64] = '\0';
                 pthread_mutex_unlock(&g_work_lock);
+            }
+            /* Derive target merit from network difficulty (nDifficulty).
+             * Gapcoin encodes difficulty as fixed-point with 48 fractional bits:
+             *   merit = nDifficulty / 2^48
+             * Use this as the minimum merit threshold unless the user
+             * explicitly set --target to override it. */
+            if (!target_explicit && g_pass.ndiff > 0) {
+                double net_merit = (double)g_pass.ndiff / (double)(1ULL << 48);
+                target = net_merit;
+                log_msg("network difficulty: %.4f merit (nDifficulty=%llu)\n",
+                        net_merit, (unsigned long long)g_pass.ndiff);
             }
         }
     }
