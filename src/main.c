@@ -73,6 +73,7 @@ struct submit_job {
 
 static pthread_mutex_t sq_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t sq_cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t sq_empty_cond = PTHREAD_COND_INITIALIZER; /* fired when queue drains to 0 */
 static struct submit_job submit_queue[SUBMIT_QUEUE_MAX];
 static int sq_head = 0, sq_tail = 0, sq_count = 0;
 static int sq_running = 0;
@@ -565,6 +566,8 @@ static struct submit_job dequeue_job(void) {
         job = submit_queue[sq_head];
         sq_head = (sq_head + 1) % SUBMIT_QUEUE_MAX;
         sq_count--;
+        if (sq_count == 0)
+            pthread_cond_signal(&sq_empty_cond); /* notify sq_drain() */
     }
     pthread_mutex_unlock(&sq_lock);
     return job;
@@ -619,6 +622,7 @@ static void *submit_thread_fn(void *arg) {
             g_abort_pass = 1;
             pthread_mutex_lock(&sq_lock);
             sq_head = sq_tail = sq_count = 0;
+            pthread_cond_signal(&sq_empty_cond); /* queue forcibly cleared */
             pthread_mutex_unlock(&sq_lock);
         } else {
             log_msg(">>> FAILED after %d attempts (connection error, async submit)\n", attempt);
@@ -642,6 +646,16 @@ static void stop_submit_thread(void) {
     pthread_cond_signal(&sq_cond);
     pthread_mutex_unlock(&sq_lock);
     pthread_join(sq_thread, NULL);
+}
+
+/* Wait until the submit queue is empty.  Must be called before any
+   build_mining_pass() invocation so that in-flight submissions finish
+   against the current mapNewBlock entry before getwork() evicts it. */
+static void sq_drain(void) {
+    pthread_mutex_lock(&sq_lock);
+    while (sq_count > 0)
+        pthread_cond_wait(&sq_empty_cond, &sq_lock);
+    pthread_mutex_unlock(&sq_lock);
 }
 #endif
 
@@ -2107,14 +2121,23 @@ int main(int argc, char **argv) {
                 }
             }
             if (keep_going && rpc_url) {
-                /* refresh work for fresh nTime and new-block detection */
+                /* Drain the submit queue BEFORE calling getwork (build_mining_pass).
+                   getwork invokes CreateNewBlock() which clears mapNewBlock and
+                   replaces it with a new entry.  Any queued submission for the
+                   old block would then hit a missing mapNewBlock entry → result=false.
+                   Waiting here ensures the submit thread finishes processing the
+                   queued gap before we invalidate mapNewBlock. */
 #ifdef WITH_RPC
+                sq_drain();
                 if (build_mining_pass(rpc_url, rpc_user, rpc_pass, shift)) {
                     memcpy(h256, g_pass.h256, 32);
                     if (g_pass.prevhex[0] && strcmp(g_pass.prevhex, header ? header : "") != 0) {
                         free((char*)header);
                         header = strdup(g_pass.prevhex);
-                        log_msg("\n*** NEW BLOCK  prevhash=%.16s...  mining on top ***\n\n", g_pass.prevhex);
+                        /* Only print if workers did NOT already print it (g_abort_pass
+                           is set by the worker poll when it detects the new block). */
+                        if (!g_abort_pass)
+                            log_msg("\n*** NEW BLOCK  prevhash=%.16s...  mining on top ***\n\n", g_pass.prevhex);
                         pthread_mutex_lock(&g_work_lock);
                         strncpy(g_prevhash, g_pass.prevhex, 64); g_prevhash[64] = '\0';
                         pthread_mutex_unlock(&g_work_lock);
@@ -2162,14 +2185,16 @@ int main(int argc, char **argv) {
             free(wargs);
 
             if (keep_going && rpc_url) {
-                /* refresh work for fresh nTime and new-block detection */
+                /* Drain submit queue before getwork to keep mapNewBlock consistent. */
 #ifdef WITH_RPC
+                sq_drain();
                 if (build_mining_pass(rpc_url, rpc_user, rpc_pass, shift)) {
                     memcpy(h256, g_pass.h256, 32);
                     if (g_pass.prevhex[0] && strcmp(g_pass.prevhex, header ? header : "") != 0) {
                         free((char*)header);
                         header = strdup(g_pass.prevhex);
-                        log_msg("\n*** NEW BLOCK  prevhash=%.16s...  mining on top ***\n\n", g_pass.prevhex);
+                        if (!g_abort_pass)
+                            log_msg("\n*** NEW BLOCK  prevhash=%.16s...  mining on top ***\n\n", g_pass.prevhex);
                         pthread_mutex_lock(&g_work_lock);
                         strncpy(g_prevhash, g_pass.prevhex, 64); g_prevhash[64] = '\0';
                         pthread_mutex_unlock(&g_work_lock);
