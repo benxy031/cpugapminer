@@ -9,14 +9,14 @@ TARGET=$(BINDIR)/gap_miner
 
 # enable WITH_RPC=1 to include RPC wrapper sources and link curl
 ifdef WITH_RPC
-	LIBS=-lcurl -ljansson -lssl -lcrypto -lm -pthread -lstdc++
+	LIBS=-lcurl -ljansson -lssl -lcrypto -lgmp -lm -pthread -lstdc++
 	CFLAGS+=-DWITH_RPC
 	# build rpc C++ objects
 	RPC_SRCS=$(SRCDIR)/rpc_cwrap.cpp $(SRCDIR)/rpc_globals.cpp $(SRCDIR)/rpc_stubs.cpp $(SRCDIR)/Rpc.cpp
 	RPC_OBJS=$(RPC_SRCS:.cpp=.o)
 	LINKER=$(CXX)
 else
-	LIBS=-lssl -lcrypto -lm -pthread
+	LIBS=-lssl -lcrypto -lgmp -lm -pthread
 	LINKER=$(CC)
 	RPC_OBJS=
 endif
