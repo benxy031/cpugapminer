@@ -192,6 +192,36 @@ mode** (state=3) on the last window of each pass—skipping the sieve entirely
 and going straight to cooperative Fermat assist.  Without this, the helper
 would idle for the entire last window (~50% of total time with 2-window passes).
 
+### Two-phase smart gap scanning
+
+Controlled by `--sample-stride K` (default 8; set to 1 to disable).
+
+Instead of testing every sieve survivor, the miner uses a two-phase approach
+that skips survivors in regions where no qualifying gap can exist:
+
+**Phase 1 – Sampling.**  Test every Kth survivor for primality.  The
+"sampled primes" form a sparse skeleton of confirmed primes across the
+window.
+
+**Gap analysis.**  Measure distance between consecutive sampled primes.
+Only regions where the gap between two sampled primes is ≥ `target × log(base)`
+can possibly contain a qualifying gap—any sampled prime *inside* a candidate
+gap would break it.  Survivors outside these regions are skipped entirely.
+
+**Phase 2 – Verification.**  Test the remaining (unsampled) survivors only
+within candidate regions.  Both phases use cooperative Fermat (worker +
+helper).
+
+The correctness guarantee is exact: every gap with merit ≥ target is found.
+Proof: if a qualifying gap `[P, Q]` exists with `Q − P ≥ needed_gap`, then
+no sampled prime can lie strictly between P and Q (it would split the gap).
+Therefore P and Q lie within the same sampled-prime interval, which is
+identified as a candidate region.
+
+At production parameters (shift=37, target≈20.89), this typically **skips
+~68% of Fermat tests**, yielding a **3.4× effective speedup** in
+block-finding rate.  The benefit grows with higher targets and shifts.
+
 ## Performance
 
 Benchmarked on an Intel i3-10100 (4 cores / 8 threads, 3.6 GHz) with
@@ -205,6 +235,17 @@ Benchmarked on an Intel i3-10100 (4 cores / 8 threads, 3.6 GHz) with
 | + GMP backend + cached sieve residues + vectorized extraction | 3,844 K/s | 150.9 K/s | 7.4× |
 | + raw Fermat (`mpz_powm`) + batched atomics | 6,920 K/s | 277.7 K/s | 13.5× |
 | + cooperative Fermat + -O3/LTO + mpz pre-alloc | 8,513 K/s | 342.6 K/s | **16.7×** |
+
+### Smart scanning impact (shift=37, target=20.89, 2 threads)
+
+| Mode | Sieve rate | ETA | Tests skipped |
+|------|-----------|-----|---------------|
+| Full (`--sample-stride 1`) | 12 M/s | 8.2 h | 0% |
+| Smart (`--sample-stride 8`) | 32 M/s | **2.4 h** | **68%** |
+
+Smart scanning processes **2.7× more sieve windows per second** by
+skipping Fermat tests in regions that provably cannot contain a qualifying
+gap.  The block-finding rate improves by **3.4×**.
 
 ### Key optimizations
 
@@ -227,10 +268,14 @@ Benchmarked on an Intel i3-10100 (4 cores / 8 threads, 3.6 GHz) with
 5. **Cooperative Fermat** -- Helper threads assist with primality testing
    after finishing their sieve work, utilizing otherwise-idle HT siblings.
 
-6. **-O3 + LTO** -- Aggressive compiler optimization with link-time
+6. **Two-phase smart scanning** -- Sample every Kth survivor, identify
+   candidate regions, verify only those.  Skips ~68% of Fermat tests at
+   production parameters for a 3.4× block-finding speedup.
+
+7. **-O3 + LTO** -- Aggressive compiler optimization with link-time
    optimization enables cross-module inlining and auto-vectorization.
 
-7. **Incremental atomic stats** -- `stats_tested` counter updated every
+8. **Incremental atomic stats** -- `stats_tested` counter updated every
    4 096 candidates (not per-candidate, not per-window).  With large sieve
    windows (33M) this keeps the display moving smoothly instead of freezing
    for 20+ seconds between window boundaries.
@@ -262,6 +307,7 @@ Benchmarked on an Intel i3-10100 (4 cores / 8 threads, 3.6 GHz) with
 | `--rpc-sign-key KEY`  | --            | HMAC key to sign payloads |
 | `--log-file FILE`     | --            | Append all log messages to FILE |
 | `--fast-fermat`       | off           | Fast single-base Fermat primality test |
+| `--sample-stride K`   | 8             | Smart scan: test every Kth survivor, skip regions that can't contain qualifying gaps.  Set to 1 to disable. |
 | `--no-primality`      | off           | Skip primality testing entirely |
 | `--build-only`        | off           | Fetch template and build one block, then exit |
 | `--no-opreturn`       | off           | Omit OP_RETURN from coinbase |
@@ -305,10 +351,10 @@ python3 scripts/inspect_tx.py /tmp/gap_miner_block_<timestamp>.hex
 
 ## Reading the stats output
 
-Every ~0.3 s the miner prints a line like:
+Every 5 s the miner prints a line like:
 
 ```
-STATS: elapsed=30.0s  sieved=255415634 (8513003/s)  tested=10279612 (342619/s)  gaps=0 (0.000/s)  built=0  submitted=0  accepted=0
+STATS: elapsed=30.0s  sieved=520000000 (34666667/s)  tested=4561182 (304079/s)  gaps=0 (0.000/s)  built=0  submitted=0  accepted=0  prob=8.46e-10/pair  est=7.0h (target=20.89)
 ```
 
 | Field | Meaning |
@@ -319,6 +365,8 @@ STATS: elapsed=30.0s  sieved=255415634 (8513003/s)  tested=10279612 (342619/s)  
 | `built` | Full blocks assembled from a GBT template after a qualifying gap |
 | `submitted` | Blocks whose header hash also met the network `bits` difficulty and were sent to the node |
 | `accepted` | Node confirmed the block |
+| `prob` | Per-pair probability of a qualifying gap (`e^(-target)`, Cramér–Granville heuristic) |
+| `est` | Estimated time to find a qualifying gap at current rate |
 
 ### Why `gaps=0` and `submitted=0` are normal early on
 
@@ -334,8 +382,9 @@ Getting to `submitted=0` requires clearing **two independent gates**:
    but still fail this check; in that case `built` increments but `submitted`
    does not.
 
-`gaps=0` after ~10 minutes at ~343 K tests/s and ~8.5 M sieved/s is completely
+`gaps=0` after ~10 minutes at ~300 K tests/s and ~30 M sieved/s is completely
 normal.  The miner is working correctly if sieve and test rates are non-zero.
+The `est` field gives a running estimate of time to find a qualifying gap.
 
 ### Troubleshooting low rates
 
