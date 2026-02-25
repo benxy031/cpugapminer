@@ -1680,31 +1680,38 @@ static void *worker_fn(void *arg) {
                 static uint64_t gbt_last_ms = 0;
                 uint64_t now = now_ms();
                 if (now - gbt_last_ms >= 5000) {
-                    /* Only check for a new block — do NOT call build_mining_pass
-                       here, since that regenerates g_pass.hdr80 with fresh ntime
-                       (new SHA256d → new h256) while workers are still searching
-                       nAdd values relative to the CURRENT h256.  Replacing g_pass
-                       mid-pass makes every subsequent submission fail PoW. */
-                    char data_hex[161] = {0};
-                    uint64_t ndiff_dummy = 0;
-                    if (rpc_getwork_data(rpc_url_local, rpc_user_local, rpc_pass_local,
-                                        data_hex, &ndiff_dummy)) {
-                        /* decode prevhex from hdr80 bytes 4..35 (LE → display reversed) */
-                        char new_prevhex[65] = {0};
-                        for (int _i = 0; _i < 32; _i++) {
-                            unsigned int bv = 0;
-                            sscanf(data_hex + (4 + 31 - _i) * 2, "%2x", &bv);
-                            sprintf(new_prevhex + 2*_i, "%02x", bv);
+                    /* Use getbestblockhash — a pure read-only query that does NOT
+                       touch mapNewBlock.  Calling getwork (no params) here would
+                       invoke CreateNewBlock(), clear mapNewBlock, and invalidate
+                       the merkle root our pending submission references, causing
+                       every gap found after the 5s poll to return result=false. */
+                    char *resp = rpc_call(rpc_url_local, rpc_user_local, rpc_pass_local,
+                                         "getbestblockhash", NULL);
+                    if (resp) {
+                        /* response: {"result":"<64-hex>","error":null,...}
+                           Three strchr jumps land q1 on the opening quote of
+                           the hash value; q2 is its closing quote 64 chars on. */
+                        const char *q1 = strchr(resp, '"');   /* " before result */
+                        if (q1) q1 = strchr(q1+1, '"');       /* " after  result */
+                        if (q1) q1 = strchr(q1+1, '"');       /* " opening hash  */
+                        const char *q2 = q1 ? strchr(q1+1, '"') : NULL; /* " closing hash */
+                        if (q1 && q2 && (q2-q1-1) == 64) {
+                            char best[65];
+                            memcpy(best, q1+1, 64); best[64] = '\0';
+                            /* g_pass.prevhex is the parent of the block we mine;
+                               if getbestblockhash differs, a new block landed */
+                            if (g_pass.prevhex[0] &&
+                                strcmp(best, g_pass.prevhex) != 0) {
+                                log_msg("\n*** NEW BLOCK  prevhash=%.16s...  mining on top ***\n\n",
+                                        best);
+                                pthread_mutex_lock(&g_work_lock);
+                                strncpy(g_prevhash, best, 64); g_prevhash[64] = '\0';
+                                pthread_mutex_unlock(&g_work_lock);
+                                free(resp);
+                                g_abort_pass = 1; break;
+                            }
                         }
-                        if (header_local && new_prevhex[0] &&
-                            strcmp(new_prevhex, header_local) != 0) {
-                            log_msg("\n*** NEW BLOCK  prevhash=%.16s...  mining on top ***\n\n",
-                                    new_prevhex);
-                            pthread_mutex_lock(&g_work_lock);
-                            strncpy(g_prevhash, new_prevhex, 64); g_prevhash[64] = '\0';
-                            pthread_mutex_unlock(&g_work_lock);
-                            g_abort_pass = 1; break;
-                        }
+                        free(resp);
                     }
                     gbt_last_ms = now_ms();
                 }
