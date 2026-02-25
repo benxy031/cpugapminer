@@ -1407,12 +1407,18 @@ static double uint256_log_approx(const uint8_t h[32], int shift) {
    ═══════════════════════════════════════════════════════════════════ */
 static __thread mpz_t  tls_base_mpz;       /* base = h256 << shift     */
 static __thread mpz_t  tls_cand_mpz;       /* candidate = base + offset */
+static __thread mpz_t  tls_two_mpz;        /* constant 2 (Fermat base)  */
+static __thread mpz_t  tls_exp_mpz;        /* n-1 exponent for Fermat   */
+static __thread mpz_t  tls_res_mpz;        /* powm result               */
 static __thread int    tls_gmp_inited = 0;  /* 0 until first init       */
 
 static void ensure_gmp_tls(void) {
     if (!tls_gmp_inited) {
         mpz_init(tls_base_mpz);
         mpz_init(tls_cand_mpz);
+        mpz_init_set_ui(tls_two_mpz, 2);
+        mpz_init(tls_exp_mpz);
+        mpz_init(tls_res_mpz);
         tls_gmp_inited = 1;
     }
 }
@@ -1459,16 +1465,17 @@ static void set_base_bn(const uint8_t h256[32], int shift) {
 
 /* Return 1 if (tls_base_mpz + offset) is probably prime.
  *
- * Three-stage pipeline:
- *  1. Trial-division against TD_EXTRA_CNT primes above the sieve limit.
- *     Cost: ~TD_EXTRA_CNT × 5 ns ≈ 20 µs; eliminates composites with a small
- *     factor not caught by the main sieve.
- *  2. GMP mpz_probab_prime_p(n, 1): single Miller-Rabin round using GMP's
- *     hand-tuned x86-64 assembly.  ~5× faster than OpenSSL BN for 284-bit.
- *  3. Full probable-prime test: mpz_probab_prime_p(n, reps).
+ * Two paths:
+ *  A. --fast-fermat: raw Fermat test via mpz_powm.
+ *     Computes 2^(n-1) mod n and checks == 1.
+ *     Bypasses mpz_probab_prime_p's internal trial-division (which is
+ *     redundant — our candidates already survived a million-prime sieve).
+ *     One modular exponentiation ≈ 284 squarings + ~142 muls.
+ *  B. Full: mpz_probab_prime_p(n, 10) — 10 MR rounds.
+ *     Internal TD overhead is negligible vs 10 rounds.
  */
 static int bn_candidate_is_prime(uint64_t offset) {
-    /* --- Stage 1: fast trial-division pre-filter --- */
+    /* --- Trial-division pre-filter (disabled when TD_EXTRA_CNT=0) --- */
     for (int i = 0; i < td_extra_count; i++) {
         uint32_t p   = td_extra_primes[i];
         uint32_t rem = (uint32_t)(((uint64_t)tls_td_residues[i]
@@ -1482,18 +1489,19 @@ static int bn_candidate_is_prime(uint64_t offset) {
     mpz_set(tls_cand_mpz, tls_base_mpz);
     mpz_add_ui(tls_cand_mpz, tls_cand_mpz, (unsigned long)offset);
 
-    /* --- Stage 2 + 3: GMP probable-prime test ---
-       mpz_probab_prime_p returns:
-         0 = definitely composite
-         1 = probably prime (passed all MR rounds)
-         2 = definitely prime (only for small numbers)
-       With reps=1: single MR round, ~5× faster than OpenSSL BN.
-       With --fast-fermat: 1 round is sufficient; composites get
-       rejected by the network anyway.
-       Without: use 10 rounds (higher confidence than OpenSSL's
-       BN_prime_checks ≈ 6, but still fast with GMP assembly). */
-    int reps = use_fast_fermat ? 1 : 10;
-    return mpz_probab_prime_p(tls_cand_mpz, reps) > 0;
+    if (use_fast_fermat) {
+        /* Raw base-2 Fermat test: 2^(n-1) mod n == 1?
+           Skips GMP's redundant internal trial-division (~700 primes
+           up to 5000) that mpz_probab_prime_p does before MR.
+           For sieve-filtered 284-bit candidates, this saves ~10-15%. */
+        mpz_sub_ui(tls_exp_mpz, tls_cand_mpz, 1);
+        mpz_powm(tls_res_mpz, tls_two_mpz, tls_exp_mpz, tls_cand_mpz);
+        return mpz_cmp_ui(tls_res_mpz, 1) == 0;
+    } else {
+        /* Full probable-prime: 10 MR rounds (higher confidence than
+           OpenSSL's BN_prime_checks ≈ 6, but still fast with GMP). */
+        return mpz_probab_prime_p(tls_cand_mpz, 10) > 0;
+    }
 }
 
 // Produce hex of SHA256(header) (useful as a simple header encoding)
@@ -1870,8 +1878,8 @@ static void *worker_fn(void *arg) {
                     if (bn_candidate_is_prime(pr[i])) {
                         pr[pf++] = pr[i];
                     }
-                    __sync_fetch_and_add(&stats_tested, 1);
                 }
+                __sync_fetch_and_add(&stats_tested, (uint64_t)orig_cnt);
                 cnt = pf;
             } else {
                 pf = cnt;
@@ -2212,10 +2220,11 @@ int main(int argc, char **argv) {
                 /* primality – compact pr[] in-place using big-prime BN test */
                 size_t pf = 0;
                 if (!no_primality) {
+                    size_t test_cnt = cnt;
                     for (size_t i = 0; i < cnt; i++) {
                         if (bn_candidate_is_prime(pr[i])) pr[pf++] = pr[i];
-                        __sync_fetch_and_add(&stats_tested, 1);
                     }
+                    __sync_fetch_and_add(&stats_tested, (uint64_t)test_cnt);
                     cnt = pf;
                 } else {
                     pf = cnt;
