@@ -86,10 +86,11 @@ static int rpc_rate_ms = 0;
 static int rpc_default_retries = 3;
 #endif
 
-// tuned segmented-sieve helper: limit primes used to pre-sieve to this bound
-// (default; can be overridden at runtime via --sieve-primes)
-#define SIEVE_SMALL_PRIME_LIMIT 900000
-static uint64_t cli_sieve_prime_limit = SIEVE_SMALL_PRIME_LIMIT;
+// Default sieve prime COUNT matching GapMiner (--sieve-primes N = N primes).
+// The VALUE limit is computed from the count via PNT upper bound after arg parsing.
+#define DEFAULT_SIEVE_PRIME_COUNT 900000
+static uint64_t cli_sieve_prime_limit = 0;   /* computed from count; 0 = not yet set */
+static uint64_t cli_sieve_prime_count = DEFAULT_SIEVE_PRIME_COUNT;
 
 // cache of small primes used for segmented sieving (allocated once)
 static uint64_t *small_primes_cache = NULL;
@@ -97,8 +98,8 @@ static size_t small_primes_count = 0;
 static size_t small_primes_cap = 0;
 static pthread_once_t small_primes_once = PTHREAD_ONCE_INIT;
 
-/* Trial-division pre-filter: primes just above SIEVE_SMALL_PRIME_LIMIT.
-   The sieve already eliminates factors <= SIEVE_SMALL_PRIME_LIMIT; these extra
+/* Trial-division pre-filter: primes just above the sieve prime limit.
+   The sieve already eliminates factors <= cli_sieve_prime_limit; these extra
    primes catch remaining small-factor composites cheaply, before the expensive
    Miller-Rabin test.  Cost per candidate: ~TD_EXTRA_CNT × 5 ns.
    NOTE: With GMP's fast mpz_probab_prime_p (~7 µs for 284-bit), TD overhead
@@ -112,7 +113,7 @@ static pthread_once_t td_extra_once = PTHREAD_ONCE_INIT;
 static void populate_small_primes_cache(void);
 
 /* Populate td_extra_primes[] with the first TD_EXTRA_CNT primes above
-   SIEVE_SMALL_PRIME_LIMIT.  Called once (via pthread_once); requires
+   the sieve prime limit.  Called once (via pthread_once); requires
    small_primes_cache to already be populated. */
 static void populate_td_extra_primes(void) {
     /* Ensure the main sieve cache is ready. */
@@ -120,7 +121,7 @@ static void populate_td_extra_primes(void) {
     if (!small_primes_cache) return;
 
     /* Segmented sieve over [lo, hi) to find primes just above the sieve limit. */
-    uint64_t lo = (uint64_t)SIEVE_SMALL_PRIME_LIMIT + 1;
+    uint64_t lo = (uint64_t)cli_sieve_prime_limit + 1;
     if ((lo & 1) == 0) lo++; /* start on odd */
     /* A window of 200 000 odd numbers (~11 000 primes) is more than enough. */
     uint64_t hi = lo + 400000ULL; /* covers ~22 000 primes */
@@ -146,11 +147,10 @@ static void populate_td_extra_primes(void) {
 }
 
 static void populate_small_primes_cache(void) {
-    /* Use the larger of SIEVE_SMALL_PRIME_LIMIT and cli_sieve_prime_limit
-       so that --sieve-primes values above the default are honoured. */
-    size_t maxp = (cli_sieve_prime_limit > SIEVE_SMALL_PRIME_LIMIT)
-                ? (size_t)cli_sieve_prime_limit + 1
-                : SIEVE_SMALL_PRIME_LIMIT + 1;
+    /* Generate all primes up to cli_sieve_prime_limit (already set from
+       COUNT via PNT upper bound before this function is called). */
+    size_t maxp = (size_t)cli_sieve_prime_limit + 1;
+    if (maxp < 100) maxp = 100;  /* sanity floor */
     unsigned char *is_small = calloc(maxp, 1);
     if (!is_small) { free(is_small); return; }
     small_primes_cap = 80000;
@@ -2205,7 +2205,8 @@ int main(int argc, char **argv) {
         printf("      --rpc-pass P      RPC password\n");
         printf("  -s, --shift N         prime size shift      (default: 20)\n");
         printf("      --sieve-size S    sieve size            (default: 33554432)\n");
-        printf("      --sieve-primes P  small prime limit for sieve\n");
+        printf("      --sieve-primes N  number of sieve primes (GapMiner-compatible)\n");
+        printf("                        N primes -> largest ~ N*ln(N); default = 900000\n");
         printf("      --target T        minimum merit         (default: 20.0)\n");
         printf("      --threads N       worker threads        (default: 1)\n");
         printf("      --adder-max M     adder upper bound     (default: 2^shift)\n");
@@ -2248,7 +2249,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"-s") && i+1<argc) shift = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--adder-max") && i+1<argc) adder_max = (int64_t)atoll(argv[++i]);
         else if (!strcmp(argv[i],"--sieve-size") && i+1<argc) sieve_size = strtoull(argv[++i], NULL, 10);
-        else if (!strcmp(argv[i],"--sieve-primes") && i+1<argc) cli_sieve_prime_limit = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i],"--sieve-primes") && i+1<argc) {
+            cli_sieve_prime_count = strtoull(argv[++i], NULL, 10);
+            /* Limit is computed from count after arg parsing (PNT upper bound). */
+        }
         else if (!strcmp(argv[i],"--target") && i+1<argc) { target = atof(argv[++i]); target_explicit = 1; }
         else if ((!strcmp(argv[i],"-o") || !strcmp(argv[i],"--host")) && i+1<argc) rpc_host = argv[++i];
         else if ((!strcmp(argv[i],"-p") || !strcmp(argv[i],"--port")) && i+1<argc) rpc_port = atoi(argv[++i]);
@@ -2300,6 +2304,19 @@ int main(int argc, char **argv) {
         fprintf(stderr, "--adder-max (%lld) must be at most 2^shift (%lld)\n", (long long)adder_max, (long long)((int64_t)1 << shift));
         return 2;
     }
+
+    /* Compute sieve prime VALUE limit from COUNT using PNT upper bound:
+       p_n < n × (ln(n) + ln(ln(n))) for n >= 6.
+       Both the default (900000) and any explicit --sieve-primes go through
+       this path so semantics always match GapMiner. */
+    if (cli_sieve_prime_limit == 0 && cli_sieve_prime_count >= 6) {
+        double n = (double)cli_sieve_prime_count;
+        double upper = n * (log(n) + log(log(n)));
+        cli_sieve_prime_limit = (uint64_t)(upper * 1.05); /* 5% safety margin */
+    } else if (cli_sieve_prime_limit == 0) {
+        cli_sieve_prime_limit = 100;
+    }
+
     if (selftest) {
         log_msg("selftest: verifying primality routines\n");
         uint64_t tests[] = {2,3,4,17,18,19,20,0};
@@ -2398,10 +2415,10 @@ int main(int argc, char **argv) {
     start_stats_thread();
     /* Trigger sieve cache population so we can log its stats. */
     pthread_once(&small_primes_once, populate_small_primes_cache);
-    log_msg("C miner starting (shift=%d sieve=%llu sieve-primes=%llu [%zu primes cached])\n",
+    log_msg("C miner starting (shift=%d sieve=%llu sieve-primes=%zu [up to %llu])\n",
             shift, (unsigned long long)sieve_size,
-            (unsigned long long)cli_sieve_prime_limit,
-            small_primes_count);
+            small_primes_count,
+            small_primes_count > 0 ? (unsigned long long)small_primes_cache[small_primes_count-1] : 0ULL);
     if (keep_going)
         log_msg("default behaviour: will continue mining after finding a valid block\n");
     else
