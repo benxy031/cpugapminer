@@ -184,10 +184,12 @@ static uint64_t now_ms(void) {
 static volatile uint64_t stats_sieved = 0;        /* total numbers fed through sieve */
 static volatile uint64_t stats_tested = 0;         /* total primality tests run */
 static volatile uint64_t stats_gaps = 0;           /* qualifying gaps found */
+static volatile uint64_t stats_pairs = 0;          /* total consecutive prime pairs scanned */
 static volatile uint64_t stats_blocks = 0;         /* blocks built */
 static volatile uint64_t stats_submits = 0;        /* shares submitted */
 static volatile uint64_t stats_success = 0;        /* shares accepted */
 static uint64_t stats_start_ms = 0;                /* time mining started */
+static volatile double   g_mining_target = 20.0;   /* merit threshold for block-prob display */
 
 /* shared current-work state so any thread can detect a new block */
 static char     g_prevhash[65]  = {0};
@@ -232,14 +234,39 @@ static void print_stats(void) {
     double sieve_rate  = (elapsed > 0.001) ? (double)stats_sieved  / elapsed : 0.0;
     double test_rate   = (elapsed > 0.001) ? (double)stats_tested  / elapsed : 0.0;
     double gap_rate    = (elapsed > 0.001) ? (double)stats_gaps    / elapsed : 0.0;
-    log_msg("STATS: elapsed=%.1fs  sieved=%llu (%.0f/s)  tested=%llu (%.0f/s)  gaps=%llu (%.3f/s)  built=%llu  submitted=%llu  accepted=%llu\n",
+    double pairs_rate  = (elapsed > 0.001) ? (double)stats_pairs   / elapsed : 0.0;
+
+    /* Block probability estimate based on Cramér–Granville heuristic:
+       P(gap merit ≥ m) ≈ e^(-m) per consecutive prime pair.
+       Expected time to next qualifying gap = 1 / (pairs/s × e^(-target)). */
+    double target_m = g_mining_target;
+    char est_buf[64] = "n/a";
+    double prob_pair = (target_m > 0) ? exp(-target_m) : 0.0;
+    if (pairs_rate > 0 && prob_pair > 0) {
+        double est_sec = 1.0 / (pairs_rate * prob_pair);
+        if (est_sec < 10.0)
+            snprintf(est_buf, sizeof(est_buf), "%.1fs", est_sec);
+        else if (est_sec < 60.0)
+            snprintf(est_buf, sizeof(est_buf), "%.0fs", est_sec);
+        else if (est_sec < 3600.0)
+            snprintf(est_buf, sizeof(est_buf), "%.1fm", est_sec / 60.0);
+        else if (est_sec < 86400.0)
+            snprintf(est_buf, sizeof(est_buf), "%.1fh", est_sec / 3600.0);
+        else
+            snprintf(est_buf, sizeof(est_buf), "%.1fd", est_sec / 86400.0);
+    }
+
+    log_msg("STATS: elapsed=%.1fs  sieved=%llu (%.0f/s)  tested=%llu (%.0f/s)  "
+            "gaps=%llu (%.3f/s)  built=%llu  submitted=%llu  accepted=%llu  "
+            "prob=%.2e/pair  est=%s (target=%.2f)\n",
             elapsed,
             (unsigned long long)stats_sieved,  sieve_rate,
             (unsigned long long)stats_tested,  test_rate,
             (unsigned long long)stats_gaps,    gap_rate,
             (unsigned long long)stats_blocks,
             (unsigned long long)stats_submits,
-            (unsigned long long)stats_success);
+            (unsigned long long)stats_success,
+            prob_pair, est_buf, target_m);
 }
 
 /* ---------- periodic stats thread ----------
@@ -1564,6 +1591,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
                            const char *rpc_sign_key_local) {
     (void)header_local;     /* param kept for API compat; abort uses g_abort_pass */
     (void)rpc_method_local; /* method is always "getwork" now */
+    if (cnt > 1) __sync_fetch_and_add(&stats_pairs, (uint64_t)(cnt - 1));
     for (size_t i = 0; i + 1 < cnt; i++) {
         uint64_t prev  = pr[i];       /* nAdd of gap start prime */
         uint64_t q     = pr[i + 1];   /* nAdd of gap end prime   */
@@ -2276,12 +2304,14 @@ int main(int argc, char **argv) {
             if (!target_explicit && g_pass.ndiff > 0) {
                 double net_merit = (double)g_pass.ndiff / (double)(1ULL << 48);
                 target = net_merit;
+                g_mining_target = target;
                 log_msg("network difficulty: %.4f merit (nDifficulty=%llu)\n",
                         net_merit, (unsigned long long)g_pass.ndiff);
             }
         }
     }
 #endif
+    g_mining_target = target;   /* publish for print_stats block-prob display */
     atexit(print_stats);
     /* free thread-local sieve buffers when the process exits */
     atexit(free_sieve_buffers);
