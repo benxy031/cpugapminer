@@ -1219,12 +1219,22 @@ static int build_mining_pass(const char *url, const char *user, const char *pass
     char data_hex[161] = {0};
     uint64_t ndiff = 0;
     if (!rpc_getwork_data(url, user, pass, data_hex, &ndiff)) return 0;
-    /* decode 80-byte header from hex */
+    /* decode 80-byte header from hex.
+       getwork "data" field stores each 4-byte word byte-swapped (little-endian
+       per word, standard Bitcoin getwork protocol).  We must un-swap each word
+       back to big-endian so that double_sha256(hdr80+nNonce) and the submitted
+       hdr80 bytes match what gapcoind wrote into mapNewBlock. */
     uint8_t hdr80[80];
     for (int i = 0; i < 80; i++) {
         unsigned int bv = 0;
         sscanf(data_hex + i*2, "%2x", &bv);
         hdr80[i] = (uint8_t)bv;
+    }
+    /* un-swap: reverse byte order within each 4-byte word */
+    for (int w = 0; w < 80; w += 4) {
+        uint8_t t;
+        t = hdr80[w]; hdr80[w] = hdr80[w+3]; hdr80[w+3] = t;
+        t = hdr80[w+1]; hdr80[w+1] = hdr80[w+2]; hdr80[w+2] = t;
     }
     /* extract prevhex: bytes 4..35 of hdr80 are prevhash in LE wire order.
        Display as big-endian hex (byte-reversed) to match Bitcoin convention. */
