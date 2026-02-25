@@ -1693,10 +1693,7 @@ static void presieve_buf_ensure(struct presieve_buf *b, size_t need) {
    Called after the helper finishes sieving; runs until all candidates consumed. */
 static void coop_fermat_assist(struct presieve_ctx *ctx) {
     struct coop_fermat *co = &ctx->coop;
-    if (!co->active) {
-        __sync_val_compare_and_swap(&co->helper_done, 0, 1);
-        return;
-    }
+    if (!co->active) return;   /* nothing to do — don't touch helper_done */
 
     for (;;) {
         size_t idx = __sync_fetch_and_add(&co->next_idx, 1);
@@ -1921,25 +1918,26 @@ static void *worker_fn(void *arg) {
             /* cur_slot is exclusively ours; helper works on next_slot      */
             uint64_t *pr     = psc.bufs[cur_slot].pr;
 
-            /* Set up cooperative Fermat testing: the helper (after finishing
-               its sieve of the next window) will join us testing the current
-               window's candidates via a shared atomic work index.           */
+            /* Cooperative Fermat: only enable when the helper is actively
+               sieving the next window (state==1).  After sieving, the helper
+               calls coop_fermat_assist before going back to its wait loop.
+               When state==0 (last window of pass, or empty window) the helper
+               is already back in its wait loop — enabling coop would deadlock
+               because helper_done would never be set.                       */
+            int helper_will_assist = (psc.state == 1);
             psc.coop.pr       = pr;
             psc.coop.cnt      = cnt;
             psc.coop.next_idx = 0;
             psc.coop.out_cnt  = 0;
-            psc.coop.helper_done = 0;
-            /* __sync_synchronize acts as a full memory barrier, ensuring the
-               helper sees the updated coop fields before reading active=1.  */
+            psc.coop.helper_done = helper_will_assist ? 0 : 1;
             __sync_synchronize();
-            psc.coop.active   = (cnt > 0 && !no_primality) ? 1 : 0;
+            psc.coop.active   = (cnt > 0 && !no_primality && helper_will_assist) ? 1 : 0;
 
             pthread_mutex_unlock(&psc.mu);
 
-            /* Primality test: worker + helper both pull from coop.next_idx.
-               Worker stores confirmed primes in-place at pr[pf++].
-               Helper stores its primes in coop.out[].
-               After both finish, we merge.                                  */
+            /* Primality test: worker pulls candidates via atomic index.
+               If helper_will_assist, the helper also pulls from the same
+               index after finishing its sieve.  Otherwise worker goes solo. */
             size_t orig_cnt = cnt;
             size_t pf = 0;
             if (!no_primality) {
@@ -1950,31 +1948,29 @@ static void *worker_fn(void *arg) {
                         pr[pf++] = pr[idx];
                     }
                 }
-                /* Signal helper that work is done (in case it hasn't started yet) */
                 psc.coop.active = 0;
                 __sync_synchronize();
 
-                /* Wait for helper to finish its Fermat work before reading
-                   its output.  The helper sets helper_done=1 after its last
-                   write to coop.out[], with a memory barrier in between.    */
-                while (!psc.coop.helper_done)
-                    __asm__ volatile("pause" ::: "memory");
+                /* Wait for helper only if it was going to assist.            */
+                if (helper_will_assist) {
+                    while (!psc.coop.helper_done)
+                        __asm__ volatile("pause" ::: "memory");
 
-                /* Merge helper's confirmed primes into our pr[] array.      */
-                for (size_t i = 0; i < psc.coop.out_cnt; i++) {
-                    pr[pf++] = psc.coop.out[i];
-                }
-                /* Sort merged primes (gap scanning needs ascending order) */
-                if (pf > 1) {
-                    /* Simple insertion sort — pf is typically small (~50-200) */
-                    for (size_t i = 1; i < pf; i++) {
-                        uint64_t key = pr[i];
-                        size_t j = i;
-                        while (j > 0 && pr[j-1] > key) {
-                            pr[j] = pr[j-1];
-                            j--;
+                    /* Merge helper's confirmed primes into our pr[] array.   */
+                    for (size_t i = 0; i < psc.coop.out_cnt; i++) {
+                        pr[pf++] = psc.coop.out[i];
+                    }
+                    /* Sort merged primes (gap scanning needs ascending order) */
+                    if (pf > 1) {
+                        for (size_t i = 1; i < pf; i++) {
+                            uint64_t key = pr[i];
+                            size_t j = i;
+                            while (j > 0 && pr[j-1] > key) {
+                                pr[j] = pr[j-1];
+                                j--;
+                            }
+                            pr[j] = key;
                         }
-                        pr[j] = key;
                     }
                 }
                 __sync_fetch_and_add(&stats_tested, (uint64_t)orig_cnt);
