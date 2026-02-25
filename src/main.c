@@ -146,7 +146,11 @@ static void populate_td_extra_primes(void) {
 }
 
 static void populate_small_primes_cache(void) {
-    size_t maxp = SIEVE_SMALL_PRIME_LIMIT + 1;
+    /* Use the larger of SIEVE_SMALL_PRIME_LIMIT and cli_sieve_prime_limit
+       so that --sieve-primes values above the default are honoured. */
+    size_t maxp = (cli_sieve_prime_limit > SIEVE_SMALL_PRIME_LIMIT)
+                ? (size_t)cli_sieve_prime_limit + 1
+                : SIEVE_SMALL_PRIME_LIMIT + 1;
     unsigned char *is_small = calloc(maxp, 1);
     if (!is_small) { free(is_small); return; }
     small_primes_cap = 80000;
@@ -512,19 +516,90 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
     uint8_t *bits = tls_bits;
 
     /* For big primes (256+shift bits), the sieve trial-division limit is
-       bounded by the user-configured --sieve-prime-limit (or default).    */
+       bounded by the user-configured --sieve-primes (or default).         */
     uint64_t use_limit = (uint64_t)cli_sieve_prime_limit;
-    if (use_limit > SIEVE_SMALL_PRIME_LIMIT) use_limit = SIEVE_SMALL_PRIME_LIMIT;
     pthread_once(&small_primes_once, populate_small_primes_cache);
 
     /* Mark composites: for each small prime p, find first offset ≡ 0 (mod p)
        and stride by 2p (odd-only sieve).
 
        Use cached base_mod_p[] when available (precomputed once per pass in
-       set_base_bn), falling back to uint256_mod_small on the cold path. */
+       set_base_bn), falling back to uint256_mod_small on the cold path.
+
+       L1-CACHE-BLOCKING: Small primes (stride 2p < block_bytes×16) have
+       many hits per window.  Instead of striding across the entire bitmap
+       (~1 MB for 20 M sieve), we process the bitmap in L1-sized blocks
+       (32 KB).  This keeps the working set warm in L1 and reduces cache
+       misses by ~30×.  Large primes (≤ 1 hit per block) use a single pass
+       since they don't cause cache pressure. */
     int have_cache = tls_base_mod_p_ready && tls_base_mod_p;
+
+    /* L1-block size in BITS (=positions).  32 KB = 262144 bits. */
+    #define SIEVE_BLOCK_BITS  (32768ULL * 8)
+    /* Primes with stride 2p covering ≤ 2 hits per block use the
+       straight-through path (no blocking benefit). */
+    #define SIEVE_BLOCK_THRESH (SIEVE_BLOCK_BITS)
+
     if (small_primes_cache) {
+        /* --- Phase 1: small primes, L1-cache-blocked --- */
+        /* Find the split index: primes where 2p < SIEVE_BLOCK_THRESH. */
+        size_t split_idx = small_primes_count;
         for (size_t idx = 1; idx < small_primes_count; ++idx) {
+            uint64_t p = small_primes_cache[idx];
+            if (p > use_limit) { split_idx = idx; break; }
+            if (2 * p >= SIEVE_BLOCK_THRESH) { split_idx = idx; break; }
+        }
+
+        /* Precompute starting positions for small primes. */
+        /* Use VLA or heap for the start array. */
+        uint64_t *sp_start = NULL;
+        size_t sp_count = split_idx > 1 ? split_idx - 1 : 0;
+        if (sp_count > 0) {
+            sp_start = (uint64_t *)malloc(sp_count * sizeof(uint64_t));
+            for (size_t i = 0; i < sp_count; i++) {
+                size_t idx = i + 1;
+                uint64_t p = small_primes_cache[idx];
+                uint64_t base_mod_p;
+                if (have_cache)
+                    base_mod_p = tls_base_mod_p[idx];
+                else
+                    base_mod_p = h256 ? uint256_mod_small(h256, shift, p) : (L % p);
+                uint64_t lrem = (base_mod_p + L % p) % p;
+                uint64_t start = L + (lrem == 0 ? 0 : p - lrem);
+                if ((start & 1) == 0) start += p;
+                sp_start[i] = start;
+            }
+
+            /* Process bitmap in L1-sized blocks */
+            for (uint64_t blk_pos = 0; blk_pos < seg_size; blk_pos += SIEVE_BLOCK_BITS) {
+                uint64_t blk_end = blk_pos + SIEVE_BLOCK_BITS;
+                if (blk_end > seg_size) blk_end = seg_size;
+                /* Translate block bounds to absolute offsets */
+                uint64_t blk_L = L + blk_pos * 2;
+                uint64_t blk_R = L + blk_end * 2;
+                if (blk_R > R) blk_R = R;
+
+                for (size_t i = 0; i < sp_count; i++) {
+                    uint64_t p = small_primes_cache[i + 1];
+                    uint64_t stride = 2 * p;
+                    uint64_t m = sp_start[i];
+                    /* Advance start into this block if needed */
+                    if (m < blk_L) {
+                        uint64_t skip = (blk_L - m + stride - 1) / stride;
+                        m += skip * stride;
+                    }
+                    for (; m < blk_R; m += stride) {
+                        uint64_t pos = (m - L) / 2;
+                        bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+                    }
+                    sp_start[i] = m; /* carry into next block */
+                }
+            }
+            free(sp_start);
+        }
+
+        /* --- Phase 2: large primes, single pass (no blocking needed) --- */
+        for (size_t idx = split_idx; idx < small_primes_count; ++idx) {
             uint64_t p = small_primes_cache[idx];
             if (p > use_limit) break;
             uint64_t base_mod_p;
@@ -537,7 +612,7 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
             if ((start & 1) == 0) start += p;
             for (uint64_t m = start; m < R; m += 2 * p) {
                 uint64_t pos = (m - L) / 2;
-                if (pos < seg_size) bits[pos>>3] |= (uint8_t)(1u << (pos & 7));
+                bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
             }
         }
     }
@@ -2321,7 +2396,12 @@ int main(int argc, char **argv) {
     }
     stats_start_ms = now_ms();
     start_stats_thread();
-    log_msg("C miner starting (shift=%d sieve=%llu)\n", shift, (unsigned long long)sieve_size);
+    /* Trigger sieve cache population so we can log its stats. */
+    pthread_once(&small_primes_once, populate_small_primes_cache);
+    log_msg("C miner starting (shift=%d sieve=%llu sieve-primes=%llu [%zu primes cached])\n",
+            shift, (unsigned long long)sieve_size,
+            (unsigned long long)cli_sieve_prime_limit,
+            small_primes_count);
     if (keep_going)
         log_msg("default behaviour: will continue mining after finding a valid block\n");
     else
