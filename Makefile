@@ -1,8 +1,8 @@
 CC=gcc
 CXX=g++
-CFLAGS=-O2 -std=c11 -Wall -Wextra -march=native
-CXXFLAGS=-O2 -std=c++17 -Wall -Wextra -march=native
-LDFLAGS=
+CFLAGS=-O3 -std=c11 -Wall -Wextra -march=native -flto
+CXXFLAGS=-O3 -std=c++17 -Wall -Wextra -march=native -flto
+LDFLAGS=-flto
 SRCDIR=src
 BINDIR=bin
 TARGET=$(BINDIR)/gap_miner

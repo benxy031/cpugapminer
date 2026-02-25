@@ -1413,12 +1413,14 @@ static __thread mpz_t  tls_res_mpz;        /* powm result               */
 static __thread int    tls_gmp_inited = 0;  /* 0 until first init       */
 
 static void ensure_gmp_tls(void) {
-    if (!tls_gmp_inited) {
-        mpz_init(tls_base_mpz);
-        mpz_init(tls_cand_mpz);
+    if (__builtin_expect(!tls_gmp_inited, 0)) {
+        /* Pre-allocate all mpz to 384 bits (6 limbs) — enough for 284-bit
+           numbers, avoiding any internal reallocation during hot paths. */
+        mpz_init2(tls_base_mpz, 384);
+        mpz_init2(tls_cand_mpz, 384);
         mpz_init_set_ui(tls_two_mpz, 2);
-        mpz_init(tls_exp_mpz);
-        mpz_init(tls_res_mpz);
+        mpz_init2(tls_exp_mpz, 384);
+        mpz_init2(tls_res_mpz, 384);
         tls_gmp_inited = 1;
     }
 }
@@ -1650,6 +1652,23 @@ struct presieve_buf {
     uint64_t  L, R;
 };
 
+/* Cooperative Fermat work-sharing: after the helper finishes sieving
+   the next window, it joins the worker to test the CURRENT window's
+   candidates.  Both threads pull from a shared atomic index.
+   On an 8-thread CPU with 6 workers + 6 helpers, this uses the otherwise-
+   idle HT siblings for useful work — effectively doubling Fermat throughput
+   per worker without increasing thread count.                              */
+struct coop_fermat {
+    uint64_t       *pr;          /* shared candidate array (current window) */
+    size_t          cnt;         /* total candidate count                   */
+    volatile size_t next_idx;    /* atomic work index (fetch-and-add)       */
+    uint64_t       *out;         /* helper's confirmed primes               */
+    size_t          out_cnt;     /* number of primes found by helper        */
+    size_t          out_cap;     /* capacity of out[]                       */
+    volatile int    active;      /* 1 = work available for helper           */
+    volatile int    helper_done; /* 1 = helper finished its Fermat batch    */
+};
+
 struct presieve_ctx {
     struct presieve_buf bufs[2]; /* ping-pong slots                     */
     int fill_slot;               /* helper writes into bufs[fill_slot]  */
@@ -1660,6 +1679,7 @@ struct presieve_ctx {
     pthread_t thread;
     const uint8_t *h256;         /* 256-bit base hash (for sieve_range) */
     int            shift;        /* bit shift for prime size             */
+    struct coop_fermat coop;     /* cooperative Fermat testing state     */
 };
 
 static void presieve_buf_ensure(struct presieve_buf *b, size_t need) {
@@ -1669,8 +1689,39 @@ static void presieve_buf_ensure(struct presieve_buf *b, size_t need) {
     b->cap = nc;
 }
 
+/* Helper: assist with Fermat testing from the shared cooperative work queue.
+   Called after the helper finishes sieving; runs until all candidates consumed. */
+static void coop_fermat_assist(struct presieve_ctx *ctx) {
+    struct coop_fermat *co = &ctx->coop;
+    if (!co->active) {
+        __sync_val_compare_and_swap(&co->helper_done, 0, 1);
+        return;
+    }
+
+    for (;;) {
+        size_t idx = __sync_fetch_and_add(&co->next_idx, 1);
+        if (idx >= co->cnt) break;
+        if (bn_candidate_is_prime(co->pr[idx])) {
+            /* Store confirmed prime in helper's private output buffer */
+            if (co->out_cnt >= co->out_cap) {
+                size_t nc = co->out_cap ? co->out_cap * 2 : 256;
+                co->out = realloc(co->out, nc * sizeof(uint64_t));
+                co->out_cap = nc;
+            }
+            co->out[co->out_cnt++] = co->pr[idx];
+        }
+    }
+    /* Signal worker: all our Fermat work is done, out[] is final. */
+    __sync_synchronize();
+    co->helper_done = 1;
+}
+
 static void *presieve_helper_fn(void *arg) {
     struct presieve_ctx *ctx = arg;
+    /* Initialize helper's GMP TLS base to match the worker's.
+       This is needed so bn_candidate_is_prime() works correctly
+       when the helper assists with cooperative Fermat testing.    */
+    set_base_bn(ctx->h256, ctx->shift);
     for (;;) {
         pthread_mutex_lock(&ctx->mu);
         while (ctx->state != 1 && ctx->state != -1)
@@ -1687,12 +1738,6 @@ static void *presieve_helper_fn(void *arg) {
 
         pthread_mutex_lock(&ctx->mu);
         struct presieve_buf *b = &ctx->bufs[slot];
-        /* RACE: worker_done may have set state=-1 while we were in
-           sieve_range (mutex was not held during the sieve).  If so,
-           discard the result and do NOT overwrite state — the top-of-loop
-           check will see -1 on the next iteration and exit cleanly.
-           Without this guard, we'd overwrite -1 with 2 and then block
-           forever on cv_go waiting for a signal that never arrives. */
         if (ctx->state != -1) {
             presieve_buf_ensure(b, cnt);
             if (cnt && pr_tls)
@@ -1703,8 +1748,15 @@ static void *presieve_helper_fn(void *arg) {
         }
         __sync_fetch_and_add(&stats_sieved, (uint64_t)(R - L));
         pthread_mutex_unlock(&ctx->mu);
+
+        /* After sieving, help with Fermat testing on the current window.
+           This uses the helper's otherwise-idle CPU time (the worker is
+           doing its own Fermat tests in parallel on the same candidate
+           array via the shared atomic index). */
+        coop_fermat_assist(ctx);
     }
     free_sieve_buffers(); /* release helper's TLS */
+    free(ctx->coop.out);  /* release coop output buffer */
     return NULL;
 }
 
@@ -1868,20 +1920,67 @@ static void *worker_fn(void *arg) {
 
             /* cur_slot is exclusively ours; helper works on next_slot      */
             uint64_t *pr     = psc.bufs[cur_slot].pr;
+
+            /* Set up cooperative Fermat testing: the helper (after finishing
+               its sieve of the next window) will join us testing the current
+               window's candidates via a shared atomic work index.           */
+            psc.coop.pr       = pr;
+            psc.coop.cnt      = cnt;
+            psc.coop.next_idx = 0;
+            psc.coop.out_cnt  = 0;
+            psc.coop.helper_done = 0;
+            /* __sync_synchronize acts as a full memory barrier, ensuring the
+               helper sees the updated coop fields before reading active=1.  */
+            __sync_synchronize();
+            psc.coop.active   = (cnt > 0 && !no_primality) ? 1 : 0;
+
             pthread_mutex_unlock(&psc.mu);
 
-            /* Primality test in-place (runs while helper sieves next window) */
+            /* Primality test: worker + helper both pull from coop.next_idx.
+               Worker stores confirmed primes in-place at pr[pf++].
+               Helper stores its primes in coop.out[].
+               After both finish, we merge.                                  */
             size_t orig_cnt = cnt;
             size_t pf = 0;
             if (!no_primality) {
-                for (size_t i = 0; i < cnt; i++) {
-                    if (bn_candidate_is_prime(pr[i])) {
-                        pr[pf++] = pr[i];
+                for (;;) {
+                    size_t idx = __sync_fetch_and_add(&psc.coop.next_idx, 1);
+                    if (idx >= cnt) break;
+                    if (bn_candidate_is_prime(pr[idx])) {
+                        pr[pf++] = pr[idx];
+                    }
+                }
+                /* Signal helper that work is done (in case it hasn't started yet) */
+                psc.coop.active = 0;
+                __sync_synchronize();
+
+                /* Wait for helper to finish its Fermat work before reading
+                   its output.  The helper sets helper_done=1 after its last
+                   write to coop.out[], with a memory barrier in between.    */
+                while (!psc.coop.helper_done)
+                    __asm__ volatile("pause" ::: "memory");
+
+                /* Merge helper's confirmed primes into our pr[] array.      */
+                for (size_t i = 0; i < psc.coop.out_cnt; i++) {
+                    pr[pf++] = psc.coop.out[i];
+                }
+                /* Sort merged primes (gap scanning needs ascending order) */
+                if (pf > 1) {
+                    /* Simple insertion sort — pf is typically small (~50-200) */
+                    for (size_t i = 1; i < pf; i++) {
+                        uint64_t key = pr[i];
+                        size_t j = i;
+                        while (j > 0 && pr[j-1] > key) {
+                            pr[j] = pr[j-1];
+                            j--;
+                        }
+                        pr[j] = key;
                     }
                 }
                 __sync_fetch_and_add(&stats_tested, (uint64_t)orig_cnt);
                 cnt = pf;
             } else {
+                psc.coop.active = 0;
                 pf = cnt;
                 __sync_fetch_and_add(&stats_tested, (uint64_t)orig_cnt);
             }
