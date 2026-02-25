@@ -1686,6 +1686,15 @@ static void *worker_fn(void *arg) {
     psc.shift = shift_local;
     pthread_create(&psc.thread, NULL, presieve_helper_fn, &psc);
 
+#ifdef WITH_RPC
+    /* Initialise here (not as static=0) so the first poll fires 5 s after
+       the worker STARTS, not immediately.  A static zero means now_ms()-0
+       is always ≥ 5000, causing an instant getbestblockhash call on the
+       very first window — before any gap is searched — which races with
+       build_mining_pass and sets g_abort_pass=1, making built=0 forever. */
+    uint64_t gbt_last_ms = now_ms();
+#endif
+
     /* Outer loop: mine continuously (same slice, same header) until either
        - a new block is detected by the RPC poller (g_abort_pass = 1), or
        - SIGINT clears keep_going, or
@@ -1709,7 +1718,6 @@ static void *worker_fn(void *arg) {
 
 #ifdef WITH_RPC
             if (rpc_thread_local && rpc_url_local) {
-                static uint64_t gbt_last_ms = 0;
                 uint64_t now = now_ms();
                 if (now - gbt_last_ms >= 5000) {
                     /* Use getbestblockhash — a pure read-only query that does NOT
