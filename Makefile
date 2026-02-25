@@ -7,16 +7,26 @@ SRCDIR=src
 BINDIR=bin
 TARGET=$(BINDIR)/gap_miner
 
+# Optional: GMP_PREFIX=/path/to/gmp  to use a custom (e.g. --enable-fat) build.
+# Static linking avoids runtime dependency on non-system libgmp.
+ifdef GMP_PREFIX
+	GMP_CFLAGS=-I$(GMP_PREFIX)/include
+	GMP_LIB=$(GMP_PREFIX)/lib/libgmp.a
+else
+	GMP_CFLAGS=
+	GMP_LIB=-lgmp
+endif
+
 # enable WITH_RPC=1 to include RPC wrapper sources and link curl
 ifdef WITH_RPC
-	LIBS=-lcurl -ljansson -lssl -lcrypto -lgmp -lm -pthread -lstdc++
-	CFLAGS+=-DWITH_RPC
+	LIBS=-lcurl -ljansson -lssl -lcrypto $(GMP_LIB) -lm -pthread -lstdc++
+	CFLAGS+=-DWITH_RPC $(GMP_CFLAGS)
 	# build rpc C++ objects
 	RPC_SRCS=$(SRCDIR)/rpc_cwrap.cpp $(SRCDIR)/rpc_globals.cpp $(SRCDIR)/rpc_stubs.cpp $(SRCDIR)/Rpc.cpp
 	RPC_OBJS=$(RPC_SRCS:.cpp=.o)
 	LINKER=$(CXX)
 else
-	LIBS=-lssl -lcrypto -lgmp -lm -pthread
+	LIBS=-lssl -lcrypto $(GMP_LIB) -lm -pthread
 	LINKER=$(CC)
 	RPC_OBJS=
 endif
