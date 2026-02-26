@@ -5,9 +5,11 @@ cpugapminer, covering shifts from 64 to 1024.
 
 ## Overview
 
-CRT files pre-compute optimal prime offsets so the miner can skip a large
-fraction of composite candidates without Fermat testing. The `gen_crt`
-tool uses a two-phase algorithm:
+CRT files pre-compute optimal prime offsets so the miner can constrain
+which `nAdd` values to test, replacing the normal windowed sieve with
+a much smaller set of CRT-aligned candidates.
+
+The `gen_crt` tool uses a two-phase algorithm:
 
 1. **Greedy phase** — assigns each CRT prime an offset that covers the
    most uncovered positions in the target gap range. Repeated many times
@@ -18,6 +20,26 @@ tool uses a two-phase algorithm:
 
 The output is a text file listing `prime offset` pairs, which the miner
 loads via `--crt-file`.
+
+### How CRT mining works
+
+When a text CRT file is loaded, the miner bypasses the normal sieve loop
+entirely. Instead:
+
+1. **CRT alignment** — for each base hash, solve
+   `nAdd ≡ -(base + offset_i) (mod prime_i)` for all CRT primes
+   simultaneously using the CRT. This yields a unique `nAdd0 (mod primorial)`.
+2. **Iterate** — step through `nAdd = nAdd0, nAdd0 + primorial, …` up to
+   `adder_max = 2^shift`. At shift 64 / 15 primes (primorial ≈ 2^59),
+   this gives only **~15 candidate nAdd values** per hash.
+3. **Fermat test** — each `base + nAdd` is tested for primality directly.
+4. **Gap check** — for each confirmed prime, a small forward sieve
+   (~10 000 positions) finds the next prime to measure the gap.
+5. **Submit** — qualifying gaps (merit ≥ target) are submitted via the
+   normal block assembly path.
+
+Because CRT replaces the sieve, `--sieve-size`, `--sieve-primes`, and
+`--sample-stride` have no effect in CRT mode.
 
 ## Key Formula
 
@@ -229,13 +251,14 @@ candidates. Example:
 ./bin/gap_miner --shift 128 --crt-file crt_s128_m22.txt \
   --rpc-url http://127.0.0.1:31397 \
   --rpc-user user --rpc-pass pass \
-  --threads 14 --sieve-size 20000000 --sieve-primes 2500000 \
-  --fast-fermat
+  --threads 14 --fast-fermat
 ```
 
 The miner auto-detects the file format (binary template vs text
-gap-solver). The text format from `gen_crt --calc-ctr` provides the
-prime:offset data that the miner uses for CRT-aligned sieving.
+gap-solver). When a text CRT file is loaded, the miner enters
+CRT-aligned mining mode — the normal sieve is bypassed entirely,
+so `--sieve-size`, `--sieve-primes`, and `--sample-stride` are
+ignored and do not need to be specified.
 
 ## Tips for Quality
 
