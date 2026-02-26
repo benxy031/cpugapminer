@@ -2090,7 +2090,7 @@ static void crt_compute_alignment_mpz(mpz_t result) {
 /* Direct Fermat/MR primality test on a full mpz_t value (no base+offset).
    Skips the trial-division pre-filter (which uses residues from the
    current base, not from the candidate). */
-static int bn_is_prime_mpz(mpz_t candidate) {
+static int __attribute__((unused)) bn_is_prime_mpz(mpz_t candidate) {
     ensure_gmp_tls();
     if (use_fast_fermat) {
         mpz_sub_ui(tls_exp_mpz, candidate, 1);
@@ -2526,68 +2526,68 @@ static void *worker_fn(void *arg) {
             /* Compute GMP CRT alignment: nAdd0 mod primorial */
             crt_compute_alignment_mpz(nAdd);  /* nAdd = nAdd0 */
 
-            /* Iterate CRT candidates: nAdd, nAdd+primorial, ... < 2^shift */
+            /* Iterate CRT windows: nAdd, nAdd+primorial, ... < 2^shift.
+               For each window, sieve the gap range, Fermat-test all
+               survivors to find primes, then scan consecutive primes
+               for gaps meeting the target merit. */
             while (mpz_cmp(nAdd, crt_end) < 0 && keep_going && !g_abort_pass) {
 
-                /* candidate = base + nAdd */
+                /* Rebase sieve state to the CRT-aligned position.
+                   The odd-only sieve requires an even base. */
                 mpz_add(candidate, tls_base_mpz, nAdd);
-
-                __sync_fetch_and_add(&stats_tested, 1);
-                if (!bn_is_prime_mpz(candidate)) {
-                    mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
-                    continue;
-                }
-
-                /* ── Prime found!  Gap-check sieve ── */
-                /* The odd-only sieve assumes an even base so that
-                   base + odd_offset = odd.  candidate is an odd prime,
-                   so rebase to candidate-1 (even).  Offsets 3,5,7,...
-                   then represent candidate+2, candidate+4, ... (all odd). */
-                mpz_sub_ui(candidate, candidate, 1);
+                int cand_odd = mpz_odd_p(candidate);
+                if (cand_odd) mpz_sub_ui(candidate, candidate, 1);
                 rebase_for_gap_check(candidate);
-                mpz_add_ui(candidate, candidate, 1);
 
-                uint64_t gap_L = 3;
-                uint64_t gap_R = (uint64_t)gap_scan_max + 1;
+                /* Sieve gap range: offsets 1..gap_scan_max from base.
+                   sieve_range forces L odd, so gap_L=1 → L=1 (odd). */
+                uint64_t gap_L = 1;
+                uint64_t gap_R = (uint64_t)gap_scan_max;
                 size_t surv_cnt = 0;
-                uint64_t *gap_surv = sieve_range(gap_L, gap_R, &surv_cnt,
-                                                 NULL, 0);
+                uint64_t *surv = sieve_range(gap_L, gap_R, &surv_cnt,
+                                             NULL, 0);
                 __sync_fetch_and_add(&stats_sieved, gap_R - gap_L);
 
-                if (!gap_surv || surv_cnt == 0) {
-                    /* Restore original base for next candidate */
+                if (!surv || surv_cnt == 0) {
                     set_base_bn(h256_nonce, shift_local);
                     mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
                     continue;
                 }
 
-                /* Fermat-test gap survivors.
-                   Offsets are relative to (candidate-1), so
-                   bn_candidate_is_prime(offset) tests (candidate-1)+offset. */
-                uint64_t next_prime_offset = 0;
+                /* Fermat-test ALL survivors to find primes */
+                size_t pf = 0;
                 for (size_t j = 0; j < surv_cnt; j++) {
                     __sync_fetch_and_add(&stats_tested, 1);
-                    if (bn_candidate_is_prime(gap_surv[j])) {
-                        next_prime_offset = gap_surv[j];
-                        break;
-                    }
+                    if (bn_candidate_is_prime(surv[j]))
+                        surv[pf++] = surv[j];
                 }
 
-                /* Restore original base before potential submission */
+                /* Restore original base for block assembly */
                 set_base_bn(h256_nonce, shift_local);
 
-                if (next_prime_offset > 0) {
-                    /* Offset is from (candidate-1); gap from candidate
-                       is one less.  E.g. offset 3 → candidate+2, gap=2. */
-                    uint64_t gap = next_prime_offset - 1;
-                    double merit = (double)gap / logbase_nonce;
+                /* Scan consecutive prime pairs for qualifying gaps */
+                if (pf >= 2) {
+                    __sync_fetch_and_add(&stats_pairs, (uint64_t)(pf - 1));
+                    for (size_t i = 0; i + 1 < pf; i++) {
+                        uint64_t gap = surv[i + 1] - surv[i];
+                        double merit = (double)gap / logbase_nonce;
+                        if (merit < target_local) continue;
 
-                    __sync_fetch_and_add(&stats_pairs, 1);
-                    if (merit >= target_local) {
                         __sync_fetch_and_add(&stats_gaps, 1);
 
+                        /* nAdd of gap-starting prime:
+                           prime = base + surv[i] (where base may be
+                           candidate-1 if candidate was odd) */
+                        mpz_t nAdd_prime;
+                        mpz_init(nAdd_prime);
+                        mpz_set(nAdd_prime, nAdd);
+                        mpz_add_ui(nAdd_prime, nAdd_prime, surv[i]);
+                        if (cand_odd)
+                            mpz_sub_ui(nAdd_prime, nAdd_prime, 1);
+
                         char nAdd_str[256];
-                        gmp_snprintf(nAdd_str, sizeof(nAdd_str), "%Zd", nAdd);
+                        gmp_snprintf(nAdd_str, sizeof(nAdd_str), "%Zd",
+                                     nAdd_prime);
                         log_msg("\n>>> GAP FOUND\n"
                                 "    gap     = %llu\n"
                                 "    merit   = %.6f  (need >= %.2f)\n"
@@ -2607,8 +2607,8 @@ static void *worker_fn(void *arg) {
                             if (!sq_busy) {
                                 char blockhex[16384];
                                 memset(blockhex, 0, sizeof(blockhex));
-                                if (assemble_mining_block_mpz(nonce_cur, nAdd,
-                                                              blockhex)) {
+                                if (assemble_mining_block_mpz(nonce_cur,
+                                        nAdd_prime, blockhex)) {
                                     __sync_fetch_and_add(&stats_blocks, 1);
                                     log_file_only("Built blockhex: %s\n",
                                                   blockhex);
@@ -2647,6 +2647,7 @@ static void *worker_fn(void *arg) {
                             }
                         }
 #endif
+                        mpz_clear(nAdd_prime);
                     }
                 }
 
@@ -3541,51 +3542,57 @@ int main(int argc, char **argv) {
                     crt_compute_alignment_mpz(nAdd_st);
 
                     while (mpz_cmp(nAdd_st, crt_end) < 0 && keep_going && !g_abort_pass) {
+                        /* Rebase to CRT-aligned position (even for
+                           odd-only sieve). */
                         mpz_add(cand_st, tls_base_mpz, nAdd_st);
-
-                        __sync_fetch_and_add(&stats_tested, 1);
-                        if (!bn_is_prime_mpz(cand_st)) {
-                            mpz_add(nAdd_st, nAdd_st, g_crt_primorial_mpz);
-                            continue;
-                        }
-
-                        /* Prime found — gap-check sieve.
-                           Rebase to cand_st-1 (even) so the odd-only sieve
-                           produces odd positions: (cand-1)+3=cand+2, etc. */
-                        mpz_sub_ui(cand_st, cand_st, 1);
+                        int st_odd = mpz_odd_p(cand_st);
+                        if (st_odd) mpz_sub_ui(cand_st, cand_st, 1);
                         rebase_for_gap_check(cand_st);
-                        mpz_add_ui(cand_st, cand_st, 1);
-                        uint64_t gap_L = 3, gap_R = (uint64_t)gap_scan_max + 1;
+
+                        uint64_t gap_L = 1;
+                        uint64_t gap_R = (uint64_t)gap_scan_max;
                         size_t surv_cnt = 0;
-                        uint64_t *gap_surv = sieve_range(gap_L, gap_R,
-                                                         &surv_cnt, NULL, 0);
+                        uint64_t *surv = sieve_range(gap_L, gap_R,
+                                                     &surv_cnt, NULL, 0);
                         __sync_fetch_and_add(&stats_sieved, gap_R - gap_L);
 
-                        if (!gap_surv || surv_cnt == 0) {
+                        if (!surv || surv_cnt == 0) {
                             set_base_bn(h256_st, shift);
                             mpz_add(nAdd_st, nAdd_st, g_crt_primorial_mpz);
                             continue;
                         }
 
-                        uint64_t next_prime_off = 0;
+                        /* Fermat-test ALL survivors */
+                        size_t pf = 0;
                         for (size_t j = 0; j < surv_cnt; j++) {
                             __sync_fetch_and_add(&stats_tested, 1);
-                            if (bn_candidate_is_prime(gap_surv[j])) {
-                                next_prime_off = gap_surv[j];
-                                break;
-                            }
+                            if (bn_candidate_is_prime(surv[j]))
+                                surv[pf++] = surv[j];
                         }
 
                         set_base_bn(h256_st, shift);
 
-                        if (next_prime_off > 0) {
-                            uint64_t gap = next_prime_off - 1;
-                            double merit = (double)gap / logbase_st;
-                            __sync_fetch_and_add(&stats_pairs, 1);
-                            if (merit >= target) {
+                        /* Scan consecutive primes for qualifying gaps */
+                        if (pf >= 2) {
+                            __sync_fetch_and_add(&stats_pairs,
+                                                 (uint64_t)(pf - 1));
+                            for (size_t i = 0; i + 1 < pf; i++) {
+                                uint64_t gap = surv[i + 1] - surv[i];
+                                double merit = (double)gap / logbase_st;
+                                if (merit < target) continue;
+
                                 __sync_fetch_and_add(&stats_gaps, 1);
+
+                                mpz_t nAdd_p;
+                                mpz_init(nAdd_p);
+                                mpz_set(nAdd_p, nAdd_st);
+                                mpz_add_ui(nAdd_p, nAdd_p, surv[i]);
+                                if (st_odd)
+                                    mpz_sub_ui(nAdd_p, nAdd_p, 1);
+
                                 char nAdd_s[256];
-                                gmp_snprintf(nAdd_s, sizeof(nAdd_s), "%Zd", nAdd_st);
+                                gmp_snprintf(nAdd_s, sizeof(nAdd_s),
+                                             "%Zd", nAdd_p);
                                 log_msg("\n>>> GAP FOUND\n"
                                         "    gap     = %llu\n"
                                         "    merit   = %.6f  (need >= %.2f)\n"
@@ -3600,7 +3607,7 @@ int main(int argc, char **argv) {
                                     char blockhex[16384];
                                     memset(blockhex, 0, sizeof(blockhex));
                                     if (assemble_mining_block_mpz(nonce_st,
-                                            nAdd_st, blockhex)) {
+                                            nAdd_p, blockhex)) {
                                         __sync_fetch_and_add(&stats_blocks, 1);
                                         log_file_only("Built blockhex: %s\n",
                                                       blockhex);
@@ -3621,14 +3628,17 @@ int main(int argc, char **argv) {
                                             memcpy(_job.hex, blockhex,
                                                    sizeof(_job.hex));
                                             _job.retries = rpc_default_retries;
-                                            __sync_fetch_and_add(&stats_submits, 1);
+                                            __sync_fetch_and_add(&stats_submits,
+                                                                 1);
                                             enqueue_job(&_job);
-                                            log_msg(">>> QUEUED for async submit\n");
+                                            log_msg(">>> QUEUED for async submit"
+                                                    "\n");
                                             print_stats();
                                         }
                                     }
                                 }
 #endif
+                                mpz_clear(nAdd_p);
                             }
                         }
 
