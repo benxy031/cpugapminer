@@ -414,16 +414,25 @@ static int load_crt_text_file(const char *path) {
 
     /* store globals */
     g_crt_n_primes    = n_primes;
-    /* Compute primorial = product of all CRT primes using GMP
-       (arbitrary precision — works for any number of primes). */
+    /* Compute primorial = product of CRT primes with offset > 0.
+       Primes with offset=0 make the candidate divisible by that prime
+       (always composite), so they are excluded from the CRT system. */
+    int skip_zero = 0;
+    for (int i = 0; i < n_primes; i++)
+        if (offset_list[i] == 0) skip_zero++;
+    if (skip_zero > 0)
+        log_msg("CRT: warning: %d prime(s) have offset=0 (candidate always "
+                "composite) — skipping them in CRT\n", skip_zero);
     if (!g_crt_primorial_mpz_init) {
         mpz_init(g_crt_primorial_mpz);
         g_crt_primorial_mpz_init = 1;
     }
     mpz_set_ui(g_crt_primorial_mpz, 1);
-    for (int i = 0; i < n_primes; i++)
+    for (int i = 0; i < n_primes; i++) {
+        if (offset_list[i] == 0) continue;  /* skip offset=0 primes */
         mpz_mul_ui(g_crt_primorial_mpz, g_crt_primorial_mpz,
                    (unsigned long)prime_list[i]);
+    }
 
     g_crt_prime_list  = prime_list;
     g_crt_offsets     = offset_list;
@@ -2008,6 +2017,9 @@ static uint64_t crt_compute_alignment(void) {
     for (int i = 0; i < g_crt_n_primes; i++) {
         uint64_t p = (uint64_t)g_crt_prime_list[i];
         uint64_t o = (uint64_t)g_crt_offsets[i];
+        /* offset=0 means candidate ≡ 0 mod p (always composite).
+           Skip these primes — they are also excluded from the primorial. */
+        if (o == 0) continue;
         uint64_t base_mod_p = mpz_fdiv_ui(tls_base_mpz, (unsigned long)p);
 
         /* Target: nAdd ≡ -(base + o) mod p
@@ -2042,6 +2054,9 @@ static void crt_compute_alignment_mpz(mpz_t result) {
     for (int i = 0; i < g_crt_n_primes; i++) {
         unsigned long p = (unsigned long)g_crt_prime_list[i];
         unsigned long o = (unsigned long)g_crt_offsets[i];
+        /* offset=0 means candidate ≡ 0 mod p (always composite).
+           Skip these primes — they are also excluded from the primorial. */
+        if (o == 0) continue;
         unsigned long base_mod_p = mpz_fdiv_ui(tls_base_mpz, p);
 
         unsigned long sum = (base_mod_p + o % p) % p;
