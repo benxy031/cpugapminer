@@ -270,6 +270,8 @@ static int            g_crt_gap_target  = 0;       /* target gap size           
 static int            g_crt_n_candidates= 0;       /* uncovered positions       */
 static double         g_crt_merit       = 0.0;     /* target merit from file    */
 static int            g_crt_shift       = 0;       /* shift from CRT file       */
+static mpz_t          g_crt_primorial_mpz;          /* GMP primorial (any size)  */
+static int            g_crt_primorial_mpz_init = 0; /* 1 once mpz_init'd         */
 
 /* Per-thread CRT base residue (base mod primorial), set in set_base_bn(). */
 static __thread uint64_t tls_crt_base_residue = 0;
@@ -412,19 +414,16 @@ static int load_crt_text_file(const char *path) {
 
     /* store globals */
     g_crt_n_primes    = n_primes;
-    /* Compute primorial = product of all CRT primes.
-       For ≤15 primes (up to 47) the primorial fits in uint64_t (~2^59.1).
-       For 16+ primes (53+) it overflows; reject for now. */
-    uint64_t prim = 1;
-    for (int i = 0; i < n_primes; i++) {
-        if (prim > UINT64_MAX / (uint64_t)prime_list[i]) {
-            log_msg("CRT: primorial overflow at prime %d (max ~15 primes for uint64_t)\n",
-                    prime_list[i]);
-            free(prime_list); free(offset_list);
-            return 0;
-        }
-        prim *= (uint64_t)prime_list[i];
+    /* Compute primorial = product of all CRT primes using GMP
+       (arbitrary precision — works for any number of primes). */
+    if (!g_crt_primorial_mpz_init) {
+        mpz_init(g_crt_primorial_mpz);
+        g_crt_primorial_mpz_init = 1;
     }
+    mpz_set_ui(g_crt_primorial_mpz, 1);
+    for (int i = 0; i < n_primes; i++)
+        mpz_mul_ui(g_crt_primorial_mpz, g_crt_primorial_mpz,
+                   (unsigned long)prime_list[i]);
 
     g_crt_prime_list  = prime_list;
     g_crt_offsets     = offset_list;
@@ -433,18 +432,19 @@ static int load_crt_text_file(const char *path) {
     g_crt_merit       = merit;
     g_crt_shift       = shift;
     g_crt_max_prime   = (uint64_t)prime_list[n_primes - 1];
-    g_crt_primorial   = prim;
+    g_crt_primorial   = 0;  /* only used for CRT_MODE_TEMPLATE */
     g_crt_mode        = CRT_MODE_SOLVER;
 
+    double prim_log2 = (double)mpz_sizeinbase(g_crt_primorial_mpz, 2);
     log_msg("CRT: loaded %s  (gap-solver mode)\n"
             "  primes=%d (2..%d)  shift=%d  merit=%.2f\n"
             "  gap_target=%d  n_candidates=%d  (%.1f%% uncovered)\n"
-            "  primorial=%llu (~2^%.1f)\n",
+            "  primorial ~2^%.0f  ctr-bits=%d\n",
             path, g_crt_n_primes, (int)g_crt_max_prime,
             g_crt_shift, g_crt_merit,
             g_crt_gap_target, g_crt_n_candidates,
             gap_target > 0 ? 100.0 * (double)n_cand / (double)gap_target : 0,
-            (unsigned long long)prim, log2((double)prim));
+            prim_log2, shift - (int)prim_log2);
     return 1;
 }
 
@@ -1736,6 +1736,28 @@ static int assemble_mining_block(uint64_t nadd_val, char out_hex[16384]) {
     bytes_to_hex(buf, (size_t)(p - buf), out_hex);
     return 1;
 }
+
+/* Like assemble_mining_block but accepts a full mpz_t nAdd and an explicit
+   nonce, so CRT mining at large shifts (512+) can submit properly. */
+static int assemble_mining_block_mpz(uint32_t mining_nonce, mpz_t nadd_val,
+                                     char out_hex[16384]) {
+    unsigned char buf[1024]; /* enough for nAdd up to ~7400 bits */
+    unsigned char *p = buf;
+    memcpy(p, g_pass.hdr80,    80); p += 80;
+    memcpy(p, &mining_nonce,    4); p += 4;
+    memcpy(p, &g_pass.nshift,   2); p += 2;
+    /* nAdd raw LE bytes */
+    if (mpz_sgn(nadd_val) == 0) {
+        *p++ = 0;
+    } else {
+        size_t count = 0;
+        mpz_export(p, &count, -1, 1, 0, 0, nadd_val); /* LE byte order */
+        p += count;
+    }
+    if ((p - buf) <= 86) { *p++ = 0x00; }
+    bytes_to_hex(buf, (size_t)(p - buf), out_hex);
+    return 1;
+}
 #endif /* WITH_RPC — build_mining_pass / assemble_mining_block */
 
 /* check whether the block should be forwarded to the node for PoW validation.
@@ -1976,6 +1998,7 @@ static uint64_t mod_inv_u64(uint64_t a, uint64_t m) {
  * congruences into a unique solution modulo primorial.
  *
  * Must be called AFTER set_base_bn() (requires tls_base_mpz). */
+static uint64_t crt_compute_alignment(void) __attribute__((unused));
 static uint64_t crt_compute_alignment(void) {
     /* Use __uint128_t for intermediate values to avoid overflow.
        Final result < primorial < 2^64, so cast back is safe. */
@@ -2004,6 +2027,82 @@ static uint64_t crt_compute_alignment(void) {
     }
 
     return (uint64_t)nAdd0;
+}
+
+/* ── GMP-based CRT alignment (arbitrary-size primorials) ──
+   Same algorithm as crt_compute_alignment() but with mpz_t arithmetic
+   so it works for any number of CRT primes / any shift.
+   Must be called AFTER set_base_bn() (requires tls_base_mpz). */
+static void crt_compute_alignment_mpz(mpz_t result) {
+    mpz_t nAdd0, M, tmp_p;
+    mpz_inits(nAdd0, M, tmp_p, NULL);
+    mpz_set_ui(nAdd0, 0);
+    mpz_set_ui(M, 1);
+
+    for (int i = 0; i < g_crt_n_primes; i++) {
+        unsigned long p = (unsigned long)g_crt_prime_list[i];
+        unsigned long o = (unsigned long)g_crt_offsets[i];
+        unsigned long base_mod_p = mpz_fdiv_ui(tls_base_mpz, p);
+
+        unsigned long sum = (base_mod_p + o % p) % p;
+        unsigned long target_r = sum == 0 ? 0 : p - sum;
+
+        unsigned long curr_r = mpz_fdiv_ui(nAdd0, p);
+        unsigned long diff   = (target_r + p - curr_r) % p;
+        unsigned long M_mod_p = mpz_fdiv_ui(M, p);
+
+        /* inv = M_mod_p^(-1) mod p via GMP */
+        mpz_set_ui(tmp_p, p);
+        mpz_t tmp_inv;
+        mpz_init(tmp_inv);
+        mpz_set_ui(tmp_inv, M_mod_p);
+        mpz_invert(tmp_inv, tmp_inv, tmp_p);
+        unsigned long inv = mpz_get_ui(tmp_inv);
+        mpz_clear(tmp_inv);
+
+        unsigned long k = (diff * inv) % p;
+
+        /* nAdd0 += k * M */
+        mpz_set_ui(tmp_p, k);
+        mpz_addmul(nAdd0, tmp_p, M);
+        mpz_mul_ui(M, M, p);
+    }
+
+    mpz_set(result, nAdd0);
+    mpz_clears(nAdd0, M, tmp_p, NULL);
+}
+
+/* Direct Fermat/MR primality test on a full mpz_t value (no base+offset).
+   Skips the trial-division pre-filter (which uses residues from the
+   current base, not from the candidate). */
+static int bn_is_prime_mpz(mpz_t candidate) {
+    ensure_gmp_tls();
+    if (use_fast_fermat) {
+        mpz_sub_ui(tls_exp_mpz, candidate, 1);
+        mpz_powm(tls_res_mpz, tls_two_mpz, tls_exp_mpz, candidate);
+        return mpz_cmp_ui(tls_res_mpz, 1) == 0;
+    } else {
+        return mpz_probab_prime_p(candidate, 10) > 0;
+    }
+}
+
+/* Rebase the thread-local sieve/prime-test state so that future calls
+   to sieve_range() and bn_candidate_is_prime() work relative to the
+   given mpz_t base position (typically a confirmed CRT prime). */
+static void rebase_for_gap_check(mpz_t new_base) {
+    mpz_set(tls_base_mpz, new_base);
+    /* Recompute sieve prime residues */
+    pthread_once(&small_primes_once, populate_small_primes_cache);
+    if (tls_base_mod_p && small_primes_cache) {
+        for (size_t i = 0; i < small_primes_count; i++)
+            tls_base_mod_p[i] = mpz_fdiv_ui(tls_base_mpz,
+                                             (unsigned long)small_primes_cache[i]);
+        tls_base_mod_p_ready = 1;
+    }
+    /* Recompute trial-division residues */
+    for (int i = 0; i < td_extra_count; i++)
+        tls_td_residues[i] = (uint32_t)mpz_fdiv_ui(tls_base_mpz,
+                                        (unsigned long)td_extra_primes[i]);
 }
 
 // process a list of primes searching for gaps meeting the local threshold.
@@ -2309,159 +2408,238 @@ static void *worker_fn(void *arg) {
     if (num_windows == 0) return NULL;
 
     /* ══════════════════════════════════════════════════════════════════
-       CRT Gap-Solver Mining Path
+       CRT Gap-Solver Mining Path  (GMP / nonce-parallel)
        ══════════════════════════════════════════════════════════════════
        When CRT_MODE_SOLVER is active, skip the normal windowed sieve.
-       Instead, compute the CRT-aligned nAdd candidates (stepping by
-       primorial) and for each one that passes a Fermat test, sieve a
-       small forward gap region to measure the gap.
-
-       At shift 64 / 15 primes: primorial ≈ 2^59, giving ~15 candidate
-       nAdd values per thread slice.  Each prime found triggers a tiny
-       gap-check sieve of ~gap_target positions.
+       Each thread iterates nonces independently (thread t starts at
+       g_pass.nonce + 1 + tid, stepping by nthreads).  For every valid
+       nonce (SHA256d[31] >= 0x80) the CRT alignment is computed and
+       candidates nAdd0, nAdd0+primorial, nAdd0+2*primorial … < 2^shift
+       are Fermat-tested.  Each confirmed prime triggers a small forward
+       gap-check sieve to measure the gap and (optionally) submit.
        ══════════════════════════════════════════════════════════════════ */
-    if (g_crt_mode == CRT_MODE_SOLVER && g_crt_primorial > 0) {
-        uint64_t crt_nAdd0   = crt_compute_alignment();
-        uint64_t primorial   = g_crt_primorial;
-        int gap_scan_max     = g_crt_gap_target * 2;
+    if (g_crt_mode == CRT_MODE_SOLVER && g_crt_primorial_mpz_init) {
+#ifdef WITH_RPC
+        int      tid_local     = wa->tid;
+        int      nth_local     = wa->nthreads;
+        int      gap_scan_max  = g_crt_gap_target * 2;
         if (gap_scan_max < 10000) gap_scan_max = 10000;
 
-        /* This thread covers nAdd in [base, base + adder_max_local) */
-        uint64_t crt_end = base + (uint64_t)adder_max_local;
+        /* crt_end = 2^shift  (upper bound for nAdd) */
+        mpz_t crt_end;
+        mpz_init(crt_end);
+        mpz_ui_pow_ui(crt_end, 2, (unsigned long)shift_local);
 
-        /* First CRT candidate ≥ base */
-        uint64_t first_nAdd;
-        if (crt_nAdd0 >= base) {
-            first_nAdd = crt_nAdd0;
-        } else {
-            uint64_t skip = (base - crt_nAdd0 + primorial - 1) / primorial;
-            first_nAdd = crt_nAdd0 + skip * primorial;
+        if (rpc_thread_local) {
+            char prim_str[128];
+            gmp_snprintf(prim_str, sizeof(prim_str), "%Zd", g_crt_primorial_mpz);
+            size_t prim_bits = mpz_sizeinbase(g_crt_primorial_mpz, 2);
+            log_msg("CRT mining (%dT): primorial~2^%zu  shift=%d  gap_scan=%d\n",
+                    nth_local, prim_bits, shift_local, gap_scan_max);
         }
-
-        /* Count CRT candidates for this thread */
-        uint64_t n_crt_cands = 0;
-        if (first_nAdd < crt_end)
-            n_crt_cands = (crt_end - first_nAdd - 1) / primorial + 1;
-
-        if (rpc_thread_local)
-            log_msg("CRT mining: nAdd0=%llu  primorial=%llu  candidates=%llu  gap_scan=%d\n",
-                    (unsigned long long)crt_nAdd0,
-                    (unsigned long long)primorial,
-                    (unsigned long long)n_crt_cands,
-                    gap_scan_max);
 
 #ifdef WITH_RPC
         uint64_t gbt_last_ms = now_ms();
 #endif
-        int crt_stop = 0;
 
-        while (keep_going && !g_abort_pass && !crt_stop) {
-            for (uint64_t nAdd = first_nAdd;
-                 nAdd < crt_end && keep_going && !g_abort_pass;
-                 nAdd += primorial) {
+        /* Nonce iteration state — each thread covers its own nonce slice */
+        uint32_t nonce_cur = g_pass.nonce + 1 + (uint32_t)tid_local;
+
+        /* Temp mpz for candidate = base + nAdd */
+        mpz_t nAdd, candidate;
+        mpz_inits(nAdd, candidate, NULL);
+
+        while (keep_going && !g_abort_pass) {
 
 #ifdef WITH_RPC
-                /* Poll for new blocks every 5 s (same logic as window path) */
-                if (rpc_thread_local && rpc_url_local) {
-                    uint64_t now = now_ms();
-                    if (now - gbt_last_ms >= 5000) {
-                        char *resp = rpc_call(rpc_url_local, rpc_user_local,
-                                              rpc_pass_local,
-                                              "getbestblockhash", NULL);
-                        if (resp) {
-                            const char *q1 = strchr(resp, '"');
-                            if (q1) q1 = strchr(q1+1, '"');
-                            if (q1) q1 = strchr(q1+1, '"');
-                            const char *q2 = q1 ? strchr(q1+1, '"') : NULL;
-                            if (q1 && q2 && (q2-q1-1) == 64) {
-                                char best[65];
-                                memcpy(best, q1+1, 64); best[64] = '\0';
-                                if (g_pass.prevhex[0] &&
-                                    strcmp(best, g_pass.prevhex) != 0) {
-                                    log_msg("\n*** NEW BLOCK  prevhash=%.16s..."
-                                            "  mining on top ***\n\n", best);
-                                    pthread_mutex_lock(&g_work_lock);
-                                    strncpy(g_prevhash, best, 64);
-                                    g_prevhash[64] = '\0';
-                                    pthread_mutex_unlock(&g_work_lock);
-                                    free(resp);
-                                    g_abort_pass = 1;
-                                    break;
-                                }
+            /* Poll for new blocks every 5 s */
+            if (rpc_thread_local && rpc_url_local) {
+                uint64_t now = now_ms();
+                if (now - gbt_last_ms >= 5000) {
+                    char *resp = rpc_call(rpc_url_local, rpc_user_local,
+                                          rpc_pass_local,
+                                          "getbestblockhash", NULL);
+                    if (resp) {
+                        const char *q1 = strchr(resp, '"');
+                        if (q1) q1 = strchr(q1+1, '"');
+                        if (q1) q1 = strchr(q1+1, '"');
+                        const char *q2 = q1 ? strchr(q1+1, '"') : NULL;
+                        if (q1 && q2 && (q2-q1-1) == 64) {
+                            char best[65];
+                            memcpy(best, q1+1, 64); best[64] = '\0';
+                            if (g_pass.prevhex[0] &&
+                                strcmp(best, g_pass.prevhex) != 0) {
+                                log_msg("\n*** NEW BLOCK  prevhash=%.16s..."
+                                        "  mining on top ***\n\n", best);
+                                pthread_mutex_lock(&g_work_lock);
+                                strncpy(g_prevhash, best, 64);
+                                g_prevhash[64] = '\0';
+                                pthread_mutex_unlock(&g_work_lock);
+                                free(resp);
+                                g_abort_pass = 1;
+                                break;
                             }
-                            free(resp);
                         }
-                        gbt_last_ms = now_ms();
+                        free(resp);
                     }
+                    gbt_last_ms = now_ms();
                 }
+            }
 #endif
-                /* ---- Test if base + nAdd is prime ---- */
+
+            /* ── Compute SHA256d for this nonce ── */
+            uint8_t hdr84[84], sha_raw[32], h256_nonce[32];
+            memcpy(hdr84, g_pass.hdr80, 80);
+            memcpy(hdr84 + 80, &nonce_cur, 4);
+            double_sha256(hdr84, 84, sha_raw);
+
+            /* Skip nonces where top bit is not set (Gapcoin requires
+               mpz_sizeinbase(hash,2)==256 → sha_raw[31] >= 0x80). */
+            if (sha_raw[31] < 0x80) {
+                nonce_cur += (uint32_t)nth_local;
+                if (nonce_cur < (uint32_t)nth_local) break; /* wrapped */
+                continue;
+            }
+
+            /* Byte-reverse: h256[k] = sha_raw[31-k] (MSB first for GMP) */
+            for (int k = 0; k < 32; k++) h256_nonce[k] = sha_raw[31 - k];
+
+            /* Set thread-local base = h256_nonce << shift */
+            set_base_bn(h256_nonce, shift_local);
+            double logbase_nonce = uint256_log_approx(h256_nonce, shift_local);
+
+            /* Compute GMP CRT alignment: nAdd0 mod primorial */
+            crt_compute_alignment_mpz(nAdd);  /* nAdd = nAdd0 */
+
+            /* Iterate CRT candidates: nAdd, nAdd+primorial, ... < 2^shift */
+            while (mpz_cmp(nAdd, crt_end) < 0 && keep_going && !g_abort_pass) {
+
+                /* candidate = base + nAdd */
+                mpz_add(candidate, tls_base_mpz, nAdd);
+
                 __sync_fetch_and_add(&stats_tested, 1);
-                if (!bn_candidate_is_prime(nAdd))
+                if (!bn_is_prime_mpz(candidate)) {
+                    mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
                     continue;
+                }
 
-                /* Prime found at base + nAdd!
-                   Sieve a small forward region to find the next prime. */
-                uint64_t gap_L = nAdd + 2;   /* first odd position after */
-                uint64_t gap_R = nAdd + (uint64_t)gap_scan_max;
-                if (gap_R < gap_L) gap_R = UINT64_MAX; /* overflow guard */
+                /* ── Prime found!  Gap-check sieve ── */
+                /* Rebase sieve state to the confirmed prime position so
+                   sieve_range offsets are small uint64_t values. */
+                rebase_for_gap_check(candidate);
 
+                uint64_t gap_L = 2;
+                uint64_t gap_R = (uint64_t)gap_scan_max;
                 size_t surv_cnt = 0;
                 uint64_t *gap_surv = sieve_range(gap_L, gap_R, &surv_cnt,
-                                                 h256_local, shift_local);
-                __sync_fetch_and_add(&stats_sieved,
-                                     (uint64_t)(gap_R - gap_L));
+                                                 NULL, 0);
+                __sync_fetch_and_add(&stats_sieved, gap_R - gap_L);
 
-                if (!gap_surv || surv_cnt == 0) continue;
+                if (!gap_surv || surv_cnt == 0) {
+                    /* Restore original base for next candidate */
+                    set_base_bn(h256_nonce, shift_local);
+                    mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
+                    continue;
+                }
 
-                /* Fermat-test gap survivors to find confirmed primes.
-                   Build array [starting_prime, gap_prime1, gap_prime2, ...]
-                   and pass to scan_candidates for gap reporting/submit. */
-                size_t pr_cap = 64;
-                uint64_t *gap_pr = (uint64_t *)malloc(
-                                       (pr_cap + 1) * sizeof(uint64_t));
-                if (!gap_pr) continue;
-
-                gap_pr[0] = nAdd;   /* the CRT-aligned starting prime */
-                size_t pf = 1;
-
+                /* Fermat-test gap survivors.
+                   Offsets are relative to the rebased candidate, so
+                   bn_candidate_is_prime(offset) tests candidate+offset. */
+                uint64_t next_prime_offset = 0;
                 for (size_t j = 0; j < surv_cnt; j++) {
                     __sync_fetch_and_add(&stats_tested, 1);
                     if (bn_candidate_is_prime(gap_surv[j])) {
-                        if (pf >= pr_cap + 1) {
-                            pr_cap *= 2;
-                            gap_pr = (uint64_t *)realloc(gap_pr,
-                                        (pr_cap + 1) * sizeof(uint64_t));
-                            if (!gap_pr) break;
-                        }
-                        if (gap_pr) gap_pr[pf++] = gap_surv[j];
-                    }
-                }
-
-                if (gap_pr && pf >= 2) {
-                    if (scan_candidates(gap_pr, pf, target_local, logbase,
-                                        shift_local, header_local,
-                                        rpc_url_local, rpc_user_local,
-                                        rpc_pass_local, rpc_method_local,
-                                        rpc_sign_key_local)) {
-                        free(gap_pr);
-                        crt_stop = 1;
+                        next_prime_offset = gap_surv[j];
                         break;
                     }
                 }
-                free(gap_pr);
-            } /* end CRT candidate loop */
 
-            /* All CRT candidates exhausted for this hash.
-               Sleep 100 ms before re-scanning (same nAdd values — useful
-               because RPC poll may set g_abort_pass while we sleep). */
-            if (!crt_stop && keep_going && !g_abort_pass) {
-                struct timespec ts = {0, 100000000}; /* 100 ms */
-                nanosleep(&ts, NULL);
-            }
-        } /* end CRT outer loop */
+                /* Restore original base before potential submission */
+                set_base_bn(h256_nonce, shift_local);
 
-        /* ── CRT cleanup (no presieve helper to shut down) ── */
+                if (next_prime_offset > 0) {
+                    uint64_t gap = next_prime_offset;
+                    double merit = (double)gap / logbase_nonce;
+
+                    __sync_fetch_and_add(&stats_pairs, 1);
+                    if (merit >= target_local) {
+                        __sync_fetch_and_add(&stats_gaps, 1);
+
+                        char nAdd_str[256];
+                        gmp_snprintf(nAdd_str, sizeof(nAdd_str), "%Zd", nAdd);
+                        log_msg("\n>>> GAP FOUND\n"
+                                "    gap     = %llu\n"
+                                "    merit   = %.6f  (need >= %.2f)\n"
+                                "    nShift  = %d\n"
+                                "    nonce   = %u\n"
+                                "    nAdd    = %s\n",
+                                (unsigned long long)gap,
+                                merit, target_local,
+                                shift_local,
+                                (unsigned)nonce_cur,
+                                nAdd_str);
+#ifdef WITH_RPC
+                        if (rpc_url_local && !g_abort_pass) {
+                            pthread_mutex_lock(&sq_lock);
+                            int sq_busy = (sq_count > 0);
+                            pthread_mutex_unlock(&sq_lock);
+                            if (!sq_busy) {
+                                char blockhex[16384];
+                                memset(blockhex, 0, sizeof(blockhex));
+                                if (assemble_mining_block_mpz(nonce_cur, nAdd,
+                                                              blockhex)) {
+                                    __sync_fetch_and_add(&stats_blocks, 1);
+                                    log_file_only("Built blockhex: %s\n",
+                                                  blockhex);
+                                    if (header_meets_target_hex(blockhex)) {
+                                        log_msg(">>> SUBMITTING to node\n"
+                                                "    merit=%.6f  gap=%llu"
+                                                "  nShift=%d  nonce=%u\n",
+                                                merit,
+                                                (unsigned long long)gap,
+                                                shift_local,
+                                                (unsigned)nonce_cur);
+                                        struct submit_job _job;
+                                        memset(&_job, 0, sizeof(_job));
+                                        strncpy(_job.url, rpc_url_local,
+                                                sizeof(_job.url)-1);
+                                        strncpy(_job.user,
+                                                rpc_user_local ? rpc_user_local : "",
+                                                sizeof(_job.user)-1);
+                                        strncpy(_job.pass,
+                                                rpc_pass_local ? rpc_pass_local : "",
+                                                sizeof(_job.pass)-1);
+                                        strncpy(_job.method, "getwork",
+                                                sizeof(_job.method)-1);
+                                        memcpy(_job.hex, blockhex,
+                                               sizeof(_job.hex));
+                                        _job.retries = rpc_default_retries;
+                                        __sync_fetch_and_add(&stats_submits, 1);
+                                        enqueue_job(&_job);
+                                        log_msg(">>> QUEUED for async submit"
+                                                " (mining continues)\n");
+                                        print_stats();
+                                    }
+                                } else {
+                                    log_msg("Failed to assemble block\n");
+                                }
+                            }
+                        }
+#endif
+                    }
+                }
+
+                mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
+            } /* end CRT candidate loop for this nonce */
+
+            /* Advance to next nonce for this thread */
+            nonce_cur += (uint32_t)nth_local;
+            if (nonce_cur < (uint32_t)nth_local) break; /* nonce space wrapped */
+
+        } /* end nonce loop */
+
+        /* ── CRT cleanup ── */
+        mpz_clears(nAdd, candidate, crt_end, NULL);
         free_sieve_buffers();
         if (tls_gmp_inited) {
             mpz_clear(tls_base_mpz);
@@ -2472,6 +2650,11 @@ static void *worker_fn(void *arg) {
             tls_gmp_inited = 0;
         }
         return NULL;
+#else
+        /* Non-RPC build: CRT-SOLVER requires nonce iteration (needs header).
+           Fall through to normal sieve path. */
+        (void)0;
+#endif
     }
     /* ══════════════════════════════════════════════════════════════════ */
 
@@ -3301,76 +3484,138 @@ int main(int argc, char **argv) {
             double logbase = uint256_log_approx(h256, shift);
             set_base_bn(h256, shift);
 
-            /* ── CRT gap-solver path (single-threaded) ── */
-            if (g_crt_mode == CRT_MODE_SOLVER && g_crt_primorial > 0) {
-                uint64_t crt_nAdd0 = crt_compute_alignment();
-                uint64_t primorial = g_crt_primorial;
-                int gap_scan_max   = g_crt_gap_target * 2;
+            /* ── CRT gap-solver path (single-threaded, GMP/nonce) ── */
+            if (g_crt_mode == CRT_MODE_SOLVER && g_crt_primorial_mpz_init) {
+#ifdef WITH_RPC
+                int gap_scan_max = g_crt_gap_target * 2;
                 if (gap_scan_max < 10000) gap_scan_max = 10000;
 
-                uint64_t crt_end = (uint64_t)adder_max;
-                uint64_t first_nAdd = crt_nAdd0;   /* base offset = 0 */
-                uint64_t n_crt = first_nAdd < crt_end
-                    ? (crt_end - first_nAdd - 1) / primorial + 1 : 0;
+                mpz_t crt_end, nAdd_st, cand_st;
+                mpz_inits(crt_end, nAdd_st, cand_st, NULL);
+                mpz_ui_pow_ui(crt_end, 2, (unsigned long)shift);
 
                 static int st_crt_logged = 0;
                 if (!st_crt_logged) {
-                    log_msg("CRT mining (1T): nAdd0=%llu  primorial=%llu  "
-                            "candidates=%llu  gap_scan=%d\n",
-                            (unsigned long long)crt_nAdd0,
-                            (unsigned long long)primorial,
-                            (unsigned long long)n_crt, gap_scan_max);
+                    size_t prim_bits = mpz_sizeinbase(g_crt_primorial_mpz, 2);
+                    log_msg("CRT mining (1T): primorial~2^%zu  shift=%d  gap_scan=%d\n",
+                            prim_bits, shift, gap_scan_max);
                     st_crt_logged = 1;
                 }
 
-                for (uint64_t nAdd = first_nAdd;
-                     nAdd < crt_end && keep_going; nAdd += primorial) {
+                uint32_t nonce_st = g_pass.nonce + 1;
 
-                    __sync_fetch_and_add(&stats_tested, 1);
-                    if (!bn_candidate_is_prime(nAdd)) continue;
+                while (keep_going && !g_abort_pass) {
+                    /* SHA256d for this nonce */
+                    uint8_t hdr84_st[84], sha_raw_st[32], h256_st[32];
+                    memcpy(hdr84_st, g_pass.hdr80, 80);
+                    memcpy(hdr84_st + 80, &nonce_st, 4);
+                    double_sha256(hdr84_st, 84, sha_raw_st);
 
-                    /* Prime found — sieve forward gap region */
-                    uint64_t gap_L = nAdd + 2;
-                    uint64_t gap_R = nAdd + (uint64_t)gap_scan_max;
-                    if (gap_R < gap_L) gap_R = UINT64_MAX;
+                    if (sha_raw_st[31] < 0x80) { nonce_st++; continue; }
 
-                    size_t surv_cnt = 0;
-                    uint64_t *gap_surv = sieve_range(gap_L, gap_R, &surv_cnt,
-                                                     h256, shift);
-                    __sync_fetch_and_add(&stats_sieved,
-                                         (uint64_t)(gap_R - gap_L));
-                    if (!gap_surv || surv_cnt == 0) continue;
+                    for (int k = 0; k < 32; k++) h256_st[k] = sha_raw_st[31 - k];
+                    set_base_bn(h256_st, shift);
+                    double logbase_st = uint256_log_approx(h256_st, shift);
 
-                    size_t pr_cap = 64;
-                    uint64_t *gap_pr = (uint64_t *)malloc(
-                                        (pr_cap + 1) * sizeof(uint64_t));
-                    if (!gap_pr) continue;
-                    gap_pr[0] = nAdd;
-                    size_t pf = 1;
+                    crt_compute_alignment_mpz(nAdd_st);
 
-                    for (size_t j = 0; j < surv_cnt; j++) {
+                    while (mpz_cmp(nAdd_st, crt_end) < 0 && keep_going && !g_abort_pass) {
+                        mpz_add(cand_st, tls_base_mpz, nAdd_st);
+
                         __sync_fetch_and_add(&stats_tested, 1);
-                        if (bn_candidate_is_prime(gap_surv[j])) {
-                            if (pf >= pr_cap + 1) {
-                                pr_cap *= 2;
-                                gap_pr = (uint64_t *)realloc(gap_pr,
-                                            (pr_cap + 1) * sizeof(uint64_t));
-                                if (!gap_pr) break;
-                            }
-                            if (gap_pr) gap_pr[pf++] = gap_surv[j];
+                        if (!bn_is_prime_mpz(cand_st)) {
+                            mpz_add(nAdd_st, nAdd_st, g_crt_primorial_mpz);
+                            continue;
                         }
-                    }
 
-                    if (gap_pr && pf >= 2) {
-                        if (scan_candidates(gap_pr, pf, target, logbase,
-                                            shift, header, rpc_url, rpc_user,
-                                            rpc_pass, rpc_method, rpc_sign_key))
-                        { free(gap_pr); return 0; }
-                    }
-                    free(gap_pr);
-                }
-                /* CRT exhausted; fall through to RPC poll / next pass */
+                        /* Prime found — gap-check sieve */
+                        rebase_for_gap_check(cand_st);
+                        uint64_t gap_L = 2, gap_R = (uint64_t)gap_scan_max;
+                        size_t surv_cnt = 0;
+                        uint64_t *gap_surv = sieve_range(gap_L, gap_R,
+                                                         &surv_cnt, NULL, 0);
+                        __sync_fetch_and_add(&stats_sieved, gap_R - gap_L);
+
+                        if (!gap_surv || surv_cnt == 0) {
+                            set_base_bn(h256_st, shift);
+                            mpz_add(nAdd_st, nAdd_st, g_crt_primorial_mpz);
+                            continue;
+                        }
+
+                        uint64_t next_prime_off = 0;
+                        for (size_t j = 0; j < surv_cnt; j++) {
+                            __sync_fetch_and_add(&stats_tested, 1);
+                            if (bn_candidate_is_prime(gap_surv[j])) {
+                                next_prime_off = gap_surv[j];
+                                break;
+                            }
+                        }
+
+                        set_base_bn(h256_st, shift);
+
+                        if (next_prime_off > 0) {
+                            uint64_t gap = next_prime_off;
+                            double merit = (double)gap / logbase_st;
+                            __sync_fetch_and_add(&stats_pairs, 1);
+                            if (merit >= target) {
+                                __sync_fetch_and_add(&stats_gaps, 1);
+                                char nAdd_s[256];
+                                gmp_snprintf(nAdd_s, sizeof(nAdd_s), "%Zd", nAdd_st);
+                                log_msg("\n>>> GAP FOUND\n"
+                                        "    gap     = %llu\n"
+                                        "    merit   = %.6f  (need >= %.2f)\n"
+                                        "    nShift  = %d\n"
+                                        "    nonce   = %u\n"
+                                        "    nAdd    = %s\n",
+                                        (unsigned long long)gap,
+                                        merit, target, shift,
+                                        (unsigned)nonce_st, nAdd_s);
+#ifdef WITH_RPC
+                                if (rpc_url && !g_abort_pass) {
+                                    char blockhex[16384];
+                                    memset(blockhex, 0, sizeof(blockhex));
+                                    if (assemble_mining_block_mpz(nonce_st,
+                                            nAdd_st, blockhex)) {
+                                        __sync_fetch_and_add(&stats_blocks, 1);
+                                        log_file_only("Built blockhex: %s\n",
+                                                      blockhex);
+                                        if (header_meets_target_hex(blockhex)) {
+                                            log_msg(">>> SUBMITTING to node\n");
+                                            struct submit_job _job;
+                                            memset(&_job, 0, sizeof(_job));
+                                            strncpy(_job.url, rpc_url,
+                                                    sizeof(_job.url)-1);
+                                            strncpy(_job.user,
+                                                    rpc_user ? rpc_user : "",
+                                                    sizeof(_job.user)-1);
+                                            strncpy(_job.pass,
+                                                    rpc_pass ? rpc_pass : "",
+                                                    sizeof(_job.pass)-1);
+                                            strncpy(_job.method, "getwork",
+                                                    sizeof(_job.method)-1);
+                                            memcpy(_job.hex, blockhex,
+                                                   sizeof(_job.hex));
+                                            _job.retries = rpc_default_retries;
+                                            __sync_fetch_and_add(&stats_submits, 1);
+                                            enqueue_job(&_job);
+                                            log_msg(">>> QUEUED for async submit\n");
+                                            print_stats();
+                                        }
+                                    }
+                                }
+#endif
+                            }
+                        }
+
+                        mpz_add(nAdd_st, nAdd_st, g_crt_primorial_mpz);
+                    } /* end CRT candidate loop */
+
+                    nonce_st++;
+                } /* end nonce loop */
+
+                mpz_clears(crt_end, nAdd_st, cand_st, NULL);
                 goto st_rpc_poll;
+#endif /* WITH_RPC — CRT-SOLVER single-thread */
             }
 
             for (int64_t adder=0; adder<num_windows; ++adder) {
@@ -3528,8 +3773,8 @@ int main(int argc, char **argv) {
             for (int t = 0; t < num_threads; t++) {
                 int64_t off  = (int64_t)t * slice;
                 int64_t sz   = (t == num_threads - 1) ? (adder_max - off) : slice;
-                wargs[t].tid               = 0;   /* stride handled internally */
-                wargs[t].nthreads          = 1;
+                wargs[t].tid               = t;
+                wargs[t].nthreads          = num_threads;
                 wargs[t].rpc_thread        = (t == 0) ? 1 : 0;
                 wargs[t].adder_base_offset = off;
                 wargs[t].adder_max         = sz;
