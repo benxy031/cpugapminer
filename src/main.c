@@ -2539,12 +2539,16 @@ static void *worker_fn(void *arg) {
                 }
 
                 /* ── Prime found!  Gap-check sieve ── */
-                /* Rebase sieve state to the confirmed prime position so
-                   sieve_range offsets are small uint64_t values. */
+                /* The odd-only sieve assumes an even base so that
+                   base + odd_offset = odd.  candidate is an odd prime,
+                   so rebase to candidate-1 (even).  Offsets 3,5,7,...
+                   then represent candidate+2, candidate+4, ... (all odd). */
+                mpz_sub_ui(candidate, candidate, 1);
                 rebase_for_gap_check(candidate);
+                mpz_add_ui(candidate, candidate, 1);
 
-                uint64_t gap_L = 2;
-                uint64_t gap_R = (uint64_t)gap_scan_max;
+                uint64_t gap_L = 3;
+                uint64_t gap_R = (uint64_t)gap_scan_max + 1;
                 size_t surv_cnt = 0;
                 uint64_t *gap_surv = sieve_range(gap_L, gap_R, &surv_cnt,
                                                  NULL, 0);
@@ -2558,8 +2562,8 @@ static void *worker_fn(void *arg) {
                 }
 
                 /* Fermat-test gap survivors.
-                   Offsets are relative to the rebased candidate, so
-                   bn_candidate_is_prime(offset) tests candidate+offset. */
+                   Offsets are relative to (candidate-1), so
+                   bn_candidate_is_prime(offset) tests (candidate-1)+offset. */
                 uint64_t next_prime_offset = 0;
                 for (size_t j = 0; j < surv_cnt; j++) {
                     __sync_fetch_and_add(&stats_tested, 1);
@@ -2573,7 +2577,9 @@ static void *worker_fn(void *arg) {
                 set_base_bn(h256_nonce, shift_local);
 
                 if (next_prime_offset > 0) {
-                    uint64_t gap = next_prime_offset;
+                    /* Offset is from (candidate-1); gap from candidate
+                       is one less.  E.g. offset 3 → candidate+2, gap=2. */
+                    uint64_t gap = next_prime_offset - 1;
                     double merit = (double)gap / logbase_nonce;
 
                     __sync_fetch_and_add(&stats_pairs, 1);
@@ -3543,9 +3549,13 @@ int main(int argc, char **argv) {
                             continue;
                         }
 
-                        /* Prime found — gap-check sieve */
+                        /* Prime found — gap-check sieve.
+                           Rebase to cand_st-1 (even) so the odd-only sieve
+                           produces odd positions: (cand-1)+3=cand+2, etc. */
+                        mpz_sub_ui(cand_st, cand_st, 1);
                         rebase_for_gap_check(cand_st);
-                        uint64_t gap_L = 2, gap_R = (uint64_t)gap_scan_max;
+                        mpz_add_ui(cand_st, cand_st, 1);
+                        uint64_t gap_L = 3, gap_R = (uint64_t)gap_scan_max + 1;
                         size_t surv_cnt = 0;
                         uint64_t *gap_surv = sieve_range(gap_L, gap_R,
                                                          &surv_cnt, NULL, 0);
@@ -3569,7 +3579,7 @@ int main(int argc, char **argv) {
                         set_base_bn(h256_st, shift);
 
                         if (next_prime_off > 0) {
-                            uint64_t gap = next_prime_off;
+                            uint64_t gap = next_prime_off - 1;
                             double merit = (double)gap / logbase_st;
                             __sync_fetch_and_add(&stats_pairs, 1);
                             if (merit >= target) {
