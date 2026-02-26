@@ -31,7 +31,12 @@ tests/
 scripts/
   inspect_tx.py     - Python utility to decode raw block/transaction hex
                       files written to /tmp by the miner
-crt_s64_m21.txt     - production CRT file: 15 primes, shift 64, merit 21
+crt/
+  crt_s64_m21.txt   - production CRT file: 15 primes, shift 64, merit 21
+  crt_7.bin          - legacy binary CRT template (7 primes)
+  crt_8.bin          - legacy binary CRT template (8 primes)
+  crt_s512_m22.txt   - CRT file: 75 primes, shift 512, merit 22
+  crt_s640_m22.txt   - CRT file: 89 primes, shift 640, merit 22
 Makefile
 ```
 
@@ -129,7 +134,7 @@ bin/gap_miner \
   --shift 64 \
   --threads 6 \
   --fast-fermat \
-  --crt-file crt_s64_m21.txt
+  --crt-file crt/crt_s64_m21.txt
 ```
 
 Capture output to a file as well:
@@ -512,7 +517,7 @@ make gen_crt
 ./bin/gen_crt --calc-ctr \
   --ctr-primes 15 --ctr-merit 21 --ctr-bits 4 \
   --ctr-strength 200 --ctr-evolution --ctr-ivs 30 \
-  --ctr-range 0 --ctr-file crt_s64_m21.txt
+  --ctr-range 0 --ctr-file crt/crt_s64_m21.txt
 ```
 
 Key parameters:

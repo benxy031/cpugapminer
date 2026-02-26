@@ -191,7 +191,7 @@ Expected: ~750 candidates. Run time: ~30s with evolution.
 ./bin/gen_crt --calc-ctr \
   --ctr-primes 75 --ctr-merit 22 --ctr-bits 2 \
   --ctr-strength 100 --ctr-evolution --ctr-fixed 10 --ctr-ivs 20 \
-  --ctr-file crt_s512_m22.txt
+  --ctr-file crt/crt_s512_m22.txt
 ```
 
 Expected: ~800 candidates.
@@ -202,7 +202,7 @@ Expected: ~800 candidates.
 ./bin/gen_crt --calc-ctr \
   --ctr-primes 89 --ctr-merit 22 --ctr-bits 8 \
   --ctr-strength 100 --ctr-evolution --ctr-fixed 12 --ctr-ivs 20 \
-  --ctr-file crt_s640_m22.txt
+  --ctr-file crt/crt_s640_m22.txt
 ```
 
 ### Shift 768 (merit 22)
