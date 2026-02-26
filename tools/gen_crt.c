@@ -1,277 +1,564 @@
 /*
- * gen_crt -- Generate a CRT (Chinese Remainder Theorem) sieve file
+ * gen_crt.c  –  CRT (Chinese Remainder Theorem) gap solver for Gapcoin mining
  *
- * Computes all integers in [0, primorial) that are coprime to the
- * primorial of the first N primes, then writes them to a binary file
- * for use by the gap miner (--crt-file option).
+ * Two-phase algorithm compatible with GapMiner --calc-ctr parameters:
  *
- * The miner uses this to replace the small-prime sieve phase with a
- * precomputed template, eliminating strided memory accesses for the
- * first N primes.
+ *   Phase 1 (Greedy):  For each prime p_i in order, pick the offset o_i
+ *                       (0 ≤ o_i < p_i) that covers the most currently-
+ *                       uncovered positions in the gap range [1, G].
+ *                       Repeated with random tie-breaking (--ctr-strength).
  *
- * Usage:
- *   gen_crt --primes 7 --output crt_7.bin
- *   gen_crt --primes 8 --output crt_8.bin
+ *   Phase 2 (Evolution): Refine the greedy population via tournament
+ *                         selection, uniform crossover, mutation, and
+ *                         local-search on non-fixed primes (--ctr-fixed).
+ *
+ * A position d ∈ [1, G] is "covered" by prime p_i with offset o_i when
+ * d ≡ o_i (mod p_i).  The miner then only searches starting values n such
+ * that (-n mod p_i) = o_i for all CRT primes (unique via CRT modulo the
+ * primorial).  Positions not covered by any CRT prime are "candidates"
+ * that must be eliminated by the sieve of larger primes + Fermat testing.
+ *
+ * Output: human-readable text file consumed by the miner (--crt-file).
  *
  * Build:
  *   make gen_crt
  *
- * File format (little-endian):
- *   bytes  0- 3:  magic "CRT1"
- *   bytes  4- 7:  n_primes       (uint32_t)
- *   bytes  8-15:  primorial      (uint64_t)
- *   bytes 16-23:  n_candidates   (uint64_t)  -- coprime residues
- *   bytes 24...:  offsets[]      (uint32_t × n_candidates, sorted)
- *                 each offset is an ODD value in [1, primorial) coprime to primorial
+ * Example:
+ *   gen_crt --calc-ctr --ctr-primes 24 --ctr-merit 22 --ctr-bits 14 \
+ *           --ctr-strength 100 --ctr-evolution --ctr-fixed 8       \
+ *           --ctr-ivs 20 --ctr-file crt_24.txt
  */
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <getopt.h>
+#include <limits.h>
 
-/* First 14 primes (primorial of 14 primes = 614889782588491410 > 2^59) */
-static const uint64_t PRIMES[] = {
-    2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43
+/* ------------------------------------------------------------------ */
+/* First 200 primes (covers up to prime 1223, log2 primorial ~ 1588)  */
+/* ------------------------------------------------------------------ */
+static const int PRIMES[] = {
+      2,   3,   5,   7,  11,  13,  17,  19,  23,  29,
+     31,  37,  41,  43,  47,  53,  59,  61,  67,  71,
+     73,  79,  83,  89,  97, 101, 103, 107, 109, 113,
+    127, 131, 137, 139, 149, 151, 157, 163, 167, 173,
+    179, 181, 191, 193, 197, 199, 211, 223, 227, 229,
+    233, 239, 241, 251, 257, 263, 269, 271, 277, 281,
+    283, 293, 307, 311, 313, 317, 331, 337, 347, 349,
+    353, 359, 367, 373, 379, 383, 389, 397, 401, 409,
+    419, 421, 431, 433, 439, 443, 449, 457, 461, 463,
+    467, 479, 487, 491, 499, 503, 509, 521, 523, 541,
+    547, 557, 563, 569, 571, 577, 587, 593, 599, 601,
+    607, 613, 617, 619, 631, 641, 643, 647, 653, 659,
+    661, 673, 677, 683, 691, 701, 709, 719, 727, 733,
+    739, 743, 751, 757, 761, 769, 773, 787, 797, 809,
+    811, 821, 823, 827, 829, 839, 853, 857, 859, 863,
+    877, 881, 883, 887, 907, 911, 919, 929, 937, 941,
+    947, 953, 967, 971, 977, 983, 991, 997,1009,1013,
+   1019,1021,1031,1033,1039,1049,1051,1061,1063,1069,
+   1087,1091,1093,1097,1103,1109,1117,1123,1129,1151,
+   1153,1163,1171,1181,1187,1193,1201,1213,1217,1223
 };
-#define MAX_PRIMES 14
+#define N_PRIMES_AVAIL ((int)(sizeof(PRIMES) / sizeof(PRIMES[0])))
 
-/* ---- CRT file header (24 bytes) ---- */
-struct crt_header {
-    char     magic[4];       /* "CRT1" */
-    uint32_t n_primes;
-    uint64_t primorial;
-    uint64_t n_candidates;
-};
+/* ------------------------------------------------------------------ */
+/* Solution: a set of offsets and its fitness (n_candidates)           */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    int  n_primes;
+    int  gap_size;
+    int *offsets;       /* offsets[i] for PRIMES[i], 0 <= o < p_i */
+    int  n_candidates;  /* uncovered positions in [1, gap_size]   */
+} Solution;
 
-static void usage(const char *prog) {
-    fprintf(stderr,
-        "Usage: %s [options]\n"
-        "\n"
-        "Options:\n"
-        "  --primes N    Number of primes in the primorial (2..10, default 7)\n"
-        "  --output FILE Output file path (default: crt.bin)\n"
-        "  --info        Show statistics only, don't write file\n"
-        "  --help        Show this help\n"
-        "\n"
-        "Recommended settings:\n"
-        "  N=7  primorial=  510,510   template=32KB (L1)  survivors=18.1%%\n"
-        "  N=8  primorial=9,699,690   template=606KB(L2)  survivors=17.1%%\n"
-        "  N=9  primorial=223,092,870 template=14MB (L3)  survivors=16.4%%\n"
-        "\n"
-        "For sieve_size=20M:\n"
-        "  N=7: 39 repetitions per window (ideal)\n"
-        "  N=8:  2 repetitions per window (OK)\n"
-        "  N=9:  0 repetitions -- primorial > sieve_size (not recommended)\n",
-        prog);
+/* ---- helpers ---- */
+
+static double primorial_log2(int n) {
+    double s = 0.0;
+    for (int i = 0; i < n && i < N_PRIMES_AVAIL; i++)
+        s += log2((double)PRIMES[i]);
+    return s;
 }
 
-int main(int argc, char **argv) {
-    int n_primes = 7;
-    const char *output = "crt.bin";
-    int info_only = 0;
+static Solution sol_alloc(int n_primes, int gap_size) {
+    Solution s;
+    s.n_primes     = n_primes;
+    s.gap_size     = gap_size;
+    s.offsets      = (int *)malloc((size_t)n_primes * sizeof(int));
+    s.n_candidates = INT_MAX;
+    if (!s.offsets) { perror("malloc"); exit(1); }
+    return s;
+}
 
-    for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--primes") && i + 1 < argc)
-            n_primes = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--output") && i + 1 < argc)
-            output = argv[++i];
-        else if (!strcmp(argv[i], "--info"))
-            info_only = 1;
-        else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
-            usage(argv[0]); return 0;
+static Solution sol_clone(const Solution *src) {
+    Solution c = sol_alloc(src->n_primes, src->gap_size);
+    memcpy(c.offsets, src->offsets, (size_t)src->n_primes * sizeof(int));
+    c.n_candidates = src->n_candidates;
+    return c;
+}
+
+static void sol_free(Solution *s) {
+    free(s->offsets);
+    s->offsets = NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Evaluate: count uncovered positions in [1, gap_size].              */
+/* Uses caller-owned buffer buf[0..gap_size] (uint8_t).               */
+/* ------------------------------------------------------------------ */
+static int evaluate(const int *offsets, int n_primes, int gap_size,
+                    uint8_t *buf) {
+    memset(buf, 0, (size_t)(gap_size + 1));
+    for (int i = 0; i < n_primes; i++) {
+        int p = PRIMES[i];
+        int o = offsets[i] % p;
+        /* positions d == o (mod p), d in [1, gap_size] */
+        for (int d = (o ? o : p); d <= gap_size; d += p)
+            buf[d] = 1;
+    }
+    int cnt = 0;
+    for (int d = 1; d <= gap_size; d++)
+        if (!buf[d]) cnt++;
+    return cnt;
+}
+
+/* ------------------------------------------------------------------ */
+/* Greedy algorithm: assign offsets one prime at a time, choosing the  */
+/* offset that covers the most currently-uncovered gap positions.      */
+/* Ties are broken randomly (reservoir sampling) for diversity.        */
+/* ------------------------------------------------------------------ */
+static void greedy_solve(int *offsets, int n_primes, int gap_size,
+                         uint8_t *buf) {
+    memset(buf, 0, (size_t)(gap_size + 1));
+
+    for (int i = 0; i < n_primes; i++) {
+        int p = PRIMES[i];
+        int best_o = 0, best_new = -1, ties = 0;
+
+        for (int o = 0; o < p; o++) {
+            int new_cov = 0;
+            for (int d = (o ? o : p); d <= gap_size; d += p)
+                if (!buf[d]) new_cov++;
+
+            if (new_cov > best_new) {
+                best_new = new_cov;
+                best_o   = o;
+                ties     = 1;
+            } else if (new_cov == best_new) {
+                ties++;
+                if (rand() % ties == 0) best_o = o;
+            }
+        }
+
+        offsets[i] = best_o;
+        for (int d = (best_o ? best_o : p); d <= gap_size; d += p)
+            buf[d] = 1;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Local search: for one prime, find the best offset given all others. */
+/* Returns 1 if the offset changed.                                    */
+/* ------------------------------------------------------------------ */
+static int local_search_one(int *offsets, int n_primes, int gap_size,
+                            int idx, uint8_t *buf) {
+    /* mark covered by all primes except idx */
+    memset(buf, 0, (size_t)(gap_size + 1));
+    for (int i = 0; i < n_primes; i++) {
+        if (i == idx) continue;
+        int p = PRIMES[i];
+        int o = offsets[i] % p;
+        for (int d = (o ? o : p); d <= gap_size; d += p)
+            buf[d] = 1;
+    }
+    /* find best offset for prime at idx */
+    int p = PRIMES[idx];
+    int best_o = offsets[idx], best_new = -1;
+    for (int o = 0; o < p; o++) {
+        int cnt = 0;
+        for (int d = (o ? o : p); d <= gap_size; d += p)
+            if (!buf[d]) cnt++;
+        if (cnt > best_new) {
+            best_new = cnt;
+            best_o   = o;
+        }
+    }
+    int changed = (best_o != offsets[idx]);
+    offsets[idx] = best_o;
+    return changed;
+}
+
+/* forward declarations (needed by evolve) */
+static int evaluate(const int *offsets, int n_primes, int gap_size,
+                    uint8_t *buf);
+static void greedy_solve(int *offsets, int n_primes, int gap_size,
+                         uint8_t *buf);
+static int local_search_one(int *offsets, int n_primes, int gap_size,
+                            int idx, uint8_t *buf);
+
+/* ------------------------------------------------------------------ */
+/* Evolutionary algorithm                                              */
+/* Tournament selection, uniform crossover on non-fixed primes,        */
+/* random mutation + local-search refinement.                          */
+/* ------------------------------------------------------------------ */
+static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
+                   int fixed, int max_gens) {
+    int     *child = (int *)malloc((size_t)n_primes * sizeof(int));
+    uint8_t *buf   = (uint8_t *)calloc((size_t)(gap_size + 1), 1);
+    if (!child || !buf) { perror("alloc"); exit(1); }
+
+    int best_ever = INT_MAX;
+    for (int i = 0; i < pop_size; i++)
+        if (pop[i].n_candidates < best_ever)
+            best_ever = pop[i].n_candidates;
+
+    int stale = 0;
+
+    for (int gen = 0; gen < max_gens; gen++) {
+        /* tournament select two parents */
+        int a = rand() % pop_size, b = rand() % pop_size;
+        int p1 = (pop[a].n_candidates <= pop[b].n_candidates) ? a : b;
+        a = rand() % pop_size; b = rand() % pop_size;
+        int p2 = (pop[a].n_candidates <= pop[b].n_candidates) ? a : b;
+
+        /* uniform crossover */
+        for (int i = 0; i < n_primes; i++) {
+            if (i < fixed)
+                child[i] = pop[p1].offsets[i];
+            else
+                child[i] = (rand() & 1) ? pop[p1].offsets[i]
+                                         : pop[p2].offsets[i];
+        }
+
+        /* random mutation: ~2/n probability per non-fixed prime */
+        for (int i = fixed; i < n_primes; i++) {
+            if (rand() % n_primes < 2)
+                child[i] = rand() % PRIMES[i];
+        }
+
+        /* local-search refinement (10% of generations) */
+        if (rand() % 10 == 0 && fixed < n_primes) {
+            int idx = fixed + rand() % (n_primes - fixed);
+            local_search_one(child, n_primes, gap_size, idx, buf);
+        }
+
+        /* evaluate */
+        int fitness = evaluate(child, n_primes, gap_size, buf);
+
+        /* replace worst if child is better */
+        int worst = 0;
+        for (int i = 1; i < pop_size; i++)
+            if (pop[i].n_candidates > pop[worst].n_candidates)
+                worst = i;
+
+        if (fitness < pop[worst].n_candidates) {
+            memcpy(pop[worst].offsets, child, (size_t)n_primes * sizeof(int));
+            pop[worst].n_candidates = fitness;
+        }
+
+        if (fitness < best_ever) {
+            best_ever = fitness;
+            stale = 0;
         } else {
-            fprintf(stderr, "Unknown option: %s\n", argv[i]);
-            usage(argv[0]); return 1;
+            stale++;
+        }
+
+        /* progress */
+        if ((gen + 1) % 10000 == 0 || gen == max_gens - 1) {
+            fprintf(stderr, "\r  evolution: gen %d/%d  best=%d  stale=%d     ",
+                    gen + 1, max_gens, best_ever, stale);
+            fflush(stderr);
+        }
+
+        /* early stop if no improvement for a long time */
+        if (stale > max_gens / 4 && stale > 50000) break;
+    }
+
+    fprintf(stderr, "\n");
+    free(child);
+    free(buf);
+}
+
+/* ------------------------------------------------------------------ */
+/* Write CRT text file                                                 */
+/* ------------------------------------------------------------------ */
+static void write_crt_file(const char *path, const Solution *sol,
+                           double merit, int shift) {
+    FILE *f = fopen(path, "w");
+    if (!f) { perror(path); exit(1); }
+
+    fprintf(f, "# CRT sieve file generated by cpugapminer gen_crt\n");
+    fprintf(f, "n_primes %d\n", sol->n_primes);
+    fprintf(f, "merit %.2f\n", merit);
+    fprintf(f, "shift %d\n", shift);
+    fprintf(f, "gap_target %d\n", sol->gap_size);
+    fprintf(f, "n_candidates %d\n", sol->n_candidates);
+
+    for (int i = 0; i < sol->n_primes; i++)
+        fprintf(f, "%d %d\n", PRIMES[i], sol->offsets[i]);
+
+    fclose(f);
+    fprintf(stderr, "wrote %s  (%d primes, %d candidates)\n",
+            path, sol->n_primes, sol->n_candidates);
+}
+
+/* ------------------------------------------------------------------ */
+/* CLI help                                                            */
+/* ------------------------------------------------------------------ */
+static void usage(const char *prog) {
+    fprintf(stderr,
+        "Usage: %s --calc-ctr [options]\n"
+        "\n"
+        "CRT gap solver -- generates optimised prime offsets for gap mining.\n"
+        "\n"
+        "  --calc-ctr            Enable CRT calculation mode\n"
+        "  --ctr-primes N        Number of CRT primes (default: 14)\n"
+        "  --ctr-merit  M        Target merit (default: 22.0)\n"
+        "  --ctr-bits   B        Extra bits: shift - log2(primorial) (default: 0)\n"
+        "  --ctr-strength S      Greedy restarts / quality (default: 50)\n"
+        "  --ctr-evolution       Enable evolutionary refinement\n"
+        "  --ctr-fixed  F        Primes frozen during evolution (default: 8)\n"
+        "  --ctr-ivs    I        Population size for evolution (default: 10)\n"
+        "  --ctr-range  R        Percent deviation from n_primes (default: 0)\n"
+        "  --ctr-file   FILE     Output CRT file path (required)\n"
+        "  --help                Show this help\n"
+        "\n"
+        "Gap size = ceil(merit * (256 + shift) * ln2)\n"
+        "Minimum shift = ceil(log2(p1 * p2 * ... * pN)) + ctr-bits\n"
+        "\n"
+        "Example -- 24 primes for shift 128, merit 22:\n"
+        "  %s --calc-ctr --ctr-primes 24 --ctr-merit 22 --ctr-bits 14 \\\n"
+        "     --ctr-strength 100 --ctr-evolution --ctr-fixed 8 --ctr-ivs 20 \\\n"
+        "     --ctr-file crt_24.txt\n"
+        "\n"
+        "Tip: the original GapMiner docs recommend ctr-merit = target_merit - 1\n"
+        "     for best sieving results.\n",
+        prog, prog);
+}
+
+/* ------------------------------------------------------------------ */
+/* Main                                                                */
+/* ------------------------------------------------------------------ */
+int main(int argc, char **argv) {
+    /* defaults */
+    int    ctr_primes   = 14;
+    double ctr_merit    = 22.0;
+    int    ctr_bits     = 0;
+    int    ctr_strength = 50;
+    bool   ctr_evolution = false;
+    int    ctr_fixed    = 8;
+    int    ctr_ivs      = 10;
+    int    ctr_range    = 0;
+    char  *ctr_file     = NULL;
+
+    static struct option long_opts[] = {
+        {"calc-ctr",       no_argument,       NULL, 'C'},
+        {"ctr-primes",     required_argument, NULL, 'p'},
+        {"ctr-merit",      required_argument, NULL, 'm'},
+        {"ctr-bits",       required_argument, NULL, 'b'},
+        {"ctr-strength",   required_argument, NULL, 's'},
+        {"ctr-evolution",  no_argument,       NULL, 'e'},
+        {"ctr-fixed",      required_argument, NULL, 'f'},
+        {"ctr-ivs",        required_argument, NULL, 'i'},
+        {"ctr-range",      required_argument, NULL, 'r'},
+        {"ctr-file",       required_argument, NULL, 'o'},
+        {"help",           no_argument,       NULL, 'h'},
+        {NULL, 0, NULL, 0}
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "Cp:m:b:s:ef:i:r:o:h",
+                              long_opts, NULL)) != -1) {
+        switch (opt) {
+        case 'C': /* --calc-ctr: accepted for compat, always active */ break;
+        case 'p': ctr_primes   = atoi(optarg); break;
+        case 'm': ctr_merit    = atof(optarg); break;
+        case 'b': ctr_bits     = atoi(optarg); break;
+        case 's': ctr_strength = atoi(optarg); break;
+        case 'e': ctr_evolution = true;         break;
+        case 'f': ctr_fixed    = atoi(optarg); break;
+        case 'i': ctr_ivs      = atoi(optarg); break;
+        case 'r': ctr_range    = atoi(optarg); break;
+        case 'o': ctr_file     = optarg;        break;
+        case 'h': usage(argv[0]); return 0;
+        default:  usage(argv[0]); return 1;
         }
     }
 
-    if (n_primes < 2 || n_primes > 10) {
-        fprintf(stderr, "Error: --primes must be 2..10 (primorial must fit in uint64 and "
-                        "template must fit in memory)\n");
+    if (!ctr_file) {
+        fprintf(stderr, "error: --ctr-file is required\n\n");
+        usage(argv[0]);
         return 1;
     }
-
-    /* ---- Compute primorial ---- */
-    uint64_t primorial = 1;
-    printf("Primes:");
-    for (int i = 0; i < n_primes; i++) {
-        printf(" %llu", (unsigned long long)PRIMES[i]);
-        primorial *= PRIMES[i];
-    }
-    printf("\nPrimorial: %llu\n", (unsigned long long)primorial);
-
-    /* Euler totient ratio = product of (1 - 1/p) */
-    double surv_ratio = 1.0;
-    for (int i = 0; i < n_primes; i++)
-        surv_ratio *= (1.0 - 1.0 / (double)PRIMES[i]);
-    uint64_t expected = (uint64_t)(surv_ratio * (double)primorial + 0.5);
-    printf("Survivor ratio: %.4f%%\n", surv_ratio * 100.0);
-    printf("Expected survivors: %llu (Euler totient)\n",
-           (unsigned long long)expected);
-
-    /* Template size (odd-only bitmap) */
-    size_t tmpl_bits = primorial / 2;
-    size_t tmpl_bytes = (tmpl_bits + 7) / 8;
-    printf("Odd-only template: %zu bits = %zu bytes", tmpl_bits, tmpl_bytes);
-    if (tmpl_bytes < 64 * 1024)
-        printf(" (fits in L1 cache)\n");
-    else if (tmpl_bytes < 1024 * 1024)
-        printf(" (fits in L2 cache)\n");
-    else if (tmpl_bytes < 32 * 1024 * 1024)
-        printf(" (fits in L3 cache)\n");
-    else
-        printf(" (WARNING: larger than typical L3)\n");
-
-    /* Sieve window coverage */
-    printf("Repetitions per 20M sieve window: %llu\n",
-           (unsigned long long)(20000000ULL / primorial));
-
-    /* ---- Sieve: mark composites ---- */
-    printf("\nSieving %llu residues...\n", (unsigned long long)primorial);
-    clock_t t0 = clock();
-
-    /* Byte array: composite[x] = 1 means x shares a factor with primorial */
-    uint8_t *composite = (uint8_t *)calloc(primorial, 1);
-    if (!composite) {
-        fprintf(stderr, "Error: cannot allocate %llu bytes for sieve\n",
-                (unsigned long long)primorial);
+    if (ctr_primes < 2 || ctr_primes > N_PRIMES_AVAIL) {
+        fprintf(stderr, "error: --ctr-primes must be 2..%d\n", N_PRIMES_AVAIL);
         return 1;
     }
+    if (ctr_merit <= 0) {
+        fprintf(stderr, "error: --ctr-merit must be > 0\n");
+        return 1;
+    }
+    if (ctr_fixed < 0) ctr_fixed = 0;
+    if (ctr_fixed > ctr_primes) ctr_fixed = ctr_primes;
+    if (ctr_ivs < 2) ctr_ivs = 2;
+    if (ctr_strength < 1) ctr_strength = 1;
 
-    composite[0] = 1; /* 0 is divisible by everything */
-    for (int i = 0; i < n_primes; i++) {
-        uint64_t p = PRIMES[i];
-        for (uint64_t j = p; j < primorial; j += p)
-            composite[j] = 1;
+    /* ---- derived parameters ---- */
+    double prim_bits = primorial_log2(ctr_primes);
+    int    shift     = (int)ceil(prim_bits) + ctr_bits;
+    int    gap_size  = (int)ceil(ctr_merit * (256.0 + (double)shift) * log(2.0));
+
+    fprintf(stderr, "CRT gap solver\n");
+    fprintf(stderr, "  primes      : %d  (2 .. %d)\n",
+            ctr_primes, PRIMES[ctr_primes - 1]);
+    fprintf(stderr, "  primorial   : %.1f bits\n", prim_bits);
+    fprintf(stderr, "  ctr-bits    : %d\n", ctr_bits);
+    fprintf(stderr, "  shift       : %d\n", shift);
+    fprintf(stderr, "  merit       : %.2f\n", ctr_merit);
+    fprintf(stderr, "  gap target  : %d\n", gap_size);
+    fprintf(stderr, "  strength    : %d  (greedy restarts)\n", ctr_strength);
+    if (ctr_evolution)
+        fprintf(stderr, "  evolution   : ivs=%d  fixed=%d\n",
+                ctr_ivs, ctr_fixed);
+    if (ctr_range > 0)
+        fprintf(stderr, "  range       : +/-%d%%  (primes %d..%d)\n",
+                ctr_range,
+                ctr_primes - ctr_primes * ctr_range / 100,
+                ctr_primes + ctr_primes * ctr_range / 100);
+    fprintf(stderr, "\n");
+
+    srand((unsigned)time(NULL));
+
+    /* ---- range of prime counts to explore ---- */
+    int lo_np = ctr_primes, hi_np = ctr_primes;
+    if (ctr_range > 0) {
+        int dev = ctr_primes * ctr_range / 100;
+        if (dev < 1) dev = 1;
+        lo_np = ctr_primes - dev;
+        hi_np = ctr_primes + dev;
+        if (lo_np < 2)              lo_np = 2;
+        if (hi_np > N_PRIMES_AVAIL) hi_np = N_PRIMES_AVAIL;
     }
 
-    /* ---- Collect ODD coprime residues ---- */
-    /* Count first */
-    uint64_t n_candidates = 0;
-    for (uint64_t x = 1; x < primorial; x += 2)
-        if (!composite[x]) n_candidates++;
+    Solution global_best;
+    global_best.offsets      = NULL;
+    global_best.n_candidates = INT_MAX;
+    global_best.n_primes     = 0;
+    global_best.gap_size     = 0;
 
-    printf("Odd coprime residues: %llu (of %llu odd values = %.2f%%)\n",
-           (unsigned long long)n_candidates,
-           (unsigned long long)(primorial / 2),
-           100.0 * (double)n_candidates / (double)(primorial / 2));
+    for (int np = lo_np; np <= hi_np; np++) {
+        double pb = primorial_log2(np);
+        int    sh = (int)ceil(pb) + ctr_bits;
+        int    gs = (int)ceil(ctr_merit * (256.0 + (double)sh) * log(2.0));
 
-    /* Collect into array */
-    uint32_t *offsets = (uint32_t *)malloc(n_candidates * sizeof(uint32_t));
-    if (!offsets) {
-        fprintf(stderr, "Error: cannot allocate offset array\n");
-        free(composite); return 1;
-    }
+        if (lo_np != hi_np)
+            fprintf(stderr, "--- %d primes  (shift=%d, gap=%d) ---\n",
+                    np, sh, gs);
 
-    uint64_t k = 0;
-    for (uint64_t x = 1; x < primorial; x += 2)
-        if (!composite[x]) offsets[k++] = (uint32_t)x;
+        /* allocate shared work buffer */
+        uint8_t *buf = (uint8_t *)calloc((size_t)(gs + 1), 1);
+        if (!buf) { perror("calloc"); exit(1); }
 
-    free(composite);
-    clock_t t1 = clock();
-    printf("Sieve completed in %.2f s\n",
-           (double)(t1 - t0) / CLOCKS_PER_SEC);
+        /* population size for evolution (or just 1 if no evolution) */
+        int pop_size = ctr_evolution ? ctr_ivs : 1;
+        if (pop_size > ctr_strength) pop_size = ctr_strength;
 
-    /* ---- Gap analysis ---- */
-    printf("\n--- Gap analysis (between consecutive coprime residues) ---\n");
+        Solution *pop = (Solution *)calloc((size_t)pop_size, sizeof(Solution));
+        for (int i = 0; i < pop_size; i++)
+            pop[i] = sol_alloc(np, gs);
 
-    uint64_t max_gap = 0, max_gap_start = 0;
-    double sum_gap = 0;
-    uint64_t min_gap = primorial;
+        /* ---- Phase 1: greedy restarts, keep best pop_size ---- */
+        int *tmp = (int *)malloc((size_t)np * sizeof(int));
+        for (int r = 0; r < ctr_strength; r++) {
+            unsigned seed = (unsigned)time(NULL) ^ ((unsigned)r * 2654435761u)
+                            ^ (unsigned)rand();
+            srand(seed);
+            greedy_solve(tmp, np, gs, buf);
+            int nc = evaluate(tmp, np, gs, buf);
 
-    /* Gaps between consecutive odd coprime residues */
-    for (uint64_t i = 0; i + 1 < n_candidates; i++) {
-        uint64_t gap = offsets[i + 1] - offsets[i];
-        sum_gap += gap;
-        if (gap > max_gap) { max_gap = gap; max_gap_start = offsets[i]; }
-        if (gap < min_gap) min_gap = gap;
-    }
-    /* Wrap-around gap */
-    uint64_t wrap = (primorial - offsets[n_candidates - 1]) + offsets[0];
-    if (wrap > max_gap) { max_gap = wrap; max_gap_start = offsets[n_candidates - 1]; }
-    if (wrap < min_gap) min_gap = wrap;
+            /* insert into population if better than worst */
+            int worst = 0;
+            for (int i = 1; i < pop_size; i++)
+                if (pop[i].n_candidates > pop[worst].n_candidates)
+                    worst = i;
 
-    printf("Minimum gap: %llu\n", (unsigned long long)min_gap);
-    printf("Average gap: %.2f\n", (double)primorial / (double)n_candidates);
-    printf("Maximum gap (Jacobsthal): %llu (starts at offset %llu)\n",
-           (unsigned long long)max_gap, (unsigned long long)max_gap_start);
+            if (nc < pop[worst].n_candidates) {
+                memcpy(pop[worst].offsets, tmp, (size_t)np * sizeof(int));
+                pop[worst].n_candidates = nc;
+            }
 
-    /* Gap distribution histogram */
-    uint64_t gap_bins[] = {2, 4, 6, 10, 20, 30, 50, 100, 200, 500, 0};
-    printf("\nGap size distribution:\n");
-    for (int b = 0; gap_bins[b]; b++) {
-        uint64_t lo = (b == 0) ? 0 : gap_bins[b - 1];
-        uint64_t hi = gap_bins[b];
-        uint64_t cnt = 0;
-        for (uint64_t i = 0; i + 1 < n_candidates; i++) {
-            uint64_t g = offsets[i + 1] - offsets[i];
-            if (g >= lo && g < hi) cnt++;
+            if ((r + 1) % 5 == 0 || r == ctr_strength - 1) {
+                int best_nc = INT_MAX;
+                for (int i = 0; i < pop_size; i++)
+                    if (pop[i].n_candidates < best_nc)
+                        best_nc = pop[i].n_candidates;
+                fprintf(stderr,
+                    "\r  greedy: %d/%d restarts  best=%d candidates     ",
+                    r + 1, ctr_strength, best_nc);
+                fflush(stderr);
+            }
         }
-        if (cnt > 0)
-            printf("  [%3llu, %3llu):  %llu gaps (%.1f%%)\n",
-                   (unsigned long long)lo, (unsigned long long)hi,
-                   (unsigned long long)cnt,
-                   100.0 * (double)cnt / (double)(n_candidates - 1));
-    }
-    {
-        uint64_t lo = gap_bins[0];
-        for (int b = 0; gap_bins[b]; b++) lo = gap_bins[b];
-        uint64_t cnt = 0;
-        for (uint64_t i = 0; i + 1 < n_candidates; i++) {
-            uint64_t g = offsets[i + 1] - offsets[i];
-            if (g >= lo) cnt++;
-        }
-        if (cnt > 0)
-            printf("  [%3llu, inf):  %llu gaps (%.1f%%)\n",
-                   (unsigned long long)lo, (unsigned long long)cnt,
-                   100.0 * (double)cnt / (double)(n_candidates - 1));
-    }
+        free(tmp);
+        fprintf(stderr, "\n");
 
-    /* ---- Recommendations ---- */
-    printf("\n--- Mining recommendations ---\n");
-    printf("For shift=37, target≈20.89:\n");
-    double logbase37 = (256.0 + 37.0) * log(2.0);
-    uint64_t needed37 = (uint64_t)(20.89 * logbase37);
-    printf("  Needed gap for merit 20.89: %llu\n", (unsigned long long)needed37);
-    printf("  Max primorial gap (Jacobsthal): %llu (%.1f%% of needed)\n",
-           (unsigned long long)max_gap,
-           100.0 * (double)max_gap / (double)needed37);
-    printf("  CRT provides a \"head start\" of up to %llu composites\n",
-           (unsigned long long)max_gap);
-    printf("  Primary benefit: replaces small-prime sieve with fast template tiling\n");
+        /* ---- Phase 2: evolution ---- */
+        if (ctr_evolution && pop_size > 1) {
+            /* re-seed so evolution is not deterministic */
+            srand((unsigned)time(NULL) ^ 0xBEEFCAFE);
 
-    /* ---- Write file ---- */
-    if (!info_only) {
-        FILE *fp = fopen(output, "wb");
-        if (!fp) {
-            perror(output);
-            free(offsets); return 1;
+            int adj_fixed = ctr_fixed;
+            if (adj_fixed > np) adj_fixed = np;
+
+            /* adaptive generation count */
+            int gens = np * pop_size * 5000;
+            if (gens < 100000)  gens = 100000;
+            if (gens > 2000000) gens = 2000000;
+
+            evolve(pop, pop_size, np, gs, adj_fixed, gens);
         }
 
-        struct crt_header hdr;
-        memcpy(hdr.magic, "CRT1", 4);
-        hdr.n_primes    = (uint32_t)n_primes;
-        hdr.primorial   = primorial;
-        hdr.n_candidates = n_candidates;
+        /* ---- find best in population ---- */
+        int best_idx = 0;
+        for (int i = 1; i < pop_size; i++)
+            if (pop[i].n_candidates < pop[best_idx].n_candidates)
+                best_idx = i;
 
-        fwrite(&hdr, sizeof(hdr), 1, fp);
-        fwrite(offsets, sizeof(uint32_t), n_candidates, fp);
-        fclose(fp);
+        if (pop[best_idx].n_candidates < global_best.n_candidates) {
+            if (global_best.offsets) sol_free(&global_best);
+            global_best = sol_clone(&pop[best_idx]);
+        }
 
-        size_t file_size = sizeof(hdr) + n_candidates * sizeof(uint32_t);
-        printf("\nWrote %s\n", output);
-        printf("  Header: %zu bytes\n", sizeof(hdr));
-        printf("  Offsets: %llu × 4 bytes = %llu bytes\n",
-               (unsigned long long)n_candidates,
-               (unsigned long long)(n_candidates * sizeof(uint32_t)));
-        printf("  Total: %zu bytes (%.1f KB)\n", file_size,
-               (double)file_size / 1024.0);
+        for (int i = 0; i < pop_size; i++) sol_free(&pop[i]);
+        free(pop);
+        free(buf);
     }
 
-    free(offsets);
-    printf("\nDone.\n");
+    /* ---- Summary ---- */
+    double pb = primorial_log2(global_best.n_primes);
+    int    sh = (int)ceil(pb) + ctr_bits;
+
+    fprintf(stderr, "\n========================================\n");
+    fprintf(stderr, "  best:  %d candidates  (%d primes, shift=%d)\n",
+            global_best.n_candidates, global_best.n_primes, sh);
+    fprintf(stderr, "  uncovered ratio: %.2f%%\n",
+            100.0 * (double)global_best.n_candidates
+                   / (double)global_best.gap_size);
+    fprintf(stderr, "========================================\n");
+
+    /* print offsets */
+    fprintf(stderr, "\n  prime -> offset:\n");
+    for (int i = 0; i < global_best.n_primes; i++)
+        fprintf(stderr, "    %4d -> %d\n",
+                PRIMES[i], global_best.offsets[i]);
+
+    /* ---- Write output file ---- */
+    write_crt_file(ctr_file, &global_best, ctr_merit, sh);
+
+    sol_free(&global_best);
     return 0;
 }
