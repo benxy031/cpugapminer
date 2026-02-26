@@ -53,4 +53,7 @@ $(TARGET): $(BINDIR) $(SRCDIR)/main.o $(RPC_OBJS)
 clean:
 	rm -rf $(BINDIR) $(SRCDIR)/*.o
 
-.PHONY: all clean
+gen_crt: $(BINDIR) tools/gen_crt.c
+	$(CC) -O2 -std=c11 -Wall -Wextra -o $(BINDIR)/gen_crt tools/gen_crt.c -lm
+
+.PHONY: all clean gen_crt
