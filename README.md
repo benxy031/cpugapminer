@@ -250,6 +250,11 @@ The CRT mining loop:
 6. **Report** — qualifying gaps (merit ≥ target) are passed to the standard
    `scan_candidates` path for block assembly and submission.
 
+Because the normal windowed sieve is bypassed entirely, `--sieve-size`,
+`--sieve-primes`, and `--sample-stride` have no effect in CRT mode.  The
+only relevant flags are `--shift`, `--threads`, `--fast-fermat`, `--target`,
+and `--crt-file`.
+
 Two CRT file formats are supported:
 
 | Format | Extension | Mode | Description |
