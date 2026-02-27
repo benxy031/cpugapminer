@@ -137,7 +137,7 @@ bin/gap_miner \
   --crt-file crt/crt_s64_m21.txt
 ```
 
-With CRT at shift 512 (high-merit mining, monolithic — best for ≤ 6 threads):
+With CRT at shift 512 (high-merit mining, default monolithic mode):
 
 ```sh
 bin/gap_miner \
@@ -147,24 +147,10 @@ bin/gap_miner \
   --shift 513 \
   --threads 6 \
   --fast-fermat \
-  --fermat-threads 0 \
   --crt-file crt/crt_s512_m22.txt
 ```
 
-With CRT at shift 512 (producer-consumer, best for many threads):
-
-```sh
-bin/gap_miner \
-  --rpc-url  http://127.0.0.1:31397/ \
-  --rpc-user USER \
-  --rpc-pass PASS \
-  --shift 513 \
-  --threads 16 \
-  --fast-fermat \
-  --crt-file crt/crt_s512_m22.txt
-```
-
-Explicit producer-consumer split (2 sieve + 14 fermat):
+With CRT at shift 512 (producer-consumer, explicit split):
 
 ```sh
 bin/gap_miner \
@@ -322,19 +308,21 @@ The gaplist has a bounded capacity of 4 096 entries.  When full, the sieve
 producer blocks until consumers free space.  The stats line shows the
 current gaplist depth (e.g. `gaplist=142`).
 
-**Auto-detection:** when `--fermat-threads` is not specified and the miner
-is using a text CRT file with ≥ 3 threads, it automatically enables
-producer-consumer mode with `threads - 1` fermat threads and 1 sieve
-thread.  To disable this and use the monolithic (all-in-one) path, pass
-`--fermat-threads 0`.
+**Default mode: monolithic.**  All threads independently sieve and
+Fermat-test their own CRT windows.  This is optimal at high shifts
+(≥ 256) where sieving is <0.1% of the work — dedicating a thread to
+sieving wastes CPU.
+
+To enable producer-consumer mode, pass `--fermat-threads N` explicitly
+(e.g. `--fermat-threads 14` with 16 threads = 2 sieve + 14 fermat).
+This may help at low shifts (< 128) where the sieve takes longer.
 
 **When to use producer-consumer vs monolithic:**
 
 | Scenario | Recommendation |
 |----------|---------------|
-| High shift (≥ 256), few threads (≤ 6) | Monolithic (`--fermat-threads 0`) — sieve is <1ms, dedicating a thread to it wastes CPU |
-| High shift (≥ 256), many threads (≥ 8) | Producer-consumer — losing 1 thread to sieve is a small fraction |
-| Low shift (< 128), any thread count | Producer-consumer — sieve takes longer, benefits from dedicated threads |
+| High shift (≥ 256), any thread count | Monolithic (default) — sieve is <1ms, every thread should do Fermat work |
+| Low shift (< 128), many threads | Producer-consumer (`--fermat-threads N`) — sieve takes longer, benefits from dedicated threads |
 
 Two CRT file formats are supported:
 
@@ -470,7 +458,7 @@ gap.  The block-finding rate improves by **3.4×**.
 | `--fast-fermat`       | off           | Fast single-base Fermat primality test |
 | `--sample-stride K`   | 8             | Smart scan: test every Kth survivor, skip regions that can't contain qualifying gaps.  Set to 1 to disable. |
 | `--crt-file FILE`     | --            | Load a CRT sieve file (binary `.bin` or text `.txt`).  Text files enable CRT-aligned mining; binary files enable template tiling. |
-| `--fermat-threads N` / `-d N` | *(auto)* | Number of Fermat consumer threads for CRT producer-consumer mode.  Auto-detected as `threads - 1` when using text CRT with ≥ 3 threads.  Set to `0` to force monolithic (all-in-one) mode. |
+| `--fermat-threads N` / `-d N` | 0 (monolithic) | Number of Fermat consumer threads for CRT producer-consumer mode.  Default `0` = monolithic (all threads sieve+fermat independently).  Set to `N` to enable producer-consumer with `threads - N` sieve and `N` fermat threads. |
 | `--no-primality`      | off           | Skip primality testing entirely |
 | `--build-only`        | off           | Fetch template and build one block, then exit |
 | `--no-opreturn`       | off           | Omit OP_RETURN from coinbase |
