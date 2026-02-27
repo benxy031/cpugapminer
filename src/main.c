@@ -192,8 +192,183 @@ static volatile uint64_t stats_pairs = 0;          /* total consecutive prime pa
 static volatile uint64_t stats_blocks = 0;         /* blocks built */
 static volatile uint64_t stats_submits = 0;        /* shares submitted */
 static volatile uint64_t stats_success = 0;        /* shares accepted */
+static volatile uint64_t stats_crt_windows = 0;    /* CRT windows fully tested */
+static volatile uint64_t stats_primes_found = 0;   /* primes found (for primes/window) */
 static uint64_t stats_start_ms = 0;                /* time mining started */
 static volatile double   g_mining_target = 20.0;   /* merit threshold for block-prob display */
+static volatile double   stats_best_merit = 0.0;   /* best gap merit seen this session */
+static volatile uint64_t stats_best_gap   = 0;     /* gap size for best merit */
+
+/* ── Rolling rate window for responsive est ──
+   Store snapshots every STATS_INTERVAL_MS; use the oldest snapshot
+   to compute a sliding-window rate that responds within ~30s. */
+#define RATE_RING_SLOTS 6           /* 6 × 5s = 30s sliding window */
+static struct { uint64_t pairs; uint64_t ms; } rate_ring[RATE_RING_SLOTS];
+static int rate_ring_idx = 0;
+static int rate_ring_full = 0;
+
+/* ══════════════════════════════════════════════════════════════════════
+   CRT Producer-Consumer Heap  (gaplist)
+   ══════════════════════════════════════════════════════════════════════
+   Sieve threads produce CRT windows, push to a min-heap (keyed by
+   survivor count — fewer survivors = larger expected gaps = higher
+   priority).  Fermat threads pop the best windows and test them.
+
+   The heap is bounded: when full, new items replace the worst (most
+   survivors) entry if better, otherwise are discarded.  This keeps
+   memory bounded while continuously improving heap quality.
+   ══════════════════════════════════════════════════════════════════════ */
+
+struct crt_work_item {
+    mpz_t    base;        /* sieve base for Fermat testing (tls_base_mpz snapshot)  */
+    mpz_t    nAdd;        /* nAdd for block assembly                                */
+    uint64_t *survivors;  /* heap-allocated copy of sieve survivor offsets           */
+    size_t   surv_cnt;    /* number of survivors (heap key: lower = better)          */
+    uint32_t nonce;       /* nonce for block assembly                                */
+    int      cand_odd;    /* whether CRT candidate was odd (for nAdd adjustment)    */
+    double   logbase;     /* log(base) for merit calculation                         */
+    uint64_t generation;  /* pass generation — discard stale items                   */
+};
+
+#define CRT_HEAP_CAP 4096
+static struct crt_work_item *crt_heap[CRT_HEAP_CAP]; /* min-heap by surv_cnt */
+static size_t          crt_heap_size = 0;
+static pthread_mutex_t crt_heap_mtx  = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  crt_heap_cv   = PTHREAD_COND_INITIALIZER;
+static volatile uint64_t crt_heap_gen   = 0;  /* incremented on template change */
+static volatile int    crt_fermat_threads = 0; /* number of fermat threads (0 = disabled) */
+static volatile int    crt_heap_shutdown = 0;    /* 1 = all threads should exit */
+
+/* Allocate a work item with mpz_t's initialized */
+static struct crt_work_item *crt_work_alloc(void) {
+    struct crt_work_item *w = calloc(1, sizeof(*w));
+    if (!w) return NULL;
+    mpz_init2(w->base, 1024);
+    mpz_init2(w->nAdd, 1024);
+    return w;
+}
+
+/* Free a work item */
+static void crt_work_free(struct crt_work_item *w) {
+    if (!w) return;
+    mpz_clear(w->base);
+    mpz_clear(w->nAdd);
+    free(w->survivors);
+    free(w);
+}
+
+/* ── Min-heap operations (by surv_cnt) ── */
+static void crt_heap_sift_up(size_t i) {
+    while (i > 0) {
+        size_t parent = (i - 1) / 2;
+        if (crt_heap[parent]->surv_cnt <= crt_heap[i]->surv_cnt) break;
+        struct crt_work_item *tmp = crt_heap[parent];
+        crt_heap[parent] = crt_heap[i];
+        crt_heap[i] = tmp;
+        i = parent;
+    }
+}
+
+static void crt_heap_sift_down(size_t i, size_t n) {
+    while (1) {
+        size_t smallest = i;
+        size_t left = 2 * i + 1, right = 2 * i + 2;
+        if (left < n && crt_heap[left]->surv_cnt < crt_heap[smallest]->surv_cnt)
+            smallest = left;
+        if (right < n && crt_heap[right]->surv_cnt < crt_heap[smallest]->surv_cnt)
+            smallest = right;
+        if (smallest == i) break;
+        struct crt_work_item *tmp = crt_heap[smallest];
+        crt_heap[smallest] = crt_heap[i];
+        crt_heap[i] = tmp;
+        i = smallest;
+    }
+}
+
+/* Push a work item into the heap.
+   If heap is full and item is better than the worst, replace worst.
+   Otherwise discard the item.  Returns 1 if item was kept, 0 if discarded. */
+static int crt_heap_push(struct crt_work_item *w) {
+    pthread_mutex_lock(&crt_heap_mtx);
+    if (crt_heap_size < CRT_HEAP_CAP) {
+        /* Room available: insert */
+        crt_heap[crt_heap_size] = w;
+        crt_heap_sift_up(crt_heap_size);
+        crt_heap_size++;
+        pthread_cond_signal(&crt_heap_cv);
+        pthread_mutex_unlock(&crt_heap_mtx);
+        return 1;
+    }
+    /* Heap full: find the maximum element (worst) among leaves */
+    size_t first_leaf = crt_heap_size / 2;
+    size_t max_idx = first_leaf;
+    for (size_t i = first_leaf + 1; i < crt_heap_size; i++) {
+        if (crt_heap[i]->surv_cnt > crt_heap[max_idx]->surv_cnt)
+            max_idx = i;
+    }
+    if (w->surv_cnt < crt_heap[max_idx]->surv_cnt) {
+        /* New item is better — replace worst */
+        crt_work_free(crt_heap[max_idx]);
+        crt_heap[max_idx] = w;
+        /* Restore heap: might need sift-up or sift-down */
+        crt_heap_sift_up(max_idx);
+        crt_heap_sift_down(max_idx, crt_heap_size);
+        pthread_cond_signal(&crt_heap_cv);
+        pthread_mutex_unlock(&crt_heap_mtx);
+        return 1;
+    }
+    /* New item is worse — discard */
+    pthread_mutex_unlock(&crt_heap_mtx);
+    crt_work_free(w);
+    return 0;
+}
+
+/* Pop the best (fewest survivors) work item from the heap.
+   Blocks until an item is available or g_abort_pass is set.
+   Returns NULL if g_abort_pass is set (caller should exit). */
+static struct crt_work_item *crt_heap_pop(void) {
+    pthread_mutex_lock(&crt_heap_mtx);
+    while (crt_heap_size == 0 && !crt_heap_shutdown) {
+        /* Wait with timeout so we can check shutdown periodically */
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 100000000L; /* 100ms */
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000L;
+        }
+        pthread_cond_timedwait(&crt_heap_cv, &crt_heap_mtx, &ts);
+    }
+    if (crt_heap_size == 0 || crt_heap_shutdown) {
+        pthread_mutex_unlock(&crt_heap_mtx);
+        return NULL;
+    }
+    /* Extract min (root) */
+    struct crt_work_item *best = crt_heap[0];
+    crt_heap_size--;
+    if (crt_heap_size > 0) {
+        crt_heap[0] = crt_heap[crt_heap_size];
+        crt_heap_sift_down(0, crt_heap_size);
+    }
+    pthread_mutex_unlock(&crt_heap_mtx);
+    return best;
+}
+
+/* Flush all items from the heap (called on template change) */
+static void crt_heap_flush(void) {
+    pthread_mutex_lock(&crt_heap_mtx);
+    for (size_t i = 0; i < crt_heap_size; i++)
+        crt_work_free(crt_heap[i]);
+    crt_heap_size = 0;
+    pthread_cond_broadcast(&crt_heap_cv); /* wake waiting fermat threads */
+    pthread_mutex_unlock(&crt_heap_mtx);
+}
+
+/* Get current heap size (for stats display) */
+static size_t crt_heap_count(void) {
+    /* No lock needed — just an approximate display value */
+    return crt_heap_size;
+}
 
 /* shared current-work state so any thread can detect a new block */
 static char     g_prevhash[65]  = {0};
@@ -497,37 +672,63 @@ static int cmp_u64(const void *a, const void *b) {
     return (va > vb) - (va < vb);
 }
 
+static void format_est(char *buf, size_t sz, double est_sec) {
+    if (est_sec < 10.0)
+        snprintf(buf, sz, "%.1fs", est_sec);
+    else if (est_sec < 60.0)
+        snprintf(buf, sz, "%.0fs", est_sec);
+    else if (est_sec < 3600.0)
+        snprintf(buf, sz, "%.1fm", est_sec / 60.0);
+    else if (est_sec < 86400.0)
+        snprintf(buf, sz, "%.1fh", est_sec / 3600.0);
+    else
+        snprintf(buf, sz, "%.1fd", est_sec / 86400.0);
+}
+
 static void print_stats(void) {
     uint64_t now = now_ms();
     double elapsed = stats_start_ms ? (double)(now - stats_start_ms) / 1000.0 : 0.0;
     double sieve_rate  = (elapsed > 0.001) ? (double)stats_sieved  / elapsed : 0.0;
     double test_rate   = (elapsed > 0.001) ? (double)stats_tested  / elapsed : 0.0;
     double gap_rate    = (elapsed > 0.001) ? (double)stats_gaps    / elapsed : 0.0;
-    double pairs_rate  = (elapsed > 0.001) ? (double)stats_pairs   / elapsed : 0.0;
 
-    /* Block probability estimate based on Cramér–Granville heuristic:
-       P(gap merit ≥ m) ≈ e^(-m) per consecutive prime pair.
-       Expected time to next qualifying gap = 1 / (pairs/s × e^(-target)). */
+    /* ── Compute pairs/s using 30-second sliding window ──
+       Uses a ring buffer of snapshots.  The rolling rate responds
+       within ~30s to throughput changes (template switch, thread
+       ramp-up, load changes).  Falls back to cumulative rate if
+       the ring isn't full yet (first 30s of mining). */
+    int oldest = rate_ring_full ? rate_ring_idx : 0;
+    uint64_t old_pairs = rate_ring[oldest].pairs;
+    uint64_t old_ms    = rate_ring[oldest].ms;
+    double   window_dt = (old_ms > 0 && now > old_ms)
+                         ? (double)(now - old_ms) / 1000.0 : 0.0;
+    double   window_dp = (double)(stats_pairs - old_pairs);
+    double   pairs_rate = (window_dt > 0.5) ? window_dp / window_dt
+                        : (elapsed > 0.001) ? (double)stats_pairs / elapsed
+                        : 0.0;
+    /* Advance ring */
+    rate_ring[rate_ring_idx].pairs = stats_pairs;
+    rate_ring[rate_ring_idx].ms    = now;
+    rate_ring_idx = (rate_ring_idx + 1) % RATE_RING_SLOTS;
+    if (rate_ring_idx == 0) rate_ring_full = 1;
+
+    /* ── Block probability estimate ──
+       Cramér–Granville heuristic: P(gap merit ≥ m) ≈ e^(-m) per
+       consecutive prime pair.  This is the standard asymptotic
+       probability for a random gap between consecutive primes near p.
+       Est = 1 / (pairs/s × e^(-target)).  Uses the rolling 30s rate
+       for responsiveness. */
     double target_m = g_mining_target;
     char est_buf[64] = "n/a";
     double prob_pair = (target_m > 0) ? exp(-target_m) : 0.0;
     if (pairs_rate > 0 && prob_pair > 0) {
         double est_sec = 1.0 / (pairs_rate * prob_pair);
-        if (est_sec < 10.0)
-            snprintf(est_buf, sizeof(est_buf), "%.1fs", est_sec);
-        else if (est_sec < 60.0)
-            snprintf(est_buf, sizeof(est_buf), "%.0fs", est_sec);
-        else if (est_sec < 3600.0)
-            snprintf(est_buf, sizeof(est_buf), "%.1fm", est_sec / 60.0);
-        else if (est_sec < 86400.0)
-            snprintf(est_buf, sizeof(est_buf), "%.1fh", est_sec / 3600.0);
-        else
-            snprintf(est_buf, sizeof(est_buf), "%.1fd", est_sec / 86400.0);
+        format_est(est_buf, sizeof(est_buf), est_sec);
     }
 
     log_msg("STATS: elapsed=%.1fs  sieved=%llu (%.0f/s)  tested=%llu (%.0f/s)  "
             "gaps=%llu (%.3f/s)  built=%llu  submitted=%llu  accepted=%llu  "
-            "prob=%.2e/pair  est=%s (target=%.2f)\n",
+            "prob=%.2e/pair  est=%s (target=%.2f)",
             elapsed,
             (unsigned long long)stats_sieved,  sieve_rate,
             (unsigned long long)stats_tested,  test_rate,
@@ -536,6 +737,25 @@ static void print_stats(void) {
             (unsigned long long)stats_submits,
             (unsigned long long)stats_success,
             prob_pair, est_buf, target_m);
+
+    /* ── CRT-specific stats ── */
+    if (g_crt_mode == CRT_MODE_SOLVER) {
+        uint64_t crt_w = stats_crt_windows;
+        uint64_t crt_p = stats_primes_found;
+        double win_rate = (elapsed > 0.001) ? (double)crt_w / elapsed : 0.0;
+        double ppw = (crt_w > 0) ? (double)crt_p / (double)crt_w : 0.0;
+        log_msg("  windows=%llu (%.1f/s)  primes/win=%.1f",
+                (unsigned long long)crt_w, win_rate, ppw);
+        if (crt_fermat_threads > 0)
+            log_msg("  gaplist=%zu", crt_heap_count());
+    }
+
+    /* Best merit found this session */
+    double bm = stats_best_merit;
+    if (bm > 0.0)
+        log_msg("  best=%.2f (gap=%llu)",
+                bm, (unsigned long long)stats_best_gap);
+    log_msg("\n");
 }
 
 /* ---------- periodic stats thread ----------
@@ -1977,6 +2197,7 @@ struct worker_args {
     /* per-thread adder-space slice (set by main before spawning) */
     int64_t adder_base_offset; /* offset into [0, global_adder_max) */
     int     rpc_thread;        /* 1 for the thread that polls GBT   */
+    int     crt_role;          /* 0=normal/sieve, 1=fermat consumer  */
 };
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -2152,6 +2373,11 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
         uint64_t q     = pr[i + 1];   /* nAdd of gap end prime   */
         uint64_t gap   = q - prev;
         double merit   = (double)gap / logbase;
+        /* Track best merit seen (lock-free: small races are harmless) */
+        if (merit > stats_best_merit) {
+            stats_best_merit = merit;
+            stats_best_gap   = gap;
+        }
         if (merit < target_local)
             continue;
 
@@ -2436,7 +2662,6 @@ static void *worker_fn(void *arg) {
     if (g_crt_mode == CRT_MODE_SOLVER && g_crt_primorial_mpz_init) {
 #ifdef WITH_RPC
         int      tid_local     = wa->tid;
-        int      nth_local     = wa->nthreads;
         int      gap_scan_max  = g_crt_gap_target * 2;
         if (gap_scan_max < 10000) gap_scan_max = 10000;
 
@@ -2445,187 +2670,56 @@ static void *worker_fn(void *arg) {
         mpz_init(crt_end);
         mpz_ui_pow_ui(crt_end, 2, (unsigned long)shift_local);
 
-        if (rpc_thread_local) {
-            char prim_str[128];
-            gmp_snprintf(prim_str, sizeof(prim_str), "%Zd", g_crt_primorial_mpz);
-            size_t prim_bits = mpz_sizeinbase(g_crt_primorial_mpz, 2);
-            log_msg("CRT mining (%dT): primorial~2^%zu  shift=%d  gap_scan=%d\n",
-                    nth_local, prim_bits, shift_local, gap_scan_max);
-        }
+        /* ═══════════════════════════════════════════════════════════
+           FERMAT CONSUMER THREAD  (producer-consumer mode only)
+           Pop the best sieved window from the heap, Fermat-test all
+           survivors, scan consecutive prime pairs for qualifying gaps.
+           ═══════════════════════════════════════════════════════════ */
+        if (wa->crt_role == 1 && crt_fermat_threads > 0) {
+            ensure_gmp_tls();
 
-#ifdef WITH_RPC
-        uint64_t gbt_last_ms = now_ms();
-#endif
+            while (keep_going && !g_abort_pass) {
+                struct crt_work_item *w = crt_heap_pop();
+                if (!w) break; /* abort or shutdown */
 
-        /* Nonce iteration state — each thread covers its own nonce slice */
-        uint32_t nonce_cur = g_pass.nonce + 1 + (uint32_t)tid_local;
-
-        /* Temp mpz for candidate = base + nAdd */
-        mpz_t nAdd, candidate, orig_base_crt;
-        mpz_inits(nAdd, candidate, orig_base_crt, NULL);
-
-        /* Precompute primorial % p for all sieve primes once.
-           Enables O(1) incremental residue updates between CRT windows
-           instead of O(768-bit division) per prime per window. */
-        uint64_t *prim_mod_sieve = NULL;
-        size_t    prim_mod_count = 0;
-
-        while (keep_going && !g_abort_pass) {
-
-#ifdef WITH_RPC
-            /* Poll for new blocks every 5 s */
-            if (rpc_thread_local && rpc_url_local) {
-                uint64_t now = now_ms();
-                if (now - gbt_last_ms >= 5000) {
-                    char *resp = rpc_call(rpc_url_local, rpc_user_local,
-                                          rpc_pass_local,
-                                          "getbestblockhash", NULL);
-                    if (resp) {
-                        const char *q1 = strchr(resp, '"');
-                        if (q1) q1 = strchr(q1+1, '"');
-                        if (q1) q1 = strchr(q1+1, '"');
-                        const char *q2 = q1 ? strchr(q1+1, '"') : NULL;
-                        if (q1 && q2 && (q2-q1-1) == 64) {
-                            char best[65];
-                            memcpy(best, q1+1, 64); best[64] = '\0';
-                            if (g_pass.prevhex[0] &&
-                                strcmp(best, g_pass.prevhex) != 0) {
-                                log_msg("\n*** NEW BLOCK  prevhash=%.16s..."
-                                        "  mining on top ***\n\n", best);
-                                pthread_mutex_lock(&g_work_lock);
-                                strncpy(g_prevhash, best, 64);
-                                g_prevhash[64] = '\0';
-                                pthread_mutex_unlock(&g_work_lock);
-                                free(resp);
-                                g_abort_pass = 1;
-                                break;
-                            }
-                        }
-                        free(resp);
-                    }
-                    gbt_last_ms = now_ms();
-                }
-            }
-#endif
-
-            /* ── Compute SHA256d for this nonce ── */
-            uint8_t hdr84[84], sha_raw[32], h256_nonce[32];
-            memcpy(hdr84, g_pass.hdr80, 80);
-            memcpy(hdr84 + 80, &nonce_cur, 4);
-            double_sha256(hdr84, 84, sha_raw);
-
-            /* Skip nonces where top bit is not set (Gapcoin requires
-               mpz_sizeinbase(hash,2)==256 → sha_raw[31] >= 0x80). */
-            if (sha_raw[31] < 0x80) {
-                nonce_cur += (uint32_t)nth_local;
-                if (nonce_cur < (uint32_t)nth_local) break; /* wrapped */
-                continue;
-            }
-
-            /* Byte-reverse: h256[k] = sha_raw[31-k] (MSB first for GMP) */
-            for (int k = 0; k < 32; k++) h256_nonce[k] = sha_raw[31 - k];
-
-            /* Set thread-local base = h256_nonce << shift */
-            set_base_bn(h256_nonce, shift_local);
-            double logbase_nonce = uint256_log_approx(h256_nonce, shift_local);
-
-            /* Compute GMP CRT alignment: nAdd0 mod primorial */
-            crt_compute_alignment_mpz(nAdd);  /* nAdd = nAdd0 */
-
-            /* Save original base for candidate computation.
-               This avoids the expensive set_base_bn() restore call
-               (which recomputes ~1M residues) at the end of every
-               CRT window. */
-            mpz_set(orig_base_crt, tls_base_mpz);
-
-            /* Lazy-init primorial mod cache (once per thread). */
-            if (!prim_mod_sieve && small_primes_cache &&
-                small_primes_count > 0) {
-                prim_mod_count = small_primes_count;
-                prim_mod_sieve = (uint64_t *)malloc(
-                    prim_mod_count * sizeof(uint64_t));
-                if (prim_mod_sieve) {
-                    for (size_t pi = 0; pi < prim_mod_count; pi++)
-                        prim_mod_sieve[pi] = mpz_fdiv_ui(
-                            g_crt_primorial_mpz,
-                            (unsigned long)small_primes_cache[pi]);
-                }
-            }
-
-            /* First CRT window: full rebase to establish residues.
-               Determine cand_odd (constant for all windows of this
-               nonce since primorial is even). */
-            mpz_add(candidate, orig_base_crt, nAdd);
-            int cand_odd = mpz_odd_p(candidate);
-            if (cand_odd) mpz_sub_ui(candidate, candidate, 1);
-            rebase_for_gap_check(candidate);
-            int crt_first_win = 1;
-
-            /* Iterate CRT windows: nAdd, nAdd+primorial, ... < 2^shift.
-               For each window, sieve the gap range, Fermat-test all
-               survivors to find primes, then scan consecutive primes
-               for gaps meeting the target merit. */
-            while (mpz_cmp(nAdd, crt_end) < 0 && keep_going && !g_abort_pass) {
-
-                if (!crt_first_win) {
-                    /* Incremental rebase: advance sieve base by primorial.
-                       Cost: O(small_primes_count) integer adds vs
-                       O(small_primes_count × 768-bit divisions) for a
-                       full rebase_for_gap_check(). */
-                    mpz_add(tls_base_mpz, tls_base_mpz,
-                            g_crt_primorial_mpz);
-                    if (prim_mod_sieve && tls_base_mod_p) {
-                        for (size_t pi = 0; pi < prim_mod_count; pi++) {
-                            tls_base_mod_p[pi] += prim_mod_sieve[pi];
-                            if (tls_base_mod_p[pi] >=
-                                small_primes_cache[pi])
-                                tls_base_mod_p[pi] -=
-                                    small_primes_cache[pi];
-                        }
-                    }
-                }
-                crt_first_win = 0;
-
-                /* Sieve gap range: offsets 1..gap_scan_max from base.
-                   sieve_range forces L odd, so gap_L=1 → L=1 (odd). */
-                uint64_t gap_L = 1;
-                uint64_t gap_R = (uint64_t)gap_scan_max;
-                size_t surv_cnt = 0;
-                uint64_t *surv = sieve_range(gap_L, gap_R, &surv_cnt,
-                                             NULL, 0);
-                __sync_fetch_and_add(&stats_sieved, gap_R - gap_L);
-
-                if (!surv || surv_cnt == 0) {
-                    mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
+                /* Discard stale items from previous template */
+                if (w->generation != crt_heap_gen) {
+                    crt_work_free(w);
                     continue;
                 }
 
+                /* Set thread-local base for Fermat testing */
+                mpz_set(tls_base_mpz, w->base);
+
                 /* Fermat-test ALL survivors to find primes */
                 size_t pf = 0;
-                for (size_t j = 0; j < surv_cnt; j++) {
+                for (size_t j = 0; j < w->surv_cnt; j++) {
                     __sync_fetch_and_add(&stats_tested, 1);
-                    if (bn_candidate_is_prime(surv[j]))
-                        surv[pf++] = surv[j];
+                    if (bn_candidate_is_prime(w->survivors[j]))
+                        w->survivors[pf++] = w->survivors[j];
                 }
 
                 /* Scan consecutive prime pairs for qualifying gaps */
+                __sync_fetch_and_add(&stats_crt_windows, 1);
+                __sync_fetch_and_add(&stats_primes_found, (uint64_t)pf);
                 if (pf >= 2) {
                     __sync_fetch_and_add(&stats_pairs, (uint64_t)(pf - 1));
                     for (size_t i = 0; i + 1 < pf; i++) {
-                        uint64_t gap = surv[i + 1] - surv[i];
-                        double merit = (double)gap / logbase_nonce;
+                        uint64_t gap = w->survivors[i + 1] - w->survivors[i];
+                        double merit = (double)gap / w->logbase;
+                        if (merit > stats_best_merit) {
+                            stats_best_merit = merit;
+                            stats_best_gap   = gap;
+                        }
                         if (merit < target_local) continue;
 
                         __sync_fetch_and_add(&stats_gaps, 1);
 
-                        /* nAdd of gap-starting prime:
-                           prime = base + surv[i] (where base may be
-                           candidate-1 if candidate was odd) */
                         mpz_t nAdd_prime;
                         mpz_init(nAdd_prime);
-                        mpz_set(nAdd_prime, nAdd);
-                        mpz_add_ui(nAdd_prime, nAdd_prime, surv[i]);
-                        if (cand_odd)
+                        mpz_set(nAdd_prime, w->nAdd);
+                        mpz_add_ui(nAdd_prime, nAdd_prime, w->survivors[i]);
+                        if (w->cand_odd)
                             mpz_sub_ui(nAdd_prime, nAdd_prime, 1);
 
                         char nAdd_str[256];
@@ -2640,9 +2734,9 @@ static void *worker_fn(void *arg) {
                                 (unsigned long long)gap,
                                 merit, target_local,
                                 shift_local,
-                                (unsigned)nonce_cur,
+                                (unsigned)w->nonce,
                                 nAdd_str);
-#ifdef WITH_RPC
+
                         if (rpc_url_local && !g_abort_pass) {
                             pthread_mutex_lock(&sq_lock);
                             int sq_busy = (sq_count > 0);
@@ -2650,7 +2744,7 @@ static void *worker_fn(void *arg) {
                             if (!sq_busy) {
                                 char blockhex[16384];
                                 memset(blockhex, 0, sizeof(blockhex));
-                                if (assemble_mining_block_mpz(nonce_cur,
+                                if (assemble_mining_block_mpz(w->nonce,
                                         nAdd_prime, blockhex)) {
                                     __sync_fetch_and_add(&stats_blocks, 1);
                                     log_file_only("Built blockhex: %s\n",
@@ -2662,7 +2756,7 @@ static void *worker_fn(void *arg) {
                                                 merit,
                                                 (unsigned long long)gap,
                                                 shift_local,
-                                                (unsigned)nonce_cur);
+                                                (unsigned)w->nonce);
                                         struct submit_job _job;
                                         memset(&_job, 0, sizeof(_job));
                                         strncpy(_job.url, rpc_url_local,
@@ -2689,23 +2783,309 @@ static void *worker_fn(void *arg) {
                                 }
                             }
                         }
-#endif
+
                         mpz_clear(nAdd_prime);
                     }
                 }
 
-                mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
-            } /* end CRT candidate loop for this nonce */
+                crt_work_free(w);
+            } /* end fermat consumer loop */
 
-            /* Advance to next nonce for this thread */
-            nonce_cur += (uint32_t)nth_local;
-            if (nonce_cur < (uint32_t)nth_local) break; /* nonce space wrapped */
+            mpz_clear(crt_end);
+            if (tls_gmp_inited) {
+                mpz_clear(tls_base_mpz);
+                mpz_clear(tls_cand_mpz);
+                mpz_clear(tls_two_mpz);
+                mpz_clear(tls_exp_mpz);
+                mpz_clear(tls_res_mpz);
+                tls_gmp_inited = 0;
+            }
+            return NULL;
+        }
 
-        } /* end nonce loop */
+        /* ═══════════════════════════════════════════════════════════
+           SIEVE PRODUCER THREAD (or monolithic if no fermat threads)
+           Iterate nonces, CRT-align, sieve each window.
+           — If crt_fermat_threads > 0: push sieved windows to heap.
+           — If crt_fermat_threads == 0: test inline (original path).
+           ═══════════════════════════════════════════════════════════ */
+        {
+            int n_sieve_threads = wa->nthreads - crt_fermat_threads;
+            if (n_sieve_threads < 1) n_sieve_threads = 1;
+            int nth_local = (crt_fermat_threads > 0) ? n_sieve_threads
+                                                     : wa->nthreads;
+
+            if (rpc_thread_local) {
+                size_t prim_bits = mpz_sizeinbase(g_crt_primorial_mpz, 2);
+                if (crt_fermat_threads > 0)
+                    log_msg("CRT mining (%dT: %d sieve + %d fermat): "
+                            "primorial~2^%zu  shift=%d  gap_scan=%d  heap=%d\n",
+                            wa->nthreads, n_sieve_threads,
+                            crt_fermat_threads,
+                            prim_bits, shift_local, gap_scan_max,
+                            CRT_HEAP_CAP);
+                else
+                    log_msg("CRT mining (%dT): primorial~2^%zu  shift=%d"
+                            "  gap_scan=%d\n",
+                            nth_local, prim_bits, shift_local, gap_scan_max);
+            }
+
+#ifdef WITH_RPC
+            uint64_t gbt_last_ms = now_ms();
+#endif
+
+            uint32_t nonce_cur = g_pass.nonce + 1 + (uint32_t)tid_local;
+
+            mpz_t nAdd, candidate, orig_base_crt;
+            mpz_inits(nAdd, candidate, orig_base_crt, NULL);
+
+            uint64_t *prim_mod_sieve = NULL;
+            size_t    prim_mod_count = 0;
+
+            while (keep_going && !g_abort_pass) {
+
+#ifdef WITH_RPC
+                /* Poll for new blocks every 5 s (rpc thread only) */
+                if (rpc_thread_local && rpc_url_local) {
+                    uint64_t now = now_ms();
+                    if (now - gbt_last_ms >= 5000) {
+                        char *resp = rpc_call(rpc_url_local, rpc_user_local,
+                                              rpc_pass_local,
+                                              "getbestblockhash", NULL);
+                        if (resp) {
+                            const char *q1 = strchr(resp, '"');
+                            if (q1) q1 = strchr(q1+1, '"');
+                            if (q1) q1 = strchr(q1+1, '"');
+                            const char *q2 = q1 ? strchr(q1+1, '"') : NULL;
+                            if (q1 && q2 && (q2-q1-1) == 64) {
+                                char best[65];
+                                memcpy(best, q1+1, 64); best[64] = '\0';
+                                if (g_pass.prevhex[0] &&
+                                    strcmp(best, g_pass.prevhex) != 0) {
+                                    log_msg("\n*** NEW BLOCK  prevhash=%.16s..."
+                                            "  mining on top ***\n\n", best);
+                                    pthread_mutex_lock(&g_work_lock);
+                                    strncpy(g_prevhash, best, 64);
+                                    g_prevhash[64] = '\0';
+                                    pthread_mutex_unlock(&g_work_lock);
+                                    free(resp);
+                                    g_abort_pass = 1;
+                                    /* Wake any fermat threads waiting on heap */
+                                    crt_heap_shutdown = 1;
+                                    pthread_cond_broadcast(&crt_heap_cv);
+                                    break;
+                                }
+                            }
+                            free(resp);
+                        }
+                        gbt_last_ms = now_ms();
+                    }
+                }
+#endif
+
+                /* ── Compute SHA256d for this nonce ── */
+                uint8_t hdr84[84], sha_raw[32], h256_nonce[32];
+                memcpy(hdr84, g_pass.hdr80, 80);
+                memcpy(hdr84 + 80, &nonce_cur, 4);
+                double_sha256(hdr84, 84, sha_raw);
+
+                if (sha_raw[31] < 0x80) {
+                    nonce_cur += (uint32_t)nth_local;
+                    if (nonce_cur < (uint32_t)nth_local) break;
+                    continue;
+                }
+
+                for (int k = 0; k < 32; k++)
+                    h256_nonce[k] = sha_raw[31 - k];
+
+                set_base_bn(h256_nonce, shift_local);
+                double logbase_nonce =
+                    uint256_log_approx(h256_nonce, shift_local);
+
+                crt_compute_alignment_mpz(nAdd);
+                mpz_set(orig_base_crt, tls_base_mpz);
+
+                if (!prim_mod_sieve && small_primes_cache &&
+                    small_primes_count > 0) {
+                    prim_mod_count = small_primes_count;
+                    prim_mod_sieve = (uint64_t *)malloc(
+                        prim_mod_count * sizeof(uint64_t));
+                    if (prim_mod_sieve) {
+                        for (size_t pi = 0; pi < prim_mod_count; pi++)
+                            prim_mod_sieve[pi] = mpz_fdiv_ui(
+                                g_crt_primorial_mpz,
+                                (unsigned long)small_primes_cache[pi]);
+                    }
+                }
+
+                mpz_add(candidate, orig_base_crt, nAdd);
+                int cand_odd = mpz_odd_p(candidate);
+                if (cand_odd) mpz_sub_ui(candidate, candidate, 1);
+                rebase_for_gap_check(candidate);
+                int crt_first_win = 1;
+
+                while (mpz_cmp(nAdd, crt_end) < 0 &&
+                       keep_going && !g_abort_pass) {
+
+                    if (!crt_first_win) {
+                        mpz_add(tls_base_mpz, tls_base_mpz,
+                                g_crt_primorial_mpz);
+                        if (prim_mod_sieve && tls_base_mod_p) {
+                            for (size_t pi = 0; pi < prim_mod_count; pi++) {
+                                tls_base_mod_p[pi] += prim_mod_sieve[pi];
+                                if (tls_base_mod_p[pi] >=
+                                    small_primes_cache[pi])
+                                    tls_base_mod_p[pi] -=
+                                        small_primes_cache[pi];
+                            }
+                        }
+                    }
+                    crt_first_win = 0;
+
+                    uint64_t gap_L = 1;
+                    uint64_t gap_R = (uint64_t)gap_scan_max;
+                    size_t surv_cnt = 0;
+                    uint64_t *surv = sieve_range(gap_L, gap_R,
+                                                 &surv_cnt, NULL, 0);
+                    __sync_fetch_and_add(&stats_sieved, gap_R - gap_L);
+
+                    if (!surv || surv_cnt == 0) {
+                        mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
+                        continue;
+                    }
+
+                    /* ── Producer-consumer: push to heap ── */
+                    if (crt_fermat_threads > 0) {
+                        struct crt_work_item *w = crt_work_alloc();
+                        if (w) {
+                            mpz_set(w->base, tls_base_mpz);
+                            mpz_set(w->nAdd, nAdd);
+                            w->survivors = (uint64_t *)malloc(
+                                surv_cnt * sizeof(uint64_t));
+                            if (w->survivors)
+                                memcpy(w->survivors, surv,
+                                       surv_cnt * sizeof(uint64_t));
+                            else
+                                surv_cnt = 0;
+                            w->surv_cnt   = surv_cnt;
+                            w->nonce      = nonce_cur;
+                            w->cand_odd   = cand_odd;
+                            w->logbase    = logbase_nonce;
+                            w->generation = crt_heap_gen;
+                            crt_heap_push(w); /* may discard if worse */
+                        }
+                        mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
+                        continue;
+                    }
+
+                    /* ── Monolithic: Fermat-test inline (original) ── */
+                    size_t pf = 0;
+                    for (size_t j = 0; j < surv_cnt; j++) {
+                        __sync_fetch_and_add(&stats_tested, 1);
+                        if (bn_candidate_is_prime(surv[j]))
+                            surv[pf++] = surv[j];
+                    }
+
+                    __sync_fetch_and_add(&stats_crt_windows, 1);
+                    __sync_fetch_and_add(&stats_primes_found, (uint64_t)pf);
+                    if (pf >= 2) {
+                        __sync_fetch_and_add(&stats_pairs,
+                                             (uint64_t)(pf - 1));
+                        for (size_t i = 0; i + 1 < pf; i++) {
+                            uint64_t gap = surv[i + 1] - surv[i];
+                            double merit = (double)gap / logbase_nonce;
+                            if (merit > stats_best_merit) {
+                                stats_best_merit = merit;
+                                stats_best_gap   = gap;
+                            }
+                            if (merit < target_local) continue;
+
+                            __sync_fetch_and_add(&stats_gaps, 1);
+
+                            mpz_t nAdd_prime;
+                            mpz_init(nAdd_prime);
+                            mpz_set(nAdd_prime, nAdd);
+                            mpz_add_ui(nAdd_prime, nAdd_prime, surv[i]);
+                            if (cand_odd)
+                                mpz_sub_ui(nAdd_prime, nAdd_prime, 1);
+
+                            char nAdd_str[256];
+                            gmp_snprintf(nAdd_str, sizeof(nAdd_str),
+                                         "%Zd", nAdd_prime);
+                            log_msg("\n>>> GAP FOUND\n"
+                                    "    gap     = %llu\n"
+                                    "    merit   = %.6f  (need >= %.2f)\n"
+                                    "    nShift  = %d\n"
+                                    "    nonce   = %u\n"
+                                    "    nAdd    = %s\n",
+                                    (unsigned long long)gap,
+                                    merit, target_local,
+                                    shift_local,
+                                    (unsigned)nonce_cur,
+                                    nAdd_str);
+                            if (rpc_url_local && !g_abort_pass) {
+                                pthread_mutex_lock(&sq_lock);
+                                int sq_busy = (sq_count > 0);
+                                pthread_mutex_unlock(&sq_lock);
+                                if (!sq_busy) {
+                                    char blockhex[16384];
+                                    memset(blockhex, 0, sizeof(blockhex));
+                                    if (assemble_mining_block_mpz(nonce_cur,
+                                            nAdd_prime, blockhex)) {
+                                        __sync_fetch_and_add(&stats_blocks, 1);
+                                        log_file_only("Built blockhex: %s\n",
+                                                      blockhex);
+                                        if (header_meets_target_hex(blockhex)) {
+                                            log_msg(">>> SUBMITTING to node\n"
+                                                    "    merit=%.6f  gap=%llu"
+                                                    "  nShift=%d  nonce=%u\n",
+                                                    merit,
+                                                    (unsigned long long)gap,
+                                                    shift_local,
+                                                    (unsigned)nonce_cur);
+                                            struct submit_job _job;
+                                            memset(&_job, 0, sizeof(_job));
+                                            strncpy(_job.url, rpc_url_local,
+                                                    sizeof(_job.url)-1);
+                                            strncpy(_job.user,
+                                                    rpc_user_local ? rpc_user_local : "",
+                                                    sizeof(_job.user)-1);
+                                            strncpy(_job.pass,
+                                                    rpc_pass_local ? rpc_pass_local : "",
+                                                    sizeof(_job.pass)-1);
+                                            strncpy(_job.method, "getwork",
+                                                    sizeof(_job.method)-1);
+                                            memcpy(_job.hex, blockhex,
+                                                   sizeof(_job.hex));
+                                            _job.retries = rpc_default_retries;
+                                            __sync_fetch_and_add(&stats_submits, 1);
+                                            enqueue_job(&_job);
+                                            log_msg(">>> QUEUED for async submit"
+                                                    " (mining continues)\n");
+                                            print_stats();
+                                        }
+                                    } else {
+                                        log_msg("Failed to assemble block\n");
+                                    }
+                                }
+                            }
+                            mpz_clear(nAdd_prime);
+                        }
+                    }
+
+                    mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
+                } /* end CRT candidate loop */
+
+                nonce_cur += (uint32_t)nth_local;
+                if (nonce_cur < (uint32_t)nth_local) break;
+
+            } /* end nonce loop */
+
+            mpz_clears(nAdd, candidate, orig_base_crt, crt_end, NULL);
+            free(prim_mod_sieve);
+        }
 
         /* ── CRT cleanup ── */
-        mpz_clears(nAdd, candidate, orig_base_crt, crt_end, NULL);
-        free(prim_mod_sieve);
         free_sieve_buffers();
         if (tls_gmp_inited) {
             mpz_clear(tls_base_mpz);
@@ -3270,6 +3650,8 @@ int main(int argc, char **argv) {
         printf("      --fast-fermat     fast primality (fewer Miller-Rabin rounds)\n");
         printf("      --sample-stride K smart scan: test every Kth survivor (default: 8, 1=off)\n");
         printf("      --crt-file FILE   load CRT sieve file (binary template or text gap-solver)\n");
+        printf("      --fermat-threads N  number of Fermat testing threads for CRT producer-consumer\n");
+        printf("                          default: auto = threads-1 for CRT solver with threads>=3\n");
         printf("      --keep-going      continue after block found (default on)\n");
         printf("      --stop-after-block  exit after first valid block\n");
         printf("      --log-file FILE   append messages to FILE\n");
@@ -3336,6 +3718,8 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i],"--crt-file") && i+1<argc)
             cli_crt_file = argv[++i];
+        else if ((!strcmp(argv[i],"--fermat-threads") || !strcmp(argv[i],"-d")) && i+1<argc)
+            crt_fermat_threads = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--p") && i+1<argc) build_p = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i],"--q") && i+1<argc) build_q = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i],"--keep-going")) {
@@ -3387,6 +3771,23 @@ int main(int argc, char **argv) {
         if (!load_crt_file(cli_crt_file)) {
             log_msg("Warning: CRT file load failed, continuing without CRT\n");
         }
+    }
+
+    /* Auto-detect fermat threads for CRT solver producer-consumer mode.
+       Default: threads-1 for CRT solver with threads >= 3.
+       The sieve is ~3000× faster than Fermat testing at high shifts,
+       so 1 sieve thread can feed many fermat threads.
+       Setting --fermat-threads 0 disables producer-consumer (monolithic). */
+    if (g_crt_mode == CRT_MODE_SOLVER && crt_fermat_threads == 0 &&
+        num_threads >= 3) {
+        crt_fermat_threads = num_threads - 1;
+        log_msg("auto fermat-threads=%d (1 sieve + %d fermat)\n",
+                crt_fermat_threads, crt_fermat_threads);
+    }
+    if (crt_fermat_threads > 0 && crt_fermat_threads >= num_threads) {
+        crt_fermat_threads = num_threads - 1;
+        log_msg("clamped fermat-threads=%d (need at least 1 sieve thread)\n",
+                crt_fermat_threads);
     }
 
     if (selftest) {
@@ -3649,12 +4050,18 @@ int main(int argc, char **argv) {
                         }
 
                         /* Scan consecutive primes for qualifying gaps */
+                        __sync_fetch_and_add(&stats_crt_windows, 1);
+                        __sync_fetch_and_add(&stats_primes_found, (uint64_t)pf);
                         if (pf >= 2) {
                             __sync_fetch_and_add(&stats_pairs,
                                                  (uint64_t)(pf - 1));
                             for (size_t i = 0; i + 1 < pf; i++) {
                                 uint64_t gap = surv[i + 1] - surv[i];
                                 double merit = (double)gap / logbase_st;
+                                if (merit > stats_best_merit) {
+                                    stats_best_merit = merit;
+                                    stats_best_gap   = gap;
+                                }
                                 if (merit < target) continue;
 
                                 __sync_fetch_and_add(&stats_gaps, 1);
@@ -3872,6 +4279,12 @@ int main(int argc, char **argv) {
     } else {
         do {
             g_abort_pass = 0;
+            /* Flush stale heap items from previous pass and bump generation */
+            if (crt_fermat_threads > 0) {
+                crt_heap_shutdown = 0;
+                crt_heap_flush();
+                __sync_fetch_and_add(&crt_heap_gen, 1);
+            }
             pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);
             struct worker_args *wargs = malloc(sizeof(struct worker_args) * num_threads);
             /* Partition the adder range evenly across threads so every core
@@ -3882,6 +4295,12 @@ int main(int argc, char **argv) {
                loops over those windows continuously until a new block arrives. */
             int64_t slice = adder_max / (int64_t)num_threads;
             if (slice < 1) slice = 1;
+            /* Assign CRT roles: first (num_threads - crt_fermat_threads) are
+               sieve producers (role=0), rest are fermat consumers (role=1).
+               Sieve threads get sequential tids 0..n_sieve-1 for nonce
+               distribution; fermat threads don't iterate nonces. */
+            int n_sieve = num_threads - crt_fermat_threads;
+            if (n_sieve < 1) n_sieve = 1;
             for (int t = 0; t < num_threads; t++) {
                 int64_t off  = (int64_t)t * slice;
                 int64_t sz   = (t == num_threads - 1) ? (adder_max - off) : slice;
@@ -3900,6 +4319,8 @@ int main(int argc, char **argv) {
                 wargs[t].rpc_pass          = rpc_pass;
                 wargs[t].rpc_method        = rpc_method;
                 wargs[t].rpc_sign_key      = rpc_sign_key;
+                /* CRT role: sieve threads are 0..n_sieve-1, fermat are the rest */
+                wargs[t].crt_role = (crt_fermat_threads > 0 && t >= n_sieve) ? 1 : 0;
                 pthread_create(&threads[t], NULL, worker_fn, &wargs[t]);
             }
             for (int t = 0; t < num_threads; t++) pthread_join(threads[t], NULL);

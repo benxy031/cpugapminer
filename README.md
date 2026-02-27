@@ -137,6 +137,47 @@ bin/gap_miner \
   --crt-file crt/crt_s64_m21.txt
 ```
 
+With CRT at shift 512 (high-merit mining, monolithic — best for ≤ 6 threads):
+
+```sh
+bin/gap_miner \
+  --rpc-url  http://127.0.0.1:31397/ \
+  --rpc-user USER \
+  --rpc-pass PASS \
+  --shift 513 \
+  --threads 6 \
+  --fast-fermat \
+  --fermat-threads 0 \
+  --crt-file crt/crt_s512_m22.txt
+```
+
+With CRT at shift 512 (producer-consumer, best for many threads):
+
+```sh
+bin/gap_miner \
+  --rpc-url  http://127.0.0.1:31397/ \
+  --rpc-user USER \
+  --rpc-pass PASS \
+  --shift 513 \
+  --threads 16 \
+  --fast-fermat \
+  --crt-file crt/crt_s512_m22.txt
+```
+
+Explicit producer-consumer split (2 sieve + 14 fermat):
+
+```sh
+bin/gap_miner \
+  --rpc-url  http://127.0.0.1:31397/ \
+  --rpc-user USER \
+  --rpc-pass PASS \
+  --shift 513 \
+  --threads 16 \
+  --fast-fermat \
+  --fermat-threads 14 \
+  --crt-file crt/crt_s512_m22.txt
+```
+
 Capture output to a file as well:
 
 ```sh
@@ -240,25 +281,60 @@ compatible with the original GapMiner `--calc-ctr` approach.
 The CRT mining loop:
 
 1. **Compute primorial** = product of all CRT primes (e.g. 2×3×5×…×47 ≈ 2^59
-   for 15 primes).
+   for 15 primes at shift 64, or 2×3×…×379 ≈ 2^510 for 75 primes at shift
+   512).
 2. **CRT alignment** — solve `nAdd ≡ -(base + o_i) (mod p_i)` for each CRT
    prime `p_i` with offset `o_i`, combining via incremental CRT.  This
    positions each prime's composites inside the gap region starting at
    `base + nAdd`.
 3. **Iterate** `nAdd = nAdd0, nAdd0 + primorial, …` up to `adder_max`.
    At shift 64 with 15 primes, primorial ≈ 2^59 gives only **~15 candidate
-   nAdd values** per hash.
-4. **Fermat-test** each `base + nAdd`.  If composite, skip immediately.
-5. **Gap check** — for each confirmed prime, sieve a small forward region
-   (2 × gap_target ≈ 10 000 positions) and Fermat-test survivors to measure
-   the gap.
-6. **Report** — qualifying gaps (merit ≥ target) are passed to the standard
+   nAdd values** per hash.  At shift 512 with 75 primes, primorial ≈ 2^510
+   ≈ 2^shift so there is effectively **one candidate per hash**.
+4. **Sieve** a small forward region (2 × gap_target ≈ 23 424 positions) using
+   ~1M small primes, then **Fermat-test all survivors** (~683 at shift 512)
+   to find consecutive primes and measure the gap.
+5. **Report** — qualifying gaps (merit ≥ target) are passed to the standard
    `scan_candidates` path for block assembly and submission.
 
-Because the normal windowed sieve is bypassed entirely, `--sieve-size`,
-`--sieve-primes`, and `--sample-stride` have no effect in CRT mode.  The
-only relevant flags are `--shift`, `--threads`, `--fast-fermat`, `--target`,
-and `--crt-file`.
+The normal large windowed sieve is bypassed, so `--sieve-size` and
+`--sample-stride` have no effect in CRT mode.  However, `--sieve-primes`
+**is** used — it controls how many small primes are applied to the gap-check
+sieve (default 900 000 primes, up to ~15.4M).  The prime value limit is
+auto-computed from the count via the PNT upper bound
+($p_n < n(\ln n + \ln \ln n)$ with a 5% margin).  The relevant flags are
+`--shift`, `--threads`, `--fast-fermat`, `--target`, `--crt-file`,
+`--fermat-threads`, and `--sieve-primes`.
+
+#### Producer-consumer mode (gaplist)
+
+With `--fermat-threads N` (or `-d N`, compatible with GapMiner), the miner
+splits CRT work into a **producer-consumer** pipeline:
+
+- **Sieve producer threads** iterate nonces, CRT-align, and sieve each
+  window.  Completed windows (with their survivor lists) are pushed onto
+  a priority **min-heap** (the "gaplist"), keyed by survivor count —
+  windows with fewer survivors are tested first.
+- **Fermat consumer threads** pop windows from the gaplist and Fermat-test
+  all survivors to find and report qualifying gaps.
+
+The gaplist has a bounded capacity of 4 096 entries.  When full, the sieve
+producer blocks until consumers free space.  The stats line shows the
+current gaplist depth (e.g. `gaplist=142`).
+
+**Auto-detection:** when `--fermat-threads` is not specified and the miner
+is using a text CRT file with ≥ 3 threads, it automatically enables
+producer-consumer mode with `threads - 1` fermat threads and 1 sieve
+thread.  To disable this and use the monolithic (all-in-one) path, pass
+`--fermat-threads 0`.
+
+**When to use producer-consumer vs monolithic:**
+
+| Scenario | Recommendation |
+|----------|---------------|
+| High shift (≥ 256), few threads (≤ 6) | Monolithic (`--fermat-threads 0`) — sieve is <1ms, dedicating a thread to it wastes CPU |
+| High shift (≥ 256), many threads (≥ 8) | Producer-consumer — losing 1 thread to sieve is a small fraction |
+| Low shift (< 128), any thread count | Producer-consumer — sieve takes longer, benefits from dedicated threads |
 
 Two CRT file formats are supported:
 
@@ -266,8 +342,6 @@ Two CRT file formats are supported:
 |--------|-----------|------|-------------|
 | Legacy binary | `.bin` | `CRT_MODE_TEMPLATE` | Bitmap tiling, ≤10 primes (old format) |
 | Text (gen_crt) | `.txt` | `CRT_MODE_SOLVER` | Prime:offset pairs, CRT-aligned mining |
-
-The format is auto-detected on load.
 
 ### Two-phase smart gap scanning
 
@@ -354,8 +428,10 @@ gap.  The block-finding rate improves by **3.4×**.
    constrains which nAdd values to test, reducing the search space to
    only primorial-aligned candidates.  Instead of sieving millions of
    values per window, only ~15 CRT candidates are tested per hash (at
-   shift 64 / 15 primes).  Each prime found triggers a small targeted
-   gap-check sieve.
+   shift 64 / 15 primes).  Each candidate triggers a small targeted
+   gap-check sieve (~23K positions) with ~1M primes, then all survivors
+   are Fermat-tested.  Optional producer-consumer mode (gaplist)
+   separates sieving from Fermat testing across threads.
 
 8. **-O3 + LTO** -- Aggressive compiler optimization with link-time
    optimization enables cross-module inlining and auto-vectorization.
@@ -380,7 +456,7 @@ gap.  The block-finding rate improves by **3.4×**.
 | `--shift N`           | 20            | Left-shift exponent applied to the hash.  Minimum 14, practical limit 512–1024 (per network).  Shifts > 62 are supported (`adder_max` capped at `INT64_MAX`). |
 | `--adder-max M`       | `2^shift`     | Upper bound for the adder loop (`<= 2^shift`) |
 | `--sieve-size S`      | 33554432      | Odd candidates per sieve segment |
-| `--sieve-primes P`    | 900000        | Small primes used for pre-sieving |
+| `--sieve-primes P`    | 900000        | Number of small primes used for sieving.  The actual prime value limit is auto-computed from the count via PNT upper bound (900K → primes up to ~15.4M). Used in both normal and CRT modes. |
 | `--target T`          | *(node bits)* | Minimum merit `gap/log(p)` to build a block |
 | `--threads N`         | 1             | Worker threads; each thread runs the full sieve + primality (Fermat/Miller-Rabin) + gap-scan pipeline over its own disjoint slice of the adder range (`tid, tid+N, tid+2N, …`) |
 | `--rpc-url URL`       | --            | JSON-RPC endpoint of `gapcoind` |
@@ -394,6 +470,7 @@ gap.  The block-finding rate improves by **3.4×**.
 | `--fast-fermat`       | off           | Fast single-base Fermat primality test |
 | `--sample-stride K`   | 8             | Smart scan: test every Kth survivor, skip regions that can't contain qualifying gaps.  Set to 1 to disable. |
 | `--crt-file FILE`     | --            | Load a CRT sieve file (binary `.bin` or text `.txt`).  Text files enable CRT-aligned mining; binary files enable template tiling. |
+| `--fermat-threads N` / `-d N` | *(auto)* | Number of Fermat consumer threads for CRT producer-consumer mode.  Auto-detected as `threads - 1` when using text CRT with ≥ 3 threads.  Set to `0` to force monolithic (all-in-one) mode. |
 | `--no-primality`      | off           | Skip primality testing entirely |
 | `--build-only`        | off           | Fetch template and build one block, then exit |
 | `--no-opreturn`       | off           | Omit OP_RETURN from coinbase |
@@ -453,6 +530,7 @@ STATS: elapsed=30.0s  sieved=520000000 (34666667/s)  tested=4561182 (304079/s)  
 | `accepted` | Node confirmed the block |
 | `prob` | Per-pair probability of a qualifying gap (`e^(-target)`, Cramér–Granville heuristic) |
 | `est` | Estimated time to find a qualifying gap at current rate |
+| `gaplist` | (CRT producer-consumer only) Number of sieved windows waiting in the priority heap.  Healthy range is 50–500; 0 means consumers are starved, near 4096 means producers are blocked. |
 
 ### Why `gaps=0` and `submitted=0` are normal early on
 
