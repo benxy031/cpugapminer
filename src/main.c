@@ -2461,8 +2461,14 @@ static void *worker_fn(void *arg) {
         uint32_t nonce_cur = g_pass.nonce + 1 + (uint32_t)tid_local;
 
         /* Temp mpz for candidate = base + nAdd */
-        mpz_t nAdd, candidate;
-        mpz_inits(nAdd, candidate, NULL);
+        mpz_t nAdd, candidate, orig_base_crt;
+        mpz_inits(nAdd, candidate, orig_base_crt, NULL);
+
+        /* Precompute primorial % p for all sieve primes once.
+           Enables O(1) incremental residue updates between CRT windows
+           instead of O(768-bit division) per prime per window. */
+        uint64_t *prim_mod_sieve = NULL;
+        size_t    prim_mod_count = 0;
 
         while (keep_going && !g_abort_pass) {
 
@@ -2526,18 +2532,59 @@ static void *worker_fn(void *arg) {
             /* Compute GMP CRT alignment: nAdd0 mod primorial */
             crt_compute_alignment_mpz(nAdd);  /* nAdd = nAdd0 */
 
+            /* Save original base for candidate computation.
+               This avoids the expensive set_base_bn() restore call
+               (which recomputes ~1M residues) at the end of every
+               CRT window. */
+            mpz_set(orig_base_crt, tls_base_mpz);
+
+            /* Lazy-init primorial mod cache (once per thread). */
+            if (!prim_mod_sieve && small_primes_cache &&
+                small_primes_count > 0) {
+                prim_mod_count = small_primes_count;
+                prim_mod_sieve = (uint64_t *)malloc(
+                    prim_mod_count * sizeof(uint64_t));
+                if (prim_mod_sieve) {
+                    for (size_t pi = 0; pi < prim_mod_count; pi++)
+                        prim_mod_sieve[pi] = mpz_fdiv_ui(
+                            g_crt_primorial_mpz,
+                            (unsigned long)small_primes_cache[pi]);
+                }
+            }
+
+            /* First CRT window: full rebase to establish residues.
+               Determine cand_odd (constant for all windows of this
+               nonce since primorial is even). */
+            mpz_add(candidate, orig_base_crt, nAdd);
+            int cand_odd = mpz_odd_p(candidate);
+            if (cand_odd) mpz_sub_ui(candidate, candidate, 1);
+            rebase_for_gap_check(candidate);
+            int crt_first_win = 1;
+
             /* Iterate CRT windows: nAdd, nAdd+primorial, ... < 2^shift.
                For each window, sieve the gap range, Fermat-test all
                survivors to find primes, then scan consecutive primes
                for gaps meeting the target merit. */
             while (mpz_cmp(nAdd, crt_end) < 0 && keep_going && !g_abort_pass) {
 
-                /* Rebase sieve state to the CRT-aligned position.
-                   The odd-only sieve requires an even base. */
-                mpz_add(candidate, tls_base_mpz, nAdd);
-                int cand_odd = mpz_odd_p(candidate);
-                if (cand_odd) mpz_sub_ui(candidate, candidate, 1);
-                rebase_for_gap_check(candidate);
+                if (!crt_first_win) {
+                    /* Incremental rebase: advance sieve base by primorial.
+                       Cost: O(small_primes_count) integer adds vs
+                       O(small_primes_count × 768-bit divisions) for a
+                       full rebase_for_gap_check(). */
+                    mpz_add(tls_base_mpz, tls_base_mpz,
+                            g_crt_primorial_mpz);
+                    if (prim_mod_sieve && tls_base_mod_p) {
+                        for (size_t pi = 0; pi < prim_mod_count; pi++) {
+                            tls_base_mod_p[pi] += prim_mod_sieve[pi];
+                            if (tls_base_mod_p[pi] >=
+                                small_primes_cache[pi])
+                                tls_base_mod_p[pi] -=
+                                    small_primes_cache[pi];
+                        }
+                    }
+                }
+                crt_first_win = 0;
 
                 /* Sieve gap range: offsets 1..gap_scan_max from base.
                    sieve_range forces L odd, so gap_L=1 → L=1 (odd). */
@@ -2549,7 +2596,6 @@ static void *worker_fn(void *arg) {
                 __sync_fetch_and_add(&stats_sieved, gap_R - gap_L);
 
                 if (!surv || surv_cnt == 0) {
-                    set_base_bn(h256_nonce, shift_local);
                     mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
                     continue;
                 }
@@ -2561,9 +2607,6 @@ static void *worker_fn(void *arg) {
                     if (bn_candidate_is_prime(surv[j]))
                         surv[pf++] = surv[j];
                 }
-
-                /* Restore original base for block assembly */
-                set_base_bn(h256_nonce, shift_local);
 
                 /* Scan consecutive prime pairs for qualifying gaps */
                 if (pf >= 2) {
@@ -2661,7 +2704,8 @@ static void *worker_fn(void *arg) {
         } /* end nonce loop */
 
         /* ── CRT cleanup ── */
-        mpz_clears(nAdd, candidate, crt_end, NULL);
+        mpz_clears(nAdd, candidate, orig_base_crt, crt_end, NULL);
+        free(prim_mod_sieve);
         free_sieve_buffers();
         if (tls_gmp_inited) {
             mpz_clear(tls_base_mpz);
@@ -3512,9 +3556,13 @@ int main(int argc, char **argv) {
                 int gap_scan_max = g_crt_gap_target * 2;
                 if (gap_scan_max < 10000) gap_scan_max = 10000;
 
-                mpz_t crt_end, nAdd_st, cand_st;
-                mpz_inits(crt_end, nAdd_st, cand_st, NULL);
+                mpz_t crt_end, nAdd_st, cand_st, orig_base_st;
+                mpz_inits(crt_end, nAdd_st, cand_st, orig_base_st, NULL);
                 mpz_ui_pow_ui(crt_end, 2, (unsigned long)shift);
+
+                /* Precompute primorial % p for incremental rebase. */
+                uint64_t *st_prim_mod = NULL;
+                size_t    st_prim_cnt = 0;
 
                 static int st_crt_logged = 0;
                 if (!st_crt_logged) {
@@ -3541,13 +3589,44 @@ int main(int argc, char **argv) {
 
                     crt_compute_alignment_mpz(nAdd_st);
 
+                    /* Save original base; lazy-init primorial mod cache. */
+                    mpz_set(orig_base_st, tls_base_mpz);
+                    if (!st_prim_mod && small_primes_cache &&
+                        small_primes_count > 0) {
+                        st_prim_cnt = small_primes_count;
+                        st_prim_mod = (uint64_t *)malloc(
+                            st_prim_cnt * sizeof(uint64_t));
+                        if (st_prim_mod) {
+                            for (size_t pi = 0; pi < st_prim_cnt; pi++)
+                                st_prim_mod[pi] = mpz_fdiv_ui(
+                                    g_crt_primorial_mpz,
+                                    (unsigned long)small_primes_cache[pi]);
+                        }
+                    }
+
+                    /* First window: full rebase. */
+                    mpz_add(cand_st, orig_base_st, nAdd_st);
+                    int st_odd = mpz_odd_p(cand_st);
+                    if (st_odd) mpz_sub_ui(cand_st, cand_st, 1);
+                    rebase_for_gap_check(cand_st);
+                    int st_first_win = 1;
+
                     while (mpz_cmp(nAdd_st, crt_end) < 0 && keep_going && !g_abort_pass) {
-                        /* Rebase to CRT-aligned position (even for
-                           odd-only sieve). */
-                        mpz_add(cand_st, tls_base_mpz, nAdd_st);
-                        int st_odd = mpz_odd_p(cand_st);
-                        if (st_odd) mpz_sub_ui(cand_st, cand_st, 1);
-                        rebase_for_gap_check(cand_st);
+                        if (!st_first_win) {
+                            /* Incremental rebase */
+                            mpz_add(tls_base_mpz, tls_base_mpz,
+                                    g_crt_primorial_mpz);
+                            if (st_prim_mod && tls_base_mod_p) {
+                                for (size_t pi = 0; pi < st_prim_cnt; pi++) {
+                                    tls_base_mod_p[pi] += st_prim_mod[pi];
+                                    if (tls_base_mod_p[pi] >=
+                                        small_primes_cache[pi])
+                                        tls_base_mod_p[pi] -=
+                                            small_primes_cache[pi];
+                                }
+                            }
+                        }
+                        st_first_win = 0;
 
                         uint64_t gap_L = 1;
                         uint64_t gap_R = (uint64_t)gap_scan_max;
@@ -3557,7 +3636,6 @@ int main(int argc, char **argv) {
                         __sync_fetch_and_add(&stats_sieved, gap_R - gap_L);
 
                         if (!surv || surv_cnt == 0) {
-                            set_base_bn(h256_st, shift);
                             mpz_add(nAdd_st, nAdd_st, g_crt_primorial_mpz);
                             continue;
                         }
@@ -3569,8 +3647,6 @@ int main(int argc, char **argv) {
                             if (bn_candidate_is_prime(surv[j]))
                                 surv[pf++] = surv[j];
                         }
-
-                        set_base_bn(h256_st, shift);
 
                         /* Scan consecutive primes for qualifying gaps */
                         if (pf >= 2) {
@@ -3648,7 +3724,8 @@ int main(int argc, char **argv) {
                     nonce_st++;
                 } /* end nonce loop */
 
-                mpz_clears(crt_end, nAdd_st, cand_st, NULL);
+                mpz_clears(crt_end, nAdd_st, cand_st, orig_base_st, NULL);
+                free(st_prim_mod);
                 goto st_rpc_poll;
 #endif /* WITH_RPC — CRT-SOLVER single-thread */
             }
