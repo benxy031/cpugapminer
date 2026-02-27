@@ -236,7 +236,8 @@ static size_t          crt_heap_size = 0;
 static pthread_mutex_t crt_heap_mtx  = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  crt_heap_cv   = PTHREAD_COND_INITIALIZER;
 static volatile uint64_t crt_heap_gen   = 0;  /* incremented on template change */
-static volatile int    crt_fermat_threads = 0; /* number of fermat threads (0 = disabled) */
+static volatile int    crt_fermat_threads = 0; /* number of fermat threads (0 = monolithic) */
+static int             crt_fermat_explicit = 0; /* 1 if user passed --fermat-threads */
 static volatile int    crt_heap_shutdown = 0;    /* 1 = all threads should exit */
 
 /* Allocate a work item with mpz_t's initialized */
@@ -3718,8 +3719,10 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i],"--crt-file") && i+1<argc)
             cli_crt_file = argv[++i];
-        else if ((!strcmp(argv[i],"--fermat-threads") || !strcmp(argv[i],"-d")) && i+1<argc)
+        else if ((!strcmp(argv[i],"--fermat-threads") || !strcmp(argv[i],"-d")) && i+1<argc) {
             crt_fermat_threads = atoi(argv[++i]);
+            crt_fermat_explicit = 1;
+        }
         else if (!strcmp(argv[i],"--p") && i+1<argc) build_p = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i],"--q") && i+1<argc) build_q = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i],"--keep-going")) {
@@ -3774,15 +3777,18 @@ int main(int argc, char **argv) {
     }
 
     /* Auto-detect fermat threads for CRT solver producer-consumer mode.
-       Default: threads-1 for CRT solver with threads >= 3.
-       The sieve is ~3000× faster than Fermat testing at high shifts,
-       so 1 sieve thread can feed many fermat threads.
-       Setting --fermat-threads 0 disables producer-consumer (monolithic). */
-    if (g_crt_mode == CRT_MODE_SOLVER && crt_fermat_threads == 0 &&
-        num_threads >= 3) {
-        crt_fermat_threads = num_threads - 1;
-        log_msg("auto fermat-threads=%d (1 sieve + %d fermat)\n",
-                crt_fermat_threads, crt_fermat_threads);
+       At high shifts (>= 256) the sieve is <1ms while Fermat testing
+       takes ~270ms per window, so the sieve is <0.1% of work.  Dedicating
+       a thread to sieving wastes CPU — monolithic is better (every thread
+       does sieve+fermat on its own work).  Default: monolithic (0).
+       Producer-consumer is only enabled with explicit --fermat-threads N.
+       Setting --fermat-threads 0 explicitly also selects monolithic. */
+    if (g_crt_mode == CRT_MODE_SOLVER && !crt_fermat_explicit &&
+        crt_fermat_threads == 0) {
+        /* Default: monolithic — all threads sieve+fermat independently */
+        log_msg("CRT mode: monolithic (all %d threads sieve+fermat)\n",
+                num_threads);
+        log_msg("  use --fermat-threads N to enable producer-consumer\n");
     }
     if (crt_fermat_threads > 0 && crt_fermat_threads >= num_threads) {
         crt_fermat_threads = num_threads - 1;
