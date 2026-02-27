@@ -2,7 +2,7 @@
 gapcoin_src/
 
 # Build output
-bin/gap_miner
+bin/
 src/*.o
 tests/test_rpc_json
 
