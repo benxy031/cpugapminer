@@ -2600,131 +2600,97 @@ static void *worker_fn(void *arg) {
                     continue;
                 }
 
-                /* ── Skip-ahead gap scan ──
-                   Instead of Fermat-testing ALL ~683 survivors (1025ms),
-                   use the gap_target to skip large swathes:
-                   1. Find next prime P by testing survivors in order.
-                   2. Binary-search for first survivor ≥ P + gap_target.
-                   3. Test survivors there looking for next prime Q.
-                   4. If Q − P ≥ gap_target → qualifying gap.
-                   5. P ← Q, repeat from step 2.
-                   Reduces Fermat tests from ~683 to ~60-80 per window. */
-                {
-                    uint64_t min_gap = (uint64_t)(target_local * logbase_nonce);
-                    size_t idx = 0;  /* current scan position in surv[] */
+                /* Fermat-test ALL survivors to find primes */
+                size_t pf = 0;
+                for (size_t j = 0; j < surv_cnt; j++) {
+                    __sync_fetch_and_add(&stats_tested, 1);
+                    if (bn_candidate_is_prime(surv[j]))
+                        surv[pf++] = surv[j];
+                }
 
-                    /* Find the first prime */
-                    while (idx < surv_cnt) {
-                        __sync_fetch_and_add(&stats_tested, 1);
-                        if (bn_candidate_is_prime(surv[idx])) break;
-                        idx++;
-                    }
-
-                    while (idx < surv_cnt) {
-                        uint64_t prev_prime = surv[idx];
-
-                        /* Binary-search for first survivor ≥ prev_prime + min_gap */
-                        uint64_t skip_to = prev_prime + min_gap;
-                        size_t lo = idx + 1, hi = surv_cnt;
-                        while (lo < hi) {
-                            size_t mid = lo + (hi - lo) / 2;
-                            if (surv[mid] < skip_to) lo = mid + 1;
-                            else hi = mid;
-                        }
-                        /* lo = first survivor index ≥ skip_to */
-
-                        /* Find next prime starting from lo */
-                        size_t nxt = lo;
-                        while (nxt < surv_cnt) {
-                            __sync_fetch_and_add(&stats_tested, 1);
-                            if (bn_candidate_is_prime(surv[nxt])) break;
-                            nxt++;
-                        }
-                        if (nxt >= surv_cnt) break; /* no more primes */
-
-                        uint64_t next_prime = surv[nxt];
-                        uint64_t gap = next_prime - prev_prime;
+                /* Scan consecutive prime pairs for qualifying gaps */
+                if (pf >= 2) {
+                    __sync_fetch_and_add(&stats_pairs, (uint64_t)(pf - 1));
+                    for (size_t i = 0; i + 1 < pf; i++) {
+                        uint64_t gap = surv[i + 1] - surv[i];
                         double merit = (double)gap / logbase_nonce;
+                        if (merit < target_local) continue;
 
-                        __sync_fetch_and_add(&stats_pairs, 1);
+                        __sync_fetch_and_add(&stats_gaps, 1);
 
-                        if (merit >= target_local) {
-                            __sync_fetch_and_add(&stats_gaps, 1);
+                        /* nAdd of gap-starting prime:
+                           prime = base + surv[i] (where base may be
+                           candidate-1 if candidate was odd) */
+                        mpz_t nAdd_prime;
+                        mpz_init(nAdd_prime);
+                        mpz_set(nAdd_prime, nAdd);
+                        mpz_add_ui(nAdd_prime, nAdd_prime, surv[i]);
+                        if (cand_odd)
+                            mpz_sub_ui(nAdd_prime, nAdd_prime, 1);
 
-                            mpz_t nAdd_prime;
-                            mpz_init(nAdd_prime);
-                            mpz_set(nAdd_prime, nAdd);
-                            mpz_add_ui(nAdd_prime, nAdd_prime, prev_prime);
-                            if (cand_odd)
-                                mpz_sub_ui(nAdd_prime, nAdd_prime, 1);
-
-                            char nAdd_str[256];
-                            gmp_snprintf(nAdd_str, sizeof(nAdd_str), "%Zd",
-                                         nAdd_prime);
-                            log_msg("\n>>> GAP FOUND\n"
-                                    "    gap     = %llu\n"
-                                    "    merit   = %.6f  (need >= %.2f)\n"
-                                    "    nShift  = %d\n"
-                                    "    nonce   = %u\n"
-                                    "    nAdd    = %s\n",
-                                    (unsigned long long)gap,
-                                    merit, target_local,
-                                    shift_local,
-                                    (unsigned)nonce_cur,
-                                    nAdd_str);
+                        char nAdd_str[256];
+                        gmp_snprintf(nAdd_str, sizeof(nAdd_str), "%Zd",
+                                     nAdd_prime);
+                        log_msg("\n>>> GAP FOUND\n"
+                                "    gap     = %llu\n"
+                                "    merit   = %.6f  (need >= %.2f)\n"
+                                "    nShift  = %d\n"
+                                "    nonce   = %u\n"
+                                "    nAdd    = %s\n",
+                                (unsigned long long)gap,
+                                merit, target_local,
+                                shift_local,
+                                (unsigned)nonce_cur,
+                                nAdd_str);
 #ifdef WITH_RPC
-                            if (rpc_url_local && !g_abort_pass) {
-                                pthread_mutex_lock(&sq_lock);
-                                int sq_busy = (sq_count > 0);
-                                pthread_mutex_unlock(&sq_lock);
-                                if (!sq_busy) {
-                                    char blockhex[16384];
-                                    memset(blockhex, 0, sizeof(blockhex));
-                                    if (assemble_mining_block_mpz(nonce_cur,
-                                            nAdd_prime, blockhex)) {
-                                        __sync_fetch_and_add(&stats_blocks, 1);
-                                        log_file_only("Built blockhex: %s\n",
-                                                      blockhex);
-                                        if (header_meets_target_hex(blockhex)) {
-                                            log_msg(">>> SUBMITTING to node\n"
-                                                    "    merit=%.6f  gap=%llu"
-                                                    "  nShift=%d  nonce=%u\n",
-                                                    merit,
-                                                    (unsigned long long)gap,
-                                                    shift_local,
-                                                    (unsigned)nonce_cur);
-                                            struct submit_job _job;
-                                            memset(&_job, 0, sizeof(_job));
-                                            strncpy(_job.url, rpc_url_local,
-                                                    sizeof(_job.url)-1);
-                                            strncpy(_job.user,
-                                                    rpc_user_local ? rpc_user_local : "",
-                                                    sizeof(_job.user)-1);
-                                            strncpy(_job.pass,
-                                                    rpc_pass_local ? rpc_pass_local : "",
-                                                    sizeof(_job.pass)-1);
-                                            strncpy(_job.method, "getwork",
-                                                    sizeof(_job.method)-1);
-                                            memcpy(_job.hex, blockhex,
-                                                   sizeof(_job.hex));
-                                            _job.retries = rpc_default_retries;
-                                            __sync_fetch_and_add(&stats_submits, 1);
-                                            enqueue_job(&_job);
-                                            log_msg(">>> QUEUED for async submit"
-                                                    " (mining continues)\n");
-                                            print_stats();
-                                        }
-                                    } else {
-                                        log_msg("Failed to assemble block\n");
+                        if (rpc_url_local && !g_abort_pass) {
+                            pthread_mutex_lock(&sq_lock);
+                            int sq_busy = (sq_count > 0);
+                            pthread_mutex_unlock(&sq_lock);
+                            if (!sq_busy) {
+                                char blockhex[16384];
+                                memset(blockhex, 0, sizeof(blockhex));
+                                if (assemble_mining_block_mpz(nonce_cur,
+                                        nAdd_prime, blockhex)) {
+                                    __sync_fetch_and_add(&stats_blocks, 1);
+                                    log_file_only("Built blockhex: %s\n",
+                                                  blockhex);
+                                    if (header_meets_target_hex(blockhex)) {
+                                        log_msg(">>> SUBMITTING to node\n"
+                                                "    merit=%.6f  gap=%llu"
+                                                "  nShift=%d  nonce=%u\n",
+                                                merit,
+                                                (unsigned long long)gap,
+                                                shift_local,
+                                                (unsigned)nonce_cur);
+                                        struct submit_job _job;
+                                        memset(&_job, 0, sizeof(_job));
+                                        strncpy(_job.url, rpc_url_local,
+                                                sizeof(_job.url)-1);
+                                        strncpy(_job.user,
+                                                rpc_user_local ? rpc_user_local : "",
+                                                sizeof(_job.user)-1);
+                                        strncpy(_job.pass,
+                                                rpc_pass_local ? rpc_pass_local : "",
+                                                sizeof(_job.pass)-1);
+                                        strncpy(_job.method, "getwork",
+                                                sizeof(_job.method)-1);
+                                        memcpy(_job.hex, blockhex,
+                                               sizeof(_job.hex));
+                                        _job.retries = rpc_default_retries;
+                                        __sync_fetch_and_add(&stats_submits, 1);
+                                        enqueue_job(&_job);
+                                        log_msg(">>> QUEUED for async submit"
+                                                " (mining continues)\n");
+                                        print_stats();
                                     }
+                                } else {
+                                    log_msg("Failed to assemble block\n");
                                 }
                             }
-#endif
-                            mpz_clear(nAdd_prime);
                         }
-
-                        /* Advance: use this prime as new start */
-                        idx = nxt;
+#endif
+                        mpz_clear(nAdd_prime);
                     }
                 }
 
@@ -3674,107 +3640,81 @@ int main(int argc, char **argv) {
                             continue;
                         }
 
-                        /* ── Skip-ahead gap scan (single-thread) ── */
-                        {
-                            uint64_t min_gap_st =
-                                (uint64_t)(target * logbase_st);
-                            size_t idx = 0;
+                        /* Fermat-test ALL survivors */
+                        size_t pf = 0;
+                        for (size_t j = 0; j < surv_cnt; j++) {
+                            __sync_fetch_and_add(&stats_tested, 1);
+                            if (bn_candidate_is_prime(surv[j]))
+                                surv[pf++] = surv[j];
+                        }
 
-                            /* Find first prime */
-                            while (idx < surv_cnt) {
-                                __sync_fetch_and_add(&stats_tested, 1);
-                                if (bn_candidate_is_prime(surv[idx])) break;
-                                idx++;
-                            }
-
-                            while (idx < surv_cnt) {
-                                uint64_t prev_prime = surv[idx];
-
-                                /* Binary-search for first survivor ≥ prev_prime + min_gap_st */
-                                uint64_t skip_to = prev_prime + min_gap_st;
-                                size_t lo = idx + 1, hi = surv_cnt;
-                                while (lo < hi) {
-                                    size_t mid = lo + (hi - lo) / 2;
-                                    if (surv[mid] < skip_to) lo = mid + 1;
-                                    else hi = mid;
-                                }
-
-                                size_t nxt = lo;
-                                while (nxt < surv_cnt) {
-                                    __sync_fetch_and_add(&stats_tested, 1);
-                                    if (bn_candidate_is_prime(surv[nxt])) break;
-                                    nxt++;
-                                }
-                                if (nxt >= surv_cnt) break;
-
-                                uint64_t next_prime = surv[nxt];
-                                uint64_t gap = next_prime - prev_prime;
+                        /* Scan consecutive primes for qualifying gaps */
+                        if (pf >= 2) {
+                            __sync_fetch_and_add(&stats_pairs,
+                                                 (uint64_t)(pf - 1));
+                            for (size_t i = 0; i + 1 < pf; i++) {
+                                uint64_t gap = surv[i + 1] - surv[i];
                                 double merit = (double)gap / logbase_st;
+                                if (merit < target) continue;
 
-                                __sync_fetch_and_add(&stats_pairs, 1);
+                                __sync_fetch_and_add(&stats_gaps, 1);
 
-                                if (merit >= target) {
-                                    __sync_fetch_and_add(&stats_gaps, 1);
+                                mpz_t nAdd_p;
+                                mpz_init(nAdd_p);
+                                mpz_set(nAdd_p, nAdd_st);
+                                mpz_add_ui(nAdd_p, nAdd_p, surv[i]);
+                                if (st_odd)
+                                    mpz_sub_ui(nAdd_p, nAdd_p, 1);
 
-                                    mpz_t nAdd_p;
-                                    mpz_init(nAdd_p);
-                                    mpz_set(nAdd_p, nAdd_st);
-                                    mpz_add_ui(nAdd_p, nAdd_p, prev_prime);
-                                    if (st_odd)
-                                        mpz_sub_ui(nAdd_p, nAdd_p, 1);
-
-                                    char nAdd_s[256];
-                                    gmp_snprintf(nAdd_s, sizeof(nAdd_s),
-                                                 "%Zd", nAdd_p);
-                                    log_msg("\n>>> GAP FOUND\n"
-                                            "    gap     = %llu\n"
-                                            "    merit   = %.6f  (need >= %.2f)\n"
-                                            "    nShift  = %d\n"
-                                            "    nonce   = %u\n"
-                                            "    nAdd    = %s\n",
-                                            (unsigned long long)gap,
-                                            merit, target, shift,
-                                            (unsigned)nonce_st, nAdd_s);
+                                char nAdd_s[256];
+                                gmp_snprintf(nAdd_s, sizeof(nAdd_s),
+                                             "%Zd", nAdd_p);
+                                log_msg("\n>>> GAP FOUND\n"
+                                        "    gap     = %llu\n"
+                                        "    merit   = %.6f  (need >= %.2f)\n"
+                                        "    nShift  = %d\n"
+                                        "    nonce   = %u\n"
+                                        "    nAdd    = %s\n",
+                                        (unsigned long long)gap,
+                                        merit, target, shift,
+                                        (unsigned)nonce_st, nAdd_s);
 #ifdef WITH_RPC
-                                    if (rpc_url && !g_abort_pass) {
-                                        char blockhex[16384];
-                                        memset(blockhex, 0, sizeof(blockhex));
-                                        if (assemble_mining_block_mpz(nonce_st,
-                                                nAdd_p, blockhex)) {
-                                            __sync_fetch_and_add(&stats_blocks, 1);
-                                            log_file_only("Built blockhex: %s\n",
-                                                          blockhex);
-                                            if (header_meets_target_hex(blockhex)) {
-                                                log_msg(">>> SUBMITTING to node\n");
-                                                struct submit_job _job;
-                                                memset(&_job, 0, sizeof(_job));
-                                                strncpy(_job.url, rpc_url,
-                                                        sizeof(_job.url)-1);
-                                                strncpy(_job.user,
-                                                        rpc_user ? rpc_user : "",
-                                                        sizeof(_job.user)-1);
-                                                strncpy(_job.pass,
-                                                        rpc_pass ? rpc_pass : "",
-                                                        sizeof(_job.pass)-1);
-                                                strncpy(_job.method, "getwork",
-                                                        sizeof(_job.method)-1);
-                                                memcpy(_job.hex, blockhex,
-                                                       sizeof(_job.hex));
-                                                _job.retries = rpc_default_retries;
-                                                __sync_fetch_and_add(&stats_submits,
-                                                                     1);
-                                                enqueue_job(&_job);
-                                                log_msg(">>> QUEUED for async submit"
-                                                        "\n");
-                                                print_stats();
-                                            }
+                                if (rpc_url && !g_abort_pass) {
+                                    char blockhex[16384];
+                                    memset(blockhex, 0, sizeof(blockhex));
+                                    if (assemble_mining_block_mpz(nonce_st,
+                                            nAdd_p, blockhex)) {
+                                        __sync_fetch_and_add(&stats_blocks, 1);
+                                        log_file_only("Built blockhex: %s\n",
+                                                      blockhex);
+                                        if (header_meets_target_hex(blockhex)) {
+                                            log_msg(">>> SUBMITTING to node\n");
+                                            struct submit_job _job;
+                                            memset(&_job, 0, sizeof(_job));
+                                            strncpy(_job.url, rpc_url,
+                                                    sizeof(_job.url)-1);
+                                            strncpy(_job.user,
+                                                    rpc_user ? rpc_user : "",
+                                                    sizeof(_job.user)-1);
+                                            strncpy(_job.pass,
+                                                    rpc_pass ? rpc_pass : "",
+                                                    sizeof(_job.pass)-1);
+                                            strncpy(_job.method, "getwork",
+                                                    sizeof(_job.method)-1);
+                                            memcpy(_job.hex, blockhex,
+                                                   sizeof(_job.hex));
+                                            _job.retries = rpc_default_retries;
+                                            __sync_fetch_and_add(&stats_submits,
+                                                                 1);
+                                            enqueue_job(&_job);
+                                            log_msg(">>> QUEUED for async submit"
+                                                    "\n");
+                                            print_stats();
                                         }
                                     }
-#endif
-                                    mpz_clear(nAdd_p);
                                 }
-
-                                idx = nxt;
+#endif
+                                mpz_clear(nAdd_p);
                             }
                         }
 
