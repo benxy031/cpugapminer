@@ -26,6 +26,13 @@ extern int      rpc_getwork_data(const char *url, const char *user, const char *
 #endif
 #ifdef WITH_RPC
 #include <curl/curl.h>
+#include "stratum.h"
+static stratum_ctx *g_stratum = NULL;   /* non-NULL when mining via stratum pool */
+#endif
+#ifdef WITH_CUDA
+#include "gpu_fermat.h"
+static gpu_fermat_ctx *g_gpu_ctx = NULL;
+#define GPU_MAX_BATCH (1 << 20)   /* 1M candidates per batch */
 #endif
 
 // logging helper (used in both RPC and non-RPC builds)
@@ -756,6 +763,14 @@ static void print_stats(void) {
     if (bm > 0.0)
         log_msg("  best=%.2f (gap=%llu)",
                 bm, (unsigned long long)stats_best_gap);
+
+#ifdef WITH_RPC
+    if (g_stratum) {
+        uint64_t s_acc, s_rej;
+        stratum_get_stats(g_stratum, &s_acc, &s_rej);
+        log_msg("  pool=%lu/%lu", (unsigned long)s_acc, (unsigned long)(s_acc + s_rej));
+    }
+#endif
     log_msg("\n");
 }
 
@@ -1988,6 +2003,48 @@ static int assemble_mining_block_mpz(uint32_t mining_nonce, mpz_t nadd_val,
     bytes_to_hex(buf, (size_t)(p - buf), out_hex);
     return 1;
 }
+
+/* Build a mining pass from stratum work data.
+   Same logic as build_mining_pass() but reads from the caller-provided
+   data_hex/ndiff (obtained from the stratum client) instead of HTTP getwork. */
+static int build_mining_pass_stratum(const char *data_hex, uint64_t ndiff, int shift) {
+    /* decode 80-byte header from hex */
+    uint8_t hdr80[80];
+    for (int i = 0; i < 80; i++) {
+        unsigned int bv = 0;
+        sscanf(data_hex + i*2, "%2x", &bv);
+        hdr80[i] = (uint8_t)bv;
+    }
+    /* extract prevhex: bytes 4..35 of hdr80 are prevhash in LE wire order.
+       Display as big-endian hex (byte-reversed) to match Bitcoin convention. */
+    char prevhex[65] = {0};
+    for (int i = 0; i < 32; i++)
+        sprintf(prevhex + 2*i, "%02x", hdr80[4 + 31 - i]);
+    /* find nNonce so SHA256d(hdr80+nNonce)[31] >= 0x80 */
+    uint8_t hdr84[84], sha_raw[32], h256[32];
+    uint32_t nonce = 0;
+    for (;;) {
+        memcpy(hdr84, hdr80, 80);
+        memcpy(hdr84 + 80, &nonce, 4);
+        double_sha256(hdr84, 84, sha_raw);
+        if (sha_raw[31] >= 0x80) break;
+        if (++nonce == 0) break;
+    }
+    for (int k = 0; k < 32; k++) h256[k] = sha_raw[31-k];
+    /* store in g_pass */
+    memcpy(g_pass.h256,  h256,  32);
+    memcpy(g_pass.hdr80, hdr80, 80);
+    g_pass.nonce  = nonce;
+    g_pass.nshift = (uint16_t)shift;
+    g_pass.ndiff  = ndiff;
+    strncpy(g_pass.prevhex, prevhex, 64);
+    g_pass.prevhex[64] = '\0';
+    g_pass.height = 0;
+    log_file_only("build_mining_pass_stratum: nonce=%u ndiff=%llu h256[0..3]=%02x%02x%02x%02x prevhex=%.16s...\n",
+                  nonce, (unsigned long long)ndiff,
+                  h256[0], h256[1], h256[2], h256[3], prevhex);
+    return 1;
+}
 #endif /* WITH_RPC — build_mining_pass / assemble_mining_block */
 
 /* check whether the block should be forwarded to the node for PoW validation.
@@ -2166,6 +2223,83 @@ static int bn_candidate_is_prime(uint64_t offset) {
         return mpz_probab_prime_p(tls_cand_mpz, 10) > 0;
     }
 }
+
+#ifdef WITH_CUDA
+/* GPU batch primality filter.
+   Takes the thread-local base (tls_base_mpz) and an array of uint64
+   offsets.  Sends (base + offset[i]) for each i to the GPU for Fermat
+   testing, then compacts the survivors in-place.
+   Returns the new count (number of probable primes).  */
+static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
+    if (!g_gpu_ctx || cnt == 0) return 0;
+
+    ensure_gmp_tls();
+    /* Export base into GPU_NLIMBS LE limb array */
+    uint64_t base_limbs[GPU_NLIMBS];
+    memset(base_limbs, 0, sizeof(base_limbs));
+    size_t nexp = 0;
+    mpz_export(base_limbs, &nexp, -1, 8, 0, 0, tls_base_mpz);
+    if (nexp > GPU_NLIMBS) {
+        static int warned = 0;
+        if (!warned) {
+            fprintf(stderr, "gpu_batch_filter: candidate needs %zu limbs "
+                    "but GPU_NLIMBS=%d — falling back to CPU.  "
+                    "Rebuild with GPU_BITS=%zu or higher.\n",
+                    nexp, GPU_NLIMBS, nexp * 64);
+            warned = 1;
+        }
+        /* CPU fallback */
+        size_t pf = 0;
+        for (size_t j = 0; j < cnt; j++)
+            if (bn_candidate_is_prime(offsets[j]))
+                offsets[pf++] = offsets[j];
+        return pf;
+    }
+
+    /* Allocate flat candidate buffer: cnt × GPU_NLIMBS limbs */
+    size_t batch = cnt;
+    if (batch > GPU_MAX_BATCH) batch = GPU_MAX_BATCH;
+    uint64_t *cands = (uint64_t *)malloc(batch * GPU_NLIMBS * sizeof(uint64_t));
+    uint8_t  *res   = (uint8_t  *)malloc(batch);
+    if (!cands || !res) { free(cands); free(res); return 0; }
+
+    size_t pf = 0;  /* prime-filtered count */
+    size_t i = 0;
+    while (i < cnt) {
+        size_t chunk = cnt - i;
+        if (chunk > batch) chunk = batch;
+        /* Build candidate limbs: base + offset */
+        for (size_t j = 0; j < chunk; j++) {
+            uint64_t *dst = &cands[j * GPU_NLIMBS];
+            /* copy base */
+            for (int k = 0; k < GPU_NLIMBS; k++) dst[k] = base_limbs[k];
+            /* add offset (single-precision add) */
+            uint64_t carry = 0;
+            dst[0] += offsets[i + j];
+            carry = (dst[0] < offsets[i + j]);
+            for (int k = 1; k < GPU_NLIMBS && carry; k++) {
+                dst[k] += carry;
+                carry = (dst[k] == 0);
+            }
+        }
+        /* GPU test */
+        int np = gpu_fermat_test_batch(g_gpu_ctx, cands, res, chunk);
+        if (np < 0) {
+            /* GPU error: fall back to CPU for remaining */
+            for (size_t j = 0; j < chunk; j++)
+                if (bn_candidate_is_prime(offsets[i + j]))
+                    offsets[pf++] = offsets[i + j];
+        } else {
+            for (size_t j = 0; j < chunk; j++)
+                if (res[j]) offsets[pf++] = offsets[i + j];
+        }
+        i += chunk;
+    }
+    free(cands);
+    free(res);
+    return pf;
+}
+#endif /* WITH_CUDA */
 
 // Produce hex of SHA256(header) (useful as a simple header encoding)
 static void sha256_hex(const char *s, char out[65]) __attribute__((unused));
@@ -2397,39 +2531,47 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
 #ifdef WITH_RPC
             if (rpc_url_local) {
                 if (g_abort_pass) continue;
-                /* Only one submission per block round: if there is already
-                   a job in the queue this gap will almost certainly be stale
-                   by the time the submit thread gets to it. */
-                pthread_mutex_lock(&sq_lock);
-                int sq_busy = (sq_count > 0);
-                pthread_mutex_unlock(&sq_lock);
-                if (sq_busy) continue;
                 char blockhex[16384]; memset(blockhex, 0, sizeof(blockhex));
                 if (assemble_mining_block(nadd_sc, blockhex)) {
                     __sync_fetch_and_add(&stats_blocks, 1);
                     log_file_only("Built blockhex: %s\n", blockhex);
                     if (header_meets_target_hex(blockhex)) {
-                        log_msg(">>> SUBMITTING to node\n"
-                                "    merit=%.6f  gap=%llu  nShift=%d  nAdd=%llu\n",
+                        log_msg(">>> SUBMITTING  merit=%.6f  gap=%llu  nShift=%d  nAdd=%llu\n",
                                 merit, (unsigned long long)gap,
                                 shift_sc, (unsigned long long)nadd_sc);
-                        if (rpc_sign_key_local) {
-                            char sig[65];
-                            hmac_sha256_hex(rpc_sign_key_local, blockhex, sig);
-                            log_msg("    signature: %s\n", sig);
-                        }
-                        struct submit_job _job;
-                        memset(&_job, 0, sizeof(_job));
-                        strncpy(_job.url,    rpc_url_local,                     sizeof(_job.url)-1);
-                        strncpy(_job.user,   rpc_user_local  ? rpc_user_local  : "", sizeof(_job.user)-1);
-                        strncpy(_job.pass,   rpc_pass_local  ? rpc_pass_local  : "", sizeof(_job.pass)-1);
-                        strncpy(_job.method, "getwork",                         sizeof(_job.method)-1);
-                        memcpy(_job.hex, blockhex, sizeof(_job.hex));
-                        _job.retries = rpc_default_retries;
                         __sync_fetch_and_add(&stats_submits, 1);
-                        enqueue_job(&_job);
-                        log_msg(">>> QUEUED for async submit (mining continues)\n");
-                        print_stats();
+                        if (g_stratum) {
+                            /* Submit via stratum (non-blocking) */
+                            if (stratum_submit(g_stratum, blockhex)) {
+                                log_msg(">>> SUBMITTED via stratum\n");
+                            } else {
+                                log_msg(">>> stratum submit FAILED\n");
+                            }
+                            print_stats();
+                        } else {
+                            /* Submit via HTTP RPC (async queue) */
+                            if (rpc_sign_key_local) {
+                                char sig[65];
+                                hmac_sha256_hex(rpc_sign_key_local, blockhex, sig);
+                                log_msg("    signature: %s\n", sig);
+                            }
+                            /* Only one submission per block round */
+                            pthread_mutex_lock(&sq_lock);
+                            int sq_busy = (sq_count > 0);
+                            pthread_mutex_unlock(&sq_lock);
+                            if (sq_busy) continue;
+                            struct submit_job _job;
+                            memset(&_job, 0, sizeof(_job));
+                            strncpy(_job.url,    rpc_url_local,                     sizeof(_job.url)-1);
+                            strncpy(_job.user,   rpc_user_local  ? rpc_user_local  : "", sizeof(_job.user)-1);
+                            strncpy(_job.pass,   rpc_pass_local  ? rpc_pass_local  : "", sizeof(_job.pass)-1);
+                            strncpy(_job.method, "getwork",                         sizeof(_job.method)-1);
+                            memcpy(_job.hex, blockhex, sizeof(_job.hex));
+                            _job.retries = rpc_default_retries;
+                            enqueue_job(&_job);
+                            log_msg(">>> QUEUED for async submit (mining continues)\n");
+                            print_stats();
+                        }
                         if (!keep_going) return 1;
                         else log_msg("continuing mining after success\n");
                     }
@@ -2693,10 +2835,18 @@ static void *worker_fn(void *arg) {
 
                 /* Fermat-test ALL survivors to find primes */
                 size_t pf = 0;
-                for (size_t j = 0; j < w->surv_cnt; j++) {
-                    __sync_fetch_and_add(&stats_tested, 1);
-                    if (bn_candidate_is_prime(w->survivors[j]))
-                        w->survivors[pf++] = w->survivors[j];
+#ifdef WITH_CUDA
+                if (g_gpu_ctx) {
+                    pf = gpu_batch_filter(w->survivors, w->surv_cnt);
+                    __sync_fetch_and_add(&stats_tested, (uint64_t)w->surv_cnt);
+                } else
+#endif
+                {
+                    for (size_t j = 0; j < w->surv_cnt; j++) {
+                        __sync_fetch_and_add(&stats_tested, 1);
+                        if (bn_candidate_is_prime(w->survivors[j]))
+                            w->survivors[pf++] = w->survivors[j];
+                    }
                 }
 
                 /* Scan consecutive prime pairs for qualifying gaps */
@@ -2849,6 +2999,21 @@ static void *worker_fn(void *arg) {
                 if (rpc_thread_local && rpc_url_local) {
                     uint64_t now = now_ms();
                     if (now - gbt_last_ms >= 5000) {
+                      if (g_stratum) {
+                        /* ── stratum: check for pushed new-work ── */
+                        char data_hex[161];
+                        uint64_t ndiff;
+                        if (stratum_poll_new_work(g_stratum, data_hex,
+                                                  &ndiff)) {
+                            log_msg("\n*** STRATUM NEW BLOCK ***\n\n");
+                            build_mining_pass_stratum(data_hex, ndiff,
+                                                     shift_local);
+                            g_abort_pass = 1;
+                            crt_heap_shutdown = 1;
+                            pthread_cond_broadcast(&crt_heap_cv);
+                            break;
+                        }
+                      } else {
                         char *resp = rpc_call(rpc_url_local, rpc_user_local,
                                               rpc_pass_local,
                                               "getbestblockhash", NULL);
@@ -2870,7 +3035,6 @@ static void *worker_fn(void *arg) {
                                     pthread_mutex_unlock(&g_work_lock);
                                     free(resp);
                                     g_abort_pass = 1;
-                                    /* Wake any fermat threads waiting on heap */
                                     crt_heap_shutdown = 1;
                                     pthread_cond_broadcast(&crt_heap_cv);
                                     break;
@@ -2878,6 +3042,7 @@ static void *worker_fn(void *arg) {
                             }
                             free(resp);
                         }
+                      }
                         gbt_last_ms = now_ms();
                     }
                 }
@@ -2980,10 +3145,18 @@ static void *worker_fn(void *arg) {
 
                     /* ── Monolithic: Fermat-test inline (original) ── */
                     size_t pf = 0;
-                    for (size_t j = 0; j < surv_cnt; j++) {
-                        __sync_fetch_and_add(&stats_tested, 1);
-                        if (bn_candidate_is_prime(surv[j]))
-                            surv[pf++] = surv[j];
+#ifdef WITH_CUDA
+                    if (g_gpu_ctx) {
+                        pf = gpu_batch_filter(surv, surv_cnt);
+                        __sync_fetch_and_add(&stats_tested, (uint64_t)surv_cnt);
+                    } else
+#endif
+                    {
+                        for (size_t j = 0; j < surv_cnt; j++) {
+                            __sync_fetch_and_add(&stats_tested, 1);
+                            if (bn_candidate_is_prime(surv[j]))
+                                surv[pf++] = surv[j];
+                        }
                     }
 
                     __sync_fetch_and_add(&stats_crt_windows, 1);
@@ -3150,6 +3323,19 @@ static void *worker_fn(void *arg) {
             if (rpc_thread_local && rpc_url_local) {
                 uint64_t now = now_ms();
                 if (now - gbt_last_ms >= 5000) {
+                    if (g_stratum) {
+                        /* Stratum: check if pool pushed new work */
+                        char sdata[161]; uint64_t sndiff = 0;
+                        if (stratum_poll_new_work(g_stratum, sdata, &sndiff)) {
+                            build_mining_pass_stratum(sdata, sndiff, shift_local);
+                            log_msg("\n*** NEW BLOCK (stratum)  prevhash=%.16s...  mining on top ***\n\n",
+                                    g_pass.prevhex);
+                            pthread_mutex_lock(&g_work_lock);
+                            strncpy(g_prevhash, g_pass.prevhex, 64); g_prevhash[64] = '\0';
+                            pthread_mutex_unlock(&g_work_lock);
+                            g_abort_pass = 1; break;
+                        }
+                    } else {
                     /* Use getbestblockhash — a pure read-only query that does NOT
                        touch mapNewBlock.  Calling getwork (no params) here would
                        invoke CreateNewBlock(), clear mapNewBlock, and invalidate
@@ -3183,6 +3369,7 @@ static void *worker_fn(void *arg) {
                         }
                         free(resp);
                     }
+                    } /* end !g_stratum */
                     gbt_last_ms = now_ms();
                 }
             }
@@ -3680,9 +3867,10 @@ int main(int argc, char **argv) {
         printf("Usage: %s [options]\n", argv[0]);
         printf("  -o, --host HOST       node hostname or IP  (default: 127.0.0.1)\n");
         printf("  -p, --port PORT       node RPC port        (default: 31397)\n");
+        printf("      --stratum H:P     stratum pool host:port (e.g. gap.suprnova.cc:4234)\n");
+        printf("  -u, --user USER       pool/RPC username (e.g. worker.1)\n");
+        printf("      --pass PASS       pool/RPC password\n");
         printf("      --rpc-url URL     full RPC URL (overrides --host/--port)\n");
-        printf("      --rpc-user U      RPC username\n");
-        printf("      --rpc-pass P      RPC password\n");
         printf("  -s, --shift N         prime size shift      (default: 20)\n");
         printf("      --sieve-size S    sieve size            (default: 33554432)\n");
         printf("      --sieve-primes N  number of sieve primes (GapMiner-compatible)\n");
@@ -3701,6 +3889,7 @@ int main(int argc, char **argv) {
         printf("      --header TEXT     override prime base (rarely needed)\n");
         printf("      --rpc-rate MS     getwork poll interval ms  (default: 5000)\n");
         printf("      --rpc-retries N   submit retries\n");
+        printf("      --cuda [DEV]      use CUDA GPU for Fermat testing (device 0 default)\n");
         return 1;
     }
     const char *header = NULL;
@@ -3717,6 +3906,7 @@ int main(int argc, char **argv) {
     int target_explicit = 0;  /* set to 1 if user passes --target */
     int cli_sieve_explicit = 0; /* set to 1 if user passes --sieve-primes */
     const char *rpc_url = NULL, *rpc_user = NULL, *rpc_pass = NULL, *rpc_method = "getwork";
+    const char *stratum_arg = NULL; /* "host:port" for stratum pool connection */
     const char *rpc_sign_key = NULL;
     const char *rpc_host = NULL;
     int rpc_port = 0;
@@ -3726,6 +3916,8 @@ int main(int argc, char **argv) {
     int build_only = 0;
     int no_opreturn = 0;
     int num_threads = 1;
+    int use_cuda = 0, cuda_device = 0;
+    (void)cuda_device;  /* suppress warning when WITH_CUDA not set */
     uint64_t build_p = 0, build_q = 0;
     for (int i=1;i<argc;i++) {
         if (!strcmp(argv[i],"--header") && i+1<argc) header = argv[++i];
@@ -3742,9 +3934,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--target") && i+1<argc) { target = atof(argv[++i]); target_explicit = 1; }
         else if ((!strcmp(argv[i],"-o") || !strcmp(argv[i],"--host")) && i+1<argc) rpc_host = argv[++i];
         else if ((!strcmp(argv[i],"-p") || !strcmp(argv[i],"--port")) && i+1<argc) rpc_port = atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--stratum") && i+1<argc) stratum_arg = argv[++i];
         else if (!strcmp(argv[i],"--rpc-url") && i+1<argc) rpc_url = argv[++i];
-        else if (!strcmp(argv[i],"--rpc-user") && i+1<argc) rpc_user = argv[++i];
-        else if (!strcmp(argv[i],"--rpc-pass") && i+1<argc) rpc_pass = argv[++i];
+        else if ((!strcmp(argv[i],"-u") || !strcmp(argv[i],"--user") || !strcmp(argv[i],"--rpc-user")) && i+1<argc) rpc_user = argv[++i];
+        else if ((!strcmp(argv[i],"--pass") || !strcmp(argv[i],"--rpc-pass")) && i+1<argc) rpc_pass = argv[++i];
         else if (!strcmp(argv[i],"--rpc-method") && i+1<argc) rpc_method = argv[++i];
         else if (!strcmp(argv[i],"--rpc-rate") && i+1<argc) cli_rpc_rate = (unsigned int)atoi(argv[++i]);
         else if (!strcmp(argv[i],"--rpc-retries") && i+1<argc) cli_rpc_retries = atoi(argv[++i]);
@@ -3754,6 +3947,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--no-opreturn")) no_opreturn = 1;
         else if (!strcmp(argv[i],"--force-solution")) debug_force = 1;
         else if (!strcmp(argv[i],"--fast-fermat")) use_fast_fermat = 1;
+        else if (!strcmp(argv[i],"--cuda")) {
+            use_cuda = 1;
+            if (i+1 < argc && argv[i+1][0] != '-') cuda_device = atoi(argv[++i]);
+        }
         else if (!strcmp(argv[i],"--no-primality")) no_primality = 1;
         else if (!strcmp(argv[i],"--selftest")) selftest = 1;
         else if (!strcmp(argv[i],"--threads") && i+1<argc) num_threads = atoi(argv[++i]);
@@ -3782,12 +3979,53 @@ int main(int argc, char **argv) {
     /* Build rpc_url from --host / --port if not given explicitly.
        Defaults: host=127.0.0.1, port=31397 (Gapcoin mainnet). */
     static char rpc_url_buf[256];
-    if (!rpc_url && (rpc_host || rpc_port)) {
+    if (!rpc_url && !stratum_arg && (rpc_host || rpc_port)) {
         const char *h = rpc_host ? rpc_host : "127.0.0.1";
         int         p = rpc_port ? rpc_port : 31397;
         snprintf(rpc_url_buf, sizeof(rpc_url_buf), "http://%s:%d/", h, p);
         rpc_url = rpc_url_buf;
     }
+    /* ── Stratum pool connection ── */
+#ifdef WITH_RPC
+    static char stratum_host_buf[256];
+    static char stratum_port_buf[16];
+    if (stratum_arg) {
+        /* Parse "host:port" */
+        const char *colon = strrchr(stratum_arg, ':');
+        if (!colon || colon == stratum_arg) {
+            fprintf(stderr, "--stratum requires host:port format (e.g. gap.suprnova.cc:4234)\n");
+            return 2;
+        }
+        size_t hlen = (size_t)(colon - stratum_arg);
+        if (hlen >= sizeof(stratum_host_buf)) hlen = sizeof(stratum_host_buf) - 1;
+        memcpy(stratum_host_buf, stratum_arg, hlen);
+        stratum_host_buf[hlen] = '\0';
+        strncpy(stratum_port_buf, colon + 1, sizeof(stratum_port_buf) - 1);
+        stratum_port_buf[sizeof(stratum_port_buf) - 1] = '\0';
+        if (!rpc_user) {
+            fprintf(stderr, "--user required for stratum (pool worker name)\n");
+            return 2;
+        }
+        log_msg("stratum: connecting to %s:%s as %s\n",
+                stratum_host_buf, stratum_port_buf, rpc_user);
+        g_stratum = stratum_connect(stratum_host_buf, stratum_port_buf,
+                                    rpc_user, rpc_pass ? rpc_pass : "",
+                                    (uint16_t)shift);
+        if (!g_stratum) {
+            fprintf(stderr, "Failed to connect to stratum pool %s:%s\n",
+                    stratum_host_buf, stratum_port_buf);
+            return 3;
+        }
+        /* Set rpc_url to a sentinel so RPC-guarded code paths activate.
+           Actual communication goes through g_stratum, not HTTP. */
+        rpc_url = "stratum";
+    }
+#else
+    if (stratum_arg) {
+        fprintf(stderr, "--stratum requires building with WITH_RPC=1\n");
+        return 2;
+    }
+#endif
     if (adder_max < 0) {
         /* no explicit value supplied – use full allowed range */
         if (shift <= 62)
@@ -3869,6 +4107,26 @@ int main(int argc, char **argv) {
                 crt_fermat_threads);
     }
 
+    /* ── CUDA GPU initialization ── */
+#ifdef WITH_CUDA
+    if (use_cuda) {
+        g_gpu_ctx = gpu_fermat_init(cuda_device, GPU_MAX_BATCH);
+        if (!g_gpu_ctx) {
+            fprintf(stderr, "CUDA init failed (device %d). Falling back to CPU.\n",
+                    cuda_device);
+            use_cuda = 0;
+        } else {
+            log_msg("CUDA: using %s (device %d) for Fermat testing\n",
+                    gpu_fermat_device_name(g_gpu_ctx), cuda_device);
+        }
+    }
+#else
+    if (use_cuda) {
+        fprintf(stderr, "--cuda requires building with WITH_CUDA=1\n");
+        return 2;
+    }
+#endif
+
     if (selftest) {
         log_msg("selftest: verifying primality routines\n");
         uint64_t tests[] = {2,3,4,17,18,19,20,0};
@@ -3881,7 +4139,8 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!header) {
-        if (rpc_url) {
+#ifdef WITH_RPC
+        if (rpc_url && !g_stratum) {
             /* fetch template and use previousblockhash as header seed */
             char *gbt = rpc_getblocktemplate(rpc_url, rpc_user, rpc_pass);
             if (gbt) {
@@ -3909,10 +4168,14 @@ int main(int argc, char **argv) {
                 free(gbt);
             }
         }
-        if (!header) {
-            fprintf(stderr, "--header required (or provide --rpc-url for automatic header)\n");
+        if (!header && !g_stratum) {
+            fprintf(stderr, "--header required (or provide --rpc-url or --stratum for automatic header)\n");
             return 2;
         }
+#else
+        fprintf(stderr, "--header required\n");
+        return 2;
+#endif
     }
     /* Auto-detect hex header: 64 hex chars → raw 256-bit prevhash, not a SHA-256 seed */
     if (!is_hex && header && strlen(header) == 64) {
@@ -3924,7 +4187,10 @@ int main(int argc, char **argv) {
         if (all_hex) is_hex = 1;
     }
     uint8_t h256[32];
-    hash_to_256(header, is_hex, h256);
+    if (header)
+        hash_to_256(header, is_hex, h256);
+    else
+        memset(h256, 0, 32);  /* stratum: will be overwritten by build_mining_pass_stratum */
 #ifdef WITH_RPC
     /* Correct the prime base: use SHA256d(84-byte block header) not prevhash.
        Without this, nAdd is prime for base=prevhash but NOT for base=block.GetHash(),
@@ -3932,7 +4198,17 @@ int main(int argc, char **argv) {
        84-byte header, double-SHA256s it, and byte-reverses to match Gapcoin's
        ary_to_mpz(order=-1) convention (data[31]=MSB → h256[0]=MSB). */
     if (rpc_url) {
-        if (build_mining_pass(rpc_url, rpc_user, rpc_pass, shift)) {
+        int got_work = 0;
+        if (g_stratum) {
+            /* Stratum: wait for first work from pool */
+            char sdata[161]; uint64_t sndiff = 0;
+            if (stratum_get_work(g_stratum, sdata, &sndiff)) {
+                got_work = build_mining_pass_stratum(sdata, sndiff, shift);
+            }
+        } else {
+            got_work = build_mining_pass(rpc_url, rpc_user, rpc_pass, shift);
+        }
+        if (got_work) {
             memcpy(h256, g_pass.h256, 32);
             if (g_pass.prevhex[0]) {
                 pthread_mutex_lock(&g_work_lock);
@@ -3990,7 +4266,7 @@ int main(int argc, char **argv) {
 #ifdef WITH_RPC
     if (cli_rpc_rate) rpc_rate_ms = cli_rpc_rate;
     if (cli_rpc_retries >= 0) rpc_default_retries = cli_rpc_retries;
-    if (rpc_url) start_submit_thread();
+    if (rpc_url && !g_stratum) start_submit_thread();
 #ifdef WITH_RPC
     if (build_only) {
         if (!rpc_url) {
@@ -4122,10 +4398,18 @@ int main(int argc, char **argv) {
 
                         /* Fermat-test ALL survivors */
                         size_t pf = 0;
-                        for (size_t j = 0; j < surv_cnt; j++) {
-                            __sync_fetch_and_add(&stats_tested, 1);
-                            if (bn_candidate_is_prime(surv[j]))
-                                surv[pf++] = surv[j];
+#ifdef WITH_CUDA
+                        if (g_gpu_ctx) {
+                            pf = gpu_batch_filter(surv, surv_cnt);
+                            __sync_fetch_and_add(&stats_tested, (uint64_t)surv_cnt);
+                        } else
+#endif
+                        {
+                            for (size_t j = 0; j < surv_cnt; j++) {
+                                __sync_fetch_and_add(&stats_tested, 1);
+                                if (bn_candidate_is_prime(surv[j]))
+                                    surv[pf++] = surv[j];
+                            }
                         }
 
                         /* Scan consecutive primes for qualifying gaps */
@@ -4240,10 +4524,25 @@ int main(int argc, char **argv) {
                     if (!sampled) { use_smart_st = 0; goto st_full; }
 
                     size_t sp = 0;
-                    for (size_t j = 0; j < cnt; j += (size_t)smart_K_st) {
-                        if (bn_candidate_is_prime(pr[j]))
-                            sampled[sp++] = pr[j];
+                    /* Build phase-1 candidate array */
+                    uint64_t *p1_arr = (uint64_t *)malloc(p1n * sizeof(uint64_t));
+                    if (p1_arr) {
+                        for (size_t j = 0, k = 0; j < cnt; j += (size_t)smart_K_st)
+                            p1_arr[k++] = pr[j];
                     }
+#ifdef WITH_CUDA
+                    if (g_gpu_ctx && p1_arr) {
+                        sp = gpu_batch_filter(p1_arr, p1n);
+                        memcpy(sampled, p1_arr, sp * sizeof(uint64_t));
+                    } else
+#endif
+                    {
+                        for (size_t j = 0; j < cnt; j += (size_t)smart_K_st) {
+                            if (bn_candidate_is_prime(pr[j]))
+                                sampled[sp++] = pr[j];
+                        }
+                    }
+                    free(p1_arr);
                     __sync_fetch_and_add(&stats_tested, (uint64_t)p1n);
 
                     size_t needed = (size_t)(target * logbase);
@@ -4299,9 +4598,18 @@ int main(int argc, char **argv) {
                     /* --- Phase 2: test verification candidates ------------ */
                     pf = sp;
                     memcpy(pr, sampled, sp * sizeof(uint64_t));
-                    for (size_t i = 0; i < v_cnt; i++) {
-                        if (bn_candidate_is_prime(verify[i]))
+#ifdef WITH_CUDA
+                    if (g_gpu_ctx && v_cnt > 0) {
+                        size_t vp = gpu_batch_filter(verify, v_cnt);
+                        for (size_t i = 0; i < vp; i++)
                             pr[pf++] = verify[i];
+                    } else
+#endif
+                    {
+                        for (size_t i = 0; i < v_cnt; i++) {
+                            if (bn_candidate_is_prime(verify[i]))
+                                pr[pf++] = verify[i];
+                        }
                     }
                     __sync_fetch_and_add(&stats_tested, (uint64_t)v_cnt);
                     if (pf > 1) qsort(pr, pf, sizeof(uint64_t), cmp_u64);
@@ -4347,8 +4655,15 @@ int main(int argc, char **argv) {
                 st_full:
                     if (!no_primality) {
                         size_t test_cnt = cnt;
-                        for (size_t i = 0; i < cnt; i++) {
-                            if (bn_candidate_is_prime(pr[i])) pr[pf++] = pr[i];
+#ifdef WITH_CUDA
+                        if (g_gpu_ctx) {
+                            pf = gpu_batch_filter(pr, cnt);
+                        } else
+#endif
+                        {
+                            for (size_t i = 0; i < cnt; i++) {
+                                if (bn_candidate_is_prime(pr[i])) pr[pf++] = pr[i];
+                            }
                         }
                         __sync_fetch_and_add(&stats_tested, (uint64_t)test_cnt);
                         cnt = pf;
@@ -4371,14 +4686,24 @@ int main(int argc, char **argv) {
         st_rpc_poll:
             if (keep_going && rpc_url) {
 #ifdef WITH_RPC
+              if (g_stratum) {
+                char sdata[161]; uint64_t sndiff;
+                if (stratum_poll_new_work(g_stratum, sdata, &sndiff)) {
+                    build_mining_pass_stratum(sdata, sndiff, shift);
+                    memcpy(h256, g_pass.h256, 32);
+                    free((char*)header);
+                    header = strdup(g_pass.prevhex);
+                    if (!g_abort_pass)
+                        log_msg("\n*** STRATUM NEW BLOCK ***\n\n");
+                    g_abort_pass = 1;
+                }
+              } else {
                 sq_drain();
                 if (build_mining_pass(rpc_url, rpc_user, rpc_pass, shift)) {
                     memcpy(h256, g_pass.h256, 32);
                     if (g_pass.prevhex[0] && strcmp(g_pass.prevhex, header ? header : "") != 0) {
                         free((char*)header);
                         header = strdup(g_pass.prevhex);
-                        /* Only print if workers did NOT already print it (g_abort_pass
-                           is set by the worker poll when it detects the new block). */
                         if (!g_abort_pass)
                             log_msg("\n*** NEW BLOCK  prevhash=%.16s...  mining on top ***\n\n", g_pass.prevhex);
                         pthread_mutex_lock(&g_work_lock);
@@ -4387,6 +4712,7 @@ int main(int argc, char **argv) {
                         g_abort_pass = 1;
                     }
                 }
+              }
 #endif
             }
         } while (keep_going);
@@ -4442,8 +4768,19 @@ int main(int argc, char **argv) {
             free(wargs);
 
             if (keep_going && rpc_url) {
-                /* Drain submit queue before getwork to keep mapNewBlock consistent. */
 #ifdef WITH_RPC
+              if (g_stratum) {
+                char sdata[161]; uint64_t sndiff;
+                if (stratum_poll_new_work(g_stratum, sdata, &sndiff)) {
+                    build_mining_pass_stratum(sdata, sndiff, shift);
+                    memcpy(h256, g_pass.h256, 32);
+                    free((char*)header);
+                    header = strdup(g_pass.prevhex);
+                    if (!g_abort_pass)
+                        log_msg("\n*** STRATUM NEW BLOCK ***\n\n");
+                }
+              } else {
+                /* Drain submit queue before getwork to keep mapNewBlock consistent. */
                 sq_drain();
                 if (build_mining_pass(rpc_url, rpc_user, rpc_pass, shift)) {
                     memcpy(h256, g_pass.h256, 32);
@@ -4457,12 +4794,17 @@ int main(int argc, char **argv) {
                         pthread_mutex_unlock(&g_work_lock);
                     }
                 }
+              }
 #endif
             }
         } while (keep_going);
     }
 #ifdef WITH_RPC
-    if (rpc_url) stop_submit_thread();
+    if (rpc_url && !g_stratum) stop_submit_thread();
+    if (g_stratum) stratum_disconnect(g_stratum);
+#endif
+#ifdef WITH_CUDA
+    if (g_gpu_ctx) gpu_fermat_destroy(g_gpu_ctx);
 #endif
     stop_stats_thread();
     if (!keep_going) {

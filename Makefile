@@ -24,11 +24,29 @@ ifdef WITH_RPC
 	# build rpc C++ objects
 	RPC_SRCS=$(SRCDIR)/rpc_cwrap.cpp $(SRCDIR)/rpc_globals.cpp $(SRCDIR)/rpc_stubs.cpp $(SRCDIR)/Rpc.cpp
 	RPC_OBJS=$(RPC_SRCS:.cpp=.o)
+	STRATUM_OBJ=$(SRCDIR)/stratum.o
 	LINKER=$(CXX)
 else
 	LIBS=-lssl -lcrypto $(GMP_LIB) -lm -pthread
 	LINKER=$(CC)
 	RPC_OBJS=
+	STRATUM_OBJ=
+endif
+
+# enable WITH_CUDA=1 to include GPU Fermat testing via CUDA
+# optional: GPU_BITS=768 (default, shift ≤ 512), 1024 (shift ≤ 768), etc.
+ifdef WITH_CUDA
+	NVCC ?= nvcc
+	CUDA_ARCH ?= -arch=sm_61
+	CUDA_PATH ?= /usr/local/cuda
+	GPU_BITS ?= 1024
+	GPU_NLIMBS := $(shell echo '$(GPU_BITS) / 64' | bc)
+	CUDA_OBJ=$(SRCDIR)/gpu_fermat.o
+	CFLAGS+=-DWITH_CUDA -DGPU_NLIMBS=$(GPU_NLIMBS) -I$(CUDA_PATH)/include
+	NVCC_FLAGS=-DGPU_NLIMBS=$(GPU_NLIMBS)
+	LIBS+=-lcudart -L$(CUDA_PATH)/lib64
+else
+	CUDA_OBJ=
 endif
 
 all: $(TARGET)
@@ -47,8 +65,11 @@ $(SRCDIR)/%.o: $(SRCDIR)/%.c
 $(SRCDIR)/%.o: $(SRCDIR)/%.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(TARGET): $(BINDIR) $(SRCDIR)/main.o $(RPC_OBJS)
-	$(LINKER) -o $@ $(SRCDIR)/main.o $(RPC_OBJS) $(LDFLAGS) $(LIBS)
+$(SRCDIR)/gpu_fermat.o: $(SRCDIR)/gpu_fermat.cu $(SRCDIR)/gpu_fermat.h
+	$(NVCC) -O3 $(CUDA_ARCH) $(NVCC_FLAGS) -c $< -o $@
+
+$(TARGET): $(BINDIR) $(SRCDIR)/main.o $(RPC_OBJS) $(STRATUM_OBJ) $(CUDA_OBJ)
+	$(LINKER) -o $@ $(SRCDIR)/main.o $(RPC_OBJS) $(STRATUM_OBJ) $(CUDA_OBJ) $(LDFLAGS) $(LIBS)
 
 clean:
 	rm -rf $(BINDIR) $(SRCDIR)/*.o

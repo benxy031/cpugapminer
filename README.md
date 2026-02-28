@@ -2,8 +2,9 @@
 
 A high-performance CPU miner for the Gapcoin proof-of-work variant that
 searches for large prime gaps and builds blocks via live `getblocktemplate`
-(GBT) RPC calls.  Every JSON-RPC POST and every raw block byte sequence is
-saved to `/tmp` for forensic inspection.
+(GBT) RPC calls or stratum pool connections.  Optional CUDA GPU acceleration
+offloads Fermat primality testing to NVIDIA GPUs.  Every JSON-RPC POST and
+every raw block byte sequence is saved to `/tmp` for forensic inspection.
 
 ## Repository layout
 
@@ -17,6 +18,9 @@ src/
   rpc_json.c        - lightweight JSON helpers (also used by tests)
   rpc_json.h
   Rpc.cpp / Rpc.h   - C++ RPC class (libcurl + JSON-RPC)
+  stratum.h / .c    - Gapcoin stratum pool client (TCP, auto-reconnect)
+  gpu_fermat.h      - public C API for CUDA batch Fermat testing
+  gpu_fermat.cu     - CUDA kernel: 384-bit Montgomery Fermat test
   Opts.h            - option singleton header
   parse_block.c     - raw block parsing utilities
   utils.h           - small shared helpers
@@ -47,14 +51,15 @@ Compiled with `-O3 -march=native -flto` for maximum throughput.
 
 Required dependencies on Linux:
 
-| Library           | Debian/Ubuntu package        |
-|-------------------|------------------------------|
-| gcc / g++         | `build-essential`            |
-| libcurl           | `libcurl4-openssl-dev`       |
-| libjansson        | `libjansson-dev`             |
-| libssl / libcrypto| `libssl-dev`                 |
-| libgmp            | `libgmp-dev`                 |
-| pthreads          | included in glibc            |
+| Library           | Debian/Ubuntu package        | Required |
+|-------------------|------------------------------|----------|
+| gcc / g++         | `build-essential`            | yes      |
+| libcurl           | `libcurl4-openssl-dev`       | yes      |
+| libjansson        | `libjansson-dev`             | yes      |
+| libssl / libcrypto| `libssl-dev`                 | yes      |
+| libgmp            | `libgmp-dev`                 | yes      |
+| pthreads          | included in glibc            | yes      |
+| CUDA toolkit      | `nvidia-cuda-toolkit`        | optional (GPU Fermat) |
 
 Install them in one go:
 
@@ -93,6 +98,38 @@ make WITH_RPC=1 GMP_PREFIX=/path/to/gmp
 
 This statically links `GMP_PREFIX/lib/libgmp.a` and uses headers from
 `GMP_PREFIX/include`.  Without `GMP_PREFIX`, the system `-lgmp` is used.
+
+### With CUDA GPU acceleration (optional)
+
+Offloads batch Fermat primality testing to an NVIDIA GPU using a 384-bit
+Montgomery multiplication kernel.  Requires an NVIDIA GPU and the CUDA
+toolkit (`nvcc`):
+
+```sh
+sudo apt-get install nvidia-cuda-toolkit
+```
+
+Build with CUDA enabled:
+
+```sh
+make clean
+make WITH_RPC=1 WITH_CUDA=1
+```
+
+To target a specific GPU architecture (default `sm_61`):
+
+```sh
+make WITH_RPC=1 WITH_CUDA=1 CUDA_ARCH="-arch=sm_86"
+```
+
+If CUDA is installed outside `/usr/local/cuda`:
+
+```sh
+make WITH_RPC=1 WITH_CUDA=1 CUDA_PATH=/opt/cuda-12
+```
+
+Common `CUDA_ARCH` values: `sm_61` (Pascal / GTX 10xx), `sm_75` (Turing /
+RTX 20xx), `sm_86` (Ampere / RTX 30xx), `sm_89` (Ada / RTX 40xx).
 
 ### CRT gap-solver tool
 
@@ -170,6 +207,66 @@ Capture output to a file as well:
 bin/gap_miner ... --log-file miner.log
 ```
 
+### With CUDA GPU acceleration
+
+Add `--cuda` to offload Fermat testing to the GPU.  The GPU pre-filters
+candidates in batches of up to 1M; survivors are verified on the CPU.
+
+```sh
+bin/gap_miner \
+  -o 127.0.0.1 -p 31397 -u USER --pass PASS \
+  --shift 25 \
+  --threads 2 \
+  --fast-fermat \
+  --cuda
+```
+
+CUDA with CRT gap-solver (shift 64):
+
+```sh
+bin/gap_miner \
+  -o 127.0.0.1 -p 31397 -u USER --pass PASS \
+  --shift 64 \
+  --threads 6 \
+  --fast-fermat \
+  --cuda \
+  --crt-file crt/crt_s64_m21.txt
+```
+
+Select a specific GPU device (0-based index):
+
+```sh
+bin/gap_miner \
+  -o 127.0.0.1 -p 31397 -u USER --pass PASS \
+  --shift 25 --threads 4 --fast-fermat \
+  --cuda 1
+```
+
+### With stratum pool
+
+Connect to a Gapcoin stratum pool instead of a local node:
+
+```sh
+bin/gap_miner \
+  --stratum pool.example.com:2434 \
+  -u worker.1 --pass x \
+  --shift 25 \
+  --threads 4 \
+  --fast-fermat
+```
+
+Stratum + CUDA:
+
+```sh
+bin/gap_miner \
+  --stratum pool.example.com:2434 \
+  -u worker.1 --pass x \
+  --shift 25 \
+  --threads 4 \
+  --fast-fermat \
+  --cuda
+```
+
 ## How it works
 
 ### Header hash and the adder
@@ -230,6 +327,14 @@ After sieving, each candidate undergoes a probabilistic primality test using
   fastest possible primality path.  False-positive composites are rejected
   by the network.
 - `--no-primality` -- skip testing entirely (benchmarking / sieve trust).
+
+When built with `WITH_CUDA=1` and run with `--cuda`, the miner offloads
+Fermat testing to the GPU in batches of up to 1M candidates.  Each candidate
+is exported as a 384-bit (6×64-bit limbs) number; the CUDA kernel performs
+Montgomery-form modular exponentiation (`2^(n-1) mod n`) on all candidates
+in parallel.  Survivors (probable primes) are returned to the CPU for gap
+scanning.  This is transparent — `--fast-fermat` is implied when using
+`--cuda`.
 
 The GMP backend replaces the original OpenSSL `BN_is_prime_fasttest_ex` path.
 GMP's hand-tuned x86-64 assembly (Montgomery multiplication, Karatsuba) is
@@ -387,6 +492,26 @@ Smart scanning processes **2.7× more sieve windows per second** by
 skipping Fermat tests in regions that provably cannot contain a qualifying
 gap.  The block-finding rate improves by **3.4×**.
 
+### CUDA GPU Fermat testing
+
+Benchmarked on an NVIDIA GeForce RTX 3060 with a single sieve thread
+(`--shift 25 --threads 1 --fast-fermat`):
+
+| Mode | Fermat tests/s | Relative |
+|------|---------------|----------|
+| CPU only | 53 K/s | 1.0× |
+| GPU (`--cuda`) | 107 K/s | **2.0×** |
+
+With 2 sieve threads feeding the GPU (`--shift 25 --threads 2 --fast-fermat --cuda`):
+**313 K tests/s** — the GPU keeps up with multiple sieve threads producing
+candidates in parallel.  The speedup scales with the number of sieve threads
+until the GPU becomes the bottleneck.
+
+The GPU kernel uses 384-bit Montgomery multiplication (6×64-bit limbs,
+CIOS form) to compute `2^(n-1) mod n` for up to 1M candidates per batch.
+Candidates are transferred to the GPU, tested in parallel (128 threads per
+block), and only probable primes are returned to the CPU for gap scanning.
+
 ### Key optimizations
 
 1. **GMP primality backend** -- Replaced OpenSSL `BIGNUM` with GMP `mpz_t`.
@@ -429,6 +554,12 @@ gap.  The block-finding rate improves by **3.4×**.
    windows (33M) this keeps the display moving smoothly instead of freezing
    for 20+ seconds between window boundaries.
 
+10. **CUDA GPU Fermat** -- Batch Fermat primality testing on NVIDIA GPUs
+    using a custom 384-bit Montgomery multiplication kernel (CIOS form).
+    Up to 1M candidates per batch are transferred to the GPU, tested in
+    parallel, and only probable primes are returned to the CPU.  ~2× single-
+    thread speedup on an RTX 3060; scales with additional sieve threads.
+
 > **Historical note:** an earlier Barrett-reduction path for fast modular
 > exponentiation contained a correctness bug for large moduli and was
 > disabled.  All arithmetic now uses GMP's assembly-optimized paths.
@@ -467,6 +598,11 @@ gap.  The block-finding rate improves by **3.4×**.
 | `--stop-after-block`  | off           | Exit after submitting a valid block |
 | `--selftest`          | off           | Run internal prime checks and exit |
 | `--p P --q Q`         | --            | Force primes for `--build-only` runs |
+| `--cuda [DEV]`        | off           | Enable CUDA GPU Fermat testing (requires `WITH_CUDA=1` build).  Optional `DEV` selects the GPU device index (default 0). |
+| `--stratum HOST:PORT` | --            | Connect to a Gapcoin stratum pool instead of using RPC/GBT (requires `WITH_RPC=1` build). |
+| `-u` / `--user`       | --            | Alias for `--rpc-user` |
+| `--pass`              | --            | Alias for `--rpc-pass` |
+| `-o HOST` / `-p PORT` | --            | Shorthand for `--rpc-url http://HOST:PORT/` |
 
 ### Minimal RPC invocation
 
