@@ -29,10 +29,12 @@ extern int      rpc_getwork_data(const char *url, const char *user, const char *
 #include "stratum.h"
 static stratum_ctx *g_stratum = NULL;   /* non-NULL when mining via stratum pool */
 #endif
+#define GPU_MAX_DEVS  8
 #ifdef WITH_CUDA
 #include "gpu_fermat.h"
-static gpu_fermat_ctx *g_gpu_ctx = NULL;
 #define GPU_MAX_BATCH (1 << 20)   /* 1M candidates per batch */
+static gpu_fermat_ctx *g_gpu_ctx[GPU_MAX_DEVS];
+static int             g_gpu_count = 0;
 #endif
 
 // logging helper (used in both RPC and non-RPC builds)
@@ -2231,7 +2233,15 @@ static int bn_candidate_is_prime(uint64_t offset) {
    testing, then compacts the survivors in-place.
    Returns the new count (number of probable primes).  */
 static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
-    if (!g_gpu_ctx || cnt == 0) return 0;
+    if (g_gpu_count == 0 || cnt == 0) return 0;
+
+    /* Round-robin GPU selection by thread (tls_tid set per worker) */
+    static __thread int tls_gpu_idx = -1;
+    if (tls_gpu_idx < 0) {
+        static volatile int gpu_rr = 0;
+        tls_gpu_idx = __sync_fetch_and_add(&gpu_rr, 1) % g_gpu_count;
+    }
+    gpu_fermat_ctx *ctx = g_gpu_ctx[tls_gpu_idx];
 
     ensure_gmp_tls();
     /* Export base into GPU_NLIMBS LE limb array */
@@ -2283,7 +2293,7 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
             }
         }
         /* GPU test */
-        int np = gpu_fermat_test_batch(g_gpu_ctx, cands, res, chunk);
+        int np = gpu_fermat_test_batch(ctx, cands, res, chunk);
         if (np < 0) {
             /* GPU error: fall back to CPU for remaining */
             for (size_t j = 0; j < chunk; j++)
@@ -2836,7 +2846,7 @@ static void *worker_fn(void *arg) {
                 /* Fermat-test ALL survivors to find primes */
                 size_t pf = 0;
 #ifdef WITH_CUDA
-                if (g_gpu_ctx) {
+                if (g_gpu_count > 0) {
                     pf = gpu_batch_filter(w->survivors, w->surv_cnt);
                     __sync_fetch_and_add(&stats_tested, (uint64_t)w->surv_cnt);
                 } else
@@ -3146,7 +3156,7 @@ static void *worker_fn(void *arg) {
                     /* ── Monolithic: Fermat-test inline (original) ── */
                     size_t pf = 0;
 #ifdef WITH_CUDA
-                    if (g_gpu_ctx) {
+                    if (g_gpu_count > 0) {
                         pf = gpu_batch_filter(surv, surv_cnt);
                         __sync_fetch_and_add(&stats_tested, (uint64_t)surv_cnt);
                     } else
@@ -3889,7 +3899,7 @@ int main(int argc, char **argv) {
         printf("      --header TEXT     override prime base (rarely needed)\n");
         printf("      --rpc-rate MS     getwork poll interval ms  (default: 5000)\n");
         printf("      --rpc-retries N   submit retries\n");
-        printf("      --cuda [DEV]      use CUDA GPU for Fermat testing (device 0 default)\n");
+        printf("      --cuda [DEV,...]  use CUDA GPU(s) for Fermat testing (e.g. --cuda 0,1)\n");
         return 1;
     }
     const char *header = NULL;
@@ -3916,8 +3926,10 @@ int main(int argc, char **argv) {
     int build_only = 0;
     int no_opreturn = 0;
     int num_threads = 1;
-    int use_cuda = 0, cuda_device = 0;
-    (void)cuda_device;  /* suppress warning when WITH_CUDA not set */
+    int use_cuda = 0;
+    int cuda_devices[GPU_MAX_DEVS];
+    int cuda_ndevs = 0;
+    (void)cuda_devices; (void)cuda_ndevs;  /* suppress warning when WITH_CUDA not set */
     uint64_t build_p = 0, build_q = 0;
     for (int i=1;i<argc;i++) {
         if (!strcmp(argv[i],"--header") && i+1<argc) header = argv[++i];
@@ -3949,7 +3961,16 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--fast-fermat")) use_fast_fermat = 1;
         else if (!strcmp(argv[i],"--cuda")) {
             use_cuda = 1;
-            if (i+1 < argc && argv[i+1][0] != '-') cuda_device = atoi(argv[++i]);
+            if (i+1 < argc && argv[i+1][0] != '-') {
+                /* Parse comma-separated device list: --cuda 0,1 or --cuda 0 */
+                char *devarg = argv[++i];
+                char *tok = strtok(devarg, ",");
+                while (tok && cuda_ndevs < GPU_MAX_DEVS) {
+                    cuda_devices[cuda_ndevs++] = atoi(tok);
+                    tok = strtok(NULL, ",");
+                }
+            }
+            if (cuda_ndevs == 0) cuda_devices[cuda_ndevs++] = 0;
         }
         else if (!strcmp(argv[i],"--no-primality")) no_primality = 1;
         else if (!strcmp(argv[i],"--selftest")) selftest = 1;
@@ -4130,14 +4151,21 @@ int main(int argc, char **argv) {
     /* ── CUDA GPU initialization ── */
 #ifdef WITH_CUDA
     if (use_cuda) {
-        g_gpu_ctx = gpu_fermat_init(cuda_device, GPU_MAX_BATCH);
-        if (!g_gpu_ctx) {
-            fprintf(stderr, "CUDA init failed (device %d). Falling back to CPU.\n",
-                    cuda_device);
+        for (int gi = 0; gi < cuda_ndevs; gi++) {
+            g_gpu_ctx[g_gpu_count] = gpu_fermat_init(cuda_devices[gi], GPU_MAX_BATCH);
+            if (!g_gpu_ctx[g_gpu_count]) {
+                fprintf(stderr, "CUDA init failed (device %d). Skipping.\n",
+                        cuda_devices[gi]);
+            } else {
+                log_msg("CUDA: using %s (device %d) for Fermat testing\n",
+                        gpu_fermat_device_name(g_gpu_ctx[g_gpu_count]),
+                        cuda_devices[gi]);
+                g_gpu_count++;
+            }
+        }
+        if (g_gpu_count == 0) {
+            fprintf(stderr, "No CUDA devices initialized. Falling back to CPU.\n");
             use_cuda = 0;
-        } else {
-            log_msg("CUDA: using %s (device %d) for Fermat testing\n",
-                    gpu_fermat_device_name(g_gpu_ctx), cuda_device);
         }
     }
 #else
@@ -4419,7 +4447,7 @@ int main(int argc, char **argv) {
                         /* Fermat-test ALL survivors */
                         size_t pf = 0;
 #ifdef WITH_CUDA
-                        if (g_gpu_ctx) {
+                        if (g_gpu_count > 0) {
                             pf = gpu_batch_filter(surv, surv_cnt);
                             __sync_fetch_and_add(&stats_tested, (uint64_t)surv_cnt);
                         } else
@@ -4551,7 +4579,7 @@ int main(int argc, char **argv) {
                             p1_arr[k++] = pr[j];
                     }
 #ifdef WITH_CUDA
-                    if (g_gpu_ctx && p1_arr) {
+                    if (g_gpu_count > 0 && p1_arr) {
                         sp = gpu_batch_filter(p1_arr, p1n);
                         memcpy(sampled, p1_arr, sp * sizeof(uint64_t));
                     } else
@@ -4619,7 +4647,7 @@ int main(int argc, char **argv) {
                     pf = sp;
                     memcpy(pr, sampled, sp * sizeof(uint64_t));
 #ifdef WITH_CUDA
-                    if (g_gpu_ctx && v_cnt > 0) {
+                    if (g_gpu_count > 0 && v_cnt > 0) {
                         size_t vp = gpu_batch_filter(verify, v_cnt);
                         for (size_t i = 0; i < vp; i++)
                             pr[pf++] = verify[i];
@@ -4676,7 +4704,7 @@ int main(int argc, char **argv) {
                     if (!no_primality) {
                         size_t test_cnt = cnt;
 #ifdef WITH_CUDA
-                        if (g_gpu_ctx) {
+                        if (g_gpu_count > 0) {
                             pf = gpu_batch_filter(pr, cnt);
                         } else
 #endif
@@ -4824,7 +4852,8 @@ int main(int argc, char **argv) {
     if (g_stratum) stratum_disconnect(g_stratum);
 #endif
 #ifdef WITH_CUDA
-    if (g_gpu_ctx) gpu_fermat_destroy(g_gpu_ctx);
+    for (int gi = 0; gi < g_gpu_count; gi++)
+        gpu_fermat_destroy(g_gpu_ctx[gi]);
 #endif
     stop_stats_thread();
     if (!keep_going) {
