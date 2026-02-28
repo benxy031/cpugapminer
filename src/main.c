@@ -3349,6 +3349,13 @@ static void *worker_fn(void *arg) {
                 size_t v_alloc = cnt / 8 + 64;
                 uint64_t *verify = (uint64_t *)malloc(v_alloc * sizeof(uint64_t));
                 size_t v_cnt = 0;
+                /* Track gap-region boundaries so scan_candidates is called
+                   only on fully-verified segments (avoids fake best_merit
+                   from gaps between sampled-only primes). */
+                size_t n_gap_regions = 0;
+                size_t gap_reg_cap = sp_cnt + 2;
+                uint64_t *gap_reg_lo = (uint64_t *)malloc(gap_reg_cap * sizeof(uint64_t));
+                uint64_t *gap_reg_hi = (uint64_t *)malloc(gap_reg_cap * sizeof(uint64_t));
                 if (verify && sp_cnt >= 1) {
                     /* Collect un-sampled survivors in (lo_val, hi_val)       */
                     #define COLLECT_REGION(lo_val, hi_val) do {                \
@@ -3371,17 +3378,23 @@ static void *worker_fn(void *arg) {
                     } while (0)
 
                     /* Left edge */
-                    if (cnt > 0 && sampled_primes[0] - pr[0] >= needed_gap)
+                    if (cnt > 0 && sampled_primes[0] - pr[0] >= needed_gap) {
                         COLLECT_REGION(pr[0] - 1, sampled_primes[0]);
+                        if (gap_reg_lo) { gap_reg_lo[n_gap_regions] = 0; gap_reg_hi[n_gap_regions] = sampled_primes[0]; n_gap_regions++; }
+                    }
                     /* Interior gaps */
                     for (size_t i = 0; i + 1 < sp_cnt; i++) {
-                        if (sampled_primes[i+1] - sampled_primes[i] >= needed_gap)
+                        if (sampled_primes[i+1] - sampled_primes[i] >= needed_gap) {
                             COLLECT_REGION(sampled_primes[i], sampled_primes[i+1]);
+                            if (gap_reg_lo) { gap_reg_lo[n_gap_regions] = sampled_primes[i]; gap_reg_hi[n_gap_regions] = sampled_primes[i+1]; n_gap_regions++; }
+                        }
                     }
                     /* Right edge */
                     if (cnt > 0 &&
-                        pr[cnt-1] - sampled_primes[sp_cnt-1] >= needed_gap)
+                        pr[cnt-1] - sampled_primes[sp_cnt-1] >= needed_gap) {
                         COLLECT_REGION(sampled_primes[sp_cnt-1], pr[cnt-1] + 1);
+                        if (gap_reg_lo) { gap_reg_lo[n_gap_regions] = sampled_primes[sp_cnt-1]; gap_reg_hi[n_gap_regions] = UINT64_MAX; n_gap_regions++; }
+                    }
 
                     #undef COLLECT_REGION
                 }
@@ -3465,17 +3478,50 @@ static void *worker_fn(void *arg) {
                         __sync_fetch_and_add(&stats_tested, (uint64_t)remainder);
                 }
 
-                /* Compensate stats_pairs so the ETA formula (based on
-                   pairs/s × exp(-m)) reflects full-window throughput.
-                   Estimate how many primes a full scan would have found
-                   from the phase-1 sample rate, and add the "missing"
-                   pairs that smart scanning intentionally skipped.         */
-                if (sp_cnt > 0 && p1_cnt > 0 && cnt >= 2) {
-                    size_t est_full = (size_t)((double)orig_cnt
-                                    * (double)sp_cnt / (double)p1_cnt);
-                    if (est_full > cnt)
-                        __sync_fetch_and_add(&stats_pairs,
-                                             (uint64_t)(est_full - cnt));
+                /* Scan ONLY fully-verified gap regions for qualifying gaps
+                   and best-merit tracking.  Scanning the full merged array
+                   would inflate best_merit with fake gaps between sampled-
+                   only primes (merit ≈ target by construction of needed_gap
+                   — explaining the suspicious best≈target on every run). */
+                {
+                    int found_block = 0;
+                    size_t region_pairs = 0;
+                    for (size_t r = 0; r < n_gap_regions && gap_reg_lo; r++) {
+                        /* Binary search for first prime >= gap_reg_lo[r] */
+                        size_t lo_idx = 0;
+                        { size_t l = 0, h = cnt;
+                          while (l < h) { size_t m = l+(h-l)/2; if (pr[m] < gap_reg_lo[r]) l=m+1; else h=m; }
+                          lo_idx = l; }
+                        /* Binary search for first prime > gap_reg_hi[r] */
+                        size_t hi_idx = cnt;
+                        { size_t l = 0, h = cnt;
+                          while (l < h) { size_t m = l+(h-l)/2; if (pr[m] <= gap_reg_hi[r]) l=m+1; else h=m; }
+                          hi_idx = l; }
+                        size_t seg_cnt = (hi_idx > lo_idx) ? hi_idx - lo_idx : 0;
+                        if (seg_cnt >= 2) {
+                            region_pairs += seg_cnt - 1;
+                            if (scan_candidates(pr + lo_idx, seg_cnt,
+                                                target_local, logbase,
+                                                shift_local, header_local,
+                                                rpc_url_local, rpc_user_local,
+                                                rpc_pass_local, rpc_method_local,
+                                                rpc_sign_key_local))
+                                found_block = 1;
+                        }
+                    }
+                    /* Compensate stats_pairs for ETA: estimate full-scan pairs
+                       from phase-1 sample rate, subtract pairs already counted
+                       by scan_candidates in the verified regions above. */
+                    if (sp_cnt > 0 && p1_cnt > 0) {
+                        size_t est_full = (size_t)((double)orig_cnt
+                                        * (double)sp_cnt / (double)p1_cnt);
+                        if (est_full > 1 + region_pairs)
+                            __sync_fetch_and_add(&stats_pairs,
+                                                 (uint64_t)(est_full - 1 - region_pairs));
+                    }
+                    free(gap_reg_lo);
+                    free(gap_reg_hi);
+                    if (found_block) goto worker_done;
                 }
 
             /* ============================================================= */
@@ -3547,7 +3593,9 @@ static void *worker_fn(void *arg) {
                 __sync_fetch_and_add(&stats_tested, (uint64_t)orig_cnt);
             }
 
-            if (cnt >= 2) {
+            /* Smart-scan path handles gap scanning internally (region-based).
+               Only run scan_candidates for full-test and no_primality. */
+            if (!use_smart && cnt >= 2) {
                 if (scan_candidates(pr, cnt, target_local, logbase,
                                     shift_local,
                                     header_local,
@@ -4225,15 +4273,27 @@ int main(int argc, char **argv) {
                         }                                                       \
                     } while (0)
 
-                    if (sp > 0 && cnt > 0 && sampled[0] - pr[0] >= needed)
+                    /* Track gap-region boundaries (same fix as cooperative path) */
+                    size_t n_greg_st = 0;
+                    size_t greg_cap_st = sp + 2;
+                    uint64_t *greg_lo_st = (uint64_t *)malloc(greg_cap_st * sizeof(uint64_t));
+                    uint64_t *greg_hi_st = (uint64_t *)malloc(greg_cap_st * sizeof(uint64_t));
+
+                    if (sp > 0 && cnt > 0 && sampled[0] - pr[0] >= needed) {
                         COLLECT_ST(pr[0] - 1, sampled[0]);
+                        if (greg_lo_st) { greg_lo_st[n_greg_st] = 0; greg_hi_st[n_greg_st] = sampled[0]; n_greg_st++; }
+                    }
                     for (size_t i = 0; i + 1 < sp; i++) {
-                        if (sampled[i+1] - sampled[i] >= needed)
+                        if (sampled[i+1] - sampled[i] >= needed) {
                             COLLECT_ST(sampled[i], sampled[i+1]);
+                            if (greg_lo_st) { greg_lo_st[n_greg_st] = sampled[i]; greg_hi_st[n_greg_st] = sampled[i+1]; n_greg_st++; }
+                        }
                     }
                     if (sp > 0 && cnt > 0 &&
-                        pr[cnt-1] - sampled[sp-1] >= needed)
+                        pr[cnt-1] - sampled[sp-1] >= needed) {
                         COLLECT_ST(sampled[sp-1], pr[cnt-1] + 1);
+                        if (greg_lo_st) { greg_lo_st[n_greg_st] = sampled[sp-1]; greg_hi_st[n_greg_st] = UINT64_MAX; n_greg_st++; }
+                    }
                     #undef COLLECT_ST
 
                     /* --- Phase 2: test verification candidates ------------ */
@@ -4247,14 +4307,40 @@ int main(int argc, char **argv) {
                     if (pf > 1) qsort(pr, pf, sizeof(uint64_t), cmp_u64);
                     cnt = pf;
 
-                    /* ETA pair compensation */
-                    if (sp > 0 && p1n > 0 && cnt >= 2) {
-                        size_t est_full = (size_t)((double)orig_cnt_st
-                                        * (double)sp / (double)p1n);
-                        if (est_full > cnt)
-                            __sync_fetch_and_add(&stats_pairs,
-                                                 (uint64_t)(est_full - cnt));
+                    /* Scan only fully-verified gap regions (same fix as cooperative path) */
+                    {
+                        size_t region_pairs_st = 0;
+                        for (size_t r = 0; r < n_greg_st && greg_lo_st; r++) {
+                            size_t lo_idx = 0;
+                            { size_t l = 0, h = cnt;
+                              while (l < h) { size_t m = l+(h-l)/2; if (pr[m] < greg_lo_st[r]) l=m+1; else h=m; }
+                              lo_idx = l; }
+                            size_t hi_idx = cnt;
+                            { size_t l = 0, h = cnt;
+                              while (l < h) { size_t m = l+(h-l)/2; if (pr[m] <= greg_hi_st[r]) l=m+1; else h=m; }
+                              hi_idx = l; }
+                            size_t seg_cnt = (hi_idx > lo_idx) ? hi_idx - lo_idx : 0;
+                            if (seg_cnt >= 2) {
+                                region_pairs_st += seg_cnt - 1;
+                                if (scan_candidates(pr + lo_idx, seg_cnt,
+                                                   target, logbase, shift,
+                                                   header, rpc_url, rpc_user,
+                                                   rpc_pass, rpc_method,
+                                                   rpc_sign_key))
+                                    return 0;
+                            }
+                        }
+                        /* ETA pair compensation */
+                        if (sp > 0 && p1n > 0) {
+                            size_t est_full = (size_t)((double)orig_cnt_st
+                                            * (double)sp / (double)p1n);
+                            if (est_full > 1 + region_pairs_st)
+                                __sync_fetch_and_add(&stats_pairs,
+                                                     (uint64_t)(est_full - 1 - region_pairs_st));
+                        }
                     }
+                    free(greg_lo_st);
+                    free(greg_hi_st);
                     free(sampled);
                     free(verify);
                 } else {
@@ -4271,7 +4357,9 @@ int main(int argc, char **argv) {
                         __sync_fetch_and_add(&stats_tested, (uint64_t)cnt);
                     }
                 }
-                if (cnt>=2) {
+                /* Smart-scan handles gap scanning via regions above;
+                   only run full-array scan for full-test / no_primality. */
+                if (!use_smart_st && cnt>=2) {
                     if (scan_candidates(pr, cnt, target, logbase,
                                        shift, header,
                                        rpc_url, rpc_user, rpc_pass,
