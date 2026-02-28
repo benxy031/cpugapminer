@@ -405,6 +405,7 @@ static volatile int debug_force = 0;    /* if nonzero, pretend any header meets 
    the full deterministic Miller‑Rabin.  This is faster but may misclassify a
    tiny number of composites as primes; use with --fast-fermat. */
 static volatile int use_fast_fermat = 0;
+static volatile int use_mont_powm  = 0;  /* custom Montgomery powm (with --fast-fermat) */
 static volatile int no_primality = 0;   /* skip all probable‑prime filtering */
 static volatile int selftest = 0;        /* run a quick internal test then exit */
 
@@ -2127,16 +2128,219 @@ static void set_base_bn(const uint8_t h256[32], int shift) {
                                                      (unsigned long)td_extra_primes[i]);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+   Montgomery modular exponentiation — fixed-width, zero-allocation.
+
+   Computes 2^(n-1) mod n for the base-2 Fermat primality test.
+
+   Uses GMP's mpn_sqr / mpn_mul_n for the heavy multiplication (they use
+   assembly-optimised Karatsuba/Toom internally) but implements REDC
+   (Montgomery reduction) inline with __uint128_t to avoid per-iteration
+   function-call overhead through the PLT.
+
+   NOTE: on modern x86-64 CPUs with MULX+ADCX+ADOX (Broadwell+), GMP's
+   mpz_powm is ~2× faster because its internal REDC uses those
+   instructions and avoids PLT overhead.  This code is kept as an
+   experimental option (--mont-powm) and may be useful on older CPUs
+   without MULX or on non-x86 platforms.
+
+   All workspace is thread-local static — zero heap allocation per call.
+   Supports moduli up to MONT_MAX_LIMBS × 64 bits (1536 bits at 24).
+   ═══════════════════════════════════════════════════════════════════════ */
+
+#define MONT_MAX_LIMBS  24          /* up to 1536-bit moduli          */
+#define MONT_WIN_BITS    5          /* exponentiation window width    */
+#define MONT_WIN_TAB    (1 << MONT_WIN_BITS) /* 32 table entries     */
+
+/* Thread-local workspace (allocated once, never freed). */
+static __thread mp_limb_t mt_prod[2 * MONT_MAX_LIMBS + 2];
+static __thread mp_limb_t mt_tab[MONT_WIN_TAB][MONT_MAX_LIMBS];
+static __thread mp_limb_t mt_r2[MONT_MAX_LIMBS];
+static __thread mp_limb_t mt_one[MONT_MAX_LIMBS];
+static __thread mp_limb_t mt_res[MONT_MAX_LIMBS];
+static __thread mp_limb_t mt_exp_buf[MONT_MAX_LIMBS];
+
+/* Compute n0inv = -n[0]^(-1) mod 2^64 via Newton iteration. */
+static inline mp_limb_t mont_n0inv(mp_limb_t n0) {
+    mp_limb_t x = 1;
+    for (int i = 0; i < 10; i++)
+        x *= 2 - n0 * x;
+    return (mp_limb_t)0 - x;   /* negate: we want -n^{-1}, not n^{-1} */
+}
+
+/* Montgomery REDC:  r[0..nl-1] = t[0..2*nl-1] × R^{-1} mod n.
+   The 'inner loop' uses __uint128_t multiply-accumulate to avoid calling
+   mpn_addmul_1 (nl times per REDC → thousands of PLT indirections). */
+static inline void mont_redc(mp_limb_t * __restrict__ r,
+                             mp_limb_t * __restrict__ t,
+                             const mp_limb_t *n,
+                             mp_limb_t n0inv, int nl) {
+    t[2 * nl] = 0;                 /* overflow sentinel */
+    for (int i = 0; i < nl; i++) {
+        mp_limb_t u = t[i] * n0inv;
+        __uint128_t carry = 0;
+        for (int j = 0; j < nl; j++) {
+            carry += (__uint128_t)u * n[j] + t[i + j];
+            t[i + j] = (mp_limb_t)carry;
+            carry >>= 64;
+        }
+        /* Propagate carry into t[i+nl .. 2*nl]. */
+        for (int j = i + nl; carry != 0 && j <= 2 * nl; j++) {
+            carry += (__uint128_t)t[j];
+            t[j] = (mp_limb_t)carry;
+            carry >>= 64;
+        }
+    }
+    /* t[0..nl-1] are zero now (Montgomery invariant).
+       Result is in t[nl..2*nl]; conditionally subtract n. */
+    if (t[2 * nl] != 0 || mpn_cmp(t + nl, n, (mp_size_t)nl) >= 0)
+        mpn_sub_n(r, t + nl, n, (mp_size_t)nl);
+    else
+        memcpy(r, t + nl, (size_t)nl * sizeof(mp_limb_t));
+}
+
+/* Base-2 Fermat test using Montgomery exponentiation with 5-bit windowing.
+   Returns 1 if 2^(n-1) ≡ 1 (mod n), i.e. n is a base-2 Fermat probable
+   prime.  Returns 0 otherwise.  Returns -1 if n is too large. */
+static int mont_fermat2(const mpz_t n_mpz) {
+    int nl = (int)mpz_size(n_mpz);
+    if (nl <= 0 || nl > MONT_MAX_LIMBS) return -1;
+
+    const mp_limb_t *np = mpz_limbs_read(n_mpz);
+    mp_limb_t n0inv = mont_n0inv(np[0]);
+
+    /* ── Setup: R mod n  and  R² mod n ── */
+    {
+        /* R mod n  where R = 2^(64·nl) */
+        mp_limb_t R_full[MONT_MAX_LIMBS + 1];
+        mp_limb_t q1[2];
+        memset(R_full, 0, sizeof(mp_limb_t) * ((size_t)nl + 1));
+        R_full[nl] = 1;
+        mpn_tdiv_qr(q1, mt_one, 0, R_full, (mp_size_t)(nl + 1),
+                     np, (mp_size_t)nl);
+
+        /* R² mod n = (R mod n)² mod n */
+        mp_limb_t sq[2 * MONT_MAX_LIMBS];
+        mp_limb_t q2[MONT_MAX_LIMBS + 1];
+        mpn_sqr(sq, mt_one, (mp_size_t)nl);
+        int sq_n = 2 * nl;
+        while (sq_n > nl && sq[sq_n - 1] == 0) sq_n--;
+        if (sq_n >= nl)
+            mpn_tdiv_qr(q2, mt_r2, 0, sq, (mp_size_t)sq_n,
+                         np, (mp_size_t)nl);
+        else {
+            memset(mt_r2, 0, (size_t)nl * sizeof(mp_limb_t));
+            memcpy(mt_r2, sq, (size_t)sq_n * sizeof(mp_limb_t));
+        }
+    }
+
+    /* ── Convert base=2 to Montgomery form: mont(2) = REDC(2 · R²) ── */
+    mp_limb_t base_m[MONT_MAX_LIMBS];
+    {
+        memset(mt_prod, 0, sizeof(mp_limb_t) * ((size_t)(2 * nl) + 2));
+        mp_limb_t cy = mpn_add_n(mt_prod, mt_r2, mt_r2, (mp_size_t)nl);
+        if (cy) mt_prod[nl] = cy;
+        mont_redc(base_m, mt_prod, np, n0inv, nl);
+    }
+
+    /* ── Precompute window table: tab[i] = i · base in Montgomery form ── */
+    memcpy(mt_tab[0], mt_one, (size_t)nl * sizeof(mp_limb_t));
+    memcpy(mt_tab[1], base_m, (size_t)nl * sizeof(mp_limb_t));
+    for (int i = 2; i < MONT_WIN_TAB; i++) {
+        mpn_mul_n(mt_prod, mt_tab[i - 1], mt_tab[1], (mp_size_t)nl);
+        mont_redc(mt_tab[i], mt_prod, np, n0inv, nl);
+    }
+
+    /* ── Exponent = n − 1 ── */
+    memcpy(mt_exp_buf, np, (size_t)nl * sizeof(mp_limb_t));
+    mpn_sub_1(mt_exp_buf, mt_exp_buf, (mp_size_t)nl, 1);
+    int exp_bits = nl * 64;
+    while (exp_bits > 0 &&
+           ((mt_exp_buf[(exp_bits - 1) / 64] >> ((exp_bits - 1) % 64)) & 1) == 0)
+        exp_bits--;
+    if (exp_bits == 0) return 0;  /* n = 1, not prime */
+
+    /* ── Fixed-window exponentiation, left-to-right ──
+       Walk the exponent from MSB to LSB using a position counter `pos`
+       that decrements as bits are consumed. */
+    int pos = exp_bits - 1;   /* bit cursor, MSB first */
+
+    /* First (possibly partial) window — skip initial squarings of 1. */
+    {
+        int first_wbits = ((exp_bits - 1) % MONT_WIN_BITS) + 1;
+        int wval = 0;
+        for (int j = 0; j < first_wbits; j++) {
+            int bit = (mt_exp_buf[pos / 64] >> (pos % 64)) & 1;
+            wval = (wval << 1) | bit;
+            pos--;
+        }
+        memcpy(mt_res, mt_tab[wval], (size_t)nl * sizeof(mp_limb_t));
+    }
+
+    /* Remaining full windows. */
+    while (pos >= MONT_WIN_BITS - 1) {
+        /* Square MONT_WIN_BITS times. */
+        for (int j = 0; j < MONT_WIN_BITS; j++) {
+            mpn_sqr(mt_prod, mt_res, (mp_size_t)nl);
+            mont_redc(mt_res, mt_prod, np, n0inv, nl);
+        }
+        /* Extract window value. */
+        int wval = 0;
+        for (int j = 0; j < MONT_WIN_BITS; j++) {
+            int bit = (mt_exp_buf[pos / 64] >> (pos % 64)) & 1;
+            wval = (wval << 1) | bit;
+            pos--;
+        }
+        if (wval != 0) {
+            mpn_mul_n(mt_prod, mt_res, mt_tab[wval], (mp_size_t)nl);
+            mont_redc(mt_res, mt_prod, np, n0inv, nl);
+        }
+    }
+
+    /* Tail bits (0 to MONT_WIN_BITS-2 remaining). */
+    if (pos >= 0) {
+        int rbits = pos + 1;
+        for (int j = 0; j < rbits; j++) {
+            mpn_sqr(mt_prod, mt_res, (mp_size_t)nl);
+            mont_redc(mt_res, mt_prod, np, n0inv, nl);
+        }
+        int wval = 0;
+        for (int j = 0; j < rbits; j++) {
+            int bit = (mt_exp_buf[pos / 64] >> (pos % 64)) & 1;
+            wval = (wval << 1) | bit;
+            pos--;
+        }
+        if (wval != 0) {
+            mpn_mul_n(mt_prod, mt_res, mt_tab[wval], (mp_size_t)nl);
+            mont_redc(mt_res, mt_prod, np, n0inv, nl);
+        }
+    }
+
+    /* ── Convert back: result = REDC(mt_res) ── */
+    memset(mt_prod, 0, sizeof(mp_limb_t) * ((size_t)(2 * nl) + 2));
+    memcpy(mt_prod, mt_res, (size_t)nl * sizeof(mp_limb_t));
+    mont_redc(mt_res, mt_prod, np, n0inv, nl);
+
+    /* ── Check result == 1 ── */
+    if (mt_res[0] != 1) return 0;
+    for (int i = 1; i < nl; i++)
+        if (mt_res[i] != 0) return 0;
+    return 1;
+}
+
+/* Validation counter — first N calls cross-check against GMP. */
+static __thread int mont_validate_cnt = 0;
+#define MONT_VALIDATE_MAX 100
+
+
 /* Return 1 if (tls_base_mpz + offset) is probably prime.
  *
- * Two paths:
- *  A. --fast-fermat: raw Fermat test via mpz_powm.
+ * Three paths:
+ *  A. --mont-powm (+ --fast-fermat): custom Montgomery Fermat test.
+ *     Inline REDC avoids per-iteration PLT overhead; 5-bit windowed exp.
+ *  B. --fast-fermat: raw Fermat test via GMP's mpz_powm.
  *     Computes 2^(n-1) mod n and checks == 1.
- *     Bypasses mpz_probab_prime_p's internal trial-division (which is
- *     redundant — our candidates already survived a million-prime sieve).
- *     One modular exponentiation ≈ 284 squarings + ~142 muls.
- *  B. Full: mpz_probab_prime_p(n, 10) — 10 MR rounds.
- *     Internal TD overhead is negligible vs 10 rounds.
+ *  C. Full: mpz_probab_prime_p(n, 10) — 10 MR rounds.
  */
 static int bn_candidate_is_prime(uint64_t offset) {
     /* --- Trial-division pre-filter (disabled when TD_EXTRA_CNT=0) --- */
@@ -2154,6 +2358,25 @@ static int bn_candidate_is_prime(uint64_t offset) {
     mpz_add_ui(tls_cand_mpz, tls_cand_mpz, (unsigned long)offset);
 
     if (use_fast_fermat) {
+        if (use_mont_powm) {
+            /* Custom Montgomery Fermat test with inline REDC. */
+            int mr = mont_fermat2(tls_cand_mpz);
+#ifndef NDEBUG
+            /* Cross-check first MONT_VALIDATE_MAX calls against GMP. */
+            if (mont_validate_cnt < MONT_VALIDATE_MAX) {
+                mpz_sub_ui(tls_exp_mpz, tls_cand_mpz, 1);
+                mpz_powm(tls_res_mpz, tls_two_mpz, tls_exp_mpz, tls_cand_mpz);
+                int gmp_r = mpz_cmp_ui(tls_res_mpz, 1) == 0;
+                if (mr != gmp_r) {
+                    gmp_fprintf(stderr,
+                        "MONT MISMATCH #%d: mont=%d gmp=%d cand=%Zd\n",
+                        mont_validate_cnt, mr, gmp_r, tls_cand_mpz);
+                }
+                mont_validate_cnt++;
+            }
+#endif
+            return mr;
+        }
         /* Raw base-2 Fermat test: 2^(n-1) mod n == 1?
            Skips GMP's redundant internal trial-division (~700 primes
            up to 5000) that mpz_probab_prime_p does before MR.
@@ -2315,6 +2538,9 @@ static void crt_compute_alignment_mpz(mpz_t result) {
 static int __attribute__((unused)) bn_is_prime_mpz(mpz_t candidate) {
     ensure_gmp_tls();
     if (use_fast_fermat) {
+        if (use_mont_powm) {
+            return mont_fermat2(candidate);
+        }
         mpz_sub_ui(tls_exp_mpz, candidate, 1);
         mpz_powm(tls_res_mpz, tls_two_mpz, tls_exp_mpz, candidate);
         return mpz_cmp_ui(tls_res_mpz, 1) == 0;
@@ -3673,6 +3899,7 @@ int main(int argc, char **argv) {
     uint64_t sieve_size = 33554432;
     double target = 20.0;
     int target_explicit = 0;  /* set to 1 if user passes --target */
+    int cli_sieve_explicit = 0; /* set to 1 if user passes --sieve-primes */
     const char *rpc_url = NULL, *rpc_user = NULL, *rpc_pass = NULL, *rpc_method = "getwork";
     const char *rpc_sign_key = NULL;
     const char *rpc_host = NULL;
@@ -3693,6 +3920,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--sieve-size") && i+1<argc) sieve_size = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i],"--sieve-primes") && i+1<argc) {
             cli_sieve_prime_count = strtoull(argv[++i], NULL, 10);
+            cli_sieve_explicit = 1;
             /* Limit is computed from count after arg parsing (PNT upper bound). */
         }
         else if (!strcmp(argv[i],"--target") && i+1<argc) { target = atof(argv[++i]); target_explicit = 1; }
@@ -3710,6 +3938,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--no-opreturn")) no_opreturn = 1;
         else if (!strcmp(argv[i],"--force-solution")) debug_force = 1;
         else if (!strcmp(argv[i],"--fast-fermat")) use_fast_fermat = 1;
+        else if (!strcmp(argv[i],"--mont-powm")) { use_mont_powm = 1; use_fast_fermat = 1; }
         else if (!strcmp(argv[i],"--no-primality")) no_primality = 1;
         else if (!strcmp(argv[i],"--selftest")) selftest = 1;
         else if (!strcmp(argv[i],"--threads") && i+1<argc) num_threads = atoi(argv[++i]);
@@ -3773,6 +4002,35 @@ int main(int argc, char **argv) {
     if (cli_crt_file) {
         if (!load_crt_file(cli_crt_file)) {
             log_msg("Warning: CRT file load failed, continuing without CRT\n");
+        }
+    }
+
+    /* ── CRT sieve-primes auto-tuning ──
+       In CRT mode (gap-solver) the sieve filters the forward gap-check
+       window (~11K positions at merit 22, shift 512).  Each additional
+       composite eliminated by the sieve saves one Fermat test (~500 µs
+       at shift 512).  The marginal sieve cost is tiny (ns per prime per
+       position), so more sieve primes pay for themselves up to ~5M.
+       Only adjust if the user didn't pass --sieve-primes explicitly. */
+    if (g_crt_mode == CRT_MODE_SOLVER && !cli_sieve_explicit) {
+        uint64_t new_count;
+        if (shift >= 768)
+            new_count = 5000000;   /* ~86M limit */
+        else if (shift >= 384)
+            new_count = 3000000;   /* ~52M limit */
+        else if (shift >= 128)
+            new_count = 2000000;   /* ~35M limit */
+        else
+            new_count = DEFAULT_SIEVE_PRIME_COUNT;
+        if (new_count != cli_sieve_prime_count) {
+            log_msg("CRT auto-tune: sieve-primes %llu -> %llu (shift=%d)\n",
+                    (unsigned long long)cli_sieve_prime_count,
+                    (unsigned long long)new_count, shift);
+            cli_sieve_prime_count = new_count;
+            /* Recompute the value limit from the new count. */
+            double n = (double)cli_sieve_prime_count;
+            double upper = n * (log(n) + log(log(n)));
+            cli_sieve_prime_limit = (uint64_t)(upper * 1.05);
         }
     }
 
@@ -3902,8 +4160,12 @@ int main(int argc, char **argv) {
         log_msg("default behaviour: will continue mining after finding a valid block\n");
     else
         log_msg("miner configured to exit when a valid block is found\n");
-    if (use_fast_fermat)
-        log_msg("fast Fermat flag: using 1 Miller-Rabin round only (faster, ~25%% false-positive rate; composites get rejected by network)\n");
+    if (use_fast_fermat) {
+        if (use_mont_powm)
+            log_msg("Montgomery Fermat: custom inline REDC + 5-bit window (--mont-powm)\n");
+        else
+            log_msg("fast Fermat: GMP mpz_powm base-2 (--fast-fermat)\n");
+    }
 
 #ifndef WITH_RPC
     /* suppress unused-but-set warnings when built without RPC */
