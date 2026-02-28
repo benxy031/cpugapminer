@@ -3386,11 +3386,6 @@ static void *worker_fn(void *arg) {
                     #undef COLLECT_REGION
                 }
 
-                if (adder == 0)
-                    log_msg("smart scan: K=%d  sampled=%zu  verified=%zu  total=%zu (%.0f%% skipped)\n",
-                            smart_K, p1_cnt, v_cnt, cnt,
-                            100.0 * (1.0 - (double)(p1_cnt + v_cnt) / (double)cnt));
-
                 /* --- Phase 2: verify survivors in candidate gaps --------- */
                 size_t p2_wn = 0;
                 uint64_t *p2_wbuf = NULL;
@@ -4240,11 +4235,6 @@ int main(int argc, char **argv) {
                         pr[cnt-1] - sampled[sp-1] >= needed)
                         COLLECT_ST(sampled[sp-1], pr[cnt-1] + 1);
                     #undef COLLECT_ST
-
-                    if (adder == 0)
-                        log_msg("smart scan: K=%d  sampled=%zu  verified=%zu  total=%zu (%.0f%% skipped)\n",
-                                smart_K_st, p1n, v_cnt, cnt,
-                                100.0 * (1.0 - (double)(p1n + v_cnt) / (double)cnt));
 
                     /* --- Phase 2: test verification candidates ------------ */
                     pf = sp;
