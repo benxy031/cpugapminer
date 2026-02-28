@@ -37,7 +37,7 @@ endif
 # optional: GPU_BITS=768 (default, shift ≤ 512), 1024 (shift ≤ 768), etc.
 ifdef WITH_CUDA
 	NVCC ?= nvcc
-	CUDA_ARCH ?= -arch=sm_61
+	CUDA_ARCH ?= -arch=sm_86
 	CUDA_PATH ?= /usr/local/cuda
 	GPU_BITS ?= 1024
 	GPU_NLIMBS := $(shell echo '$(GPU_BITS) / 64' | bc)

@@ -4067,6 +4067,19 @@ int main(int argc, char **argv) {
        Only adjust if the user didn't pass --sieve-primes explicitly. */
     if (g_crt_mode == CRT_MODE_SOLVER && !cli_sieve_explicit) {
         uint64_t new_count;
+#ifdef WITH_CUDA
+        if (use_cuda) {
+            /* GPU Fermat: keep sieve primes low to feed larger batches.
+               At 500K primes the gap-check sieve is still effective
+               (same primes/win as 3M) but survivors per window are ~3×
+               higher, keeping GPU occupancy near 100%.  */
+            if (shift >= 384)
+                new_count = 500000;
+            else
+                new_count = DEFAULT_SIEVE_PRIME_COUNT;
+        } else
+#endif
+        {
         if (shift >= 768)
             new_count = 5000000;   /* ~86M limit */
         else if (shift >= 384)
@@ -4075,10 +4088,17 @@ int main(int argc, char **argv) {
             new_count = 2000000;   /* ~35M limit */
         else
             new_count = DEFAULT_SIEVE_PRIME_COUNT;
+        }
         if (new_count != cli_sieve_prime_count) {
-            log_msg("CRT auto-tune: sieve-primes %llu -> %llu (shift=%d)\n",
+            log_msg("CRT auto-tune: sieve-primes %llu -> %llu (shift=%d%s)\n",
                     (unsigned long long)cli_sieve_prime_count,
-                    (unsigned long long)new_count, shift);
+                    (unsigned long long)new_count, shift,
+#ifdef WITH_CUDA
+                    use_cuda ? ", cuda" : ""
+#else
+                    ""
+#endif
+                    );
             cli_sieve_prime_count = new_count;
             /* Recompute the value limit from the new count. */
             double n = (double)cli_sieve_prime_count;
