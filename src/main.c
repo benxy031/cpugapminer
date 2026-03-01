@@ -30,6 +30,7 @@ extern int      rpc_getwork_data(const char *url, const char *user, const char *
 static stratum_ctx *g_stratum = NULL;   /* non-NULL when mining via stratum pool */
 #endif
 #define GPU_MAX_DEVS  8
+static int             g_gpu_batch_size = 0;  /* --gpu-batch; 0 = use default (4096) */
 #ifdef WITH_CUDA
 #include "gpu_fermat.h"
 #define GPU_MAX_BATCH (1 << 20)   /* 1M candidates per batch */
@@ -207,6 +208,8 @@ static uint64_t stats_start_ms = 0;                /* time mining started */
 static volatile double   g_mining_target = 20.0;   /* merit threshold for block-prob display */
 static volatile double   stats_best_merit = 0.0;   /* best gap merit seen this session */
 static volatile uint64_t stats_best_gap   = 0;     /* gap size for best merit */
+static volatile uint64_t stats_gpu_flushes = 0;    /* GPU accumulator flushes */
+static volatile uint64_t stats_gpu_batched = 0;    /* total candidates sent in GPU flushes */
 
 /* ── Rolling rate window for responsive est ──
    Store snapshots every STATS_INTERVAL_MS; use the oldest snapshot
@@ -765,6 +768,13 @@ static void print_stats(void) {
     if (bm > 0.0)
         log_msg("  best=%.2f (gap=%llu)",
                 bm, (unsigned long long)stats_best_gap);
+
+#ifdef WITH_CUDA
+    if (stats_gpu_flushes > 0) {
+        double avg_batch = (double)stats_gpu_batched / (double)stats_gpu_flushes;
+        log_msg("  gpu_batch=%.0f", avg_batch);
+    }
+#endif
 
 #ifdef WITH_RPC
     if (g_stratum) {
@@ -2311,6 +2321,264 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
 }
 #endif /* WITH_CUDA */
 
+#ifdef WITH_CUDA
+/* ── Scan gap results for one window ──
+   After Fermat testing, scan consecutive prime survivors for qualifying
+   gaps.  Updates global stats, logs gaps, submits qualifying blocks. */
+static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
+                             double logbase, uint32_t nonce, int cand_odd,
+                             mpz_srcptr nAdd, int shift_v, double target,
+                             const char *rpc_url, const char *rpc_user,
+                             const char *rpc_pass) {
+    __sync_fetch_and_add(&stats_crt_windows, 1);
+    __sync_fetch_and_add(&stats_primes_found, (uint64_t)prime_cnt);
+    if (prime_cnt < 2) return;
+    __sync_fetch_and_add(&stats_pairs, (uint64_t)(prime_cnt - 1));
+    for (size_t i = 0; i + 1 < prime_cnt; i++) {
+        uint64_t gap = primes[i + 1] - primes[i];
+        double merit = (double)gap / logbase;
+        if (merit > stats_best_merit) {
+            stats_best_merit = merit;
+            stats_best_gap   = gap;
+        }
+        if (merit < target) continue;
+        __sync_fetch_and_add(&stats_gaps, 1);
+        mpz_t nAdd_prime;
+        mpz_init(nAdd_prime);
+        mpz_set(nAdd_prime, nAdd);
+        mpz_add_ui(nAdd_prime, nAdd_prime, primes[i]);
+        if (cand_odd)
+            mpz_sub_ui(nAdd_prime, nAdd_prime, 1);
+        char nAdd_str[256];
+        gmp_snprintf(nAdd_str, sizeof(nAdd_str), "%Zd", nAdd_prime);
+        log_msg("\n>>> GAP FOUND\n"
+                "    gap     = %llu\n"
+                "    merit   = %.6f  (need >= %.2f)\n"
+                "    nShift  = %d\n"
+                "    nonce   = %u\n"
+                "    nAdd    = %s\n",
+                (unsigned long long)gap,
+                merit, target, shift_v,
+                (unsigned)nonce, nAdd_str);
+#ifdef WITH_RPC
+        if (rpc_url && !g_abort_pass) {
+            pthread_mutex_lock(&sq_lock);
+            int sq_busy = (sq_count > 0);
+            pthread_mutex_unlock(&sq_lock);
+            if (!sq_busy) {
+                char blockhex[16384];
+                memset(blockhex, 0, sizeof(blockhex));
+                if (assemble_mining_block_mpz(nonce, nAdd_prime, blockhex)) {
+                    __sync_fetch_and_add(&stats_blocks, 1);
+                    log_file_only("Built blockhex: %s\n", blockhex);
+                    if (header_meets_target_hex(blockhex)) {
+                        log_msg(">>> SUBMITTING to node\n"
+                                "    merit=%.6f  gap=%llu"
+                                "  nShift=%d  nonce=%u\n",
+                                merit, (unsigned long long)gap,
+                                shift_v, (unsigned)nonce);
+                        struct submit_job _job;
+                        memset(&_job, 0, sizeof(_job));
+                        strncpy(_job.url, rpc_url, sizeof(_job.url)-1);
+                        strncpy(_job.user, rpc_user ? rpc_user : "",
+                                sizeof(_job.user)-1);
+                        strncpy(_job.pass, rpc_pass ? rpc_pass : "",
+                                sizeof(_job.pass)-1);
+                        strncpy(_job.method, "getwork",
+                                sizeof(_job.method)-1);
+                        memcpy(_job.hex, blockhex, sizeof(_job.hex));
+                        _job.retries = rpc_default_retries;
+                        __sync_fetch_and_add(&stats_submits, 1);
+                        enqueue_job(&_job);
+                        log_msg(">>> QUEUED for async submit"
+                                " (mining continues)\n");
+                        print_stats();
+                    }
+                } else {
+                    log_msg("Failed to assemble block\n");
+                }
+            }
+        }
+#endif
+        mpz_clear(nAdd_prime);
+    }
+}
+
+/* ── GPU batch accumulator ──
+   Collects candidates from multiple CRT windows into a single large
+   buffer, then sends them all to the GPU in one kernel launch.
+   Instead of ~800 candidates per window (tiny batch), we accumulate
+   4096+ before flushing for much better GPU SM utilization. */
+
+#define GPU_ACCUM_DEFAULT  4096
+
+struct gpu_accum_win {
+    size_t    cand_start;     /* index into flat cand_limbs buffer */
+    size_t    cand_count;     /* survivors from this window */
+    uint64_t *surv;           /* owned copy of survivor offsets */
+    size_t    surv_cnt;
+    uint32_t  nonce;
+    int       cand_odd;
+    double    logbase;
+    double    target;
+    int       shift;
+    const char *rpc_url, *rpc_user, *rpc_pass;
+    mpz_t     nAdd;           /* owned copy */
+};
+
+struct gpu_accum {
+    uint64_t *limbs;           /* flat: total × GPU_NLIMBS uint64_t */
+    size_t    total;           /* current accumulated candidate count */
+    size_t    capacity;
+    struct gpu_accum_win *wins;
+    size_t    win_count;
+    size_t    win_cap;
+    uint8_t  *results;
+    size_t    res_cap;
+    int       threshold;       /* flush when total >= this */
+    gpu_fermat_ctx *ctx;       /* assigned GPU context */
+};
+
+static __thread struct gpu_accum *tls_gpu_accum;
+
+static struct gpu_accum *gpu_accum_create(gpu_fermat_ctx *ctx, int threshold) {
+    struct gpu_accum *a = (struct gpu_accum *)calloc(1, sizeof(*a));
+    if (!a) return NULL;
+    a->threshold = threshold > 0 ? threshold : GPU_ACCUM_DEFAULT;
+    a->ctx = ctx;
+    a->capacity = (size_t)a->threshold + 1024;
+    a->limbs = (uint64_t *)malloc(a->capacity * GPU_NLIMBS * sizeof(uint64_t));
+    a->win_cap = 256;
+    a->wins = (struct gpu_accum_win *)malloc(a->win_cap * sizeof(a->wins[0]));
+    a->res_cap = a->capacity;
+    a->results = (uint8_t *)malloc(a->res_cap);
+    if (!a->limbs || !a->wins || !a->results) {
+        free(a->limbs); free(a->wins); free(a->results); free(a);
+        return NULL;
+    }
+    return a;
+}
+
+static void gpu_accum_reset(struct gpu_accum *a) {
+    for (size_t i = 0; i < a->win_count; i++) {
+        free(a->wins[i].surv);
+        mpz_clear(a->wins[i].nAdd);
+    }
+    a->total = 0;
+    a->win_count = 0;
+}
+
+static void gpu_accum_destroy(struct gpu_accum *a) {
+    if (!a) return;
+    gpu_accum_reset(a);
+    free(a->limbs);
+    free(a->wins);
+    free(a->results);
+    free(a);
+}
+
+/* Add a window's survivors to the accumulator.
+   Returns 1 if threshold reached (caller should call gpu_accum_flush). */
+static int gpu_accum_add(struct gpu_accum *a,
+                         const uint64_t base_limbs[GPU_NLIMBS],
+                         const uint64_t *offsets, size_t cnt,
+                         uint32_t nonce, int cand_odd,
+                         double logbase, double target_v, int shift_v,
+                         mpz_srcptr nAdd,
+                         const char *rpc_url, const char *rpc_user,
+                         const char *rpc_pass) {
+    if (!a || cnt == 0) return 0;
+    /* Grow limbs buffer if needed */
+    if (a->total + cnt > a->capacity) {
+        size_t new_cap = (a->total + cnt) * 2;
+        uint64_t *nl = (uint64_t *)realloc(a->limbs,
+            new_cap * GPU_NLIMBS * sizeof(uint64_t));
+        if (!nl) return 0;
+        a->limbs = nl;
+        a->capacity = new_cap;
+        if (new_cap > a->res_cap) {
+            uint8_t *nr = (uint8_t *)realloc(a->results, new_cap);
+            if (!nr) return 0;
+            a->results = nr;
+            a->res_cap = new_cap;
+        }
+    }
+    /* Grow window array if needed */
+    if (a->win_count >= a->win_cap) {
+        size_t nwc = a->win_cap * 2;
+        struct gpu_accum_win *nw = (struct gpu_accum_win *)realloc(
+            a->wins, nwc * sizeof(a->wins[0]));
+        if (!nw) return 0;
+        a->wins = nw;
+        a->win_cap = nwc;
+    }
+    /* Convert candidates: base + offset → limbs */
+    for (size_t j = 0; j < cnt; j++) {
+        uint64_t *dst = &a->limbs[(a->total + j) * GPU_NLIMBS];
+        for (int k = 0; k < GPU_NLIMBS; k++) dst[k] = base_limbs[k];
+        dst[0] += offsets[j];
+        uint64_t carry = (dst[0] < offsets[j]);
+        for (int k = 1; k < GPU_NLIMBS && carry; k++) {
+            dst[k] += carry;
+            carry = (dst[k] == 0);
+        }
+    }
+    /* Record window metadata */
+    struct gpu_accum_win *w = &a->wins[a->win_count];
+    w->cand_start = a->total;
+    w->cand_count = cnt;
+    w->surv = (uint64_t *)malloc(cnt * sizeof(uint64_t));
+    if (w->surv) memcpy(w->surv, offsets, cnt * sizeof(uint64_t));
+    w->surv_cnt   = cnt;
+    w->nonce      = nonce;
+    w->cand_odd   = cand_odd;
+    w->logbase    = logbase;
+    w->target     = target_v;
+    w->shift      = shift_v;
+    w->rpc_url    = rpc_url;
+    w->rpc_user   = rpc_user;
+    w->rpc_pass   = rpc_pass;
+    mpz_init(w->nAdd);
+    mpz_set(w->nAdd, nAdd);
+    a->total += cnt;
+    a->win_count++;
+    return (int)(a->total >= (size_t)a->threshold);
+}
+
+/* Flush: send all accumulated candidates to GPU, process results. */
+static void gpu_accum_flush(struct gpu_accum *a) {
+    if (!a || a->total == 0 || !a->ctx) return;
+    /* GPU test entire accumulated batch */
+    __sync_fetch_and_add(&stats_gpu_flushes, 1);
+    __sync_fetch_and_add(&stats_gpu_batched, a->total);
+    int np = gpu_fermat_test_batch(a->ctx, a->limbs, a->results, a->total);
+    /* Distribute results to each window and scan gaps */
+    for (size_t wi = 0; wi < a->win_count; wi++) {
+        struct gpu_accum_win *w = &a->wins[wi];
+        if (np < 0 || !w->surv) {
+            /* GPU error: count the window, skip gap-scanning */
+            __sync_fetch_and_add(&stats_crt_windows, 1);
+            free(w->surv); w->surv = NULL;
+            mpz_clear(w->nAdd);
+            continue;
+        }
+        /* Compact survivors using GPU results */
+        size_t pf = 0;
+        for (size_t j = 0; j < w->cand_count; j++) {
+            if (a->results[w->cand_start + j])
+                w->surv[pf++] = w->surv[j];
+        }
+        scan_gap_results(w->surv, pf, w->logbase, w->nonce, w->cand_odd,
+                         w->nAdd, w->shift, w->target,
+                         w->rpc_url, w->rpc_user, w->rpc_pass);
+        free(w->surv); w->surv = NULL;
+        mpz_clear(w->nAdd);
+    }
+    a->total = 0;
+    a->win_count = 0;
+}
+#endif /* WITH_CUDA — accumulator */
+
 // Produce hex of SHA256(header) (useful as a simple header encoding)
 static void sha256_hex(const char *s, char out[65]) __attribute__((unused));
 static void sha256_hex(const char *s, char out[65]) {
@@ -3153,12 +3421,45 @@ static void *worker_fn(void *arg) {
                         continue;
                     }
 
-                    /* ── Monolithic: Fermat-test inline (original) ── */
+                    /* ── Monolithic: Fermat-test ── */
                     size_t pf = 0;
 #ifdef WITH_CUDA
                     if (g_gpu_count > 0) {
+                        /* Lazy-init thread-local GPU accumulator */
+                        if (!tls_gpu_accum) {
+                            static volatile int accum_rr = 0;
+                            int gi = __sync_fetch_and_add(&accum_rr, 1)
+                                     % g_gpu_count;
+                            tls_gpu_accum = gpu_accum_create(
+                                g_gpu_ctx[gi], g_gpu_batch_size);
+                        }
+                        if (tls_gpu_accum) {
+                            ensure_gmp_tls();
+                            uint64_t bl[GPU_NLIMBS];
+                            memset(bl, 0, sizeof(bl));
+                            size_t nexp = 0;
+                            mpz_export(bl, &nexp, -1, 8, 0, 0,
+                                       tls_base_mpz);
+                            if (nexp <= (size_t)GPU_NLIMBS) {
+                                __sync_fetch_and_add(&stats_tested,
+                                    (uint64_t)surv_cnt);
+                                if (gpu_accum_add(tls_gpu_accum, bl,
+                                        surv, surv_cnt, nonce_cur,
+                                        cand_odd, logbase_nonce,
+                                        target_local, shift_local,
+                                        nAdd, rpc_url_local,
+                                        rpc_user_local, rpc_pass_local))
+                                    gpu_accum_flush(tls_gpu_accum);
+                                mpz_add(nAdd, nAdd,
+                                        g_crt_primorial_mpz);
+                                continue;
+                            }
+                            /* nexp > GPU_NLIMBS: fall through to CPU */
+                        }
+                        /* Accumulator unavailable: direct GPU batch */
                         pf = gpu_batch_filter(surv, surv_cnt);
-                        __sync_fetch_and_add(&stats_tested, (uint64_t)surv_cnt);
+                        __sync_fetch_and_add(&stats_tested,
+                                             (uint64_t)surv_cnt);
                     } else
 #endif
                     {
@@ -3169,6 +3470,7 @@ static void *worker_fn(void *arg) {
                         }
                     }
 
+                    /* Gap processing (CPU path + GPU fallback) */
                     __sync_fetch_and_add(&stats_crt_windows, 1);
                     __sync_fetch_and_add(&stats_primes_found, (uint64_t)pf);
                     if (pf >= 2) {
@@ -3258,6 +3560,15 @@ static void *worker_fn(void *arg) {
 
                     mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
                 } /* end CRT candidate loop */
+#ifdef WITH_CUDA
+                /* Flush any remaining accumulated GPU windows */
+                if (tls_gpu_accum && tls_gpu_accum->win_count > 0) {
+                    if (g_abort_pass)
+                        gpu_accum_reset(tls_gpu_accum);
+                    else
+                        gpu_accum_flush(tls_gpu_accum);
+                }
+#endif
 
                 nonce_cur += (uint32_t)nth_local;
                 if (nonce_cur < (uint32_t)nth_local) break;
@@ -3269,6 +3580,12 @@ static void *worker_fn(void *arg) {
         }
 
         /* ── CRT cleanup ── */
+#ifdef WITH_CUDA
+        if (tls_gpu_accum) {
+            gpu_accum_destroy(tls_gpu_accum);
+            tls_gpu_accum = NULL;
+        }
+#endif
         free_sieve_buffers();
         if (tls_gmp_inited) {
             mpz_clear(tls_base_mpz);
@@ -3822,6 +4139,12 @@ worker_done:
        Without this, every pass (new block) leaks ~103 MB per worker:
        tls_pr (~80 MB) + tls_base_mod_p (~22 MB) + tls_bits (~1.25 MB).
        With 14 threads that's ~1.45 GB leaked per block, causing OOM. */
+#ifdef WITH_CUDA
+    if (tls_gpu_accum) {
+        gpu_accum_destroy(tls_gpu_accum);
+        tls_gpu_accum = NULL;
+    }
+#endif
     free_sieve_buffers();
     if (tls_gmp_inited) {
         mpz_clear(tls_base_mpz);
@@ -3900,6 +4223,7 @@ int main(int argc, char **argv) {
         printf("      --rpc-rate MS     getwork poll interval ms  (default: 5000)\n");
         printf("      --rpc-retries N   submit retries\n");
         printf("      --cuda [DEV,...]  use CUDA GPU(s) for Fermat testing (e.g. --cuda 0,1)\n");
+        printf("      --gpu-batch N     accumulate N candidates before GPU flush (default: 4096)\n");
         return 1;
     }
     const char *header = NULL;
@@ -3971,6 +4295,10 @@ int main(int argc, char **argv) {
                 }
             }
             if (cuda_ndevs == 0) cuda_devices[cuda_ndevs++] = 0;
+        }
+        else if (!strcmp(argv[i],"--gpu-batch") && i+1<argc) {
+            g_gpu_batch_size = atoi(argv[++i]);
+            if (g_gpu_batch_size < 64) g_gpu_batch_size = 64;
         }
         else if (!strcmp(argv[i],"--no-primality")) no_primality = 1;
         else if (!strcmp(argv[i],"--selftest")) selftest = 1;
@@ -4448,6 +4776,37 @@ int main(int argc, char **argv) {
                         size_t pf = 0;
 #ifdef WITH_CUDA
                         if (g_gpu_count > 0) {
+                            /* Lazy-init thread-local GPU accumulator */
+                            if (!tls_gpu_accum) {
+                                static volatile int st_accum_rr = 0;
+                                int gi = __sync_fetch_and_add(&st_accum_rr, 1)
+                                         % g_gpu_count;
+                                tls_gpu_accum = gpu_accum_create(
+                                    g_gpu_ctx[gi], g_gpu_batch_size);
+                            }
+                            if (tls_gpu_accum) {
+                                ensure_gmp_tls();
+                                uint64_t bl[GPU_NLIMBS];
+                                memset(bl, 0, sizeof(bl));
+                                size_t nexp = 0;
+                                mpz_export(bl, &nexp, -1, 8, 0, 0,
+                                           tls_base_mpz);
+                                if (nexp <= (size_t)GPU_NLIMBS) {
+                                    __sync_fetch_and_add(&stats_tested,
+                                        (uint64_t)surv_cnt);
+                                    if (gpu_accum_add(tls_gpu_accum, bl,
+                                            surv, surv_cnt, nonce_st,
+                                            st_odd, logbase_st,
+                                            target, shift,
+                                            nAdd_st, rpc_url,
+                                            rpc_user, rpc_pass))
+                                        gpu_accum_flush(tls_gpu_accum);
+                                    mpz_add(nAdd_st, nAdd_st,
+                                            g_crt_primorial_mpz);
+                                    continue;
+                                }
+                            }
+                            /* Fallback: direct GPU batch */
                             pf = gpu_batch_filter(surv, surv_cnt);
                             __sync_fetch_and_add(&stats_tested, (uint64_t)surv_cnt);
                         } else
@@ -4538,6 +4897,15 @@ int main(int argc, char **argv) {
 
                         mpz_add(nAdd_st, nAdd_st, g_crt_primorial_mpz);
                     } /* end CRT candidate loop */
+#ifdef WITH_CUDA
+                    /* Flush remaining accumulated GPU windows */
+                    if (tls_gpu_accum && tls_gpu_accum->win_count > 0) {
+                        if (g_abort_pass)
+                            gpu_accum_reset(tls_gpu_accum);
+                        else
+                            gpu_accum_flush(tls_gpu_accum);
+                    }
+#endif
 
                     nonce_st++;
                 } /* end nonce loop */
