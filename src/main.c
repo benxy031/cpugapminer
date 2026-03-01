@@ -2023,6 +2023,93 @@ static int assemble_mining_block_mpz(uint32_t mining_nonce, mpz_t nadd_val,
     return 1;
 }
 
+/* ── Self-verify PoW from a constructed block hex ──
+   Replicates Gapcoin's CheckProofOfWork locally so we can detect data
+   corruption BEFORE submitting.
+   Returns: 1 = valid, 0 = invalid (logs details in either case). */
+static int verify_pow_hex(const char *blockhex) {
+    size_t hexlen = strlen(blockhex);
+    if (hexlen < 174) {  /* 87 bytes minimum = hdr80+nonce4+shift2+nAdd1 */
+        log_msg("[verify_pow] FAIL: hex too short (%zu chars)\n", hexlen);
+        return 0;
+    }
+
+    /* Decode hex → raw bytes */
+    size_t nbytes = hexlen / 2;
+    unsigned char *raw = (unsigned char *)malloc(nbytes);
+    if (!raw) return 0;
+    for (size_t i = 0; i < nbytes; i++) {
+        unsigned int bv = 0;
+        sscanf(blockhex + i*2, "%2x", &bv);
+        raw[i] = (unsigned char)bv;
+    }
+
+    /* Extract fields */
+    /* hdr80 = raw[0..79], nNonce = raw[80..83], nShift = raw[84..85], nAdd = raw[86..] */
+    uint32_t nonce_v = 0;
+    memcpy(&nonce_v, raw + 80, 4);
+    uint16_t shift_v = 0;
+    memcpy(&shift_v, raw + 84, 2);
+    size_t nadd_len = nbytes - 86;
+
+    /* Compute SHA256d(raw[0..83]) = SHA256d(header + nonce) = 84 bytes */
+    uint8_t sha1[32], sha2[32];
+    SHA256(raw, 84, sha1);
+    SHA256(sha1, 32, sha2);
+    /* sha2 is the double-SHA256 hash.  sha2[31] must be >= 0x80 for bit 255 set */
+    int hash_ok = (sha2[31] >= 0x80);
+
+    /* Import hash as mpz (little-endian, matching GapMiner's ary_to_mpz) */
+    mpz_t mpz_hash, mpz_prime, mpz_nadd;
+    mpz_init(mpz_hash);
+    mpz_init(mpz_prime);
+    mpz_init(mpz_nadd);
+    mpz_import(mpz_hash, 32, -1, 1, 0, 0, sha2);  /* LE like GapMiner */
+
+    /* Import nAdd from raw bytes (LE) */
+    mpz_import(mpz_nadd, nadd_len, -1, 1, 0, 0, raw + 86);
+
+    /* prime = hash * 2^shift + nAdd */
+    mpz_mul_2exp(mpz_prime, mpz_hash, (unsigned long)shift_v);
+    mpz_add(mpz_prime, mpz_prime, mpz_nadd);
+
+    /* Check primality */
+    int is_prime = mpz_probab_prime_p(mpz_prime, 16);
+
+    /* Compute merit approximation = gap is not computed here, just log components */
+    int hash_bits = (int)mpz_sizeinbase(mpz_hash, 2);
+
+    /* Log diagnostics */
+    char hash_hex[65];
+    for (int i = 0; i < 32; i++)
+        sprintf(hash_hex + i*2, "%02x", sha2[31 - i]);  /* big-endian display */
+    hash_hex[64] = '\0';
+
+    log_msg("[verify_pow] hex_len=%zu bytes=%zu nonce=%u shift=%u nAdd_len=%zu\n",
+            hexlen, nbytes, (unsigned)nonce_v, (unsigned)shift_v, nadd_len);
+    log_msg("[verify_pow] hash=%s bits=%d hash_ok=%d is_prime=%d\n",
+            hash_hex, hash_bits, hash_ok, is_prime);
+
+    /* Compare header with g_pass.hdr80 */
+    int hdr_match = (memcmp(raw, g_pass.hdr80, 80) == 0);
+    if (!hdr_match)
+        log_msg("[verify_pow] WARNING: header bytes don't match g_pass.hdr80!\n");
+
+    /* Overall validity */
+    int valid = hash_ok && (hash_bits == 256) && is_prime && hdr_match;
+    if (!valid)
+        log_msg("[verify_pow] FAIL: hash_ok=%d bits=%d prime=%d hdr_match=%d\n",
+                hash_ok, hash_bits, is_prime, hdr_match);
+    else
+        log_msg("[verify_pow] OK: PoW is valid locally\n");
+
+    mpz_clear(mpz_hash);
+    mpz_clear(mpz_prime);
+    mpz_clear(mpz_nadd);
+    free(raw);
+    return valid;
+}
+
 /* Build a mining pass from stratum work data.
    Same logic as build_mining_pass() but reads from the caller-provided
    data_hex/ndiff (obtained from the stratum client) instead of HTTP getwork. */
@@ -2383,6 +2470,7 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
                             shift_v, (unsigned)nonce);
                     __sync_fetch_and_add(&stats_submits, 1);
                     if (g_stratum) {
+                        verify_pow_hex(blockhex);
                         if (stratum_submit(g_stratum, blockhex))
                             log_msg(">>> SUBMITTED via stratum\n");
                         else
@@ -2835,6 +2923,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
                         __sync_fetch_and_add(&stats_submits, 1);
                         if (g_stratum) {
                             /* Submit via stratum (non-blocking) */
+                            verify_pow_hex(blockhex);
                             if (stratum_submit(g_stratum, blockhex)) {
                                 log_msg(">>> SUBMITTED via stratum\n");
                             } else {
@@ -3198,6 +3287,7 @@ static void *worker_fn(void *arg) {
                                             (unsigned)w->nonce);
                                     __sync_fetch_and_add(&stats_submits, 1);
                                     if (g_stratum) {
+                                        verify_pow_hex(blockhex);
                                         if (stratum_submit(g_stratum,
                                                 blockhex))
                                             log_msg(">>> SUBMITTED via"
@@ -3552,6 +3642,7 @@ static void *worker_fn(void *arg) {
                                                     (unsigned)nonce_cur);
                                             __sync_fetch_and_add(&stats_submits, 1);
                                             if (g_stratum) {
+                                                verify_pow_hex(blockhex);
                                                 if (stratum_submit(g_stratum,
                                                         blockhex))
                                                     log_msg(">>> SUBMITTED via"
@@ -5045,6 +5136,7 @@ int main(int argc, char **argv) {
                                             __sync_fetch_and_add(&stats_submits,
                                                                  1);
                                             if (g_stratum) {
+                                                verify_pow_hex(blockhex);
                                                 if (stratum_submit(g_stratum,
                                                         blockhex))
                                                     log_msg(">>> SUBMITTED via"

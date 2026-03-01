@@ -428,6 +428,16 @@ int stratum_submit(stratum_ctx *ctx, const char *block_hex) {
 
     /* Compute required buffer size: fixed JSON overhead + variable hex length */
     size_t hex_len = strlen(block_hex);
+    fprintf(stderr, "[stratum] submitting share id=%d hex_len=%zu bytes=%zu\n",
+            id, hex_len, hex_len / 2);
+    /* Log first 180 and last 20 hex chars for diagnostics */
+    if (hex_len > 200) {
+        fprintf(stderr, "[stratum]   hex[0:180]=%.*s...\n", 180, block_hex);
+        fprintf(stderr, "[stratum]   hex[end-20:]=%s\n", block_hex + hex_len - 20);
+    } else {
+        fprintf(stderr, "[stratum]   hex=%s\n", block_hex);
+    }
+
     size_t buf_size = 256 + strlen(ctx->user) + strlen(ctx->pass) + hex_len;
     buf = (char *)malloc(buf_size);
     if (!buf) return 0;
