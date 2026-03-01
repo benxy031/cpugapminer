@@ -556,22 +556,35 @@ gap.  The block-finding rate improves by **3.4×**.
 
 ### CUDA GPU Fermat testing
 
-Benchmarked on an NVIDIA GeForce RTX 3060 with CRT gap-solver
-(`--shift 512 --fast-fermat --crt-file crt/crt_s512_m22.txt --sieve-primes 150000`):
+Benchmarked on an NVIDIA GeForce RTX 3060 at shift 512
+(`--shift 512 --fast-fermat --cuda --threads 2 --sieve-primes 150000`):
+
+#### CRT gap-solver (`--crt-file crt/crt_s512_m22.txt`)
 
 | Mode | Threads | Fermat tests/s | Est | Relative |
 |------|---------|---------------|-----|----------|
 | CPU only | 3 | 47 K/s | 5.0d | 1.0× |
 | GPU (no accumulator) | 3 | 47 K/s | 5.0d | 1.0× |
-| GPU + batch accumulator | 2 | 125 K/s | 1.9d | **2.6×** |
+| GPU + batch accumulator | 2 | 125 K/s | 1.8d | **2.6×** |
 
 Without the accumulator, each GPU kernel launch received only ~38 candidates
 per CRT window — far too few to saturate 3584 CUDA cores.  The batch
 accumulator collects ~3000+ candidates across windows before flushing,
 achieving full SM utilization.
 
+#### Non-CRT (normal sieve + smart-scan)
+
+| Mode | Threads | Fermat tests/s | Est | Relative |
+|------|---------|---------------|-----|----------|
+| GPU (non-CRT) | 2 | 350 K/s | 5.1h | **2.8×** vs CRT GPU |
+
+At shift 512, the non-CRT path with GPU is **dramatically faster** than CRT:
+each 33M sieve window produces thousands of candidates, fully saturating the
+GPU without needing an accumulator.  The CRT path is limited by its tiny
+per-window candidate count (~38), even with batching across windows.
+
 The `gpu_batch=N` stat in the output shows the average candidates per GPU
-flush.  Larger values indicate better GPU utilization.
+flush (CRT mode only).  Larger values indicate better GPU utilization.
 
 The GPU kernel uses configurable-width Montgomery multiplication (default
 16×64-bit limbs / 1024-bit, CIOS form) to compute `2^(n-1) mod n` for
