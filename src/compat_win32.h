@@ -20,8 +20,11 @@
 #include <io.h>
 #include <process.h>          /* _getpid() */
 
-/* Link against ws2_32.lib */
+/* Link against ws2_32 (handled by Makefile -lws2_32 for MinGW,
+   or #pragma comment for MSVC). */
+#ifdef _MSC_VER
 #pragma comment(lib, "ws2_32")
+#endif
 
 /* ── socket compat ── */
 typedef SOCKET sock_t;
@@ -52,7 +55,9 @@ typedef intptr_t ssize_t;
 #endif
 
 /* ── nanosleep ── */
-#ifndef HAVE_NANOSLEEP
+/* MinGW winpthreads already provides nanosleep via pthread_time.h.
+   Only define our fallback for MSVC or if it's genuinely missing. */
+#if defined(_MSC_VER) || (!defined(__MINGW32__) && !defined(HAVE_NANOSLEEP))
 static inline int nanosleep(const struct timespec *req, struct timespec *rem) {
     (void)rem;
     DWORD ms = (DWORD)(req->tv_sec * 1000 + req->tv_nsec / 1000000);

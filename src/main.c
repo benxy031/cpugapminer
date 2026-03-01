@@ -534,12 +534,12 @@ static int load_crt_binary_file(const char *path) {
 
     log_msg("CRT: loaded %s  (template mode)\n"
             "  primes=%d (up to %llu)  primorial=%llu  "
-            "candidates=%llu  template=%zu bytes\n",
+            "candidates=%llu  template=%lu bytes\n",
             path, g_crt_n_primes,
             (unsigned long long)g_crt_max_prime,
             (unsigned long long)g_crt_primorial,
             (unsigned long long)hdr.ncand,
-            g_crt_tmpl_bytes);
+            (unsigned long)g_crt_tmpl_bytes);
     return 1;
 }
 
@@ -764,7 +764,7 @@ static void print_stats(void) {
         log_msg("  windows=%llu (%.1f/s)  primes/win=%.1f",
                 (unsigned long long)crt_w, win_rate, ppw);
         if (crt_fermat_threads > 0)
-            log_msg("  gaplist=%zu", crt_heap_count());
+            log_msg("  gaplist=%lu", (unsigned long)crt_heap_count());
     }
 
     /* Best merit found this session */
@@ -1523,8 +1523,8 @@ static unsigned char *build_coinbase_tx_opreturn(const char *opdata_hex, uint64_
     write_u32_le(&p, 0);
 
     *out_len = p - tx;
-    log_file_only("DEBUG coinbase details: scriptsig_len=%zu extranonce_len=%zu pk_script_len=%zu datalen=%zu tx_len=%zu\n",
-            scriptsig_len, extranonce_len, pk_script_len, datalen, *out_len);
+    log_file_only("DEBUG coinbase details: scriptsig_len=%lu extranonce_len=%lu pk_script_len=%lu datalen=%lu tx_len=%lu\n",
+            (unsigned long)scriptsig_len, (unsigned long)extranonce_len, (unsigned long)pk_script_len, (unsigned long)datalen, (unsigned long)*out_len);
     free(data);
     return tx;
 }
@@ -1575,8 +1575,8 @@ static unsigned char *build_coinbase_tx_minimal(uint64_t value_satoshis, uint64_
     write_u32_le(&p, 0);
 
     *out_len = p - tx;
-    log_file_only("DEBUG coinbase minimal: scriptsig_len=%zu extranonce_len=%zu pk_script_len=%zu tx_len=%zu\n",
-            scriptsig_len, extranonce_len, pk_script_len, *out_len);
+    log_file_only("DEBUG coinbase minimal: scriptsig_len=%lu extranonce_len=%lu pk_script_len=%lu tx_len=%lu\n",
+            (unsigned long)scriptsig_len, (unsigned long)extranonce_len, (unsigned long)pk_script_len, (unsigned long)*out_len);
     return tx;
 }
 
@@ -1673,7 +1673,7 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
         log_msg("ERROR: failed to build coinbase tx (OOM?)\n");
         return 0;
     }
-    log_file_only("GBT: version=%u curtime=%u prev=%s txlen=%zu coinbase_value=%llu height=%llu\n", version, curtime, prevhex[0]?prevhex:"(none)", coin_txlen, (unsigned long long)coinbase_value, (unsigned long long)block_height);
+    log_file_only("GBT: version=%u curtime=%u prev=%s txlen=%lu coinbase_value=%llu height=%llu\n", version, curtime, prevhex[0]?prevhex:"(none)", (unsigned long)coin_txlen, (unsigned long long)coinbase_value, (unsigned long long)block_height);
     // debug coinbase tx bytes
     char coin_hex_dbg[2048]; if (coin_txlen < 1024) { bytes_to_hex(coin_tx, coin_txlen, coin_hex_dbg); log_file_only("DEBUG coin_tx hex: %s\n", coin_hex_dbg); }
 
@@ -1791,7 +1791,7 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
        For nadd=0 that is 88 bytes (CompactSize=1 + 1 zero byte).
        For larger adders the nAdd field grows (1 byte per 8 additional bits). */
     size_t header_size = (size_t)(hp - headerbin);
-    log_file_only("DEBUG header_size=%zu (expected 88)\n", header_size);
+    log_file_only("DEBUG header_size=%lu (expected 88)\n", (unsigned long)header_size);
 
     // serialize full block: header + varint txcount + tx raw bytes
     size_t full_len = header_size + 1;
@@ -2266,10 +2266,10 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
     if (nexp > GPU_NLIMBS) {
         static int warned = 0;
         if (!warned) {
-            fprintf(stderr, "gpu_batch_filter: candidate needs %zu limbs "
+            fprintf(stderr, "gpu_batch_filter: candidate needs %lu limbs "
                     "but GPU_NLIMBS=%d — falling back to CPU.  "
-                    "Rebuild with GPU_BITS=%zu or higher.\n",
-                    nexp, GPU_NLIMBS, nexp * 64);
+                    "Rebuild with GPU_BITS=%lu or higher.\n",
+                    (unsigned long)nexp, GPU_NLIMBS, (unsigned long)(nexp * 64));
             warned = 1;
         }
         /* CPU fallback */
@@ -3251,15 +3251,15 @@ static void *worker_fn(void *arg) {
                 size_t prim_bits = mpz_sizeinbase(g_crt_primorial_mpz, 2);
                 if (crt_fermat_threads > 0)
                     log_msg("CRT mining (%dT: %d sieve + %d fermat): "
-                            "primorial~2^%zu  shift=%d  gap_scan=%d  heap=%d\n",
+                            "primorial~2^%lu  shift=%d  gap_scan=%d  heap=%d\n",
                             wa->nthreads, n_sieve_threads,
                             crt_fermat_threads,
-                            prim_bits, shift_local, gap_scan_max,
+                            (unsigned long)prim_bits, shift_local, gap_scan_max,
                             CRT_HEAP_CAP);
                 else
-                    log_msg("CRT mining (%dT): primorial~2^%zu  shift=%d"
+                    log_msg("CRT mining (%dT): primorial~2^%lu  shift=%d"
                             "  gap_scan=%d\n",
-                            nth_local, prim_bits, shift_local, gap_scan_max);
+                            nth_local, (unsigned long)prim_bits, shift_local, gap_scan_max);
             }
 
 #ifdef WITH_RPC
@@ -4759,9 +4759,9 @@ int main(int argc, char **argv) {
     start_stats_thread();
     /* Trigger sieve cache population so we can log its stats. */
     pthread_once(&small_primes_once, populate_small_primes_cache);
-    log_msg("C miner starting (shift=%d sieve=%llu sieve-primes=%zu [up to %llu])\n",
+    log_msg("C miner starting (shift=%d sieve=%llu sieve-primes=%lu [up to %llu])\n",
             shift, (unsigned long long)sieve_size,
-            small_primes_count,
+            (unsigned long)small_primes_count,
             small_primes_count > 0 ? (unsigned long long)small_primes_cache[small_primes_count-1] : 0ULL);
     if (keep_going)
         log_msg("default behaviour: will continue mining after finding a valid block\n");
@@ -4839,8 +4839,8 @@ int main(int argc, char **argv) {
                 static int st_crt_logged = 0;
                 if (!st_crt_logged) {
                     size_t prim_bits = mpz_sizeinbase(g_crt_primorial_mpz, 2);
-                    log_msg("CRT mining (1T): primorial~2^%zu  shift=%d  gap_scan=%d\n",
-                            prim_bits, shift, gap_scan_max);
+                    log_msg("CRT mining (1T): primorial~2^%lu  shift=%d  gap_scan=%d\n",
+                            (unsigned long)prim_bits, shift, gap_scan_max);
                     st_crt_logged = 1;
                 }
 
