@@ -2122,6 +2122,28 @@ static int verify_pow_hex(const char *blockhex) {
     /* Check primality */
     int is_prime = mpz_probab_prime_p(mpz_prime, 16);
 
+    /* Cross-check: also compute using set_base_bn's import path (reversed, BE) */
+    {
+        uint8_t h256_chk[32];
+        for (int k = 0; k < 32; k++) h256_chk[k] = sha2[31 - k];
+        mpz_t base_chk;
+        mpz_init(base_chk);
+        mpz_import(base_chk, 32, 1, 1, 1, 0, h256_chk);
+        mpz_mul_2exp(base_chk, base_chk, (unsigned long)shift_v);
+        mpz_add(base_chk, base_chk, mpz_nadd);
+        int cmp = mpz_cmp(base_chk, mpz_prime);
+        uint64_t low64_v = mpz_get_ui(mpz_prime);
+        uint64_t low64_b = mpz_get_ui(base_chk);
+        size_t pbits_v = mpz_sizeinbase(mpz_prime, 2);
+        size_t pbits_b = mpz_sizeinbase(base_chk, 2);
+        log_msg("[verify_pow] prime: bits_v=%zu bits_b=%zu low64_v=%llu low64_b=%llu cmp=%d\n",
+                pbits_v, pbits_b,
+                (unsigned long long)low64_v, (unsigned long long)low64_b, cmp);
+        if (cmp != 0)
+            log_msg("[verify_pow] BUG: set_base_bn path produces DIFFERENT prime!\n");
+        mpz_clear(base_chk);
+    }
+
     /* Compute merit approximation = gap is not computed here, just log components */
     int hash_bits = (int)mpz_sizeinbase(mpz_hash, 2);
 
@@ -2953,6 +2975,21 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
         __sync_fetch_and_add(&stats_gaps, 1);
         /* nAdd = relative offset = prev (prime = base + nAdd). */
         uint64_t nadd_sc = prev;
+        /* ── Cross-verify: check gap start prime with MR (debug) ── */
+        {
+            mpz_t dbg_prime;
+            mpz_init(dbg_prime);
+            mpz_set(dbg_prime, tls_base_mpz);
+            mpz_add_ui(dbg_prime, dbg_prime, (unsigned long)nadd_sc);
+            int mr_ok = mpz_probab_prime_p(dbg_prime, 16);
+            uint64_t low64 = mpz_get_ui(dbg_prime);
+            size_t pbits = mpz_sizeinbase(dbg_prime, 2);
+            log_msg("[debug] scan_cand prime: MR=%d bits=%zu low64=%llu nAdd=%llu base_bits=%zu\n",
+                    mr_ok, pbits, (unsigned long long)low64,
+                    (unsigned long long)nadd_sc,
+                    mpz_sizeinbase(tls_base_mpz, 2));
+            mpz_clear(dbg_prime);
+        }
         log_msg("\n>>> GAP FOUND\n"
                 "    gap     = %llu\n"
                 "    merit   = %.6f  (need >= %.2f)\n"
