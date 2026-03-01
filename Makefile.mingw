@@ -71,7 +71,7 @@ $(SRCDIR)/%.o: $(SRCDIR)/%.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(SRCDIR)/gpu_fermat.o: $(SRCDIR)/gpu_fermat.cu $(SRCDIR)/gpu_fermat.h
-	"$(NVCC)" -O3 $(CUDA_ARCH) $(NVCC_FLAGS) -ccbin $(CXX) -c $< -o $@
+	"$(NVCC)" -O3 $(CUDA_ARCH) $(NVCC_FLAGS) -c $< -o $@
 
 $(TARGET): $(BINDIR) $(SRCDIR)/main.o $(RPC_OBJS) $(STRATUM_OBJ) $(CUDA_OBJ)
 	$(LINKER) -o $@ $(SRCDIR)/main.o $(RPC_OBJS) $(STRATUM_OBJ) $(CUDA_OBJ) $(LDFLAGS) $(LIBS)

@@ -112,28 +112,28 @@ jobs:
           cuda: '12.4.0'
           method: network
 
-      - name: Build (CUDA + RPC)
+      - name: Compile CUDA kernel (nvcc + MSVC)
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          nvcc --version
+          nvcc -O3 -arch=sm_61 -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_86,code=sm_86 -gencode=arch=compute_89,code=sm_89 -DGPU_NLIMBS=16 -c src\gpu_fermat.cu -o src\gpu_fermat.o
+
+      - name: Build (CPU + RPC, link CUDA object)
         shell: msys2 {0}
         run: |
-          # The cuda-toolkit action sets CUDA_PATH as a Windows path
-          # (e.g. C:\Program Files\...).  MSYS2 doesn't inherit the
-          # Windows PATH additions, so we derive everything from that
-          # env-var and add the bin dir to PATH ourselves.
           if [ -z "$CUDA_PATH" ]; then
             echo "ERROR: CUDA_PATH env var is not set"
             exit 1
           fi
-          # Unix-style path for shell PATH, mixed (C:/) for compiler flags
-          CUDA_U=$(cygpath -u "$CUDA_PATH")
           CUDA_M=$(cygpath -m "$CUDA_PATH")
-          export PATH="$CUDA_U/bin:$PATH"
           echo "CUDA_PATH (mixed)=$CUDA_M"
-          echo "nvcc=$(nvcc --version | tail -1)"
 
-          make -f Makefile.mingw clean
+          # gpu_fermat.o was already compiled by nvcc+MSVC in the previous step.
+          # Build everything else and link.  Make will skip the .cu rule because
+          # the .o is already present and newer than the source.
           make -f Makefile.mingw WITH_RPC=1 WITH_CUDA=1 \
-            CUDA_PATH="$CUDA_M" \
-            CUDA_ARCH="-arch=sm_61 -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_86,code=sm_86 -gencode=arch=compute_89,code=sm_89"
+            CUDA_PATH="$CUDA_M"
 
       - name: Build gen_crt
         run: make -f Makefile.mingw gen_crt
