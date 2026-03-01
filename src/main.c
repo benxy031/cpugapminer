@@ -1943,21 +1943,20 @@ static int build_mining_pass(const char *url, const char *user, const char *pass
     char prevhex[65] = {0};
     for (int i = 0; i < 32; i++)
         sprintf(prevhex + 2*i, "%02x", hdr80[4 + 31 - i]);
-    /* find nNonce so SHA256d(hdr80+nNonce)[31] >= 0x80.
-     * Bitcoin uint256: SHA256d_byte[k] = data[k]; ary_to_mpz(order=-1) treats data[31] as MSB.
-     * BN_bin2bn/uint256_mod_small expect h256[0] = MSB → h256[k] = sha_raw[31-k].
+    /* find nNonce so SHA256d(hdr80)[31] >= 0x80.
+     * Gapcoin CBlockHeader::GetHash() = SHA256d(version..nNonce) = 80 bytes.
+     * nNonce is at offset 76 (standard Bitcoin nonce position).
      * Gapcoin requires mpz_sizeinbase(hash,2) == 256 → sha_raw[31] >= 0x80. */
-    uint8_t hdr84[84], sha_raw[32], h256[32];
+    uint8_t sha_raw[32], h256[32];
     uint32_t nonce = 0;
     for (;;) {
-        memcpy(hdr84, hdr80, 80);
-        memcpy(hdr84 + 80, &nonce, 4);  /* nNonce appended after 80-byte header */
-        double_sha256(hdr84, 84, sha_raw);
+        memcpy(hdr80 + 76, &nonce, 4);  /* nNonce at offset 76 */
+        double_sha256(hdr80, 80, sha_raw);
         if (sha_raw[31] >= 0x80) break;
         if (++nonce == 0) break;
     }
     for (int k = 0; k < 32; k++) h256[k] = sha_raw[31-k];
-    /* store in g_pass */
+    /* store in g_pass (hdr80 now has the good nonce at offset 76) */
     memcpy(g_pass.h256,  h256,  32);
     memcpy(g_pass.hdr80, hdr80, 80);
     g_pass.nonce  = nonce;
@@ -1974,13 +1973,15 @@ static int build_mining_pass(const char *url, const char *user, const char *pass
 
 static int assemble_mining_block(uint64_t nadd_val, char out_hex[16384]) {
     /* getwork submit format: hdr80(80) + nNonce(4,LE) + nShift(2,LE) + nAdd(raw LE, ≥ 1 byte)
-     * gapcoind casts vchData to CBlock*; nNonce is at offset 80, nShift at 84,
-     * nAdd starts at byte 86.  gapcoind requires vchData.size() > 86.
+     * nNonce lives at offset 76 in the 80-byte header (standard Bitcoin position).
+     * g_pass.hdr80 already has the correct nonce from build_mining_pass().
+     * The redundant nNonce copy at offset 80 is kept for gapcoind getwork
+     * backward compatibility.
      * nAdd is raw little-endian bytes, NO compact-size prefix. */
     unsigned char buf[512];
     unsigned char *p = buf;
-    memcpy(p, g_pass.hdr80,    80); p += 80;  /* header unchanged */
-    memcpy(p, &g_pass.nonce,    4); p += 4;   /* nNonce LE (offset 80) */
+    memcpy(p, g_pass.hdr80,    80); p += 80;  /* header with nonce at offset 76 */
+    memcpy(p, &g_pass.nonce,    4); p += 4;   /* redundant nNonce copy (offset 80) */
     memcpy(p, &g_pass.nshift,   2); p += 2;   /* nShift LE (offset 84) */
     /* nAdd raw LE bytes, minimum 1 byte */
     unsigned char nb[8];
@@ -2004,8 +2005,10 @@ static int assemble_mining_block_mpz(uint32_t mining_nonce, mpz_t nadd_val,
                                      char out_hex[16384]) {
     unsigned char buf[1024]; /* enough for nAdd up to ~7400 bits */
     unsigned char *p = buf;
-    memcpy(p, g_pass.hdr80,    80); p += 80;
-    memcpy(p, &mining_nonce,    4); p += 4;
+    memcpy(p, g_pass.hdr80,    80);
+    memcpy(p + 76, &mining_nonce, 4); /* set nonce at offset 76 in header */
+    p += 80;
+    memcpy(p, &mining_nonce,    4); p += 4; /* redundant copy at offset 80 */
     memcpy(p, &g_pass.nshift,   2); p += 2;
     /* nAdd raw LE bytes */
     if (mpz_sgn(nadd_val) == 0) {
@@ -2036,13 +2039,13 @@ static int build_mining_pass_stratum(const char *data_hex, uint64_t ndiff, int s
     char prevhex[65] = {0};
     for (int i = 0; i < 32; i++)
         sprintf(prevhex + 2*i, "%02x", hdr80[4 + 31 - i]);
-    /* find nNonce so SHA256d(hdr80+nNonce)[31] >= 0x80 */
-    uint8_t hdr84[84], sha_raw[32], h256[32];
+    /* find nNonce so SHA256d(hdr80)[31] >= 0x80
+     * nNonce is at offset 76 in the 80-byte header (standard position). */
+    uint8_t sha_raw[32], h256[32];
     uint32_t nonce = 0;
     for (;;) {
-        memcpy(hdr84, hdr80, 80);
-        memcpy(hdr84 + 80, &nonce, 4);
-        double_sha256(hdr84, 84, sha_raw);
+        memcpy(hdr80 + 76, &nonce, 4);
+        double_sha256(hdr80, 80, sha_raw);
         if (sha_raw[31] >= 0x80) break;
         if (++nonce == 0) break;
     }
@@ -2366,41 +2369,47 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
                 (unsigned)nonce, nAdd_str);
 #ifdef WITH_RPC
         if (rpc_url && !g_abort_pass) {
-            pthread_mutex_lock(&sq_lock);
-            int sq_busy = (sq_count > 0);
-            pthread_mutex_unlock(&sq_lock);
-            if (!sq_busy) {
-                char blockhex[16384];
-                memset(blockhex, 0, sizeof(blockhex));
-                if (assemble_mining_block_mpz(nonce, nAdd_prime, blockhex)) {
-                    __sync_fetch_and_add(&stats_blocks, 1);
-                    log_file_only("Built blockhex: %s\n", blockhex);
-                    if (header_meets_target_hex(blockhex)) {
-                        log_msg(">>> SUBMITTING to node\n"
-                                "    merit=%.6f  gap=%llu"
-                                "  nShift=%d  nonce=%u\n",
-                                merit, (unsigned long long)gap,
-                                shift_v, (unsigned)nonce);
-                        struct submit_job _job;
-                        memset(&_job, 0, sizeof(_job));
-                        strncpy(_job.url, rpc_url, sizeof(_job.url)-1);
-                        strncpy(_job.user, rpc_user ? rpc_user : "",
-                                sizeof(_job.user)-1);
-                        strncpy(_job.pass, rpc_pass ? rpc_pass : "",
-                                sizeof(_job.pass)-1);
-                        strncpy(_job.method, "getwork",
-                                sizeof(_job.method)-1);
-                        memcpy(_job.hex, blockhex, sizeof(_job.hex));
-                        _job.retries = rpc_default_retries;
-                        __sync_fetch_and_add(&stats_submits, 1);
-                        enqueue_job(&_job);
-                        log_msg(">>> QUEUED for async submit"
-                                " (mining continues)\n");
+            char blockhex[16384];
+            memset(blockhex, 0, sizeof(blockhex));
+            if (assemble_mining_block_mpz(nonce, nAdd_prime, blockhex)) {
+                __sync_fetch_and_add(&stats_blocks, 1);
+                log_file_only("Built blockhex: %s\n", blockhex);
+                if (header_meets_target_hex(blockhex)) {
+                    log_msg(">>> SUBMITTING  merit=%.6f  gap=%llu"
+                            "  nShift=%d  nonce=%u\n",
+                            merit, (unsigned long long)gap,
+                            shift_v, (unsigned)nonce);
+                    __sync_fetch_and_add(&stats_submits, 1);
+                    if (g_stratum) {
+                        if (stratum_submit(g_stratum, blockhex))
+                            log_msg(">>> SUBMITTED via stratum\n");
+                        else
+                            log_msg(">>> stratum submit FAILED\n");
                         print_stats();
+                    } else {
+                        pthread_mutex_lock(&sq_lock);
+                        int sq_busy = (sq_count > 0);
+                        pthread_mutex_unlock(&sq_lock);
+                        if (!sq_busy) {
+                            struct submit_job _job;
+                            memset(&_job, 0, sizeof(_job));
+                            strncpy(_job.url, rpc_url, sizeof(_job.url)-1);
+                            strncpy(_job.user, rpc_user ? rpc_user : "",
+                                    sizeof(_job.user)-1);
+                            strncpy(_job.pass, rpc_pass ? rpc_pass : "",
+                                    sizeof(_job.pass)-1);
+                            strncpy(_job.method, "getwork",
+                                    sizeof(_job.method)-1);
+                            memcpy(_job.hex, blockhex, sizeof(_job.hex));
+                            _job.retries = rpc_default_retries;
+                            enqueue_job(&_job);
+                            log_msg(">>> QUEUED for async submit\n");
+                            print_stats();
+                        }
                     }
-                } else {
-                    log_msg("Failed to assemble block\n");
                 }
+            } else {
+                log_msg("Failed to assemble block\n");
             }
         }
 #endif
@@ -3170,49 +3179,60 @@ static void *worker_fn(void *arg) {
                                 nAdd_str);
 
                         if (rpc_url_local && !g_abort_pass) {
-                            pthread_mutex_lock(&sq_lock);
-                            int sq_busy = (sq_count > 0);
-                            pthread_mutex_unlock(&sq_lock);
-                            if (!sq_busy) {
-                                char blockhex[16384];
-                                memset(blockhex, 0, sizeof(blockhex));
-                                if (assemble_mining_block_mpz(w->nonce,
-                                        nAdd_prime, blockhex)) {
-                                    __sync_fetch_and_add(&stats_blocks, 1);
-                                    log_file_only("Built blockhex: %s\n",
-                                                  blockhex);
-                                    if (header_meets_target_hex(blockhex)) {
-                                        log_msg(">>> SUBMITTING to node\n"
-                                                "    merit=%.6f  gap=%llu"
-                                                "  nShift=%d  nonce=%u\n",
-                                                merit,
-                                                (unsigned long long)gap,
-                                                shift_local,
-                                                (unsigned)w->nonce);
-                                        struct submit_job _job;
-                                        memset(&_job, 0, sizeof(_job));
-                                        strncpy(_job.url, rpc_url_local,
-                                                sizeof(_job.url)-1);
-                                        strncpy(_job.user,
-                                                rpc_user_local ? rpc_user_local : "",
-                                                sizeof(_job.user)-1);
-                                        strncpy(_job.pass,
-                                                rpc_pass_local ? rpc_pass_local : "",
-                                                sizeof(_job.pass)-1);
-                                        strncpy(_job.method, "getwork",
-                                                sizeof(_job.method)-1);
-                                        memcpy(_job.hex, blockhex,
-                                               sizeof(_job.hex));
-                                        _job.retries = rpc_default_retries;
-                                        __sync_fetch_and_add(&stats_submits, 1);
-                                        enqueue_job(&_job);
-                                        log_msg(">>> QUEUED for async submit"
-                                                " (mining continues)\n");
+                            char blockhex[16384];
+                            memset(blockhex, 0, sizeof(blockhex));
+                            if (assemble_mining_block_mpz(w->nonce,
+                                    nAdd_prime, blockhex)) {
+                                __sync_fetch_and_add(&stats_blocks, 1);
+                                log_file_only("Built blockhex: %s\n",
+                                              blockhex);
+                                if (header_meets_target_hex(blockhex)) {
+                                    log_msg(">>> SUBMITTING  merit=%.6f"
+                                            "  gap=%llu  nShift=%d"
+                                            "  nonce=%u\n",
+                                            merit,
+                                            (unsigned long long)gap,
+                                            shift_local,
+                                            (unsigned)w->nonce);
+                                    __sync_fetch_and_add(&stats_submits, 1);
+                                    if (g_stratum) {
+                                        if (stratum_submit(g_stratum,
+                                                blockhex))
+                                            log_msg(">>> SUBMITTED via"
+                                                    " stratum\n");
+                                        else
+                                            log_msg(">>> stratum submit"
+                                                    " FAILED\n");
                                         print_stats();
+                                    } else {
+                                        pthread_mutex_lock(&sq_lock);
+                                        int sq_busy = (sq_count > 0);
+                                        pthread_mutex_unlock(&sq_lock);
+                                        if (!sq_busy) {
+                                            struct submit_job _job;
+                                            memset(&_job, 0, sizeof(_job));
+                                            strncpy(_job.url, rpc_url_local,
+                                                    sizeof(_job.url)-1);
+                                            strncpy(_job.user,
+                                                    rpc_user_local ? rpc_user_local : "",
+                                                    sizeof(_job.user)-1);
+                                            strncpy(_job.pass,
+                                                    rpc_pass_local ? rpc_pass_local : "",
+                                                    sizeof(_job.pass)-1);
+                                            strncpy(_job.method, "getwork",
+                                                    sizeof(_job.method)-1);
+                                            memcpy(_job.hex, blockhex,
+                                                   sizeof(_job.hex));
+                                            _job.retries = rpc_default_retries;
+                                            enqueue_job(&_job);
+                                            log_msg(">>> QUEUED for async"
+                                                    " submit\n");
+                                            print_stats();
+                                        }
                                     }
-                                } else {
-                                    log_msg("Failed to assemble block\n");
                                 }
+                            } else {
+                                log_msg("Failed to assemble block\n");
                             }
                         }
 
@@ -3331,10 +3351,10 @@ static void *worker_fn(void *arg) {
 #endif
 
                 /* ── Compute SHA256d for this nonce ── */
-                uint8_t hdr84[84], sha_raw[32], h256_nonce[32];
-                memcpy(hdr84, g_pass.hdr80, 80);
-                memcpy(hdr84 + 80, &nonce_cur, 4);
-                double_sha256(hdr84, 84, sha_raw);
+                uint8_t hdr80_tmp[80], sha_raw[32], h256_nonce[32];
+                memcpy(hdr80_tmp, g_pass.hdr80, 80);
+                memcpy(hdr80_tmp + 76, &nonce_cur, 4);
+                double_sha256(hdr80_tmp, 80, sha_raw);
 
                 if (sha_raw[31] < 0x80) {
                     nonce_cur += (uint32_t)nth_local;
@@ -3513,10 +3533,6 @@ static void *worker_fn(void *arg) {
                                     (unsigned)nonce_cur,
                                     nAdd_str);
                             if (rpc_url_local && !g_abort_pass) {
-                                pthread_mutex_lock(&sq_lock);
-                                int sq_busy = (sq_count > 0);
-                                pthread_mutex_unlock(&sq_lock);
-                                if (!sq_busy) {
                                     char blockhex[16384];
                                     memset(blockhex, 0, sizeof(blockhex));
                                     if (assemble_mining_block_mpz(nonce_cur,
@@ -3525,38 +3541,53 @@ static void *worker_fn(void *arg) {
                                         log_file_only("Built blockhex: %s\n",
                                                       blockhex);
                                         if (header_meets_target_hex(blockhex)) {
-                                            log_msg(">>> SUBMITTING to node\n"
-                                                    "    merit=%.6f  gap=%llu"
-                                                    "  nShift=%d  nonce=%u\n",
+                                            log_msg(">>> SUBMITTING  merit=%.6f"
+                                                    "  gap=%llu  nShift=%d"
+                                                    "  nonce=%u\n",
                                                     merit,
                                                     (unsigned long long)gap,
                                                     shift_local,
                                                     (unsigned)nonce_cur);
-                                            struct submit_job _job;
-                                            memset(&_job, 0, sizeof(_job));
-                                            strncpy(_job.url, rpc_url_local,
-                                                    sizeof(_job.url)-1);
-                                            strncpy(_job.user,
-                                                    rpc_user_local ? rpc_user_local : "",
-                                                    sizeof(_job.user)-1);
-                                            strncpy(_job.pass,
-                                                    rpc_pass_local ? rpc_pass_local : "",
-                                                    sizeof(_job.pass)-1);
-                                            strncpy(_job.method, "getwork",
-                                                    sizeof(_job.method)-1);
-                                            memcpy(_job.hex, blockhex,
-                                                   sizeof(_job.hex));
-                                            _job.retries = rpc_default_retries;
                                             __sync_fetch_and_add(&stats_submits, 1);
-                                            enqueue_job(&_job);
-                                            log_msg(">>> QUEUED for async submit"
-                                                    " (mining continues)\n");
-                                            print_stats();
+                                            if (g_stratum) {
+                                                if (stratum_submit(g_stratum,
+                                                        blockhex))
+                                                    log_msg(">>> SUBMITTED via"
+                                                            " stratum\n");
+                                                else
+                                                    log_msg(">>> stratum submit"
+                                                            " FAILED\n");
+                                                print_stats();
+                                            } else {
+                                                pthread_mutex_lock(&sq_lock);
+                                                int sq_busy = (sq_count > 0);
+                                                pthread_mutex_unlock(&sq_lock);
+                                                if (!sq_busy) {
+                                                    struct submit_job _job;
+                                                    memset(&_job, 0, sizeof(_job));
+                                                    strncpy(_job.url, rpc_url_local,
+                                                            sizeof(_job.url)-1);
+                                                    strncpy(_job.user,
+                                                            rpc_user_local ? rpc_user_local : "",
+                                                            sizeof(_job.user)-1);
+                                                    strncpy(_job.pass,
+                                                            rpc_pass_local ? rpc_pass_local : "",
+                                                            sizeof(_job.pass)-1);
+                                                    strncpy(_job.method, "getwork",
+                                                            sizeof(_job.method)-1);
+                                                    memcpy(_job.hex, blockhex,
+                                                           sizeof(_job.hex));
+                                                    _job.retries = rpc_default_retries;
+                                                    enqueue_job(&_job);
+                                                    log_msg(">>> QUEUED for async"
+                                                            " submit\n");
+                                                    print_stats();
+                                                }
+                                            }
                                         }
                                     } else {
                                         log_msg("Failed to assemble block\n");
                                     }
-                                }
                             }
                             mpz_clear(nAdd_prime);
                         }
@@ -4848,10 +4879,10 @@ int main(int argc, char **argv) {
 
                 while (keep_going && !g_abort_pass) {
                     /* SHA256d for this nonce */
-                    uint8_t hdr84_st[84], sha_raw_st[32], h256_st[32];
-                    memcpy(hdr84_st, g_pass.hdr80, 80);
-                    memcpy(hdr84_st + 80, &nonce_st, 4);
-                    double_sha256(hdr84_st, 84, sha_raw_st);
+                    uint8_t hdr80_st[80], sha_raw_st[32], h256_st[32];
+                    memcpy(hdr80_st, g_pass.hdr80, 80);
+                    memcpy(hdr80_st + 76, &nonce_st, 4);
+                    double_sha256(hdr80_st, 80, sha_raw_st);
 
                     if (sha_raw_st[31] < 0x80) { nonce_st++; continue; }
 
@@ -5005,28 +5036,42 @@ int main(int argc, char **argv) {
                                         log_file_only("Built blockhex: %s\n",
                                                       blockhex);
                                         if (header_meets_target_hex(blockhex)) {
-                                            log_msg(">>> SUBMITTING to node\n");
-                                            struct submit_job _job;
-                                            memset(&_job, 0, sizeof(_job));
-                                            strncpy(_job.url, rpc_url,
-                                                    sizeof(_job.url)-1);
-                                            strncpy(_job.user,
-                                                    rpc_user ? rpc_user : "",
-                                                    sizeof(_job.user)-1);
-                                            strncpy(_job.pass,
-                                                    rpc_pass ? rpc_pass : "",
-                                                    sizeof(_job.pass)-1);
-                                            strncpy(_job.method, "getwork",
-                                                    sizeof(_job.method)-1);
-                                            memcpy(_job.hex, blockhex,
-                                                   sizeof(_job.hex));
-                                            _job.retries = rpc_default_retries;
+                                            log_msg(">>> SUBMITTING  merit=%.6f"
+                                                    "  gap=%llu  nonce=%u\n",
+                                                    merit, (unsigned long long)gap,
+                                                    (unsigned)nonce_st);
                                             __sync_fetch_and_add(&stats_submits,
                                                                  1);
-                                            enqueue_job(&_job);
-                                            log_msg(">>> QUEUED for async submit"
-                                                    "\n");
-                                            print_stats();
+                                            if (g_stratum) {
+                                                if (stratum_submit(g_stratum,
+                                                        blockhex))
+                                                    log_msg(">>> SUBMITTED via"
+                                                            " stratum\n");
+                                                else
+                                                    log_msg(">>> stratum submit"
+                                                            " FAILED\n");
+                                                print_stats();
+                                            } else {
+                                                struct submit_job _job;
+                                                memset(&_job, 0, sizeof(_job));
+                                                strncpy(_job.url, rpc_url,
+                                                        sizeof(_job.url)-1);
+                                                strncpy(_job.user,
+                                                        rpc_user ? rpc_user : "",
+                                                        sizeof(_job.user)-1);
+                                                strncpy(_job.pass,
+                                                        rpc_pass ? rpc_pass : "",
+                                                        sizeof(_job.pass)-1);
+                                                strncpy(_job.method, "getwork",
+                                                        sizeof(_job.method)-1);
+                                                memcpy(_job.hex, blockhex,
+                                                       sizeof(_job.hex));
+                                                _job.retries = rpc_default_retries;
+                                                enqueue_job(&_job);
+                                                log_msg(">>> QUEUED for async"
+                                                        " submit\n");
+                                                print_stats();
+                                            }
                                         }
                                     }
                                 }

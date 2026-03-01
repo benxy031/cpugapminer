@@ -45,6 +45,10 @@ struct stratum_ctx {
     int              msg_id;
     pthread_mutex_t  send_lock;
 
+    /* Track the last submit id so we can distinguish share responses
+       from getwork responses when result is null.  -1 = none pending. */
+    volatile int     last_submit_id;
+
     /* latest work (protected by work_lock) */
     pthread_mutex_t  work_lock;
     pthread_cond_t   work_cond;
@@ -286,6 +290,8 @@ static void *recv_thread_fn(void *arg) {
 
         /* ── Response to our request (id is integer) ── */
         if (json_is_integer(j_id)) {
+            int resp_id = (int)json_integer_value(j_id);
+            int is_submit = (resp_id == ctx->last_submit_id);
             json_t *result = json_object_get(root, "result");
 
             /* Share response: result is boolean */
@@ -303,10 +309,31 @@ static void *recv_thread_fn(void *arg) {
             else if (json_is_object(result)) {
                 parse_work(ctx, result);
             }
-            /* result is null → share stale (some pools) */
+            /* result is null → error response; extract reason from "error" */
             else if (json_is_null(result)) {
-                __sync_fetch_and_add(&ctx->shares_rejected, 1);
-                fprintf(stderr, "[stratum] share STALE (result=null)\n");
+                json_t *j_err = json_object_get(root, "error");
+                const char *tag = is_submit ? "share" : "request";
+                if (json_is_array(j_err) && json_array_size(j_err) >= 2) {
+                    /* Gapcoin-style: [code,"message",...] */
+                    json_t *j_msg = json_array_get(j_err, 1);
+                    fprintf(stderr, "[stratum] %s REJECTED (id=%d): %s\n",
+                            tag, resp_id,
+                            json_is_string(j_msg) ? json_string_value(j_msg) : "(unknown)");
+                } else if (json_is_object(j_err)) {
+                    /* Standard JSON-RPC: {"code":N,"message":"..."} */
+                    json_t *j_msg = json_object_get(j_err, "message");
+                    fprintf(stderr, "[stratum] %s REJECTED (id=%d): %s\n",
+                            tag, resp_id,
+                            json_is_string(j_msg) ? json_string_value(j_msg) : "(unknown)");
+                } else {
+                    /* Dump raw response for diagnostics */
+                    char *raw = json_dumps(root, JSON_COMPACT);
+                    fprintf(stderr, "[stratum] %s REJECTED (id=%d, result=null): %s\n",
+                            tag, resp_id, raw ? raw : "?");
+                    free(raw);
+                }
+                if (is_submit)
+                    __sync_fetch_and_add(&ctx->shares_rejected, 1);
             }
         }
         /* ── Server push notification (id is null) ── */
@@ -339,6 +366,7 @@ stratum_ctx *stratum_connect(const char *host, const char *port,
     ctx->shift = shift;
     ctx->running = 1;
     ctx->msg_id = 1;
+    ctx->last_submit_id = -1;
 
     pthread_mutex_init(&ctx->send_lock, NULL);
     pthread_mutex_init(&ctx->work_lock, NULL);
@@ -395,6 +423,8 @@ int stratum_submit(stratum_ctx *ctx, const char *block_hex) {
     pthread_mutex_lock(&ctx->send_lock);
     id = ctx->msg_id++;
     pthread_mutex_unlock(&ctx->send_lock);
+
+    ctx->last_submit_id = id;
 
     /* Compute required buffer size: fixed JSON overhead + variable hex length */
     size_t hex_len = strlen(block_hex);
