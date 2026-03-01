@@ -20,7 +20,8 @@ src/
   Rpc.cpp / Rpc.h   - C++ RPC class (libcurl + JSON-RPC)
   stratum.h / .c    - Gapcoin stratum pool client (TCP, auto-reconnect)
   gpu_fermat.h      - public C API for CUDA batch Fermat testing
-  gpu_fermat.cu     - CUDA kernel: 384-bit Montgomery Fermat test
+  gpu_fermat.cu     - CUDA kernel: configurable-width Montgomery Fermat test
+                      (default 1024-bit / 16 limbs, supports shift ≤ 768)
   Opts.h            - option singleton header
   parse_block.c     - raw block parsing utilities
   utils.h           - small shared helpers
@@ -101,9 +102,10 @@ This statically links `GMP_PREFIX/lib/libgmp.a` and uses headers from
 
 ### With CUDA GPU acceleration (optional)
 
-Offloads batch Fermat primality testing to an NVIDIA GPU using a 384-bit
-Montgomery multiplication kernel.  Requires an NVIDIA GPU and the CUDA
-toolkit (`nvcc`):
+Offloads batch Fermat primality testing to an NVIDIA GPU using a
+configurable-width Montgomery multiplication kernel (default 1024-bit /
+16 limbs, supporting shifts up to 768).  Requires an NVIDIA GPU and the
+CUDA toolkit (`nvcc`):
 
 ```sh
 sudo apt-get install nvidia-cuda-toolkit
@@ -130,6 +132,16 @@ make WITH_RPC=1 WITH_CUDA=1 CUDA_PATH=/opt/cuda-12
 
 Common `CUDA_ARCH` values: `sm_61` (Pascal / GTX 10xx), `sm_75` (Turing /
 RTX 20xx), `sm_86` (Ampere / RTX 30xx), `sm_89` (Ada / RTX 40xx).
+
+To change the GPU arithmetic width (e.g. for very high shifts):
+
+```sh
+make WITH_RPC=1 WITH_CUDA=1 GPU_BITS=1536
+```
+
+`GPU_BITS` sets the number of bits per candidate (`GPU_NLIMBS = GPU_BITS/64`).
+Default is 1024 (16 limbs, shift ≤ 768).  Larger values support higher shifts
+but use more GPU registers and reduce occupancy.
 
 ### CRT gap-solver tool
 
@@ -209,8 +221,9 @@ bin/gap_miner ... --log-file miner.log
 
 ### With CUDA GPU acceleration
 
-Add `--cuda` to offload Fermat testing to the GPU.  The GPU pre-filters
-candidates in batches of up to 1M; survivors are verified on the CPU.
+Add `--cuda` to offload Fermat testing to the GPU.  A batch accumulator
+collects candidates from multiple CRT windows and flushes them to the GPU
+in large batches (default 4096) for efficient SM utilization.
 
 ```sh
 bin/gap_miner \
@@ -221,16 +234,29 @@ bin/gap_miner \
   --cuda
 ```
 
-CUDA with CRT gap-solver (shift 64):
+CUDA with CRT gap-solver (shift 512):
 
 ```sh
 bin/gap_miner \
   -o 127.0.0.1 -p 31397 -u USER --pass PASS \
-  --shift 64 \
-  --threads 6 \
+  --shift 512 \
+  --threads 3 \
   --fast-fermat \
   --cuda \
-  --crt-file crt/crt_s64_m21.txt
+  --crt-file crt/crt_s512_m22.txt
+```
+
+Tune GPU batch size for larger flushes:
+
+```sh
+bin/gap_miner \
+  -o 127.0.0.1 -p 31397 -u USER --pass PASS \
+  --shift 512 \
+  --threads 2 \
+  --fast-fermat \
+  --cuda \
+  --gpu-batch 8192 \
+  --crt-file crt/crt_s512_m22.txt
 ```
 
 Select a specific GPU device (0-based index):
@@ -240,6 +266,16 @@ bin/gap_miner \
   -o 127.0.0.1 -p 31397 -u USER --pass PASS \
   --shift 25 --threads 4 --fast-fermat \
   --cuda 1
+```
+
+Multiple GPUs (round-robin dispatch across threads):
+
+```sh
+bin/gap_miner \
+  -o 127.0.0.1 -p 31397 -u USER --pass PASS \
+  --shift 512 --threads 4 --fast-fermat \
+  --cuda 0,1 \
+  --crt-file crt/crt_s512_m22.txt
 ```
 
 ### With stratum pool
@@ -329,12 +365,21 @@ After sieving, each candidate undergoes a probabilistic primality test using
 - `--no-primality` -- skip testing entirely (benchmarking / sieve trust).
 
 When built with `WITH_CUDA=1` and run with `--cuda`, the miner offloads
-Fermat testing to the GPU in batches of up to 1M candidates.  Each candidate
-is exported as a 384-bit (6×64-bit limbs) number; the CUDA kernel performs
-Montgomery-form modular exponentiation (`2^(n-1) mod n`) on all candidates
-in parallel.  Survivors (probable primes) are returned to the CPU for gap
-scanning.  This is transparent — `--fast-fermat` is implied when using
-`--cuda`.
+Fermat testing to the GPU.  A **batch accumulator** collects candidates from
+multiple CRT windows into a single large buffer (default 4096 candidates,
+configurable via `--gpu-batch N`) before flushing to the GPU.  This
+dramatically improves GPU SM utilization — instead of launching a kernel
+with ~38 candidates per window (wasting 99% of SMs), the GPU receives
+thousands of candidates per launch.
+
+Each candidate is exported as a configurable-width number (default 1024-bit
+/ 16×64-bit limbs); the CUDA kernel performs Montgomery-form modular
+exponentiation (`2^(n-1) mod n`) on all candidates in parallel.  Survivors
+(probable primes) are returned to the CPU for gap scanning.  This is
+transparent — `--fast-fermat` is implied when using `--cuda`.
+
+Multiple GPUs are supported via `--cuda 0,1,2` — worker threads are assigned
+to GPUs round-robin, each with an independent CUDA context and accumulator.
 
 The GMP backend replaces the original OpenSSL `BN_is_prime_fasttest_ex` path.
 GMP's hand-tuned x86-64 assembly (Montgomery multiplication, Karatsuba) is
@@ -494,23 +539,29 @@ gap.  The block-finding rate improves by **3.4×**.
 
 ### CUDA GPU Fermat testing
 
-Benchmarked on an NVIDIA GeForce RTX 3060 with a single sieve thread
-(`--shift 25 --threads 1 --fast-fermat`):
+Benchmarked on an NVIDIA GeForce RTX 3060 with CRT gap-solver
+(`--shift 512 --fast-fermat --crt-file crt/crt_s512_m22.txt --sieve-primes 150000`):
 
-| Mode | Fermat tests/s | Relative |
-|------|---------------|----------|
-| CPU only | 53 K/s | 1.0× |
-| GPU (`--cuda`) | 107 K/s | **2.0×** |
+| Mode | Threads | Fermat tests/s | Est | Relative |
+|------|---------|---------------|-----|----------|
+| CPU only | 3 | 47 K/s | 5.0d | 1.0× |
+| GPU (no accumulator) | 3 | 47 K/s | 5.0d | 1.0× |
+| GPU + batch accumulator | 2 | 125 K/s | 1.9d | **2.6×** |
 
-With 2 sieve threads feeding the GPU (`--shift 25 --threads 2 --fast-fermat --cuda`):
-**313 K tests/s** — the GPU keeps up with multiple sieve threads producing
-candidates in parallel.  The speedup scales with the number of sieve threads
-until the GPU becomes the bottleneck.
+Without the accumulator, each GPU kernel launch received only ~38 candidates
+per CRT window — far too few to saturate 3584 CUDA cores.  The batch
+accumulator collects ~3000+ candidates across windows before flushing,
+achieving full SM utilization.
 
-The GPU kernel uses 384-bit Montgomery multiplication (6×64-bit limbs,
-CIOS form) to compute `2^(n-1) mod n` for up to 1M candidates per batch.
-Candidates are transferred to the GPU, tested in parallel (128 threads per
-block), and only probable primes are returned to the CPU for gap scanning.
+The `gpu_batch=N` stat in the output shows the average candidates per GPU
+flush.  Larger values indicate better GPU utilization.
+
+The GPU kernel uses configurable-width Montgomery multiplication (default
+16×64-bit limbs / 1024-bit, CIOS form) to compute `2^(n-1) mod n` for
+candidates.  A thread-local accumulator buffers candidates across CRT
+windows and flushes them to the GPU in batches of 4096+ (configurable via
+`--gpu-batch`).  Only probable primes are returned to the CPU for gap
+scanning.  Multiple GPUs are supported via `--cuda 0,1`.
 
 ### Key optimizations
 
@@ -555,10 +606,14 @@ block), and only probable primes are returned to the CPU for gap scanning.
    for 20+ seconds between window boundaries.
 
 10. **CUDA GPU Fermat** -- Batch Fermat primality testing on NVIDIA GPUs
-    using a custom 384-bit Montgomery multiplication kernel (CIOS form).
-    Up to 1M candidates per batch are transferred to the GPU, tested in
-    parallel, and only probable primes are returned to the CPU.  ~2× single-
-    thread speedup on an RTX 3060; scales with additional sieve threads.
+    using a configurable-width Montgomery multiplication kernel (CIOS form,
+    default 1024-bit / 16 limbs).  A thread-local **batch accumulator**
+    collects candidates from multiple CRT windows (~38 survivors each)
+    into a single large GPU buffer (default 4096, `--gpu-batch N`), then
+    flushes them in one kernel launch.  This transforms tiny per-window
+    batches into GPU-filling workloads — 2.6× speedup on an RTX 3060 at
+    shift 512.  Multiple GPUs are supported via `--cuda 0,1` with
+    round-robin thread assignment.
 
 > **Historical note:** an earlier Barrett-reduction path for fast modular
 > exponentiation contained a correctness bug for large moduli and was
@@ -598,7 +653,8 @@ block), and only probable primes are returned to the CPU for gap scanning.
 | `--stop-after-block`  | off           | Exit after submitting a valid block |
 | `--selftest`          | off           | Run internal prime checks and exit |
 | `--p P --q Q`         | --            | Force primes for `--build-only` runs |
-| `--cuda [DEV]`        | off           | Enable CUDA GPU Fermat testing (requires `WITH_CUDA=1` build).  Optional `DEV` selects the GPU device index (default 0). |
+| `--cuda [DEV,...]`    | off           | Enable CUDA GPU Fermat testing (requires `WITH_CUDA=1` build).  Optional comma-separated `DEV` list selects GPU devices (e.g. `--cuda 0,1`).  Up to 8 GPUs, round-robin dispatch. |
+| `--gpu-batch N`       | 4096          | Accumulate N candidates across CRT windows before flushing to GPU.  Larger values improve GPU utilization at the cost of slightly delayed gap processing. |
 | `--stratum HOST:PORT` | --            | Connect to a Gapcoin stratum pool instead of using RPC/GBT (requires `WITH_RPC=1` build). |
 | `-u` / `--user`       | --            | Alias for `--rpc-user` |
 | `--pass`              | --            | Alias for `--rpc-pass` |
@@ -654,6 +710,7 @@ STATS: elapsed=30.0s  sieved=520000000 (34666667/s)  tested=4561182 (304079/s)  
 | `accepted` | Node confirmed the block |
 | `prob` | Per-pair probability of a qualifying gap (`e^(-target)`, Cramér–Granville heuristic) |
 | `est` | Estimated time to find a qualifying gap at current rate |
+| `gpu_batch` | (CUDA only) Average candidates per GPU flush.  Higher = better GPU utilization.  Absent when not using `--cuda`. |
 | `gaplist` | (CRT producer-consumer only) Number of sieved windows waiting in the priority heap.  Healthy range is 50–500; 0 means consumers are starved, near 4096 means producers are blocked. |
 
 ### Why `gaps=0` and `submitted=0` are normal early on
