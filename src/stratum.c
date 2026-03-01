@@ -6,17 +6,21 @@
  * Copyright (C) 2026  cpugapminer contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
+#ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
+#endif
 #include "stratum.h"
+#include "compat_win32.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <errno.h>
+#ifndef _WIN32
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
+#endif
 #include <pthread.h>
 #include <jansson.h>
 
@@ -28,7 +32,7 @@
 /* ──────────────── context ──────────────── */
 struct stratum_ctx {
     /* connection */
-    int              sock;
+    sock_t           sock;
     char             host[256];
     char             port[16];
     char             user[128];
@@ -64,8 +68,8 @@ struct stratum_ctx {
 
 /* ──────────────── TCP helpers ──────────────── */
 
-/* Create socket and connect. Returns fd or -1. */
-static int tcp_connect(const char *host, const char *port) {
+/* Create socket and connect. Returns fd or SOCK_INVALID. */
+static sock_t tcp_connect(const char *host, const char *port) {
     struct addrinfo hints, *result, *rp;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family   = AF_INET;
@@ -75,23 +79,23 @@ static int tcp_connect(const char *host, const char *port) {
     if (ret != 0) {
         fprintf(stderr, "[stratum] getaddrinfo(%s:%s): %s\n",
                 host, port, gai_strerror(ret));
-        return -1;
+        return SOCK_INVALID;
     }
 
-    int fd = -1;
+    sock_t fd = SOCK_INVALID;
     for (rp = result; rp; rp = rp->ai_next) {
         fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (fd < 0) continue;
+        if (fd == SOCK_INVALID) continue;
 
         /* TCP keepalive */
         int optval = 1;
-        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &optval, sizeof(optval));
+        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (const char *)&optval, sizeof(optval));
 
-        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0)
+        if (connect(fd, rp->ai_addr, (int)rp->ai_addrlen) == 0)
             break;  /* success */
 
-        close(fd);
-        fd = -1;
+        sock_close(fd);
+        fd = SOCK_INVALID;
     }
     freeaddrinfo(result);
     return fd;
@@ -99,14 +103,14 @@ static int tcp_connect(const char *host, const char *port) {
 
 /* Reconnect loop (blocking, retries until success or !running). */
 static void stratum_reconnect(stratum_ctx *ctx) {
-    if (ctx->sock >= 0) { close(ctx->sock); ctx->sock = -1; }
+    if (ctx->sock != SOCK_INVALID) { sock_close(ctx->sock); ctx->sock = SOCK_INVALID; }
     ctx->connected = 0;
     ctx->recv_buf_len = 0;  /* flush partial recv data */
 
     while (ctx->running) {
         fprintf(stderr, "[stratum] connecting to %s:%s ...\n", ctx->host, ctx->port);
         ctx->sock = tcp_connect(ctx->host, ctx->port);
-        if (ctx->sock >= 0) {
+        if (ctx->sock != SOCK_INVALID) {
             ctx->connected = 1;
             fprintf(stderr, "[stratum] connected to %s:%s\n", ctx->host, ctx->port);
             return;
@@ -124,7 +128,7 @@ static int stratum_send(stratum_ctx *ctx, const char *msg, size_t len) {
     pthread_mutex_lock(&ctx->send_lock);
     size_t sent = 0;
     while (sent < len) {
-        ssize_t n = send(ctx->sock, msg + sent, len - sent, MSG_NOSIGNAL);
+        int n = send(ctx->sock, msg + sent, (int)(len - sent), MSG_NOSIGNAL);
         if (n <= 0) {
             pthread_mutex_unlock(&ctx->send_lock);
             return -1;
@@ -138,7 +142,7 @@ static int stratum_send(stratum_ctx *ctx, const char *msg, size_t len) {
 /* Receive one newline-terminated line (blocking).
    Returns line length (NUL-terminated in *out), or -1 on error.
    Caller must free *out. */
-static ssize_t stratum_recv_line(stratum_ctx *ctx, char **out) {
+static int stratum_recv_line(stratum_ctx *ctx, char **out) {
     /* Ensure we have a recv buffer */
     if (!ctx->recv_buf) {
         ctx->recv_buf_cap = RECV_BUF_INIT;
@@ -162,7 +166,7 @@ static ssize_t stratum_recv_line(stratum_ctx *ctx, char **out) {
                 if (remaining > 0)
                     memmove(ctx->recv_buf, ctx->recv_buf + i + 1, remaining);
                 ctx->recv_buf_len = remaining;
-                return (ssize_t)i;
+                return (int)i;
             }
         }
 
@@ -174,7 +178,7 @@ static ssize_t stratum_recv_line(stratum_ctx *ctx, char **out) {
             ctx->recv_buf = tmp;
         }
 
-        ssize_t n = recv(ctx->sock, ctx->recv_buf + ctx->recv_buf_len, 1024, 0);
+        int n = recv(ctx->sock, ctx->recv_buf + ctx->recv_buf_len, 1024, 0);
         if (n <= 0) return -1;  /* disconnect or error */
         ctx->recv_buf_len += (size_t)n;
     }
@@ -253,7 +257,7 @@ static void *recv_thread_fn(void *arg) {
         }
 
         char *line = NULL;
-        ssize_t len = stratum_recv_line(ctx, &line);
+        int len = stratum_recv_line(ctx, &line);
         if (len < 0) {
             if (ctx->running) {
                 fprintf(stderr, "[stratum] connection lost, reconnecting...\n");
@@ -327,7 +331,7 @@ stratum_ctx *stratum_connect(const char *host, const char *port,
     stratum_ctx *ctx = (stratum_ctx *)calloc(1, sizeof(stratum_ctx));
     if (!ctx) return NULL;
 
-    ctx->sock = -1;
+    ctx->sock = SOCK_INVALID;
     strncpy(ctx->host, host, sizeof(ctx->host) - 1);
     strncpy(ctx->port, port, sizeof(ctx->port) - 1);
     strncpy(ctx->user, user, sizeof(ctx->user) - 1);
@@ -428,10 +432,10 @@ void stratum_disconnect(stratum_ctx *ctx) {
     pthread_mutex_unlock(&ctx->work_lock);
 
     /* Close socket to unblock recv */
-    if (ctx->sock >= 0) {
+    if (ctx->sock != SOCK_INVALID) {
         shutdown(ctx->sock, SHUT_RDWR);
-        close(ctx->sock);
-        ctx->sock = -1;
+        sock_close(ctx->sock);
+        ctx->sock = SOCK_INVALID;
     }
 
     pthread_join(ctx->recv_thread, NULL);

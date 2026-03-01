@@ -1,4 +1,6 @@
+#ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
+#endif
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -6,7 +8,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
-#include <unistd.h>
+#include "compat_win32.h"
 #include <openssl/sha.h>
 #include <openssl/bn.h>
 #include <gmp.h>
@@ -66,7 +68,9 @@ static void log_file_only(const char *fmt, ...) {
 }
 #include <openssl/hmac.h>
 #include <pthread.h>
+#ifndef _WIN32
 #include <sys/time.h>
+#endif
 
 #ifdef WITH_RPC
 // submit queue and RPC globals
@@ -1866,10 +1870,10 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
        Filename includes timestamp, pid and a small random value. */
     {
         char binpath[256]; char hexpath[256];
-        snprintf(binpath, sizeof(binpath), "/tmp/gap_miner_block_%lu_%lu_%u.bin",
-                 (unsigned long)time(NULL), (unsigned long)getpid(), (unsigned)rand());
-        snprintf(hexpath, sizeof(hexpath), "/tmp/gap_miner_block_%lu_%lu_%u.hex",
-                 (unsigned long)time(NULL), (unsigned long)getpid(), (unsigned)rand());
+        snprintf(binpath, sizeof(binpath), "%sgap_miner_block_%lu_%lu_%u.bin",
+                 win_temp_dir(), (unsigned long)time(NULL), (unsigned long)getpid(), (unsigned)rand());
+        snprintf(hexpath, sizeof(hexpath), "%sgap_miner_block_%lu_%lu_%u.hex",
+                 win_temp_dir(), (unsigned long)time(NULL), (unsigned long)getpid(), (unsigned)rand());
         FILE *bf = fopen(binpath, "wb");
         if (bf) {
             fwrite(full, 1, full_len, bf);
@@ -4745,6 +4749,8 @@ int main(int argc, char **argv) {
     atexit(print_stats);
     /* free thread-local sieve buffers when the process exits */
     atexit(free_sieve_buffers);
+    /* Windows: initialise Winsock2 (no-op on POSIX) */
+    win_wsa_init();
     if (log_file) {
         log_fp = fopen(log_file, "a");
         if (!log_fp) fprintf(stderr, "Failed to open log file %s\n", log_file);

@@ -4,8 +4,7 @@
 #include <cstring>
 #include <string>
 #include <curl/curl.h>
-#include <sys/time.h>
-#include <unistd.h>
+#include "compat_win32.h"
 #include <jansson.h>
 
 extern "C" {
@@ -49,9 +48,9 @@ int rpc_submit(const char *url, const char *user, const char *pass, const char *
     /* save exact payload for forensic inspection */
     {
         char fname[256];
-        pid_t pid = getpid();
+        int pid = (int)getpid();
         struct timeval tv; gettimeofday(&tv, NULL);
-        snprintf(fname, sizeof(fname), "/tmp/gap_miner_submit_%ld_%d.json", (long)tv.tv_sec, (int)pid);
+        snprintf(fname, sizeof(fname), "%sgap_miner_submit_%ld_%d.json", win_temp_dir(), (long)tv.tv_sec, pid);
         FILE *fp = fopen(fname, "wb");
         if (fp) {
             fwrite(payload, 1, strlen(payload), fp);

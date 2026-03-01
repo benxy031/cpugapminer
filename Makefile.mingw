@@ -1,0 +1,85 @@
+# Makefile.mingw — Build cpugapminer on Windows using MSYS2 / MinGW-w64
+#
+# Usage (inside an MSYS2 MINGW64 shell):
+#   make -f Makefile.mingw WITH_RPC=1
+#   make -f Makefile.mingw WITH_RPC=1 WITH_CUDA=1
+#
+# Prerequisites (pacman):
+#   pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-gmp \
+#             mingw-w64-x86_64-curl mingw-w64-x86_64-jansson \
+#             mingw-w64-x86_64-openssl make
+#
+# For CUDA, install the NVIDIA CUDA Toolkit for Windows and set CUDA_PATH.
+
+CC=gcc
+CXX=g++
+CFLAGS=-O3 -std=c11 -Wall -Wextra -mtune=native -flto
+CXXFLAGS=-O3 -std=c++17 -Wall -Wextra -mtune=native -flto
+LDFLAGS=-flto
+SRCDIR=src
+BINDIR=bin
+TARGET=$(BINDIR)/gap_miner.exe
+
+ifdef GMP_PREFIX
+	GMP_CFLAGS=-I$(GMP_PREFIX)/include
+	GMP_LIB=$(GMP_PREFIX)/lib/libgmp.a
+else
+	GMP_CFLAGS=
+	GMP_LIB=-lgmp
+endif
+
+# Windows socket library
+WINLIBS=-lws2_32
+
+ifdef WITH_RPC
+	LIBS=-lcurl -ljansson -lssl -lcrypto $(GMP_LIB) -lm -lpthread -lstdc++ $(WINLIBS)
+	CFLAGS+=-DWITH_RPC $(GMP_CFLAGS)
+	RPC_SRCS=$(SRCDIR)/rpc_cwrap.cpp $(SRCDIR)/rpc_globals.cpp $(SRCDIR)/rpc_stubs.cpp $(SRCDIR)/Rpc.cpp
+	RPC_OBJS=$(RPC_SRCS:.cpp=.o)
+	STRATUM_OBJ=$(SRCDIR)/stratum.o
+	LINKER=$(CXX)
+else
+	LIBS=-lssl -lcrypto $(GMP_LIB) -lm -lpthread $(WINLIBS)
+	LINKER=$(CC)
+	RPC_OBJS=
+	STRATUM_OBJ=
+endif
+
+ifdef WITH_CUDA
+	NVCC ?= nvcc
+	CUDA_ARCH ?= -arch=sm_86
+	CUDA_PATH ?= C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4
+	GPU_BITS ?= 1024
+	GPU_NLIMBS := $(shell echo '$(GPU_BITS) / 64' | bc)
+	CUDA_OBJ=$(SRCDIR)/gpu_fermat.o
+	CFLAGS+=-DWITH_CUDA -DGPU_NLIMBS=$(GPU_NLIMBS) -I"$(CUDA_PATH)/include"
+	NVCC_FLAGS=-DGPU_NLIMBS=$(GPU_NLIMBS)
+	LIBS+=-lcudart -L"$(CUDA_PATH)/lib/x64"
+else
+	CUDA_OBJ=
+endif
+
+all: $(TARGET)
+
+$(BINDIR):
+	mkdir -p $(BINDIR)
+
+$(SRCDIR)/%.o: $(SRCDIR)/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(SRCDIR)/%.o: $(SRCDIR)/%.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(SRCDIR)/gpu_fermat.o: $(SRCDIR)/gpu_fermat.cu $(SRCDIR)/gpu_fermat.h
+	"$(NVCC)" -O3 $(CUDA_ARCH) $(NVCC_FLAGS) -c $< -o $@
+
+$(TARGET): $(BINDIR) $(SRCDIR)/main.o $(RPC_OBJS) $(STRATUM_OBJ) $(CUDA_OBJ)
+	$(LINKER) -o $@ $(SRCDIR)/main.o $(RPC_OBJS) $(STRATUM_OBJ) $(CUDA_OBJ) $(LDFLAGS) $(LIBS)
+
+clean:
+	rm -rf $(BINDIR) $(SRCDIR)/*.o
+
+gen_crt: $(BINDIR) tools/gen_crt.c
+	$(CC) -O2 -std=c11 -Wall -Wextra -o $(BINDIR)/gen_crt.exe tools/gen_crt.c -lm
+
+.PHONY: all clean gen_crt
