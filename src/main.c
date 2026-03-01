@@ -3781,6 +3781,20 @@ static void *worker_fn(void *arg) {
             }
 
             /* --- set up cooperative Fermat and unlock mutex (once) ------- */
+#ifdef WITH_CUDA
+            /* When GPU handles Fermat, disable cooperative assist — the GPU
+               replaces all CPU Fermat work.  Helper still sieves the next
+               window but skips coop_fermat_assist (active=0).               */
+            int gpu_fermat_path = (g_gpu_count > 0);
+            if (gpu_fermat_path) {
+                psc.coop.active      = 0;
+                psc.coop.more_work   = 0;
+                psc.coop.helper_done = 1;
+                __sync_synchronize();
+                pthread_mutex_unlock(&psc.mu);
+            } else
+#endif
+            {
             if (use_smart) {
                 psc.coop.pr        = p1_cands;
                 psc.coop.cnt       = p1_cnt;
@@ -3802,8 +3816,128 @@ static void *worker_fn(void *arg) {
                                    && helper_will_assist) ? 1 : 0;
             }
             pthread_mutex_unlock(&psc.mu);       /* exactly once per window */
+            }
 
             /* ============================================================= */
+#ifdef WITH_CUDA
+            if (gpu_fermat_path && !no_primality) {
+            /* ======= GPU FERMAT PATH (non-CRT) ============================
+               Send all candidates to the GPU in one batch.  No cooperative
+               Fermat needed — the GPU replaces all CPU Fermat work.
+               Smart-scan phases are handled via gpu_batch_filter calls.
+               ==============================================================*/
+                if (use_smart) {
+                    /* --- Phase 1: GPU tests sampled candidates ----------- */
+                    size_t sp = gpu_batch_filter(p1_cands, p1_cnt);
+                    __sync_fetch_and_add(&stats_tested, (uint64_t)p1_cnt);
+
+                    uint64_t *sampled_primes = p1_cands; /* reuse buffer */
+                    size_t sp_cnt = sp;
+
+                    /* --- Gap analysis: find candidate regions ------------ */
+                    size_t v_alloc = cnt / 8 + 64;
+                    uint64_t *verify = (uint64_t *)malloc(v_alloc * sizeof(uint64_t));
+                    size_t v_cnt = 0;
+                    size_t n_gap_regions = 0;
+                    size_t gap_reg_cap = sp_cnt + 2;
+                    uint64_t *gap_reg_lo = (uint64_t *)malloc(gap_reg_cap * sizeof(uint64_t));
+                    uint64_t *gap_reg_hi = (uint64_t *)malloc(gap_reg_cap * sizeof(uint64_t));
+                    if (verify && sp_cnt >= 1) {
+                        #define GPU_COLLECT_REGION(lo_val, hi_val) do {        \
+                            size_t _lo = 0, _hi = cnt;                        \
+                            while (_lo < _hi) {                               \
+                                size_t _m = _lo + (_hi - _lo) / 2;            \
+                                if (pr[_m] <= (lo_val)) _lo = _m + 1;         \
+                                else _hi = _m;                                \
+                            }                                                 \
+                            for (size_t _j = _lo;                             \
+                                 _j < cnt && pr[_j] < (hi_val); _j++) {       \
+                                if (_j % (size_t)smart_K == 0) continue;      \
+                                if (v_cnt >= v_alloc) {                       \
+                                    v_alloc *= 2;                             \
+                                    verify = (uint64_t *)realloc(verify,      \
+                                                v_alloc * sizeof(uint64_t));  \
+                                }                                             \
+                                verify[v_cnt++] = pr[_j];                     \
+                            }                                                 \
+                        } while (0)
+
+                        if (cnt > 0 && sampled_primes[0] - pr[0] >= needed_gap) {
+                            GPU_COLLECT_REGION(pr[0] - 1, sampled_primes[0]);
+                            if (gap_reg_lo) { gap_reg_lo[n_gap_regions] = 0; gap_reg_hi[n_gap_regions] = sampled_primes[0]; n_gap_regions++; }
+                        }
+                        for (size_t i = 0; i + 1 < sp_cnt; i++) {
+                            if (sampled_primes[i+1] - sampled_primes[i] >= needed_gap) {
+                                GPU_COLLECT_REGION(sampled_primes[i], sampled_primes[i+1]);
+                                if (gap_reg_lo) { gap_reg_lo[n_gap_regions] = sampled_primes[i]; gap_reg_hi[n_gap_regions] = sampled_primes[i+1]; n_gap_regions++; }
+                            }
+                        }
+                        if (cnt > 0 && pr[cnt-1] - sampled_primes[sp_cnt-1] >= needed_gap) {
+                            GPU_COLLECT_REGION(sampled_primes[sp_cnt-1], pr[cnt-1] + 1);
+                            if (gap_reg_lo) { gap_reg_lo[n_gap_regions] = sampled_primes[sp_cnt-1]; gap_reg_hi[n_gap_regions] = UINT64_MAX; n_gap_regions++; }
+                        }
+                        #undef GPU_COLLECT_REGION
+                    }
+
+                    /* --- Phase 2: GPU tests verification candidates ------ */
+                    pf = sp_cnt;
+                    memcpy(pr, sampled_primes, sp_cnt * sizeof(uint64_t));
+                    if (v_cnt > 0) {
+                        size_t vp = gpu_batch_filter(verify, v_cnt);
+                        for (size_t i = 0; i < vp; i++)
+                            pr[pf++] = verify[i];
+                    }
+                    __sync_fetch_and_add(&stats_tested, (uint64_t)v_cnt);
+                    if (pf > 1) qsort(pr, pf, sizeof(uint64_t), cmp_u64);
+                    cnt = pf;
+
+                    /* Scan verified gap regions */
+                    {
+                        int found_block = 0;
+                        size_t region_pairs = 0;
+                        for (size_t r = 0; r < n_gap_regions && gap_reg_lo; r++) {
+                            size_t lo_idx = 0;
+                            { size_t l = 0, h = cnt;
+                              while (l < h) { size_t m = l+(h-l)/2; if (pr[m] < gap_reg_lo[r]) l=m+1; else h=m; }
+                              lo_idx = l; }
+                            size_t hi_idx = cnt;
+                            { size_t l = 0, h = cnt;
+                              while (l < h) { size_t m = l+(h-l)/2; if (pr[m] <= gap_reg_hi[r]) l=m+1; else h=m; }
+                              hi_idx = l; }
+                            size_t seg_cnt = (hi_idx > lo_idx) ? hi_idx - lo_idx : 0;
+                            if (seg_cnt >= 2) {
+                                region_pairs += seg_cnt - 1;
+                                if (scan_candidates(pr + lo_idx, seg_cnt,
+                                                    target_local, logbase,
+                                                    shift_local, header_local,
+                                                    rpc_url_local, rpc_user_local,
+                                                    rpc_pass_local, rpc_method_local,
+                                                    rpc_sign_key_local))
+                                    found_block = 1;
+                            }
+                        }
+                        if (sp_cnt > 0 && p1_cnt > 0) {
+                            size_t est_full = (size_t)((double)orig_cnt
+                                            * (double)sp_cnt / (double)p1_cnt);
+                            if (est_full > 1 + region_pairs)
+                                __sync_fetch_and_add(&stats_pairs,
+                                                     (uint64_t)(est_full - 1 - region_pairs));
+                        }
+                        free(gap_reg_lo);
+                        free(gap_reg_hi);
+                        if (found_block) { free(p1_cands); free(p1_wbuf); free(verify); goto worker_done; }
+                    }
+                    free(p1_cands); p1_cands = NULL;
+                    free(p1_wbuf);  p1_wbuf = NULL;
+                    free(verify);
+                } else {
+                    /* GPU full test (non-smart) */
+                    pf = gpu_batch_filter(pr, cnt);
+                    __sync_fetch_and_add(&stats_tested, (uint64_t)cnt);
+                    cnt = pf;
+                }
+            } else
+#endif
             if (use_smart) {
             /* ======= TWO-PHASE SMART SCANNING =============================
                Phase 1: sample every Kth sieve survivor (cooperative).
