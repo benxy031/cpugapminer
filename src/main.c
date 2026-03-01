@@ -23,7 +23,7 @@ static void     set_base_bn(const uint8_t h256[32], int shift);
 static int      bn_candidate_is_prime(uint64_t offset);
 #ifdef WITH_RPC
 static int      build_mining_pass(const char *url, const char *user, const char *pass, int shift);
-static int      assemble_mining_block(uint64_t nadd_val, char out_hex[16384]);
+static int      assemble_mining_block(uint64_t nadd_val, uint64_t expect_seq, char out_hex[16384]);
 extern int      rpc_getwork_data(const char *url, const char *user, const char *pass, char data_out[161], uint64_t *ndiff_out);
 #endif
 #ifdef WITH_RPC
@@ -244,6 +244,8 @@ struct crt_work_item {
     int      cand_odd;    /* whether CRT candidate was odd (for nAdd adjustment)    */
     double   logbase;     /* log(base) for merit calculation                         */
     uint64_t generation;  /* pass generation — discard stale items                   */
+    uint8_t  hdr80[80];   /* snapshot of header at time of sieving                   */
+    uint16_t nshift;      /* snapshot of shift at time of sieving                    */
 };
 
 #define CRT_HEAP_CAP 4096
@@ -408,6 +410,7 @@ struct pass_state {
     uint64_t ndiff;       /* nDifficulty from getwork response                 */
     char     prevhex[65]; /* previous block hash for change detection          */
     uint64_t height;      /* reserved (not available from getwork header)      */
+    volatile uint64_t pass_seq;  /* incremented on every new mining pass        */
 };
 static struct pass_state g_pass = {0};
 #endif
@@ -1968,13 +1971,23 @@ static int build_mining_pass(const char *url, const char *user, const char *pass
     strncpy(g_pass.prevhex, prevhex, 64);
     g_pass.prevhex[64] = '\0';
     g_pass.height = 0; /* not available from getwork header */
+    __sync_fetch_and_add(&g_pass.pass_seq, 1);
     log_file_only("build_mining_pass: nonce=%u ndiff=%llu h256[0..3]=%02x%02x%02x%02x prevhex=%.16s...\n",
                   nonce, (unsigned long long)ndiff,
                   h256[0], h256[1], h256[2], h256[3], prevhex);
     return 1;
 }
 
-static int assemble_mining_block(uint64_t nadd_val, char out_hex[16384]) {
+static int assemble_mining_block(uint64_t nadd_val, uint64_t expect_seq,
+                                 char out_hex[16384]) {
+    /* Stale-pass guard: reject if g_pass was overwritten since the worker
+       started mining with this header.  This prevents submitting a block
+       whose nAdd was computed for a different hash. */
+    if (expect_seq && expect_seq != g_pass.pass_seq) {
+        log_msg("[assemble] stale pass (seq %llu vs current %llu) — skipping\n",
+                (unsigned long long)expect_seq, (unsigned long long)g_pass.pass_seq);
+        return 0;
+    }
     /* getwork submit format: hdr80(80) + nNonce(4,LE) + nShift(2,LE) + nAdd(raw LE, ≥ 1 byte)
      * Gapcoin header:  version(4)+prevhash(32)+merkle(32)+time(4)+nDifficulty(8) = 80 bytes.
      * nNonce(4) goes at offset 80, nShift(2) at offset 84, nAdd at offset 86+.
@@ -1997,6 +2010,21 @@ static int assemble_mining_block(uint64_t nadd_val, char out_hex[16384]) {
     memcpy(p, nb, nl); p += nl;
     /* gapcoind requires vchData.size() > 86; pad with one zero byte if too short */
     if ((p - buf) <= 86) { *p++ = 0x00; }
+
+    /* Stale-header guard: recompute SHA256d(hdr80||nonce) and verify bit 255
+       is set.  If g_pass was overwritten by a new stratum/RPC pass between
+       the time the worker sieved and now, the nonce won't match the header
+       and the hash will (almost certainly) fail this check. */
+    {
+        uint8_t chk1[32], chk2[32];
+        SHA256(buf, 84, chk1);   /* SHA256d(header 80 + nonce 4) */
+        SHA256(chk1, 32, chk2);
+        if (chk2[31] < 0x80) {
+            log_msg("[assemble] stale header detected (hash bit 255 not set) — skipping submit\n");
+            return 0;  /* caller won't submit */
+        }
+    }
+
     bytes_to_hex(buf, (size_t)(p - buf), out_hex);
     return 1;
 }
@@ -2004,7 +2032,13 @@ static int assemble_mining_block(uint64_t nadd_val, char out_hex[16384]) {
 /* Like assemble_mining_block but accepts a full mpz_t nAdd and an explicit
    nonce, so CRT mining at large shifts (512+) can submit properly. */
 static int assemble_mining_block_mpz(uint32_t mining_nonce, mpz_t nadd_val,
+                                     uint64_t expect_seq,
                                      char out_hex[16384]) {
+    if (expect_seq && expect_seq != g_pass.pass_seq) {
+        log_msg("[assemble] stale pass (seq %llu vs current %llu) — skipping\n",
+                (unsigned long long)expect_seq, (unsigned long long)g_pass.pass_seq);
+        return 0;
+    }
     unsigned char buf[1024]; /* enough for nAdd up to ~7400 bits */
     unsigned char *p = buf;
     memcpy(p, g_pass.hdr80,    80); p += 80;
@@ -2019,6 +2053,18 @@ static int assemble_mining_block_mpz(uint32_t mining_nonce, mpz_t nadd_val,
         p += count;
     }
     if ((p - buf) <= 86) { *p++ = 0x00; }
+
+    /* Stale-header guard (see assemble_mining_block for details) */
+    {
+        uint8_t chk1[32], chk2[32];
+        SHA256(buf, 84, chk1);
+        SHA256(chk1, 32, chk2);
+        if (chk2[31] < 0x80) {
+            log_msg("[assemble] stale header detected (hash bit 255 not set) — skipping submit\n");
+            return 0;
+        }
+    }
+
     bytes_to_hex(buf, (size_t)(p - buf), out_hex);
     return 1;
 }
@@ -2148,6 +2194,11 @@ static int build_mining_pass_stratum(const char *data_hex, uint64_t ndiff, int s
     strncpy(g_pass.prevhex, prevhex, 64);
     g_pass.prevhex[64] = '\0';
     g_pass.height = 0;
+    __sync_fetch_and_add(&g_pass.pass_seq, 1);
+    /* Signal all workers that the current pass is stale BEFORE returning.
+       This closes the race window between g_pass update and the caller's
+       g_abort_pass = 1 (which is now redundant but harmless). */
+    g_abort_pass = 1;
     log_file_only("build_mining_pass_stratum: nonce=%u ndiff=%llu h256[0..3]=%02x%02x%02x%02x prevhex=%.16s...\n",
                   nonce, (unsigned long long)ndiff,
                   h256[0], h256[1], h256[2], h256[3], prevhex);
@@ -2460,7 +2511,7 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
         if (rpc_url && !g_abort_pass) {
             char blockhex[16384];
             memset(blockhex, 0, sizeof(blockhex));
-            if (assemble_mining_block_mpz(nonce, nAdd_prime, blockhex)) {
+            if (assemble_mining_block_mpz(nonce, nAdd_prime, 0, blockhex)) {
                 __sync_fetch_and_add(&stats_blocks, 1);
                 log_file_only("Built blockhex: %s\n", blockhex);
                 if (header_meets_target_hex(blockhex)) {
@@ -2470,8 +2521,9 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
                             shift_v, (unsigned)nonce);
                     __sync_fetch_and_add(&stats_submits, 1);
                     if (g_stratum) {
-                        verify_pow_hex(blockhex);
-                        if (stratum_submit(g_stratum, blockhex))
+                        if (!verify_pow_hex(blockhex)) {
+                            log_msg(">>> SKIPPING invalid PoW (stale pass)\n");
+                        } else if (stratum_submit(g_stratum, blockhex))
                             log_msg(">>> SUBMITTED via stratum\n");
                         else
                             log_msg(">>> stratum submit FAILED\n");
@@ -2527,6 +2579,8 @@ struct gpu_accum_win {
     int       shift;
     const char *rpc_url, *rpc_user, *rpc_pass;
     mpz_t     nAdd;           /* owned copy */
+    uint8_t   hdr80[80];      /* snapshot of header at time of sieving */
+    uint16_t  nshift;         /* snapshot of shift at time of sieving */
 };
 
 struct gpu_accum {
@@ -2913,7 +2967,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
             if (rpc_url_local) {
                 if (g_abort_pass) continue;
                 char blockhex[16384]; memset(blockhex, 0, sizeof(blockhex));
-                if (assemble_mining_block(nadd_sc, blockhex)) {
+                if (assemble_mining_block(nadd_sc, 0, blockhex)) {
                     __sync_fetch_and_add(&stats_blocks, 1);
                     log_file_only("Built blockhex: %s\n", blockhex);
                     if (header_meets_target_hex(blockhex)) {
@@ -2923,8 +2977,9 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
                         __sync_fetch_and_add(&stats_submits, 1);
                         if (g_stratum) {
                             /* Submit via stratum (non-blocking) */
-                            verify_pow_hex(blockhex);
-                            if (stratum_submit(g_stratum, blockhex)) {
+                            if (!verify_pow_hex(blockhex)) {
+                                log_msg(">>> SKIPPING invalid PoW (stale pass)\n");
+                            } else if (stratum_submit(g_stratum, blockhex)) {
                                 log_msg(">>> SUBMITTED via stratum\n");
                             } else {
                                 log_msg(">>> stratum submit FAILED\n");
@@ -3273,7 +3328,7 @@ static void *worker_fn(void *arg) {
                             char blockhex[16384];
                             memset(blockhex, 0, sizeof(blockhex));
                             if (assemble_mining_block_mpz(w->nonce,
-                                    nAdd_prime, blockhex)) {
+                                    nAdd_prime, 0, blockhex)) {
                                 __sync_fetch_and_add(&stats_blocks, 1);
                                 log_file_only("Built blockhex: %s\n",
                                               blockhex);
@@ -3287,8 +3342,10 @@ static void *worker_fn(void *arg) {
                                             (unsigned)w->nonce);
                                     __sync_fetch_and_add(&stats_submits, 1);
                                     if (g_stratum) {
-                                        verify_pow_hex(blockhex);
-                                        if (stratum_submit(g_stratum,
+                                        if (!verify_pow_hex(blockhex))
+                                            log_msg(">>> SKIPPING invalid"
+                                                    " PoW (stale pass)\n");
+                                        else if (stratum_submit(g_stratum,
                                                 blockhex))
                                             log_msg(">>> SUBMITTED via"
                                                     " stratum\n");
@@ -3628,7 +3685,7 @@ static void *worker_fn(void *arg) {
                                     char blockhex[16384];
                                     memset(blockhex, 0, sizeof(blockhex));
                                     if (assemble_mining_block_mpz(nonce_cur,
-                                            nAdd_prime, blockhex)) {
+                                            nAdd_prime, 0, blockhex)) {
                                         __sync_fetch_and_add(&stats_blocks, 1);
                                         log_file_only("Built blockhex: %s\n",
                                                       blockhex);
@@ -3642,8 +3699,10 @@ static void *worker_fn(void *arg) {
                                                     (unsigned)nonce_cur);
                                             __sync_fetch_and_add(&stats_submits, 1);
                                             if (g_stratum) {
-                                                verify_pow_hex(blockhex);
-                                                if (stratum_submit(g_stratum,
+                                                if (!verify_pow_hex(blockhex))
+                                                    log_msg(">>> SKIPPING invalid"
+                                                            " PoW (stale pass)\n");
+                                                else if (stratum_submit(g_stratum,
                                                         blockhex))
                                                     log_msg(">>> SUBMITTED via"
                                                             " stratum\n");
@@ -5124,7 +5183,7 @@ int main(int argc, char **argv) {
                                     char blockhex[16384];
                                     memset(blockhex, 0, sizeof(blockhex));
                                     if (assemble_mining_block_mpz(nonce_st,
-                                            nAdd_p, blockhex)) {
+                                            nAdd_p, 0, blockhex)) {
                                         __sync_fetch_and_add(&stats_blocks, 1);
                                         log_file_only("Built blockhex: %s\n",
                                                       blockhex);
@@ -5136,8 +5195,10 @@ int main(int argc, char **argv) {
                                             __sync_fetch_and_add(&stats_submits,
                                                                  1);
                                             if (g_stratum) {
-                                                verify_pow_hex(blockhex);
-                                                if (stratum_submit(g_stratum,
+                                                if (!verify_pow_hex(blockhex))
+                                                    log_msg(">>> SKIPPING invalid"
+                                                            " PoW (stale pass)\n");
+                                                else if (stratum_submit(g_stratum,
                                                         blockhex))
                                                     log_msg(">>> SUBMITTED via"
                                                             " stratum\n");
