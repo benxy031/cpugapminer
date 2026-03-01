@@ -8,9 +8,6 @@
 name: Windows Build
 
 on:
-  push:
-    branches: [master]
-    paths-ignore: ['**.md', 'docs/**', 'scripts/**']
   workflow_dispatch:
 
 jobs:
