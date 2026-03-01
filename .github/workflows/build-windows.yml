@@ -115,21 +115,24 @@ jobs:
       - name: Build (CUDA + RPC)
         shell: msys2 {0}
         run: |
-          # nvcc is installed in the system PATH by the cuda-toolkit action.
-          # Locate it and derive CUDA_PATH.
-          NVCC_PATH=$(which nvcc.exe 2>/dev/null || echo "")
-          if [ -z "$NVCC_PATH" ]; then
-            echo "ERROR: nvcc not found in PATH"
+          # The cuda-toolkit action sets CUDA_PATH as a Windows path
+          # (e.g. C:\Program Files\...).  MSYS2 doesn't inherit the
+          # Windows PATH additions, so we derive everything from that
+          # env-var and add the bin dir to PATH ourselves.
+          if [ -z "$CUDA_PATH" ]; then
+            echo "ERROR: CUDA_PATH env var is not set"
             exit 1
           fi
-          CUDA_BIN=$(dirname "$NVCC_PATH")
-          export CUDA_PATH=$(cygpath -u "$(dirname "$CUDA_BIN")")
-          echo "CUDA_PATH=$CUDA_PATH"
+          # Unix-style path for shell PATH, mixed (C:/) for compiler flags
+          CUDA_U=$(cygpath -u "$CUDA_PATH")
+          CUDA_M=$(cygpath -m "$CUDA_PATH")
+          export PATH="$CUDA_U/bin:$PATH"
+          echo "CUDA_PATH (mixed)=$CUDA_M"
           echo "nvcc=$(nvcc --version | tail -1)"
 
           make -f Makefile.mingw clean
           make -f Makefile.mingw WITH_RPC=1 WITH_CUDA=1 \
-            CUDA_PATH="$CUDA_PATH" \
+            CUDA_PATH="$CUDA_M" \
             CUDA_ARCH="-arch=sm_61 -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_86,code=sm_86 -gencode=arch=compute_89,code=sm_89"
 
       - name: Build gen_crt
@@ -169,15 +172,9 @@ jobs:
           done
 
           # CUDA runtime DLL
-          NVCC_PATH=$(which nvcc.exe 2>/dev/null || echo "")
-          if [ -n "$NVCC_PATH" ]; then
-            CUDA_BIN=$(dirname "$NVCC_PATH")
-            for dll in cudart64_*.dll; do
-              [ -f "$CUDA_BIN/$dll" ] && cp "$CUDA_BIN/$dll" dist/
-            done
-            # Also check bin directory
-            CUDA_ROOT=$(dirname "$CUDA_BIN")
-            for f in "$CUDA_ROOT"/bin/cudart64_*.dll; do
+          if [ -n "$CUDA_PATH" ]; then
+            CUDA_UNIX=$(cygpath -u "$CUDA_PATH")
+            for f in "$CUDA_UNIX"/bin/cudart64_*.dll; do
               [ -f "$f" ] && cp "$f" dist/
             done
           fi
