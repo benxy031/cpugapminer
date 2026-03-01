@@ -221,9 +221,13 @@ bin/gap_miner ... --log-file miner.log
 
 ### With CUDA GPU acceleration
 
-Add `--cuda` to offload Fermat testing to the GPU.  A batch accumulator
-collects candidates from multiple CRT windows and flushes them to the GPU
-in large batches (default 4096) for efficient SM utilization.
+Add `--cuda` to offload Fermat testing to the GPU.  This works on **all
+mining paths** — normal sieve, smart-scan, and CRT gap-solver.  In CRT
+mode, a batch accumulator collects candidates from multiple windows and
+flushes them to the GPU in large batches (default 4096) for efficient SM
+utilization.  In non-CRT mode, each sieve window already produces
+thousands of candidates, so they are sent directly to the GPU without
+accumulation.
 
 ```sh
 bin/gap_miner \
@@ -365,12 +369,21 @@ After sieving, each candidate undergoes a probabilistic primality test using
 - `--no-primality` -- skip testing entirely (benchmarking / sieve trust).
 
 When built with `WITH_CUDA=1` and run with `--cuda`, the miner offloads
-Fermat testing to the GPU.  A **batch accumulator** collects candidates from
-multiple CRT windows into a single large buffer (default 4096 candidates,
-configurable via `--gpu-batch N`) before flushing to the GPU.  This
-dramatically improves GPU SM utilization — instead of launching a kernel
-with ~38 candidates per window (wasting 99% of SMs), the GPU receives
-thousands of candidates per launch.
+Fermat testing to the GPU on **all mining paths**:
+
+- **CRT gap-solver** — A **batch accumulator** collects candidates from
+  multiple CRT windows into a single large buffer (default 4096 candidates,
+  configurable via `--gpu-batch N`) before flushing to the GPU.  This
+  dramatically improves GPU SM utilization — instead of launching a kernel
+  with ~38 candidates per window (wasting 99% of SMs), the GPU receives
+  thousands of candidates per launch.
+- **Normal sieve (non-CRT)** — Each sieve window already produces thousands
+  of candidates, so they are sent directly to the GPU via `gpu_batch_filter`
+  without accumulation.  Both the full-test path and the two-phase
+  smart-scan path (Phase 1 sampling + Phase 2 verification) use the GPU.
+  Cooperative Fermat is disabled (`coop.active=0`) so the helper thread
+  only sieves the next window and does not waste CPU on redundant Fermat
+  work.
 
 Each candidate is exported as a configurable-width number (default 1024-bit
 / 16×64-bit limbs); the CUDA kernel performs Montgomery-form modular
@@ -398,6 +411,10 @@ candidates via a shared lock-free atomic work index
 helper stores its finds in a separate buffer.  Results are merged and sorted
 before gap scanning.  On hyperthreaded CPUs, this turns idle HT siblings
 into productive Fermat workers.
+
+When `--cuda` is active, cooperative Fermat is bypassed entirely: the helper
+thread only sieves the next window and does not assist with primality
+testing, since all Fermat work is offloaded to the GPU.
 
 For large sieve windows (e.g. 33 554 432), the helper enters a **fermat-only
 mode** (state=3) on the last window of each pass—skipping the sieve entirely
@@ -558,10 +575,12 @@ flush.  Larger values indicate better GPU utilization.
 
 The GPU kernel uses configurable-width Montgomery multiplication (default
 16×64-bit limbs / 1024-bit, CIOS form) to compute `2^(n-1) mod n` for
-candidates.  A thread-local accumulator buffers candidates across CRT
-windows and flushes them to the GPU in batches of 4096+ (configurable via
-`--gpu-batch`).  Only probable primes are returned to the CPU for gap
-scanning.  Multiple GPUs are supported via `--cuda 0,1`.
+candidates in parallel.  In CRT mode, a thread-local accumulator buffers
+candidates across windows and flushes them to the GPU in batches of 4096+
+(configurable via `--gpu-batch`).  In non-CRT mode, each sieve window
+already produces thousands of candidates, so they are sent directly to the
+GPU without accumulation.  Only probable primes are returned to the CPU for
+gap scanning.  Multiple GPUs are supported via `--cuda 0,1`.
 
 ### Key optimizations
 
@@ -607,13 +626,15 @@ scanning.  Multiple GPUs are supported via `--cuda 0,1`.
 
 10. **CUDA GPU Fermat** -- Batch Fermat primality testing on NVIDIA GPUs
     using a configurable-width Montgomery multiplication kernel (CIOS form,
-    default 1024-bit / 16 limbs).  A thread-local **batch accumulator**
-    collects candidates from multiple CRT windows (~38 survivors each)
-    into a single large GPU buffer (default 4096, `--gpu-batch N`), then
-    flushes them in one kernel launch.  This transforms tiny per-window
-    batches into GPU-filling workloads — 2.6× speedup on an RTX 3060 at
-    shift 512.  Multiple GPUs are supported via `--cuda 0,1` with
-    round-robin thread assignment.
+    default 1024-bit / 16 limbs).  Works on **all mining paths**: CRT
+    gap-solver uses a thread-local **batch accumulator** to collect
+    candidates from multiple windows (~38 survivors each) into a single
+    large GPU buffer (default 4096, `--gpu-batch N`), transforming tiny
+    per-window batches into GPU-filling workloads — 2.6× speedup on an
+    RTX 3060 at shift 512.  Non-CRT paths (full-test and smart-scan)
+    send entire sieve windows directly to the GPU.  Cooperative Fermat
+    is disabled when GPU is active so the helper thread only sieves.
+    Multiple GPUs supported via `--cuda 0,1` with round-robin dispatch.
 
 > **Historical note:** an earlier Barrett-reduction path for fast modular
 > exponentiation contained a correctness bug for large moduli and was
@@ -654,7 +675,7 @@ scanning.  Multiple GPUs are supported via `--cuda 0,1`.
 | `--selftest`          | off           | Run internal prime checks and exit |
 | `--p P --q Q`         | --            | Force primes for `--build-only` runs |
 | `--cuda [DEV,...]`    | off           | Enable CUDA GPU Fermat testing (requires `WITH_CUDA=1` build).  Optional comma-separated `DEV` list selects GPU devices (e.g. `--cuda 0,1`).  Up to 8 GPUs, round-robin dispatch. |
-| `--gpu-batch N`       | 4096          | Accumulate N candidates across CRT windows before flushing to GPU.  Larger values improve GPU utilization at the cost of slightly delayed gap processing. |
+| `--gpu-batch N`       | 4096          | Accumulate N candidates across CRT windows before flushing to GPU (CRT mode only; non-CRT paths send full sieve windows directly).  Larger values improve GPU utilization at the cost of slightly delayed gap processing. |
 | `--stratum HOST:PORT` | --            | Connect to a Gapcoin stratum pool instead of using RPC/GBT (requires `WITH_RPC=1` build). |
 | `-u` / `--user`       | --            | Alias for `--rpc-user` |
 | `--pass`              | --            | Alias for `--rpc-pass` |
