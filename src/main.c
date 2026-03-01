@@ -1943,20 +1943,23 @@ static int build_mining_pass(const char *url, const char *user, const char *pass
     char prevhex[65] = {0};
     for (int i = 0; i < 32; i++)
         sprintf(prevhex + 2*i, "%02x", hdr80[4 + 31 - i]);
-    /* find nNonce so SHA256d(hdr80)[31] >= 0x80.
-     * Gapcoin CBlockHeader::GetHash() = SHA256d(version..nNonce) = 80 bytes.
-     * nNonce is at offset 76 (standard Bitcoin nonce position).
+    /* find nNonce so SHA256d(hdr80||nNonce)[31] >= 0x80.
+     * Gapcoin CBlockHeader::GetHash() = Hash(BEGIN(nVersion), END(nNonce)).
+     *   Header layout: version(4)+prevhash(32)+merkle(32)+time(4)+nDifficulty(8)
+     *   = 80 bytes.  nNonce(4) is appended → SHA256d(84 bytes).
+     *   nDifficulty is uint64_t (8 bytes at offset 72), NOT Bitcoin's 4-byte nBits.
      * Gapcoin requires mpz_sizeinbase(hash,2) == 256 → sha_raw[31] >= 0x80. */
-    uint8_t sha_raw[32], h256[32];
+    uint8_t hdr84[84], sha_raw[32], h256[32];
     uint32_t nonce = 0;
     for (;;) {
-        memcpy(hdr80 + 76, &nonce, 4);  /* nNonce at offset 76 */
-        double_sha256(hdr80, 80, sha_raw);
+        memcpy(hdr84, hdr80, 80);
+        memcpy(hdr84 + 80, &nonce, 4);  /* nNonce appended after 80-byte header */
+        double_sha256(hdr84, 84, sha_raw);
         if (sha_raw[31] >= 0x80) break;
         if (++nonce == 0) break;
     }
     for (int k = 0; k < 32; k++) h256[k] = sha_raw[31-k];
-    /* store in g_pass (hdr80 now has the good nonce at offset 76) */
+    /* store in g_pass (hdr80 stays unmodified — nonce is separate) */
     memcpy(g_pass.h256,  h256,  32);
     memcpy(g_pass.hdr80, hdr80, 80);
     g_pass.nonce  = nonce;
@@ -1973,15 +1976,14 @@ static int build_mining_pass(const char *url, const char *user, const char *pass
 
 static int assemble_mining_block(uint64_t nadd_val, char out_hex[16384]) {
     /* getwork submit format: hdr80(80) + nNonce(4,LE) + nShift(2,LE) + nAdd(raw LE, ≥ 1 byte)
-     * nNonce lives at offset 76 in the 80-byte header (standard Bitcoin position).
-     * g_pass.hdr80 already has the correct nonce from build_mining_pass().
-     * The redundant nNonce copy at offset 80 is kept for gapcoind getwork
-     * backward compatibility.
+     * Gapcoin header:  version(4)+prevhash(32)+merkle(32)+time(4)+nDifficulty(8) = 80 bytes.
+     * nNonce(4) goes at offset 80, nShift(2) at offset 84, nAdd at offset 86+.
+     * gapcoind casts vchData to CBlock*; nNonce is at offset 80.
      * nAdd is raw little-endian bytes, NO compact-size prefix. */
     unsigned char buf[512];
     unsigned char *p = buf;
-    memcpy(p, g_pass.hdr80,    80); p += 80;  /* header with nonce at offset 76 */
-    memcpy(p, &g_pass.nonce,    4); p += 4;   /* redundant nNonce copy (offset 80) */
+    memcpy(p, g_pass.hdr80,    80); p += 80;  /* header unchanged */
+    memcpy(p, &g_pass.nonce,    4); p += 4;   /* nNonce LE (offset 80) */
     memcpy(p, &g_pass.nshift,   2); p += 2;   /* nShift LE (offset 84) */
     /* nAdd raw LE bytes, minimum 1 byte */
     unsigned char nb[8];
@@ -2005,10 +2007,8 @@ static int assemble_mining_block_mpz(uint32_t mining_nonce, mpz_t nadd_val,
                                      char out_hex[16384]) {
     unsigned char buf[1024]; /* enough for nAdd up to ~7400 bits */
     unsigned char *p = buf;
-    memcpy(p, g_pass.hdr80,    80);
-    memcpy(p + 76, &mining_nonce, 4); /* set nonce at offset 76 in header */
-    p += 80;
-    memcpy(p, &mining_nonce,    4); p += 4; /* redundant copy at offset 80 */
+    memcpy(p, g_pass.hdr80,    80); p += 80;
+    memcpy(p, &mining_nonce,    4); p += 4; /* nNonce at offset 80 */
     memcpy(p, &g_pass.nshift,   2); p += 2;
     /* nAdd raw LE bytes */
     if (mpz_sgn(nadd_val) == 0) {
@@ -2039,13 +2039,15 @@ static int build_mining_pass_stratum(const char *data_hex, uint64_t ndiff, int s
     char prevhex[65] = {0};
     for (int i = 0; i < 32; i++)
         sprintf(prevhex + 2*i, "%02x", hdr80[4 + 31 - i]);
-    /* find nNonce so SHA256d(hdr80)[31] >= 0x80
-     * nNonce is at offset 76 in the 80-byte header (standard position). */
-    uint8_t sha_raw[32], h256[32];
+    /* find nNonce so SHA256d(hdr80||nNonce)[31] >= 0x80
+     * Gapcoin header = 80 bytes (nDifficulty is 8 bytes, not 4).
+     * nNonce(4) is appended → SHA256d(84 bytes). */
+    uint8_t hdr84[84], sha_raw[32], h256[32];
     uint32_t nonce = 0;
     for (;;) {
-        memcpy(hdr80 + 76, &nonce, 4);
-        double_sha256(hdr80, 80, sha_raw);
+        memcpy(hdr84, hdr80, 80);
+        memcpy(hdr84 + 80, &nonce, 4);
+        double_sha256(hdr84, 84, sha_raw);
         if (sha_raw[31] >= 0x80) break;
         if (++nonce == 0) break;
     }
@@ -3351,10 +3353,10 @@ static void *worker_fn(void *arg) {
 #endif
 
                 /* ── Compute SHA256d for this nonce ── */
-                uint8_t hdr80_tmp[80], sha_raw[32], h256_nonce[32];
-                memcpy(hdr80_tmp, g_pass.hdr80, 80);
-                memcpy(hdr80_tmp + 76, &nonce_cur, 4);
-                double_sha256(hdr80_tmp, 80, sha_raw);
+                uint8_t hdr84[84], sha_raw[32], h256_nonce[32];
+                memcpy(hdr84, g_pass.hdr80, 80);
+                memcpy(hdr84 + 80, &nonce_cur, 4);
+                double_sha256(hdr84, 84, sha_raw);
 
                 if (sha_raw[31] < 0x80) {
                     nonce_cur += (uint32_t)nth_local;
@@ -4879,10 +4881,10 @@ int main(int argc, char **argv) {
 
                 while (keep_going && !g_abort_pass) {
                     /* SHA256d for this nonce */
-                    uint8_t hdr80_st[80], sha_raw_st[32], h256_st[32];
-                    memcpy(hdr80_st, g_pass.hdr80, 80);
-                    memcpy(hdr80_st + 76, &nonce_st, 4);
-                    double_sha256(hdr80_st, 80, sha_raw_st);
+                    uint8_t hdr84_st[84], sha_raw_st[32], h256_st[32];
+                    memcpy(hdr84_st, g_pass.hdr80, 80);
+                    memcpy(hdr84_st + 80, &nonce_st, 4);
+                    double_sha256(hdr84_st, 84, sha_raw_st);
 
                     if (sha_raw_st[31] < 0x80) { nonce_st++; continue; }
 
