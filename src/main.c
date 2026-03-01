@@ -5560,6 +5560,16 @@ int main(int argc, char **argv) {
             free(threads);
             free(wargs);
 
+#ifdef WITH_RPC
+            /* Always re-sync h256 from g_pass BEFORE checking for more work.
+               Worker thread 0 may have already called build_mining_pass_stratum
+               (consuming the new-work event and updating g_pass) and set
+               g_abort_pass=1.  If we only update h256 when stratum_poll_new_work
+               returns true, h256 becomes stale — workers mine with one base but
+               blocks are assembled with a different header. */
+            memcpy(h256, g_pass.h256, 32);
+#endif
+
             if (keep_going && rpc_url) {
 #ifdef WITH_RPC
               if (g_stratum) {
