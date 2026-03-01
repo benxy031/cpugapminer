@@ -73,8 +73,12 @@ static inline int nanosleep(const struct timespec *req, struct timespec *rem) {
 #endif
 
 /* ── clock_gettime ── */
+/* MinGW winpthreads already provides clock_gettime via pthread_time.h.
+   Only define our fallback for MSVC or if genuinely missing. */
+#if defined(_MSC_VER) || (!defined(__MINGW32__) && !defined(CLOCK_REALTIME))
 #ifndef CLOCK_REALTIME
 #define CLOCK_REALTIME 0
+#endif
 static inline int clock_gettime(int clk_id, struct timespec *ts) {
     (void)clk_id;
     FILETIME ft;

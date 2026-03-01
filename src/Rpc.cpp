@@ -218,7 +218,7 @@ BlockHeader *Rpc::getwork(bool do_lp) {
   struct curl_slist *header = NULL;
   static bool init_msg = false;
 
-  sprintf(content_len, "Content-Length: %lu", getwork_rpccmd.length());
+  sprintf(content_len, "Content-Length: %llu", (unsigned long long)getwork_rpccmd.length());
   header = curl_slist_append(header, "Content-Type: application/json");
   header = curl_slist_append(header, content_len);
   header = curl_slist_append(header, "User-Agent: " USER_AGENT);
@@ -358,7 +358,7 @@ bool Rpc::sendwork(BlockHeader *header) {
   struct curl_slist *httphead = NULL;
   string hex = data.str();
 
-  sprintf(content_len, "Content-Length: %lu", hex.length());
+  sprintf(content_len, "Content-Length: %llu", (unsigned long long)hex.length());
   httphead = curl_slist_append(httphead, "Content-Type: application/json");
   httphead = curl_slist_append(httphead, content_len);
   httphead = curl_slist_append(httphead, "User-Agent: " USER_AGENT);
