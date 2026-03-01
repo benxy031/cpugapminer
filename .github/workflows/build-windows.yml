@@ -129,6 +129,11 @@ jobs:
           CUDA_M=$(cygpath -m "$CUDA_PATH")
           echo "CUDA_PATH (mixed)=$CUDA_M"
 
+          # The MSVC-compiled CUDA object contains .drectve sections with
+          # MSVC-specific /DEFAULTLIB: directives that corrupt MinGW's
+          # linker and break CRT symbol resolution.  Strip them.
+          objcopy --remove-section .drectve src/gpu_fermat.o
+
           # gpu_fermat.o was already compiled by nvcc+MSVC in the previous step.
           # Build everything else and link.  Make will skip the .cu rule because
           # the .o is already present and newer than the source.
