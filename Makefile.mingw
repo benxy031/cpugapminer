@@ -13,11 +13,19 @@
 
 CC=gcc
 CXX=g++
-CFLAGS=-O3 -std=c11 -Wall -Wextra -mtune=native -flto
-CXXFLAGS=-O3 -std=c++17 -Wall -Wextra -mtune=native -flto
-LDFLAGS=-flto
+CFLAGS=-O3 -std=c11 -Wall -Wextra -mtune=native
+CXXFLAGS=-O3 -std=c++17 -Wall -Wextra -mtune=native
+LDFLAGS=
 SRCDIR=src
 BINDIR=bin
+
+# LTO (link-time optimisation).  Disable with NO_LTO=1 when linking
+# MSVC-compiled CUDA objects, since MinGW's LTO can't process MSVC COFF.
+ifndef NO_LTO
+  CFLAGS+=-flto
+  CXXFLAGS+=-flto
+  LDFLAGS+=-flto
+endif
 TARGET=$(BINDIR)/gap_miner.exe
 
 ifdef GMP_PREFIX

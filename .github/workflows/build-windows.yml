@@ -117,7 +117,7 @@ jobs:
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
           nvcc --version
-          nvcc -O3 -arch=sm_61 -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_86,code=sm_86 -gencode=arch=compute_89,code=sm_89 -DGPU_NLIMBS=16 -c src\gpu_fermat.cu -o src\gpu_fermat.o
+          nvcc -O3 -arch=sm_61 -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_86,code=sm_86 -gencode=arch=compute_89,code=sm_89 -DGPU_NLIMBS=16 -Xcompiler "/GS- /Zl" -c src\gpu_fermat.cu -o src\gpu_fermat.o
 
       - name: Build (CPU + RPC, link CUDA object)
         shell: msys2 {0}
@@ -132,8 +132,9 @@ jobs:
           # gpu_fermat.o was already compiled by nvcc+MSVC in the previous step.
           # Build everything else and link.  Make will skip the .cu rule because
           # the .o is already present and newer than the source.
+          # NO_LTO=1 — MinGW's LTO cannot process MSVC COFF objects.
           make -f Makefile.mingw WITH_RPC=1 WITH_CUDA=1 \
-            CUDA_PATH="$CUDA_M"
+            CUDA_PATH="$CUDA_M" NO_LTO=1
 
       - name: Build gen_crt
         run: make -f Makefile.mingw gen_crt
