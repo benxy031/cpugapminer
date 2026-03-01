@@ -1841,7 +1841,7 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
     char tmphex[1024*4]; size_t dbg_len = full_len < 200 ? full_len : 200; bytes_to_hex(full, dbg_len, tmphex);
     char headerhex[200]; bytes_to_hex(headerbin, header_size, headerhex); headerhex[header_size*2]='\0';
     log_file_only("DEBUG block header hex: %s\n", headerhex);
-    log_file_only("DEBUG txcount=%zu first_bytes=%s\n", (size_t)total_txs, tmphex + 160);
+    log_file_only("DEBUG txcount=%lu first_bytes=%s\n", (unsigned long)total_txs, tmphex + 160);
 
     // Verify that the coinbase tx bytes appear immediately after header + txcount varint
     if (txraw_lens[0] > 0) {
@@ -1878,7 +1878,7 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
         if (bf) {
             fwrite(full, 1, full_len, bf);
             fclose(bf);
-            log_file_only("WROTE raw block binary: %s (len=%zu)\n", binpath, full_len);
+            log_file_only("WROTE raw block binary: %s (len=%lu)\n", binpath, (unsigned long)full_len);
         } else {
             log_msg("FAILED to write raw block binary: %s\n", binpath);
         }
@@ -1886,7 +1886,7 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
         if (hf) {
             fprintf(hf, "%s", outhex);
             fclose(hf);
-            log_file_only("WROTE raw block hex: %s (chars=%zu)\n", hexpath, strlen(outhex));
+            log_file_only("WROTE raw block hex: %s (chars=%lu)\n", hexpath, (unsigned long)strlen(outhex));
         } else {
             log_msg("FAILED to write raw block hex: %s\n", hexpath);
         }
