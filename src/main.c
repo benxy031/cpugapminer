@@ -758,11 +758,14 @@ static void print_stats(void) {
     }
 
     log_msg("STATS: elapsed=%.1fs  sieved=%llu (%.0f/s)  tested=%llu (%.0f/s)  "
+            "primes=%llu (%.1f%%)  "
             "gaps=%llu (%.3f/s)  built=%llu  submitted=%llu  accepted=%llu  "
             "prob=%.2e/pair  est=%s (target=%.2f)",
             elapsed,
             (unsigned long long)stats_sieved,  sieve_rate,
             (unsigned long long)stats_tested,  test_rate,
+            (unsigned long long)stats_primes_found,
+            (stats_tested > 0) ? 100.0 * (double)stats_primes_found / (double)stats_tested : 0.0,
             (unsigned long long)stats_gaps,    gap_rate,
             (unsigned long long)stats_blocks,
             (unsigned long long)stats_submits,
