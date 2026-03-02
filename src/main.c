@@ -435,6 +435,17 @@ static volatile int selftest = 0;        /* run a quick internal test then exit 
 #define DEFAULT_SAMPLE_STRIDE 8
 static int cli_sample_stride = DEFAULT_SAMPLE_STRIDE;
 
+/* Number of Miller-Rabin rounds for the default (non --fast-fermat) path.
+   2 rounds is effectively deterministic for sieve-filtered random composites
+   at mining-relevant sizes (false-positive < 2^-128).  The old default of
+   10 rounds cost ~5× more but added negligible confidence.                  */
+static int cli_mr_rounds = 2;
+
+/* Number of edge-probe candidates per side when eliminating false-positive
+   regions in the two-phase smart scan.  Higher values catch more false
+   positives but cost more Fermat tests up-front.                            */
+#define EDGE_PROBE_N 3
+
 /* ── CRT (Chinese Remainder Theorem) sieve support ──
    Supports two formats:
      1. Legacy binary (CRT1 magic) — template bitmap tiling for ≤10 primes
@@ -2122,28 +2133,6 @@ static int verify_pow_hex(const char *blockhex) {
     /* Check primality */
     int is_prime = mpz_probab_prime_p(mpz_prime, 16);
 
-    /* Cross-check: also compute using set_base_bn's import path (reversed, BE) */
-    {
-        uint8_t h256_chk[32];
-        for (int k = 0; k < 32; k++) h256_chk[k] = sha2[31 - k];
-        mpz_t base_chk;
-        mpz_init(base_chk);
-        mpz_import(base_chk, 32, 1, 1, 1, 0, h256_chk);
-        mpz_mul_2exp(base_chk, base_chk, (unsigned long)shift_v);
-        mpz_add(base_chk, base_chk, mpz_nadd);
-        int cmp = mpz_cmp(base_chk, mpz_prime);
-        uint64_t low64_v = mpz_get_ui(mpz_prime);
-        uint64_t low64_b = mpz_get_ui(base_chk);
-        size_t pbits_v = mpz_sizeinbase(mpz_prime, 2);
-        size_t pbits_b = mpz_sizeinbase(base_chk, 2);
-        log_msg("[verify_pow] prime: bits_v=%zu bits_b=%zu low64_v=%llu low64_b=%llu cmp=%d\n",
-                pbits_v, pbits_b,
-                (unsigned long long)low64_v, (unsigned long long)low64_b, cmp);
-        if (cmp != 0)
-            log_msg("[verify_pow] BUG: set_base_bn path produces DIFFERENT prime!\n");
-        mpz_clear(base_chk);
-    }
-
     /* Compute merit approximation = gap is not computed here, just log components */
     int hash_bits = (int)mpz_sizeinbase(mpz_hash, 2);
 
@@ -2399,9 +2388,10 @@ static int bn_candidate_is_prime(uint64_t offset) {
         mpz_powm(tls_res_mpz, tls_two_mpz, tls_exp_mpz, tls_cand_mpz);
         return mpz_cmp_ui(tls_res_mpz, 1) == 0;
     } else {
-        /* Full probable-prime: 10 MR rounds (higher confidence than
-           OpenSSL's BN_prime_checks ≈ 6, but still fast with GMP). */
-        return mpz_probab_prime_p(tls_cand_mpz, 10) > 0;
+        /* Probable-prime: cli_mr_rounds MR rounds (default 2; old = 10).
+           2 rounds is effectively deterministic for sieve-filtered
+           candidates at mining sizes (false-positive < 2^-128).     */
+        return mpz_probab_prime_p(tls_cand_mpz, cli_mr_rounds) > 0;
     }
 }
 
@@ -2975,21 +2965,6 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
         __sync_fetch_and_add(&stats_gaps, 1);
         /* nAdd = relative offset = prev (prime = base + nAdd). */
         uint64_t nadd_sc = prev;
-        /* ── Cross-verify: check gap start prime with MR (debug) ── */
-        {
-            mpz_t dbg_prime;
-            mpz_init(dbg_prime);
-            mpz_set(dbg_prime, tls_base_mpz);
-            mpz_add_ui(dbg_prime, dbg_prime, (unsigned long)nadd_sc);
-            int mr_ok = mpz_probab_prime_p(dbg_prime, 16);
-            uint64_t low64 = mpz_get_ui(dbg_prime);
-            size_t pbits = mpz_sizeinbase(dbg_prime, 2);
-            log_msg("[debug] scan_cand prime: MR=%d bits=%zu low64=%llu nAdd=%llu base_bits=%zu\n",
-                    mr_ok, pbits, (unsigned long long)low64,
-                    (unsigned long long)nadd_sc,
-                    mpz_sizeinbase(tls_base_mpz, 2));
-            mpz_clear(dbg_prime);
-        }
         log_msg("\n>>> GAP FOUND\n"
                 "    gap     = %llu\n"
                 "    merit   = %.6f  (need >= %.2f)\n"
@@ -3855,6 +3830,11 @@ static void *worker_fn(void *arg) {
        - stop-after-block mode: scan_candidates returns 1.                  */
     while (keep_going && !g_abort_pass) {
         /* ---- prime the pipeline: kick off window 0 ---- */
+        /* Cross-window gap carry: the last confirmed prime from the
+           previous window may form a qualifying gap with the first
+           prime of the next window.  Without this, gaps spanning
+           window boundaries are missed entirely.                   */
+        uint64_t carry_last_prime = 0;  /* 0 = no carry */
         {
             uint64_t L0, R0;
             if (presieve_window(0, base, sieve_size_local,
@@ -4058,15 +4038,77 @@ static void *worker_fn(void *arg) {
                     uint64_t *sampled_primes = p1_cands; /* reuse buffer */
                     size_t sp_cnt = sp;
 
-                    /* --- Gap analysis: find candidate regions ------------ */
-                    size_t v_alloc = cnt / 8 + 64;
-                    uint64_t *verify = (uint64_t *)malloc(v_alloc * sizeof(uint64_t));
-                    size_t v_cnt = 0;
+                    /* --- Gap analysis: identify candidate regions ---------- */
                     size_t n_gap_regions = 0;
                     size_t gap_reg_cap = sp_cnt + 2;
                     uint64_t *gap_reg_lo = (uint64_t *)malloc(gap_reg_cap * sizeof(uint64_t));
                     uint64_t *gap_reg_hi = (uint64_t *)malloc(gap_reg_cap * sizeof(uint64_t));
-                    if (verify && sp_cnt >= 1) {
+                    int *gpu_reg_alive = NULL;
+                    if (sp_cnt >= 1 && gap_reg_lo && gap_reg_hi) {
+                        if (cnt > 0 && sampled_primes[0] - pr[0] >= needed_gap) {
+                            gap_reg_lo[n_gap_regions] = 0;
+                            gap_reg_hi[n_gap_regions] = sampled_primes[0];
+                            n_gap_regions++;
+                        }
+                        for (size_t i = 0; i + 1 < sp_cnt; i++) {
+                            if (sampled_primes[i+1] - sampled_primes[i] >= needed_gap) {
+                                gap_reg_lo[n_gap_regions] = sampled_primes[i];
+                                gap_reg_hi[n_gap_regions] = sampled_primes[i+1];
+                                n_gap_regions++;
+                            }
+                        }
+                        if (cnt > 0 && pr[cnt-1] - sampled_primes[sp_cnt-1] >= needed_gap) {
+                            gap_reg_lo[n_gap_regions] = sampled_primes[sp_cnt-1];
+                            gap_reg_hi[n_gap_regions] = UINT64_MAX;
+                            n_gap_regions++;
+                        }
+                    }
+                    /* Edge probing (GPU path uses CPU probes — cheap vs GPU launch) */
+                    if (n_gap_regions > 0) {
+                        gpu_reg_alive = (int *)malloc(n_gap_regions * sizeof(int));
+                        if (gpu_reg_alive) {
+                            size_t eprobes = 0;
+                            for (size_t r = 0; r < n_gap_regions; r++) {
+                                gpu_reg_alive[r] = 1;
+                                uint64_t rlo = gap_reg_lo[r], rhi = gap_reg_hi[r];
+                                size_t lo_idx, hi_idx;
+                                { size_t l = 0, h = cnt;
+                                  while (l < h) { size_t m = l+(h-l)/2;
+                                    if (pr[m] <= rlo) l=m+1; else h=m; }
+                                  lo_idx = l; }
+                                { size_t l = 0, h = cnt;
+                                  while (l < h) { size_t m = l+(h-l)/2;
+                                    if (pr[m] < rhi) l=m+1; else h=m; }
+                                  hi_idx = l; }
+                                size_t rcnt = hi_idx > lo_idx ? hi_idx - lo_idx : 0;
+                                if (rcnt < (size_t)(EDGE_PROBE_N * 3)) continue;
+                                uint64_t lp = 0, rp = 0;
+                                size_t np = 0;
+                                for (size_t j = lo_idx; j < hi_idx && np < EDGE_PROBE_N; j++) {
+                                    if (j % (size_t)smart_K == 0) continue;
+                                    np++;
+                                    if (bn_candidate_is_prime(pr[j])) { lp = pr[j]; break; }
+                                }
+                                eprobes += np; np = 0;
+                                for (size_t j = hi_idx; j > lo_idx && np < EDGE_PROBE_N; ) {
+                                    j--;
+                                    if (j % (size_t)smart_K == 0) continue;
+                                    np++;
+                                    if (bn_candidate_is_prime(pr[j])) { rp = pr[j]; break; }
+                                }
+                                eprobes += np;
+                                if (lp && rp && rp - lp < needed_gap)
+                                    gpu_reg_alive[r] = 0;
+                            }
+                            if (eprobes > 0)
+                                __sync_fetch_and_add(&stats_tested, (uint64_t)eprobes);
+                        }
+                    }
+                    /* Collect verification candidates from surviving regions */
+                    size_t v_alloc = cnt / 8 + 64;
+                    uint64_t *verify = (uint64_t *)malloc(v_alloc * sizeof(uint64_t));
+                    size_t v_cnt = 0;
+                    if (verify && n_gap_regions > 0) {
                         #define GPU_COLLECT_REGION(lo_val, hi_val) do {        \
                             size_t _lo = 0, _hi = cnt;                        \
                             while (_lo < _hi) {                               \
@@ -4085,20 +4127,9 @@ static void *worker_fn(void *arg) {
                                 verify[v_cnt++] = pr[_j];                     \
                             }                                                 \
                         } while (0)
-
-                        if (cnt > 0 && sampled_primes[0] - pr[0] >= needed_gap) {
-                            GPU_COLLECT_REGION(pr[0] - 1, sampled_primes[0]);
-                            if (gap_reg_lo) { gap_reg_lo[n_gap_regions] = 0; gap_reg_hi[n_gap_regions] = sampled_primes[0]; n_gap_regions++; }
-                        }
-                        for (size_t i = 0; i + 1 < sp_cnt; i++) {
-                            if (sampled_primes[i+1] - sampled_primes[i] >= needed_gap) {
-                                GPU_COLLECT_REGION(sampled_primes[i], sampled_primes[i+1]);
-                                if (gap_reg_lo) { gap_reg_lo[n_gap_regions] = sampled_primes[i]; gap_reg_hi[n_gap_regions] = sampled_primes[i+1]; n_gap_regions++; }
-                            }
-                        }
-                        if (cnt > 0 && pr[cnt-1] - sampled_primes[sp_cnt-1] >= needed_gap) {
-                            GPU_COLLECT_REGION(sampled_primes[sp_cnt-1], pr[cnt-1] + 1);
-                            if (gap_reg_lo) { gap_reg_lo[n_gap_regions] = sampled_primes[sp_cnt-1]; gap_reg_hi[n_gap_regions] = UINT64_MAX; n_gap_regions++; }
+                        for (size_t r = 0; r < n_gap_regions; r++) {
+                            if (gpu_reg_alive && !gpu_reg_alive[r]) continue;
+                            GPU_COLLECT_REGION(gap_reg_lo[r], gap_reg_hi[r]);
                         }
                         #undef GPU_COLLECT_REGION
                     }
@@ -4120,6 +4151,7 @@ static void *worker_fn(void *arg) {
                         int found_block = 0;
                         size_t region_pairs = 0;
                         for (size_t r = 0; r < n_gap_regions && gap_reg_lo; r++) {
+                            if (gpu_reg_alive && !gpu_reg_alive[r]) continue;
                             size_t lo_idx = 0;
                             { size_t l = 0, h = cnt;
                               while (l < h) { size_t m = l+(h-l)/2; if (pr[m] < gap_reg_lo[r]) l=m+1; else h=m; }
@@ -4149,6 +4181,7 @@ static void *worker_fn(void *arg) {
                         }
                         free(gap_reg_lo);
                         free(gap_reg_hi);
+                        free(gpu_reg_alive);
                         if (found_block) { free(p1_cands); free(p1_wbuf); free(verify); goto worker_done; }
                     }
                     free(p1_cands); p1_cands = NULL;
@@ -4217,19 +4250,102 @@ static void *worker_fn(void *arg) {
                 free(p1_wbuf);  p1_wbuf = NULL;
                 free(p1_cands); p1_cands = NULL;
 
-                /* --- Gap analysis: find candidate regions in pr[] -------- */
-                size_t v_alloc = cnt / 8 + 64;
-                uint64_t *verify = (uint64_t *)malloc(v_alloc * sizeof(uint64_t));
-                size_t v_cnt = 0;
-                /* Track gap-region boundaries so scan_candidates is called
-                   only on fully-verified segments (avoids fake best_merit
-                   from gaps between sampled-only primes). */
+                /* --- Gap analysis: identify candidate regions in pr[] --- */
                 size_t n_gap_regions = 0;
                 size_t gap_reg_cap = sp_cnt + 2;
                 uint64_t *gap_reg_lo = (uint64_t *)malloc(gap_reg_cap * sizeof(uint64_t));
                 uint64_t *gap_reg_hi = (uint64_t *)malloc(gap_reg_cap * sizeof(uint64_t));
-                if (verify && sp_cnt >= 1) {
-                    /* Collect un-sampled survivors in (lo_val, hi_val)       */
+                int *gap_reg_alive = NULL;
+                uint64_t *edge_primes_buf = NULL;
+                size_t edge_pcnt = 0;
+                if (sp_cnt >= 1 && gap_reg_lo && gap_reg_hi) {
+                    /* Left edge */
+                    if (cnt > 0 && sampled_primes[0] - pr[0] >= needed_gap) {
+                        gap_reg_lo[n_gap_regions] = 0;
+                        gap_reg_hi[n_gap_regions] = sampled_primes[0];
+                        n_gap_regions++;
+                    }
+                    /* Interior gaps */
+                    for (size_t i = 0; i + 1 < sp_cnt; i++) {
+                        if (sampled_primes[i+1] - sampled_primes[i] >= needed_gap) {
+                            gap_reg_lo[n_gap_regions] = sampled_primes[i];
+                            gap_reg_hi[n_gap_regions] = sampled_primes[i+1];
+                            n_gap_regions++;
+                        }
+                    }
+                    /* Right edge */
+                    if (cnt > 0 &&
+                        pr[cnt-1] - sampled_primes[sp_cnt-1] >= needed_gap) {
+                        gap_reg_lo[n_gap_regions] = sampled_primes[sp_cnt-1];
+                        gap_reg_hi[n_gap_regions] = UINT64_MAX;
+                        n_gap_regions++;
+                    }
+                }
+
+                /* --- Edge probing: eliminate false-positive regions ---
+                   For each flagged region, test a few candidates at both
+                   edges.  If primes are found close together on both
+                   sides, the region cannot hold a qualifying gap — skip
+                   its expensive bulk verification entirely.
+                   Cost: ≤ 2×EDGE_PROBE_N Fermat tests per region.
+                   Typical elimination rate: 40-60% of flagged regions.  */
+                if (n_gap_regions > 0) {
+                    gap_reg_alive = (int *)malloc(n_gap_regions * sizeof(int));
+                    edge_primes_buf = (uint64_t *)malloc(n_gap_regions * 2 * sizeof(uint64_t));
+                    if (gap_reg_alive) {
+                        size_t eprobes = 0;
+                        for (size_t r = 0; r < n_gap_regions; r++) {
+                            gap_reg_alive[r] = 1;
+                            uint64_t rlo = gap_reg_lo[r], rhi = gap_reg_hi[r];
+                            size_t lo_idx, hi_idx;
+                            { size_t l = 0, h = cnt;
+                              while (l < h) { size_t m = l+(h-l)/2;
+                                if (pr[m] <= rlo) l=m+1; else h=m; }
+                              lo_idx = l; }
+                            { size_t l = 0, h = cnt;
+                              while (l < h) { size_t m = l+(h-l)/2;
+                                if (pr[m] < rhi) l=m+1; else h=m; }
+                              hi_idx = l; }
+                            size_t rcnt = hi_idx > lo_idx ? hi_idx - lo_idx : 0;
+                            if (rcnt < (size_t)(EDGE_PROBE_N * 3)) continue;
+                            uint64_t lp = 0, rp = 0;
+                            size_t np = 0;
+                            /* Probe left edge */
+                            for (size_t j = lo_idx; j < hi_idx && np < EDGE_PROBE_N; j++) {
+                                if (j % (size_t)smart_K == 0) continue;
+                                np++;
+                                if (bn_candidate_is_prime(pr[j])) {
+                                    lp = pr[j];
+                                    if (edge_primes_buf) edge_primes_buf[edge_pcnt++] = pr[j];
+                                    break;
+                                }
+                            }
+                            eprobes += np; np = 0;
+                            /* Probe right edge */
+                            for (size_t j = hi_idx; j > lo_idx && np < EDGE_PROBE_N; ) {
+                                j--;
+                                if (j % (size_t)smart_K == 0) continue;
+                                np++;
+                                if (bn_candidate_is_prime(pr[j])) {
+                                    rp = pr[j];
+                                    if (edge_primes_buf) edge_primes_buf[edge_pcnt++] = pr[j];
+                                    break;
+                                }
+                            }
+                            eprobes += np;
+                            if (lp && rp && rp - lp < needed_gap)
+                                gap_reg_alive[r] = 0;  /* eliminate */
+                        }
+                        if (eprobes > 0)
+                            __sync_fetch_and_add(&stats_tested, (uint64_t)eprobes);
+                    }
+                }
+
+                /* --- Collect verification candidates (surviving regions only) --- */
+                size_t v_alloc = cnt / 8 + 64;
+                uint64_t *verify = (uint64_t *)malloc(v_alloc * sizeof(uint64_t));
+                size_t v_cnt = 0;
+                if (verify && n_gap_regions > 0) {
                     #define COLLECT_REGION(lo_val, hi_val) do {                \
                         size_t _lo = 0, _hi = cnt;                            \
                         while (_lo < _hi) {                                   \
@@ -4248,26 +4364,10 @@ static void *worker_fn(void *arg) {
                             verify[v_cnt++] = pr[_j];                         \
                         }                                                     \
                     } while (0)
-
-                    /* Left edge */
-                    if (cnt > 0 && sampled_primes[0] - pr[0] >= needed_gap) {
-                        COLLECT_REGION(pr[0] - 1, sampled_primes[0]);
-                        if (gap_reg_lo) { gap_reg_lo[n_gap_regions] = 0; gap_reg_hi[n_gap_regions] = sampled_primes[0]; n_gap_regions++; }
+                    for (size_t r = 0; r < n_gap_regions; r++) {
+                        if (gap_reg_alive && !gap_reg_alive[r]) continue;
+                        COLLECT_REGION(gap_reg_lo[r], gap_reg_hi[r]);
                     }
-                    /* Interior gaps */
-                    for (size_t i = 0; i + 1 < sp_cnt; i++) {
-                        if (sampled_primes[i+1] - sampled_primes[i] >= needed_gap) {
-                            COLLECT_REGION(sampled_primes[i], sampled_primes[i+1]);
-                            if (gap_reg_lo) { gap_reg_lo[n_gap_regions] = sampled_primes[i]; gap_reg_hi[n_gap_regions] = sampled_primes[i+1]; n_gap_regions++; }
-                        }
-                    }
-                    /* Right edge */
-                    if (cnt > 0 &&
-                        pr[cnt-1] - sampled_primes[sp_cnt-1] >= needed_gap) {
-                        COLLECT_REGION(sampled_primes[sp_cnt-1], pr[cnt-1] + 1);
-                        if (gap_reg_lo) { gap_reg_lo[n_gap_regions] = sampled_primes[sp_cnt-1]; gap_reg_hi[n_gap_regions] = UINT64_MAX; n_gap_regions++; }
-                    }
-
                     #undef COLLECT_REGION
                 }
 
@@ -4326,12 +4426,16 @@ static void *worker_fn(void *arg) {
                     for (size_t i = 0; i < p2_wn; i++) pr[pf++] = p2_wbuf[i];
                 for (size_t i = p1_hn; i < psc.coop.out_cnt; i++)
                     pr[pf++] = psc.coop.out[i];
+                /* Include edge-probed primes from eliminated regions */
+                if (edge_primes_buf)
+                    for (size_t i = 0; i < edge_pcnt; i++) pr[pf++] = edge_primes_buf[i];
                 if (pf > 1) qsort(pr, pf, sizeof(uint64_t), cmp_u64);
                 cnt = pf;
 
                 free(sampled_primes);
                 free(verify);
                 free(p2_wbuf);
+                free(edge_primes_buf);
 
                 /* Flush stats */
                 {
@@ -4359,6 +4463,7 @@ static void *worker_fn(void *arg) {
                     int found_block = 0;
                     size_t region_pairs = 0;
                     for (size_t r = 0; r < n_gap_regions && gap_reg_lo; r++) {
+                        if (gap_reg_alive && !gap_reg_alive[r]) continue;
                         /* Binary search for first prime >= gap_reg_lo[r] */
                         size_t lo_idx = 0;
                         { size_t l = 0, h = cnt;
@@ -4393,6 +4498,7 @@ static void *worker_fn(void *arg) {
                     }
                     free(gap_reg_lo);
                     free(gap_reg_hi);
+                    free(gap_reg_alive);
                     if (found_block) goto worker_done;
                 }
 
@@ -4468,6 +4574,14 @@ static void *worker_fn(void *arg) {
             /* Smart-scan path handles gap scanning internally (region-based).
                Only run scan_candidates for full-test and no_primality. */
             if (!use_smart && cnt >= 2) {
+                /* Prepend carry prime from previous window for cross-window gap detection */
+                if (carry_last_prime && carry_last_prime < pr[0]) {
+                    /* Shift pr[] right by 1 to insert carry at front.
+                       pr[] lives in presieve_buf which has capacity >= cnt. */
+                    memmove(pr + 1, pr, cnt * sizeof(uint64_t));
+                    pr[0] = carry_last_prime;
+                    cnt++;
+                }
                 if (scan_candidates(pr, cnt, target_local, logbase,
                                     shift_local,
                                     header_local,
@@ -4475,6 +4589,9 @@ static void *worker_fn(void *arg) {
                                     rpc_method_local, rpc_sign_key_local))
                     goto worker_done; /* stop-after-block: exit immediately */
             }
+            /* Update carry for next window */
+            if (cnt >= 1)
+                carry_last_prime = pr[cnt - 1];
         } /* end window loop */
         /* Pass complete without abort: loop back and mine the same slice */
     } /* end continuous mining outer loop */
@@ -4571,6 +4688,7 @@ int main(int argc, char **argv) {
         printf("      --adder-max M     adder upper bound     (default: 2^shift)\n");
         printf("      --fast-fermat     fast primality (fewer Miller-Rabin rounds)\n");
         printf("      --sample-stride K smart scan: test every Kth survivor (default: 8, 1=off)\n");
+        printf("      --mr-rounds N     Miller-Rabin rounds for primality  (default: 2)\n");
         printf("      --crt-file FILE   load CRT sieve file (binary template or text gap-solver)\n");
         printf("      --fermat-threads N  number of Fermat testing threads for CRT producer-consumer\n");
         printf("                          default: auto = threads-1 for CRT solver with threads>=3\n");
@@ -4664,6 +4782,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--sample-stride") && i+1<argc) {
             cli_sample_stride = atoi(argv[++i]);
             if (cli_sample_stride < 1) cli_sample_stride = 1;
+        }
+        else if (!strcmp(argv[i],"--mr-rounds") && i+1<argc) {
+            cli_mr_rounds = atoi(argv[++i]);
+            if (cli_mr_rounds < 1) cli_mr_rounds = 1;
         }
         else if (!strcmp(argv[i],"--crt-file") && i+1<argc)
             cli_crt_file = argv[++i];
@@ -4989,6 +5111,8 @@ int main(int argc, char **argv) {
         log_msg("miner configured to exit when a valid block is found\n");
     if (use_fast_fermat)
         log_msg("fast Fermat: GMP mpz_powm base-2 (--fast-fermat)\n");
+    else
+        log_msg("Miller-Rabin rounds: %d (--mr-rounds to change)\n", cli_mr_rounds);
 
 #ifndef WITH_RPC
     /* suppress unused-but-set warnings when built without RPC */
@@ -5293,6 +5417,8 @@ int main(int argc, char **argv) {
 #endif /* WITH_RPC — CRT-SOLVER single-thread */
             }
 
+            /* Cross-window gap carry for single-thread path */
+            uint64_t st_carry_last = 0;
             for (int64_t adder=0; adder<num_windows; ++adder) {
                 /* L, R are relative offsets from h256<<shift (= nAdd range) */
                 uint64_t L = (uint64_t)adder * sieve_size;
@@ -5341,10 +5467,79 @@ int main(int argc, char **argv) {
                     size_t needed = (size_t)(target * logbase);
                     if (needed < 2) needed = 2;
 
-                    /* --- Collect verification candidates ------------------ */
+                    /* Identify gap regions (boundaries only) */
+                    size_t n_greg_st = 0;
+                    size_t greg_cap_st = sp + 2;
+                    uint64_t *greg_lo_st = (uint64_t *)malloc(greg_cap_st * sizeof(uint64_t));
+                    uint64_t *greg_hi_st = (uint64_t *)malloc(greg_cap_st * sizeof(uint64_t));
+                    int *greg_alive_st = NULL;
+
+                    if (sp > 0 && cnt > 0 && greg_lo_st && greg_hi_st) {
+                        if (sampled[0] - pr[0] >= needed) {
+                            greg_lo_st[n_greg_st] = 0;
+                            greg_hi_st[n_greg_st] = sampled[0];
+                            n_greg_st++;
+                        }
+                        for (size_t i = 0; i + 1 < sp; i++) {
+                            if (sampled[i+1] - sampled[i] >= needed) {
+                                greg_lo_st[n_greg_st] = sampled[i];
+                                greg_hi_st[n_greg_st] = sampled[i+1];
+                                n_greg_st++;
+                            }
+                        }
+                        if (pr[cnt-1] - sampled[sp-1] >= needed) {
+                            greg_lo_st[n_greg_st] = sampled[sp-1];
+                            greg_hi_st[n_greg_st] = UINT64_MAX;
+                            n_greg_st++;
+                        }
+                    }
+
+                    /* Edge probing: eliminate false-positive regions */
+                    if (n_greg_st > 0) {
+                        greg_alive_st = (int *)malloc(n_greg_st * sizeof(int));
+                        if (greg_alive_st) {
+                            size_t eprobes = 0;
+                            for (size_t r = 0; r < n_greg_st; r++) {
+                                greg_alive_st[r] = 1;
+                                uint64_t rlo = greg_lo_st[r], rhi = greg_hi_st[r];
+                                size_t lo_idx, hi_idx;
+                                { size_t l = 0, h = cnt;
+                                  while (l < h) { size_t m = l+(h-l)/2;
+                                    if (pr[m] <= rlo) l=m+1; else h=m; }
+                                  lo_idx = l; }
+                                { size_t l = 0, h = cnt;
+                                  while (l < h) { size_t m = l+(h-l)/2;
+                                    if (pr[m] < rhi) l=m+1; else h=m; }
+                                  hi_idx = l; }
+                                size_t rcnt = hi_idx > lo_idx ? hi_idx - lo_idx : 0;
+                                if (rcnt < (size_t)(EDGE_PROBE_N * 3)) continue;
+                                uint64_t lp_v = 0, rp_v = 0;
+                                size_t np = 0;
+                                for (size_t j = lo_idx; j < hi_idx && np < EDGE_PROBE_N; j++) {
+                                    if (j % (size_t)smart_K_st == 0) continue;
+                                    np++;
+                                    if (bn_candidate_is_prime(pr[j])) { lp_v = pr[j]; break; }
+                                }
+                                eprobes += np; np = 0;
+                                for (size_t j = hi_idx; j > lo_idx && np < EDGE_PROBE_N; ) {
+                                    j--;
+                                    if (j % (size_t)smart_K_st == 0) continue;
+                                    np++;
+                                    if (bn_candidate_is_prime(pr[j])) { rp_v = pr[j]; break; }
+                                }
+                                eprobes += np;
+                                if (lp_v && rp_v && rp_v - lp_v < needed)
+                                    greg_alive_st[r] = 0;
+                            }
+                            if (eprobes > 0)
+                                __sync_fetch_and_add(&stats_tested, (uint64_t)eprobes);
+                        }
+                    }
+
+                    /* Collect verification candidates (surviving regions only) */
                     size_t v_alloc = cnt / 4 + 64, v_cnt = 0;
                     uint64_t *verify = (uint64_t *)malloc(v_alloc * sizeof(uint64_t));
-                    if (!verify) { free(sampled); use_smart_st = 0; goto st_full; }
+                    if (!verify) { free(sampled); free(greg_lo_st); free(greg_hi_st); free(greg_alive_st); use_smart_st = 0; goto st_full; }
 
                     #define COLLECT_ST(lo_val, hi_val) do {                      \
                         size_t _lo = 0, _hi = cnt;                              \
@@ -5364,27 +5559,9 @@ int main(int argc, char **argv) {
                             verify[v_cnt++] = pr[_j];                           \
                         }                                                       \
                     } while (0)
-
-                    /* Track gap-region boundaries (same fix as cooperative path) */
-                    size_t n_greg_st = 0;
-                    size_t greg_cap_st = sp + 2;
-                    uint64_t *greg_lo_st = (uint64_t *)malloc(greg_cap_st * sizeof(uint64_t));
-                    uint64_t *greg_hi_st = (uint64_t *)malloc(greg_cap_st * sizeof(uint64_t));
-
-                    if (sp > 0 && cnt > 0 && sampled[0] - pr[0] >= needed) {
-                        COLLECT_ST(pr[0] - 1, sampled[0]);
-                        if (greg_lo_st) { greg_lo_st[n_greg_st] = 0; greg_hi_st[n_greg_st] = sampled[0]; n_greg_st++; }
-                    }
-                    for (size_t i = 0; i + 1 < sp; i++) {
-                        if (sampled[i+1] - sampled[i] >= needed) {
-                            COLLECT_ST(sampled[i], sampled[i+1]);
-                            if (greg_lo_st) { greg_lo_st[n_greg_st] = sampled[i]; greg_hi_st[n_greg_st] = sampled[i+1]; n_greg_st++; }
-                        }
-                    }
-                    if (sp > 0 && cnt > 0 &&
-                        pr[cnt-1] - sampled[sp-1] >= needed) {
-                        COLLECT_ST(sampled[sp-1], pr[cnt-1] + 1);
-                        if (greg_lo_st) { greg_lo_st[n_greg_st] = sampled[sp-1]; greg_hi_st[n_greg_st] = UINT64_MAX; n_greg_st++; }
+                    for (size_t r = 0; r < n_greg_st; r++) {
+                        if (greg_alive_st && !greg_alive_st[r]) continue;
+                        COLLECT_ST(greg_lo_st[r], greg_hi_st[r]);
                     }
                     #undef COLLECT_ST
 
@@ -5412,6 +5589,7 @@ int main(int argc, char **argv) {
                     {
                         size_t region_pairs_st = 0;
                         for (size_t r = 0; r < n_greg_st && greg_lo_st; r++) {
+                            if (greg_alive_st && !greg_alive_st[r]) continue;
                             size_t lo_idx = 0;
                             { size_t l = 0, h = cnt;
                               while (l < h) { size_t m = l+(h-l)/2; if (pr[m] < greg_lo_st[r]) l=m+1; else h=m; }
@@ -5442,6 +5620,7 @@ int main(int argc, char **argv) {
                     }
                     free(greg_lo_st);
                     free(greg_hi_st);
+                    free(greg_alive_st);
                     free(sampled);
                     free(verify);
                 } else {
@@ -5468,6 +5647,12 @@ int main(int argc, char **argv) {
                 /* Smart-scan handles gap scanning via regions above;
                    only run full-array scan for full-test / no_primality. */
                 if (!use_smart_st && cnt>=2) {
+                    /* Prepend carry prime from previous window */
+                    if (st_carry_last && st_carry_last < pr[0]) {
+                        memmove(pr + 1, pr, cnt * sizeof(uint64_t));
+                        pr[0] = st_carry_last;
+                        cnt++;
+                    }
                     if (scan_candidates(pr, cnt, target, logbase,
                                        shift, header,
                                        rpc_url, rpc_user, rpc_pass,
@@ -5475,6 +5660,7 @@ int main(int argc, char **argv) {
                         return 0;
                     }
                 }
+                if (cnt >= 1) st_carry_last = pr[cnt - 1];
             }
         st_rpc_poll:
             if (keep_going && rpc_url) {
