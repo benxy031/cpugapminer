@@ -3430,17 +3430,23 @@ static void *worker_fn(void *arg) {
 
             if (rpc_thread_local) {
                 size_t prim_bits = mpz_sizeinbase(g_crt_primorial_mpz, 2);
+                /* CRT sieve covers [1, gap_scan_max) as an odd-only bitmap */
+                size_t crt_seg    = (size_t)gap_scan_max / 2;
+                size_t crt_bytes  = (crt_seg + 7) / 8;
                 if (crt_fermat_threads > 0)
                     log_msg("CRT mining (%dT: %d sieve + %d fermat): "
-                            "primorial~2^%lu  shift=%d  gap_scan=%d  heap=%d\n",
+                            "primorial~2^%lu  shift=%d  gap_scan=%d  "
+                            "sieve_bitmap=%zu bytes (%.1f KB)  heap=%d\n",
                             wa->nthreads, n_sieve_threads,
                             crt_fermat_threads,
                             (unsigned long)prim_bits, shift_local, gap_scan_max,
+                            crt_bytes, (double)crt_bytes / 1024.0,
                             CRT_HEAP_CAP);
                 else
                     log_msg("CRT mining (%dT): primorial~2^%lu  shift=%d"
-                            "  gap_scan=%d\n",
-                            nth_local, (unsigned long)prim_bits, shift_local, gap_scan_max);
+                            "  gap_scan=%d  sieve_bitmap=%zu bytes (%.1f KB)\n",
+                            nth_local, (unsigned long)prim_bits, shift_local,
+                            gap_scan_max, crt_bytes, (double)crt_bytes / 1024.0);
             }
 
 #ifdef WITH_RPC
@@ -5183,8 +5189,12 @@ int main(int argc, char **argv) {
                 static int st_crt_logged = 0;
                 if (!st_crt_logged) {
                     size_t prim_bits = mpz_sizeinbase(g_crt_primorial_mpz, 2);
-                    log_msg("CRT mining (1T): primorial~2^%lu  shift=%d  gap_scan=%d\n",
-                            (unsigned long)prim_bits, shift, gap_scan_max);
+                    size_t crt_seg   = (size_t)gap_scan_max / 2;
+                    size_t crt_bytes = (crt_seg + 7) / 8;
+                    log_msg("CRT mining (1T): primorial~2^%lu  shift=%d"
+                            "  gap_scan=%d  sieve_bitmap=%zu bytes (%.1f KB)\n",
+                            (unsigned long)prim_bits, shift, gap_scan_max,
+                            crt_bytes, (double)crt_bytes / 1024.0);
                     st_crt_logged = 1;
                 }
 
