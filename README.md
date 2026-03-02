@@ -676,6 +676,7 @@ gap scanning.  Multiple GPUs are supported via `--cuda 0,1`.
 | `--rpc-sign-key KEY`  | --            | HMAC key to sign payloads |
 | `--log-file FILE`     | --            | Append all log messages to FILE |
 | `--fast-fermat`       | off           | Fast single-base Fermat primality test |
+| `--mr-rounds N`       | 2             | Miller-Rabin rounds for `mpz_probab_prime_p` (default path, not `--fast-fermat`).  Old default was 10; 2 rounds gives false-positive rate < 2^-128 for sieve-filtered candidates. |
 | `--sample-stride K`   | 8             | Smart scan: test every Kth survivor, skip regions that can't contain qualifying gaps.  Set to 1 to disable. |
 | `--crt-file FILE`     | --            | Load a CRT sieve file (binary `.bin` or text `.txt`).  Text files enable CRT-aligned mining; binary files enable template tiling. |
 | `--fermat-threads N` / `-d N` | 0 (monolithic) | Number of Fermat consumer threads for CRT producer-consumer mode.  Default `0` = monolithic (all threads sieve+fermat independently).  Set to `N` to enable producer-consumer with `threads - N` sieve and `N` fermat threads. |
@@ -738,6 +739,7 @@ STATS: elapsed=30.0s  sieved=520000000 (34666667/s)  tested=4561182 (304079/s)  
 |-------|---------|
 | `sieved` | Odd candidates eliminated by the segmented sieve |
 | `tested` | Primality tests (Fermat / Miller-Rabin) actually run |
+| `primes` | Candidates that passed primality testing (with Fermat pass rate %) |
 | `gaps` | Gaps found whose merit ≥ `--target` |
 | `built` | Full blocks assembled from a GBT template after a qualifying gap |
 | `submitted` | Blocks whose header hash also met the network `bits` difficulty and were sent to the node |
@@ -781,6 +783,60 @@ To verify the **submission path** end-to-end without waiting for a real gap use 
 bin/gap_miner --rpc-url http://127.0.0.1:31397/ --rpc-user USER --rpc-pass PASS \
   --force-solution --build-only
 ```
+
+## Tuning guide (shift 25–64)
+
+Recommended `--sieve-primes` and `--sieve-size` values for the normal
+(non-CRT) sieve path.  These balance sieve throughput against Fermat
+testing cost, which grows with candidate bit-size.
+
+| Shift | Bits | adder\_max | Windows @32M | Fermat cost | `--sieve-primes` | `--sieve-size` |
+|------:|-----:|-----------:|-------------:|:-----------:|------------------:|---------------:|
+| 25 | 281 | 33M | 1 | ~50 µs | **900K** (default) | **33M** (default) |
+| 30 | 286 | 1B | 32 | ~60 µs | **900K** | **33M** |
+| 35 | 291 | 34B | 1K | ~70 µs | **900K** | **33M** |
+| 40 | 296 | 1T | 33K | ~85 µs | **1M** | **33M** |
+| 45 | 301 | 35T | 1M | ~100 µs | **1M** | **67M** |
+| 50 | 306 | 1P | 33M | ~120 µs | **1.2M** | **67M** |
+| 55 | 311 | 36P | 1B | ~140 µs | **1.5M** | **67M** |
+| 60 | 316 | 1E | 33B | ~170 µs | **1.5M** | **134M** |
+| 64 | 320 | 18E | 549B | ~200 µs | **2M** | **134M** |
+
+**Bits** = 256 + shift (candidate prime size).
+**Fermat cost** = approximate wall-time per `mpz_probab_prime_p` call
+(2 MR rounds, single core, modern x86-64).
+
+### Rationale
+
+- **Sieve size 33M** (2 MB bitmap): fits L2 cache.  At shift ≤ 40 the
+  adder space is small enough that windows are covered quickly.
+- **Sieve size 67M** (4 MB): at shift 45+ there are millions of windows.
+  Doubling the window halves per-window setup overhead; bitmap still fits
+  L3 cache.
+- **Sieve size 134M** (8 MB): at shift 60+ there are billions of windows
+  per nonce — maximise work per window since you'll never exhaust the
+  adder space before a new block arrives.
+- **Sieve primes 900K→2M**: each extra prime eliminates ~1 additional
+  composite per window.  At 900K the marginal prime is ~15.4M (marks ~1
+  position per 32M window).  Going to 2M (primes up to ~34M) is cheap
+  and saves expensive Fermat tests.
+
+### Example: shift 50 with sieve tuning
+
+```sh
+bin/gap_miner \
+  --rpc-url  http://127.0.0.1:31397/ \
+  --rpc-user USER \
+  --rpc-pass PASS \
+  --shift 50 \
+  --threads 6 \
+  --sieve-primes 1200000 \
+  --sieve-size 67000000 \
+  --fast-fermat
+```
+
+> At shift 50+ the bottleneck is Fermat throughput, not sieve coverage.
+> Use GPU (`WITH_CUDA=1`) to offload primality testing when available.
 
 ## Notes
 
