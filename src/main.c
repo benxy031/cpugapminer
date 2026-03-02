@@ -5052,11 +5052,12 @@ int main(int argc, char **argv) {
 #ifdef WITH_CUDA
         if (use_cuda) {
             /* GPU Fermat: keep sieve primes low to feed larger batches.
-               At 500K primes the gap-check sieve is still effective
-               (same primes/win as 3M) but survivors per window are ~3×
-               higher, keeping GPU occupancy near 100%.  */
+               At 300K primes the gap-check sieve keeps the same
+               primes/window as 500K–3M but the sieve runs ~30% faster,
+               giving +35% tested/s and ~21% lower est time (benchmarked
+               on RTX 3060, shift 512, CRT m22, 2 threads).             */
             if (shift >= 384)
-                new_count = 500000;
+                new_count = 300000;
             else
                 new_count = DEFAULT_SIEVE_PRIME_COUNT;
         } else
