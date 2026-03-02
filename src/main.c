@@ -1198,9 +1198,25 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
         }
     }
 
+    /* Count survivors via popcount before allocating the result array.
+       Each 0-bit in the bitmap is a survivor; total survivors =
+       seg_size - popcount(bits).  This avoids allocating seg_size × 8 bytes
+       (e.g. 536 MB for --sieve-size 134M) when only ~3-7% survive.      */
+    size_t set_bits = 0;
+    {
+        const uint64_t *wp = (const uint64_t *)bits;
+        size_t nw = bit_size / 8;
+        for (size_t i = 0; i < nw; i++)
+            set_bits += (size_t)__builtin_popcountll(wp[i]);
+        for (size_t i = nw * 8; i < bit_size; i++)
+            set_bits += (size_t)__builtin_popcount((unsigned)bits[i]);
+    }
+    size_t est_survivors = (seg_size > set_bits) ? seg_size - set_bits : 0;
+    est_survivors += 64;  /* small safety margin for rounding */
+
     /* ensure the tls_pr buffer is large enough */
-    if (tls_cap < seg_size) {
-        size_t newcap = seg_size;
+    if (tls_cap < est_survivors) {
+        size_t newcap = est_survivors;
         tls_pr = realloc(tls_pr, newcap * sizeof(uint64_t));
         if (!tls_pr) {
             *out_count = 0;
