@@ -233,8 +233,13 @@ __global__ void fermat_kernel(const uint64_t * __restrict__ cands,
 struct gpu_fermat_ctx {
     int       device_id;
     size_t    max_batch;
-    uint64_t *d_cands;      /* device buffer: max_batch × NL uint64_t */
-    uint8_t  *d_results;    /* device buffer: max_batch bytes          */
+    /* Double-buffered async pipeline: 2 slots for overlap */
+    cudaStream_t stream[2];
+    uint64_t *d_cands[2];      /* device candidate buffers  */
+    uint8_t  *d_results[2];    /* device result buffers     */
+    uint64_t *h_cands[2];      /* pinned host staging cands */
+    uint8_t  *h_results[2];    /* pinned host staging res   */
+    size_t    pending[2];      /* candidates in-flight per slot (0=idle) */
     char      dev_name[256];
 };
 
@@ -259,26 +264,123 @@ gpu_fermat_ctx *gpu_fermat_init(int device_id, size_t max_batch)
     ctx->device_id = device_id;
     ctx->max_batch = max_batch;
 
-    err = cudaMalloc(&ctx->d_cands, max_batch * NL * sizeof(uint64_t));
-    if (err != cudaSuccess) {
-        fprintf(stderr, "gpu_fermat: cudaMalloc cands (%zu B): %s\n",
-                max_batch * NL * 8, cudaGetErrorString(err));
-        free(ctx);
-        return NULL;
-    }
+    /* Allocate double-buffered device + pinned host memory */
+    for (int s = 0; s < 2; s++) {
+        err = cudaStreamCreate(&ctx->stream[s]);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "gpu_fermat: cudaStreamCreate[%d]: %s\n",
+                    s, cudaGetErrorString(err));
+            goto fail;
+        }
 
-    err = cudaMalloc(&ctx->d_results, max_batch);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "gpu_fermat: cudaMalloc results: %s\n",
-                cudaGetErrorString(err));
-        cudaFree(ctx->d_cands);
-        free(ctx);
-        return NULL;
+        err = cudaMalloc(&ctx->d_cands[s], max_batch * NL * sizeof(uint64_t));
+        if (err != cudaSuccess) {
+            fprintf(stderr, "gpu_fermat: cudaMalloc cands[%d] (%zu B): %s\n",
+                    s, max_batch * NL * 8, cudaGetErrorString(err));
+            goto fail;
+        }
+
+        err = cudaMalloc(&ctx->d_results[s], max_batch);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "gpu_fermat: cudaMalloc results[%d]: %s\n",
+                    s, cudaGetErrorString(err));
+            goto fail;
+        }
+
+        err = cudaMallocHost(&ctx->h_cands[s], max_batch * NL * sizeof(uint64_t));
+        if (err != cudaSuccess) {
+            fprintf(stderr, "gpu_fermat: cudaMallocHost cands[%d]: %s\n",
+                    s, cudaGetErrorString(err));
+            goto fail;
+        }
+
+        err = cudaMallocHost(&ctx->h_results[s], max_batch);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "gpu_fermat: cudaMallocHost results[%d]: %s\n",
+                    s, cudaGetErrorString(err));
+            goto fail;
+        }
+
+        ctx->pending[s] = 0;
     }
 
     return ctx;
+
+fail:
+    gpu_fermat_destroy(ctx);
+    return NULL;
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ *  Async double-buffered pipeline
+ * ═══════════════════════════════════════════════════════════════════ */
+
+int gpu_fermat_submit(gpu_fermat_ctx *ctx, int slot,
+                      const uint64_t *candidates, size_t count)
+{
+    if (!ctx || !candidates || count == 0) return -1;
+    if (slot < 0 || slot > 1) return -1;
+    if (count > ctx->max_batch) count = ctx->max_batch;
+
+    cudaError_t err = cudaSetDevice(ctx->device_id);
+    if (err != cudaSuccess) return -1;
+
+    /* Copy candidates into pinned staging buffer.
+       After this memcpy the caller's buffer can be reused. */
+    memcpy(ctx->h_cands[slot], candidates,
+           count * NL * sizeof(uint64_t));
+
+    /* Async H→D on stream[slot] */
+    err = cudaMemcpyAsync(ctx->d_cands[slot], ctx->h_cands[slot],
+                          count * NL * sizeof(uint64_t),
+                          cudaMemcpyHostToDevice, ctx->stream[slot]);
+    if (err != cudaSuccess) return -1;
+
+    /* Launch kernel on stream[slot] */
+    int block = 128;
+    int grid  = (int)((count + block - 1) / block);
+    fermat_kernel<<<grid, block, 0, ctx->stream[slot]>>>(
+        ctx->d_cands[slot], ctx->d_results[slot], (uint32_t)count);
+
+    /* Async D→H on stream[slot] */
+    err = cudaMemcpyAsync(ctx->h_results[slot], ctx->d_results[slot],
+                          count, cudaMemcpyDeviceToHost,
+                          ctx->stream[slot]);
+    if (err != cudaSuccess) return -1;
+
+    ctx->pending[slot] = count;
+    return 0;
+}
+
+int gpu_fermat_collect(gpu_fermat_ctx *ctx, int slot,
+                       uint8_t *results, size_t count)
+{
+    if (!ctx || !results) return -1;
+    if (slot < 0 || slot > 1) return -1;
+    if (ctx->pending[slot] == 0) return 0;
+
+    size_t n = ctx->pending[slot];
+    if (count < n) n = count;
+
+    cudaError_t err = cudaSetDevice(ctx->device_id);
+    if (err != cudaSuccess) return -1;
+
+    /* Wait for all operations on this stream */
+    err = cudaStreamSynchronize(ctx->stream[slot]);
+    if (err != cudaSuccess) return -1;
+
+    /* Results are already in pinned host buffer — copy to user */
+    memcpy(results, ctx->h_results[slot], n);
+
+    int primes = 0;
+    for (size_t i = 0; i < n; i++)
+        primes += results[i];
+
+    ctx->pending[slot] = 0;
+    return primes;
+}
+
+/* Synchronous wrapper (backward compatible) */
 int gpu_fermat_test_batch(gpu_fermat_ctx *ctx,
                           const uint64_t *candidates,
                           uint8_t *results,
@@ -287,36 +389,9 @@ int gpu_fermat_test_batch(gpu_fermat_ctx *ctx,
     if (!ctx || !candidates || !results || count == 0) return 0;
     if (count > ctx->max_batch) count = ctx->max_batch;
 
-    cudaError_t err;
-    err = cudaSetDevice(ctx->device_id);
-    if (err != cudaSuccess) return -1;
-
-    /* H→D: copy candidate limbs */
-    err = cudaMemcpy(ctx->d_cands, candidates,
-                     count * NL * sizeof(uint64_t),
-                     cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "gpu_fermat: memcpy H→D: %s\n", cudaGetErrorString(err));
+    if (gpu_fermat_submit(ctx, 0, candidates, count) < 0)
         return -1;
-    }
-
-    /* Launch kernel */
-    int block = 128;
-    int grid  = (int)((count + block - 1) / block);
-    fermat_kernel<<<grid, block>>>(ctx->d_cands, ctx->d_results, (uint32_t)count);
-
-    /* D→H: copy results */
-    err = cudaMemcpy(results, ctx->d_results, count, cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "gpu_fermat: memcpy D→H: %s\n", cudaGetErrorString(err));
-        return -1;
-    }
-
-    /* Count probable primes */
-    int primes = 0;
-    for (size_t i = 0; i < count; i++)
-        primes += results[i];
-    return primes;
+    return gpu_fermat_collect(ctx, 0, results, count);
 }
 
 const char *gpu_fermat_device_name(gpu_fermat_ctx *ctx)
@@ -328,7 +403,14 @@ void gpu_fermat_destroy(gpu_fermat_ctx *ctx)
 {
     if (!ctx) return;
     cudaSetDevice(ctx->device_id);
-    if (ctx->d_cands)   cudaFree(ctx->d_cands);
-    if (ctx->d_results) cudaFree(ctx->d_results);
+    for (int s = 0; s < 2; s++) {
+        if (ctx->pending[s] && ctx->stream[s])
+            cudaStreamSynchronize(ctx->stream[s]);
+        if (ctx->d_cands[s])   cudaFree(ctx->d_cands[s]);
+        if (ctx->d_results[s]) cudaFree(ctx->d_results[s]);
+        if (ctx->h_cands[s])   cudaFreeHost(ctx->h_cands[s]);
+        if (ctx->h_results[s]) cudaFreeHost(ctx->h_results[s]);
+        if (ctx->stream[s])    cudaStreamDestroy(ctx->stream[s]);
+    }
     free(ctx);
 }

@@ -2462,16 +2462,28 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
     if (!cands || !res) { free(cands); free(res); return 0; }
 
     size_t pf = 0;  /* prime-filtered count */
+
+    /* ── Double-buffered async pipeline ──
+       When cnt > batch (multiple chunks), overlap GPU compute of chunk N
+       with CPU candidate preparation for chunk N+1.
+
+       gpu_fermat_submit() copies candidates into pinned staging and returns
+       immediately (GPU works via async stream).  We then build the next
+       chunk on CPU, collect previous results, and submit again.
+       For a single chunk, this degrades to a simple submit+collect. */
     size_t i = 0;
+    int slot = 0;                  /* current GPU slot (0 or 1) */
+    int prev_slot = -1;            /* slot with pending results */
+    size_t prev_start = 0, prev_size = 0;
+
     while (i < cnt) {
         size_t chunk = cnt - i;
         if (chunk > batch) chunk = batch;
+
         /* Build candidate limbs: base + offset */
         for (size_t j = 0; j < chunk; j++) {
             uint64_t *dst = &cands[j * GPU_NLIMBS];
-            /* copy base */
             for (int k = 0; k < GPU_NLIMBS; k++) dst[k] = base_limbs[k];
-            /* add offset (single-precision add) */
             uint64_t carry = 0;
             dst[0] += offsets[i + j];
             carry = (dst[0] < offsets[i + j]);
@@ -2480,19 +2492,50 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
                 carry = (dst[k] == 0);
             }
         }
-        /* GPU test */
-        int np = gpu_fermat_test_batch(ctx, cands, res, chunk);
-        if (np < 0) {
-            /* GPU error: fall back to CPU for remaining */
+
+        /* Submit this chunk (async — returns immediately) */
+        if (gpu_fermat_submit(ctx, slot, cands, chunk) < 0) {
+            /* GPU error: fall back to CPU for this chunk */
             for (size_t j = 0; j < chunk; j++)
                 if (bn_candidate_is_prime(offsets[i + j]))
                     offsets[pf++] = offsets[i + j];
-        } else {
-            for (size_t j = 0; j < chunk; j++)
-                if (res[j]) offsets[pf++] = offsets[i + j];
+            i += chunk;
+            continue;
         }
-        i += chunk;
+
+        /* Collect PREVIOUS chunk's results (if any) while GPU works on current */
+        if (prev_slot >= 0) {
+            int np = gpu_fermat_collect(ctx, prev_slot, res, prev_size);
+            if (np < 0) {
+                for (size_t j = 0; j < prev_size; j++)
+                    if (bn_candidate_is_prime(offsets[prev_start + j]))
+                        offsets[pf++] = offsets[prev_start + j];
+            } else {
+                for (size_t j = 0; j < prev_size; j++)
+                    if (res[j]) offsets[pf++] = offsets[prev_start + j];
+            }
+        }
+
+        prev_slot  = slot;
+        prev_start = i;
+        prev_size  = chunk;
+        slot       = 1 - slot;   /* alternate slots */
+        i         += chunk;
     }
+
+    /* Collect final chunk */
+    if (prev_slot >= 0) {
+        int np = gpu_fermat_collect(ctx, prev_slot, res, prev_size);
+        if (np < 0) {
+            for (size_t j = 0; j < prev_size; j++)
+                if (bn_candidate_is_prime(offsets[prev_start + j]))
+                    offsets[pf++] = offsets[prev_start + j];
+        } else {
+            for (size_t j = 0; j < prev_size; j++)
+                if (res[j]) offsets[pf++] = offsets[prev_start + j];
+        }
+    }
+
     free(cands);
     free(res);
     return pf;
@@ -2590,11 +2633,21 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
     }
 }
 
-/* ── GPU batch accumulator ──
-   Collects candidates from multiple CRT windows into a single large
-   buffer, then sends them all to the GPU in one kernel launch.
-   Instead of ~800 candidates per window (tiny batch), we accumulate
-   4096+ before flushing for much better GPU SM utilization. */
+/* ── GPU batch accumulator (double-buffered async pipeline) ──
+   Collects candidates from multiple CRT windows into a buffer, then
+   submits them to the GPU asynchronously.  Two buffers alternate (ping-
+   pong): while the GPU processes buffer A, the CPU continues sieving
+   new CRT windows into buffer B.  This keeps both CPU and GPU busy
+   simultaneously, typically doubling throughput vs. the synchronous path.
+
+   Flow:
+     1. CPU fills buf[fill] with CRT window survivors
+     2. Threshold reached → gpu_accum_flush():
+        a. If buf[inflight] has pending GPU work, collect & process it
+        b. Submit buf[fill] to GPU (async, returns immediately)
+        c. Swap fill to the other buffer
+     3. CPU immediately continues sieving into the new fill buffer
+     4. At shutdown, flush remaining + collect final batch               */
 
 #define GPU_ACCUM_DEFAULT  4096
 
@@ -2614,58 +2667,96 @@ struct gpu_accum_win {
     uint16_t  nshift;         /* snapshot of shift at time of sieving */
 };
 
-struct gpu_accum {
-    uint64_t *limbs;           /* flat: total × GPU_NLIMBS uint64_t */
-    size_t    total;           /* current accumulated candidate count */
-    size_t    capacity;
+/* One half of the ping-pong buffer */
+struct gpu_accum_buf {
+    uint64_t             *limbs;     /* flat: total × GPU_NLIMBS uint64_t */
+    size_t                total;     /* current accumulated candidate count */
+    size_t                capacity;
     struct gpu_accum_win *wins;
-    size_t    win_count;
-    size_t    win_cap;
-    uint8_t  *results;
-    size_t    res_cap;
-    int       threshold;       /* flush when total >= this */
-    gpu_fermat_ctx *ctx;       /* assigned GPU context */
+    size_t                win_count;
+    size_t                win_cap;
+    uint8_t              *results;
+    size_t                res_cap;
+};
+
+struct gpu_accum {
+    struct gpu_accum_buf buf[2];     /* ping-pong buffers                */
+    int       fill;                  /* 0 or 1: which buf we're adding to */
+    int       inflight;              /* 0 or 1 or -1: buf with GPU work   */
+    int       threshold;             /* flush when total >= this          */
+    gpu_fermat_ctx *ctx;             /* assigned GPU context              */
 };
 
 static __thread struct gpu_accum *tls_gpu_accum;
+
+static int gpu_accum_buf_init(struct gpu_accum_buf *b, size_t cap) {
+    b->capacity = cap;
+    b->limbs = (uint64_t *)malloc(cap * GPU_NLIMBS * sizeof(uint64_t));
+    b->win_cap = 256;
+    b->wins = (struct gpu_accum_win *)malloc(b->win_cap * sizeof(b->wins[0]));
+    b->res_cap = cap;
+    b->results = (uint8_t *)malloc(b->res_cap);
+    b->total = 0;
+    b->win_count = 0;
+    if (!b->limbs || !b->wins || !b->results) return -1;
+    return 0;
+}
+
+static void gpu_accum_buf_reset(struct gpu_accum_buf *b) {
+    for (size_t i = 0; i < b->win_count; i++) {
+        free(b->wins[i].surv);
+        mpz_clear(b->wins[i].nAdd);
+    }
+    b->total = 0;
+    b->win_count = 0;
+}
+
+static void gpu_accum_buf_free(struct gpu_accum_buf *b) {
+    gpu_accum_buf_reset(b);
+    free(b->limbs);  b->limbs   = NULL;
+    free(b->wins);   b->wins    = NULL;
+    free(b->results); b->results = NULL;
+}
 
 static struct gpu_accum *gpu_accum_create(gpu_fermat_ctx *ctx, int threshold) {
     struct gpu_accum *a = (struct gpu_accum *)calloc(1, sizeof(*a));
     if (!a) return NULL;
     a->threshold = threshold > 0 ? threshold : GPU_ACCUM_DEFAULT;
     a->ctx = ctx;
-    a->capacity = (size_t)a->threshold + 1024;
-    a->limbs = (uint64_t *)malloc(a->capacity * GPU_NLIMBS * sizeof(uint64_t));
-    a->win_cap = 256;
-    a->wins = (struct gpu_accum_win *)malloc(a->win_cap * sizeof(a->wins[0]));
-    a->res_cap = a->capacity;
-    a->results = (uint8_t *)malloc(a->res_cap);
-    if (!a->limbs || !a->wins || !a->results) {
-        free(a->limbs); free(a->wins); free(a->results); free(a);
+    a->fill = 0;
+    a->inflight = -1;
+    size_t cap = (size_t)a->threshold + 1024;
+    if (gpu_accum_buf_init(&a->buf[0], cap) < 0 ||
+        gpu_accum_buf_init(&a->buf[1], cap) < 0) {
+        gpu_accum_buf_free(&a->buf[0]);
+        gpu_accum_buf_free(&a->buf[1]);
+        free(a);
         return NULL;
     }
     return a;
 }
 
+static void gpu_accum_collect(struct gpu_accum *a);
 static void gpu_accum_reset(struct gpu_accum *a) {
-    for (size_t i = 0; i < a->win_count; i++) {
-        free(a->wins[i].surv);
-        mpz_clear(a->wins[i].nAdd);
+    if (a->inflight >= 0) {
+        /* Drain pending GPU work first */
+        gpu_accum_collect(a);
     }
-    a->total = 0;
-    a->win_count = 0;
+    gpu_accum_buf_reset(&a->buf[0]);
+    gpu_accum_buf_reset(&a->buf[1]);
+    a->fill = 0;
+    a->inflight = -1;
 }
 
 static void gpu_accum_destroy(struct gpu_accum *a) {
     if (!a) return;
     gpu_accum_reset(a);
-    free(a->limbs);
-    free(a->wins);
-    free(a->results);
+    gpu_accum_buf_free(&a->buf[0]);
+    gpu_accum_buf_free(&a->buf[1]);
     free(a);
 }
 
-/* Add a window's survivors to the accumulator.
+/* Add a window's survivors to the active fill buffer.
    Returns 1 if threshold reached (caller should call gpu_accum_flush). */
 static int gpu_accum_add(struct gpu_accum *a,
                          const uint64_t base_limbs[GPU_NLIMBS],
@@ -2676,33 +2767,35 @@ static int gpu_accum_add(struct gpu_accum *a,
                          const char *rpc_url, const char *rpc_user,
                          const char *rpc_pass) {
     if (!a || cnt == 0) return 0;
+    struct gpu_accum_buf *b = &a->buf[a->fill];
+
     /* Grow limbs buffer if needed */
-    if (a->total + cnt > a->capacity) {
-        size_t new_cap = (a->total + cnt) * 2;
-        uint64_t *nl = (uint64_t *)realloc(a->limbs,
+    if (b->total + cnt > b->capacity) {
+        size_t new_cap = (b->total + cnt) * 2;
+        uint64_t *nl = (uint64_t *)realloc(b->limbs,
             new_cap * GPU_NLIMBS * sizeof(uint64_t));
         if (!nl) return 0;
-        a->limbs = nl;
-        a->capacity = new_cap;
-        if (new_cap > a->res_cap) {
-            uint8_t *nr = (uint8_t *)realloc(a->results, new_cap);
+        b->limbs = nl;
+        b->capacity = new_cap;
+        if (new_cap > b->res_cap) {
+            uint8_t *nr = (uint8_t *)realloc(b->results, new_cap);
             if (!nr) return 0;
-            a->results = nr;
-            a->res_cap = new_cap;
+            b->results = nr;
+            b->res_cap = new_cap;
         }
     }
     /* Grow window array if needed */
-    if (a->win_count >= a->win_cap) {
-        size_t nwc = a->win_cap * 2;
+    if (b->win_count >= b->win_cap) {
+        size_t nwc = b->win_cap * 2;
         struct gpu_accum_win *nw = (struct gpu_accum_win *)realloc(
-            a->wins, nwc * sizeof(a->wins[0]));
+            b->wins, nwc * sizeof(b->wins[0]));
         if (!nw) return 0;
-        a->wins = nw;
-        a->win_cap = nwc;
+        b->wins = nw;
+        b->win_cap = nwc;
     }
     /* Convert candidates: base + offset → limbs */
     for (size_t j = 0; j < cnt; j++) {
-        uint64_t *dst = &a->limbs[(a->total + j) * GPU_NLIMBS];
+        uint64_t *dst = &b->limbs[(b->total + j) * GPU_NLIMBS];
         for (int k = 0; k < GPU_NLIMBS; k++) dst[k] = base_limbs[k];
         dst[0] += offsets[j];
         uint64_t carry = (dst[0] < offsets[j]);
@@ -2712,8 +2805,8 @@ static int gpu_accum_add(struct gpu_accum *a,
         }
     }
     /* Record window metadata */
-    struct gpu_accum_win *w = &a->wins[a->win_count];
-    w->cand_start = a->total;
+    struct gpu_accum_win *w = &b->wins[b->win_count];
+    w->cand_start = b->total;
     w->cand_count = cnt;
     w->surv = (uint64_t *)malloc(cnt * sizeof(uint64_t));
     if (w->surv) memcpy(w->surv, offsets, cnt * sizeof(uint64_t));
@@ -2728,32 +2821,33 @@ static int gpu_accum_add(struct gpu_accum *a,
     w->rpc_pass   = rpc_pass;
     mpz_init(w->nAdd);
     mpz_set(w->nAdd, nAdd);
-    a->total += cnt;
-    a->win_count++;
-    return (int)(a->total >= (size_t)a->threshold);
+    b->total += cnt;
+    b->win_count++;
+    return (int)(b->total >= (size_t)a->threshold);
 }
 
-/* Flush: send all accumulated candidates to GPU, process results. */
-static void gpu_accum_flush(struct gpu_accum *a) {
-    if (!a || a->total == 0 || !a->ctx) return;
-    /* GPU test entire accumulated batch */
-    __sync_fetch_and_add(&stats_gpu_flushes, 1);
-    __sync_fetch_and_add(&stats_gpu_batched, a->total);
-    int np = gpu_fermat_test_batch(a->ctx, a->limbs, a->results, a->total);
+/* Collect results from the in-flight GPU batch, process gap scanning. */
+static void gpu_accum_collect(struct gpu_accum *a) {
+    if (!a || a->inflight < 0) return;
+    int slot = a->inflight;
+    struct gpu_accum_buf *b = &a->buf[slot];
+    if (b->total == 0) { a->inflight = -1; return; }
+
+    /* Wait for GPU results */
+    int np = gpu_fermat_collect(a->ctx, slot, b->results, b->total);
+
     /* Distribute results to each window and scan gaps */
-    for (size_t wi = 0; wi < a->win_count; wi++) {
-        struct gpu_accum_win *w = &a->wins[wi];
+    for (size_t wi = 0; wi < b->win_count; wi++) {
+        struct gpu_accum_win *w = &b->wins[wi];
         if (np < 0 || !w->surv) {
-            /* GPU error: count the window, skip gap-scanning */
             __sync_fetch_and_add(&stats_crt_windows, 1);
             free(w->surv); w->surv = NULL;
             mpz_clear(w->nAdd);
             continue;
         }
-        /* Compact survivors using GPU results */
         size_t pf = 0;
         for (size_t j = 0; j < w->cand_count; j++) {
-            if (a->results[w->cand_start + j])
+            if (b->results[w->cand_start + j])
                 w->surv[pf++] = w->surv[j];
         }
         scan_gap_results(w->surv, pf, w->logbase, w->nonce, w->cand_odd,
@@ -2762,8 +2856,36 @@ static void gpu_accum_flush(struct gpu_accum *a) {
         free(w->surv); w->surv = NULL;
         mpz_clear(w->nAdd);
     }
-    a->total = 0;
-    a->win_count = 0;
+    b->total = 0;
+    b->win_count = 0;
+    a->inflight = -1;
+}
+
+/* Flush: submit the active buffer to GPU asynchronously, swap to other buffer.
+   If a previous batch is still in-flight, collect it first.
+   After this call, the caller can immediately continue adding to the new
+   active buffer while the GPU works on the submitted batch.              */
+static void gpu_accum_flush(struct gpu_accum *a) {
+    if (!a || !a->ctx) return;
+    struct gpu_accum_buf *b = &a->buf[a->fill];
+    if (b->total == 0) return;
+
+    /* If previous batch in-flight, collect it first */
+    if (a->inflight >= 0)
+        gpu_accum_collect(a);
+
+    /* Submit current fill buffer to GPU asynchronously */
+    __sync_fetch_and_add(&stats_gpu_flushes, 1);
+    __sync_fetch_and_add(&stats_gpu_batched, b->total);
+    int slot = a->fill;    /* GPU slot matches buffer index */
+    gpu_fermat_submit(a->ctx, slot, b->limbs, b->total);
+
+    /* Mark this buffer as in-flight */
+    a->inflight = slot;
+
+    /* Swap fill to the other buffer — CPU continues sieving here */
+    a->fill = 1 - a->fill;
+    /* The other buffer should be clean (was reset in collect or init) */
 }
 #endif /* WITH_CUDA — accumulator */
 
@@ -3785,12 +3907,14 @@ static void *worker_fn(void *arg) {
                     mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
                 } /* end CRT candidate loop */
 #ifdef WITH_CUDA
-                /* Flush any remaining accumulated GPU windows */
-                if (tls_gpu_accum && tls_gpu_accum->win_count > 0) {
+                /* Flush + collect any remaining accumulated GPU windows */
+                if (tls_gpu_accum) {
                     if (g_abort_pass)
                         gpu_accum_reset(tls_gpu_accum);
-                    else
+                    else {
                         gpu_accum_flush(tls_gpu_accum);
+                        gpu_accum_collect(tls_gpu_accum);
+                    }
                 }
 #endif
 
@@ -5430,12 +5554,14 @@ int main(int argc, char **argv) {
                         mpz_add(nAdd_st, nAdd_st, g_crt_primorial_mpz);
                     } /* end CRT candidate loop */
 #ifdef WITH_CUDA
-                    /* Flush remaining accumulated GPU windows */
-                    if (tls_gpu_accum && tls_gpu_accum->win_count > 0) {
+                    /* Flush + collect any remaining accumulated GPU windows */
+                    if (tls_gpu_accum) {
                         if (g_abort_pass)
                             gpu_accum_reset(tls_gpu_accum);
-                        else
+                        else {
                             gpu_accum_flush(tls_gpu_accum);
+                            gpu_accum_collect(tls_gpu_accum);
+                        }
                     }
 #endif
 
