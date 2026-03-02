@@ -2538,6 +2538,8 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
 
     free(cands);
     free(res);
+    if (pf > 0)
+        __sync_fetch_and_add(&stats_primes_found, (uint64_t)pf);
     return pf;
 }
 #endif /* WITH_CUDA */
