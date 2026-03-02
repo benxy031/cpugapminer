@@ -4440,6 +4440,7 @@ static void *worker_fn(void *arg) {
                     for (size_t i = 0; i < edge_pcnt; i++) pr[pf++] = edge_primes_buf[i];
                 if (pf > 1) qsort(pr, pf, sizeof(uint64_t), cmp_u64);
                 cnt = pf;
+                __sync_fetch_and_add(&stats_primes_found, (uint64_t)pf);
 
                 free(sampled_primes);
                 free(verify);
@@ -4571,6 +4572,7 @@ static void *worker_fn(void *arg) {
                         __sync_fetch_and_add(&stats_tested, (uint64_t)remainder);
                 }
                 cnt = pf;
+                __sync_fetch_and_add(&stats_primes_found, (uint64_t)pf);
 
             /* ============================================================= */
             } else {
@@ -5597,6 +5599,7 @@ int main(int argc, char **argv) {
                     __sync_fetch_and_add(&stats_tested, (uint64_t)v_cnt);
                     if (pf > 1) qsort(pr, pf, sizeof(uint64_t), cmp_u64);
                     cnt = pf;
+                    __sync_fetch_and_add(&stats_primes_found, (uint64_t)pf);
 
                     /* Scan only fully-verified gap regions (same fix as cooperative path) */
                     {
@@ -5652,6 +5655,7 @@ int main(int argc, char **argv) {
                         }
                         __sync_fetch_and_add(&stats_tested, (uint64_t)test_cnt);
                         cnt = pf;
+                        __sync_fetch_and_add(&stats_primes_found, (uint64_t)pf);
                     } else {
                         pf = cnt;
                         __sync_fetch_and_add(&stats_tested, (uint64_t)cnt);
