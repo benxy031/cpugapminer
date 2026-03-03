@@ -540,7 +540,20 @@ smart-scan, there is no sampling step that can miss primes.
 
 **Threading:** the backward scan is serial (each step depends on the
 previous result).  The helper thread sieves the next window in parallel;
-cooperative Fermat is disabled for this path.
+cooperative Fermat is disabled for this path.  At shift ≤ 64, sieve time
+and backward-scan time are closely balanced (~1.1s each), so the pipeline
+overlap is already near-optimal.
+
+**Est estimation:** the backward scan tests only ~5% of sieve survivors,
+but the Cramér–Granville formula requires the count of ALL consecutive
+prime pairs in the window.  The miner extrapolates: `est_pairs =
+total_survivors × (primes_found / tests_run) − 1`.  This produces accurate
+est values (~22 min at shift 43) instead of the inflated 7+ hours that
+result from counting only backward-scan jumps as pairs.
+
+**Sampling pass:** the first 200 sieve survivors of each window are
+fully Fermat-tested (regardless of backward-scan logic) to track verified
+consecutive-prime gaps for the `best=` display.  Cost: ~3% overhead.
 
 #### GPU: Two-phase smart-scan
 
@@ -647,10 +660,15 @@ gap scanning.  Multiple GPUs are supported via `--cuda 0,1`.
    after finishing their sieve work, utilizing otherwise-idle HT siblings.
 
 6. **Backward-scan gap mining** (CPU) -- Inspired by the original GapMiner's
-   skip-ahead algorithm.  Instead of testing all survivors, jump ahead by
-   `needed_gap` and scan backward for the nearest prime.  Finds primes in
-   ~8 tests on average, then skips thousands of survivors in dense clusters.
-   ~8× fewer Fermat tests than full-test, with zero false gaps.
+   skip-ahead algorithm.  Extracted into a standalone `backward_scan_segment()`
+   function that returns a result struct (primes found, tests run, best
+   merit, qualifying gap pairs).  Jumps ahead by `needed_gap` and scans
+   backward; finds primes in ~8 tests on average, then skips thousands
+   of survivors in dense clusters.  ~8× fewer Fermat tests than full-test,
+   with zero false gaps.  A 200-survivor sampling pass at the start of
+   each window provides gradual best-merit tracking.  The est formula
+   extrapolates full-window prime pairs from the Fermat pass rate for
+   accurate time-to-block estimates.
    GPU path retains two-phase smart-scan with a gap-verify safety net.
 
 7. **CRT gap-solver mining** -- Chinese Remainder Theorem alignment
@@ -765,7 +783,7 @@ python3 scripts/inspect_tx.py /tmp/gap_miner_block_<timestamp>.hex
 Every 5 s the miner prints a line like:
 
 ```
-STATS: elapsed=30.0s  sieved=520000000 (34666667/s)  tested=4561182 (304079/s)  gaps=0 (0.000/s)  built=0  submitted=0  accepted=0  prob=8.46e-10/pair  est=7.0h (target=20.89)
+STATS: elapsed=30.0s  sieved=5502926848 (183400328/s)  tested=8665707 (288809/s)  primes=1244781 (14.4%)  gaps=0 (0.000/s)  built=0  submitted=0  accepted=0  prob=8.74e-10/pair  est=22.4m (target=20.86)  best=9.77 (gap=2022)
 ```
 
 | Field | Meaning |
@@ -778,7 +796,8 @@ STATS: elapsed=30.0s  sieved=520000000 (34666667/s)  tested=4561182 (304079/s)  
 | `submitted` | Blocks whose header hash also met the network `bits` difficulty and were sent to the node |
 | `accepted` | Node confirmed the block |
 | `prob` | Per-pair probability of a qualifying gap (`e^(-target)`, Cramér–Granville heuristic) |
-| `est` | Estimated time to find a qualifying gap at current rate |
+| `est` | Estimated time to find a qualifying gap at current rate.  For backward-scan, pairs/s is extrapolated from the Fermat pass rate (`primes / tested × total_survivors`), not counted directly — since the backward scan only tests ~5% of survivors, the extrapolation estimates how many consecutive prime pairs the full window contains. |
+| `best` | Best verified gap merit seen so far (from the sampling pass and qualifying-gap forward searches) |
 | `gpu_batch` | (CUDA only) Average candidates per GPU flush.  Higher = better GPU utilization.  Absent when not using `--cuda`. |
 | `gaplist` | (CRT producer-consumer only) Number of sieved windows waiting in the priority heap.  Healthy range is 50–500; 0 means consumers are starved, near 4096 means producers are blocked. |
 
@@ -796,7 +815,7 @@ Getting to `submitted=0` requires clearing **two independent gates**:
    but still fail this check; in that case `built` increments but `submitted`
    does not.
 
-`gaps=0` after ~10 minutes at ~300 K tests/s and ~30 M sieved/s is completely
+`gaps=0` after ~10 minutes at ~300 K tests/s and ~180 M sieved/s is completely
 normal.  The miner is working correctly if sieve and test rates are non-zero.
 The `est` field gives a running estimate of time to find a qualifying gap.
 
