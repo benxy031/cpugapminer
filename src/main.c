@@ -2056,6 +2056,9 @@ static int assemble_mining_block(uint64_t nadd_val, uint64_t expect_seq,
     }
 
     bytes_to_hex(buf, (size_t)(p - buf), out_hex);
+    log_msg("[assemble] block: %zu bytes, nonce=%u nShift=%u nAdd=%llu (0x%llx) nAdd_bytes=%d\n",
+            (size_t)(p - buf), g_pass.nonce, (unsigned)g_pass.nshift,
+            (unsigned long long)nadd_val, (unsigned long long)nadd_val, nl);
     return 1;
 }
 
@@ -2149,8 +2152,40 @@ static int verify_pow_hex(const char *blockhex) {
     mpz_mul_2exp(mpz_prime, mpz_hash, (unsigned long)shift_v);
     mpz_add(mpz_prime, mpz_prime, mpz_nadd);
 
-    /* Check primality */
-    int is_prime = mpz_probab_prime_p(mpz_prime, 16);
+    /* Check primality with strong test */
+    int is_prime = mpz_probab_prime_p(mpz_prime, 25);
+
+    /* Find actual gap: search forward from prime+2 (skip even) */
+    unsigned long long actual_gap = 0;
+    double actual_merit = 0.0;
+    if (is_prime) {
+        mpz_t next;
+        mpz_init_set(next, mpz_prime);
+        mpz_add_ui(next, next, 2);
+        while (!mpz_probab_prime_p(next, 25)) {
+            mpz_add_ui(next, next, 2);
+            /* Safety limit: don't search more than 100000 */
+            if (mpz_cmp(next, mpz_prime) > 0) {
+                mpz_t diff;
+                mpz_init(diff);
+                mpz_sub(diff, next, mpz_prime);
+                if (mpz_cmp_ui(diff, 100000) > 0) {
+                    mpz_clear(diff);
+                    break;
+                }
+                mpz_clear(diff);
+            }
+        }
+        mpz_t gap_mpz;
+        mpz_init(gap_mpz);
+        mpz_sub(gap_mpz, next, mpz_prime);
+        actual_gap = mpz_get_ui(gap_mpz);
+        /* merit = gap / log(prime) */
+        double log_prime = (double)mpz_sizeinbase(mpz_prime, 2) * 0.6931471805599453;
+        actual_merit = (double)actual_gap / log_prime;
+        mpz_clear(gap_mpz);
+        mpz_clear(next);
+    }
 
     /* Compute merit approximation = gap is not computed here, just log components */
     int hash_bits = (int)mpz_sizeinbase(mpz_hash, 2);
@@ -2165,17 +2200,38 @@ static int verify_pow_hex(const char *blockhex) {
             hexlen, nbytes, (unsigned)nonce_v, (unsigned)shift_v, nadd_len);
     log_msg("[verify_pow] hash=%s bits=%d hash_ok=%d is_prime=%d\n",
             hash_hex, hash_bits, hash_ok, is_prime);
+    if (is_prime)
+        log_msg("[verify_pow] actual_gap=%llu actual_merit=%.6f\n",
+                actual_gap, actual_merit);
 
     /* Compare header with g_pass.hdr80 */
     int hdr_match = (memcmp(raw, g_pass.hdr80, 80) == 0);
     if (!hdr_match)
         log_msg("[verify_pow] WARNING: header bytes don't match g_pass.hdr80!\n");
 
+    /* Check actual merit against network target.
+       The miner's sieve/Fermat pipeline can produce false gaps (reported gap
+       larger than actual) when the smart-scan misses primes in non-flagged
+       regions or at window boundaries.  Reject any block whose verified gap
+       doesn't meet the target difficulty. */
+    int merit_ok = 1;
+    if (is_prime && g_pass.ndiff > 0) {
+        double target_merit = (double)g_pass.ndiff / (double)(1ULL << 48);
+        if (actual_merit < target_merit * 0.99) {
+            log_msg("[verify_pow] REJECT: actual_merit=%.6f < target=%.6f"
+                    "  (false gap: reported would be larger)\n",
+                    actual_merit, target_merit);
+            merit_ok = 0;
+        }
+    }
+
     /* Overall validity */
-    int valid = hash_ok && (hash_bits == 256) && is_prime && hdr_match;
+    int valid = hash_ok && (hash_bits == 256) && is_prime && hdr_match
+                && merit_ok;
     if (!valid)
-        log_msg("[verify_pow] FAIL: hash_ok=%d bits=%d prime=%d hdr_match=%d\n",
-                hash_ok, hash_bits, is_prime, hdr_match);
+        log_msg("[verify_pow] FAIL: hash_ok=%d bits=%d prime=%d hdr_match=%d"
+                " merit_ok=%d\n",
+                hash_ok, hash_bits, is_prime, hdr_match, merit_ok);
     else
         log_msg("[verify_pow] OK: PoW is valid locally\n");
 
@@ -2605,6 +2661,10 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
                             log_msg(">>> stratum submit FAILED\n");
                         print_stats();
                     } else {
+                        /* Local PoW verification before sending to node */
+                        if (!verify_pow_hex(blockhex)) {
+                            log_msg(">>> SKIPPING: local PoW verification FAILED\n");
+                        } else {
                         struct submit_job _job;
                         memset(&_job, 0, sizeof(_job));
                         strncpy(_job.url, rpc_url, sizeof(_job.url)-1);
@@ -2619,6 +2679,7 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
                         enqueue_job(&_job);
                         log_msg(">>> QUEUED for async submit\n");
                         print_stats();
+                        }
                     }
                 }
             } else {
@@ -3092,13 +3153,43 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
         uint64_t q     = pr[i + 1];   /* nAdd of gap end prime   */
         uint64_t gap   = q - prev;
         double merit   = (double)gap / logbase;
-        /* Track best merit seen (lock-free: small races are harmless) */
+        /* Track best merit seen (lock-free: small races are harmless).
+           Updated for ALL pairs so the stats display shows progress.
+           Note: smart-scan false gaps may inflate this — cosmetic only. */
         if (merit > stats_best_merit) {
             stats_best_merit = merit;
             stats_best_gap   = gap;
         }
         if (merit < target_local)
             continue;
+
+        /* ── Quick gap verification ──
+           Scan odd offsets between prev and q using bn_candidate_is_prime()
+           (fast-fermat + TD pre-filter — same cost as the normal sieve
+           pipeline).  If ANY intermediate value is prime, the reported gap
+           is false (smart-scan missed that prime).  Cost: O(gap/2) cheap
+           TD checks + ~10% Fermat tests.  Typically <1 ms for false gaps
+           (actual gap 24–650) and ~10 ms for real qualifying gaps (~4 K).
+           Only fires for gaps that already pass the merit threshold. */
+        {
+            int false_gap = 0;
+            uint64_t found_at = 0;
+            for (uint64_t off = 2; off < gap; off += 2) {
+                if (bn_candidate_is_prime(prev + off)) {
+                    false_gap = 1;
+                    found_at = off;
+                    break;
+                }
+            }
+            if (false_gap) {
+                log_msg("[gap_verify] FALSE GAP: reported=%llu"
+                        "  prime at nAdd+%llu (nAdd=%llu)\n",
+                        (unsigned long long)gap,
+                        (unsigned long long)found_at,
+                        (unsigned long long)prev);
+                continue;
+            }
+        }
 
         __sync_fetch_and_add(&stats_gaps, 1);
         /* nAdd = relative offset = prev (prime = base + nAdd). */
@@ -3141,6 +3232,11 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
                                 char sig[65];
                                 hmac_sha256_hex(rpc_sign_key_local, blockhex, sig);
                                 log_msg("    signature: %s\n", sig);
+                            }
+                            /* Local PoW verification before sending to node */
+                            if (!verify_pow_hex(blockhex)) {
+                                log_msg(">>> SKIPPING: local PoW verification FAILED\n");
+                                continue;
                             }
                             struct submit_job _job;
                             memset(&_job, 0, sizeof(_job));
@@ -4595,25 +4691,16 @@ static void *worker_fn(void *arg) {
                     int found_block = 0;
                     size_t region_pairs = 0;
 
-                    /* Cross-window carry: check if the last confirmed prime
-                       from the previous window forms a qualifying gap with the
-                       first confirmed prime in this window.  The gap cannot
-                       underestimate because pr[0] >= the first sieve survivor
-                       and no primes exist before it (sieve-eliminated).  When
-                       the pair is submitted, the node independently verifies
-                       the gap by searching forward from carry. */
-                    if (carry_last_prime && cnt >= 1
-                        && carry_last_prime < pr[0]
-                        && pr[0] - carry_last_prime >= needed_gap) {
-                        uint64_t xw_pair[2] = { carry_last_prime, pr[0] };
-                        if (scan_candidates(xw_pair, 2,
-                                            target_local, logbase,
-                                            shift_local, header_local,
-                                            rpc_url_local, rpc_user_local,
-                                            rpc_pass_local, rpc_method_local,
-                                            rpc_sign_key_local))
-                            found_block = 1;
-                    }
+                    /* NOTE: cross-window carry is NOT used in smart-scan mode.
+                       carry_last_prime and pr[0] are the last/first CONFIRMED
+                       primes, but between them lie non-flagged sampling
+                       intervals where non-sampled survivors were never phase-2
+                       tested.  Those untested survivors may be prime, making
+                       the carry gap an overestimate (false gap).  Real
+                       qualifying gaps are found within fully-tested flagged
+                       regions below.  Cross-window carry works correctly in
+                       the full-test path (--sample-stride 1) where every
+                       survivor is tested. */
 
                     for (size_t r = 0; r < n_gap_regions && gap_reg_lo; r++) {
                         if (gap_reg_alive && !gap_reg_alive[r]) continue;

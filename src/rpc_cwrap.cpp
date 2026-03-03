@@ -65,6 +65,10 @@ int rpc_submit(const char *url, const char *user, const char *pass, const char *
     CURLcode rc = curl_easy_perform(c);
     int ret = -1;
     if (rc == CURLE_OK) {
+        /* Log raw response for diagnostics */
+        fprintf(stderr, "[rpc_submit] raw response: %.*s\n",
+                (int)(s.len < 512 ? s.len : 512), s.ptr);
+
         /* Properly parse JSON-RPC response and surface detailed errors. */
         json_error_t jerr;
         json_t *root = json_loads(s.ptr, 0, &jerr);
@@ -196,6 +200,14 @@ int rpc_getwork_data(const char *url, const char *user, const char *pass,
             if (jdata && json_is_string(jdata) && jdiff && json_is_number(jdiff)) {
                 const char *ds = json_string_value(jdata);
                 size_t dlen = strlen(ds);
+                fprintf(stderr, "[getwork] data field: %zu hex chars (%zu bytes)\n",
+                        dlen, dlen / 2);
+                /* Log first 40 and last 40 hex chars for diagnostics */
+                if (dlen > 80)
+                    fprintf(stderr, "[getwork] data: %.40s...%s\n",
+                            ds, ds + dlen - 40);
+                else
+                    fprintf(stderr, "[getwork] data: %s\n", ds);
                 if (dlen >= 160) {
                     strncpy(data_out, ds, 160);
                     data_out[160] = '\0';
