@@ -39,23 +39,38 @@ uint64_t mac(uint64_t *acc, uint64_t a, uint64_t b, uint64_t carry)
     return hi;
 }
 
-/* a ≥ b  (NL limbs) ? */
+/* ═══════════════════════════════════════════════════════════════════
+ *  Templated device helpers: AL-limb unsigned integer arithmetic
+ *
+ *  AL = "arithmetic limbs" — the actual number of 64-bit words needed
+ *  for the candidate.  At shift 43, candidates are ~299 bits → AL=5.
+ *  At shift 512, candidates are ~768 bits → AL=12.
+ *
+ *  Montgomery multiplication is O(AL²), so using AL=5 instead of
+ *  NL=16 gives (16/5)² ≈ 10× speedup.  The compiler fully unrolls
+ *  inner loops for each template instantiation, optimizing register
+ *  allocation and instruction scheduling per size.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* a ≥ b  (AL limbs) ? */
+template<int AL>
 __device__ static __forceinline__
-int gte(const uint64_t *a, const uint64_t *b)
+int gte_t(const uint64_t *a, const uint64_t *b)
 {
-    for (int i = NL - 1; i >= 0; i--) {
+    for (int i = AL - 1; i >= 0; i--) {
         if (a[i] > b[i]) return 1;
         if (a[i] < b[i]) return 0;
     }
     return 1;  /* equal → a ≥ b */
 }
 
-/* r = a − b  (NL limbs, unsigned wrap-around) */
+/* r = a − b  (AL limbs, unsigned wrap-around) */
+template<int AL>
 __device__ static __forceinline__
-void sub(uint64_t *r, const uint64_t *a, const uint64_t *b)
+void sub_t(uint64_t *r, const uint64_t *a, const uint64_t *b)
 {
     uint64_t borrow = 0;
-    for (int i = 0; i < NL; i++) {
+    for (int i = 0; i < AL; i++) {
         uint64_t ai = a[i], bi = b[i];
         uint64_t d  = ai - bi;
         uint64_t b1 = (ai < bi);
@@ -67,163 +82,191 @@ void sub(uint64_t *r, const uint64_t *a, const uint64_t *b)
 }
 
 /* a = 2a mod n  (modular doubling) */
+template<int AL>
 __device__ static __forceinline__
-void moddbl(uint64_t *a, const uint64_t *n)
+void moddbl_t(uint64_t *a, const uint64_t *n)
 {
     uint64_t carry = 0;
-    for (int i = 0; i < NL; i++) {
+    for (int i = 0; i < AL; i++) {
         uint64_t v = a[i];
         a[i]  = (v << 1) | carry;
         carry = v >> 63;
     }
-    /* If carry or a ≥ n → subtract n (at most once since a < 2n) */
-    if (carry || gte(a, n))
-        sub(a, a, n);
+    if (carry || gte_t<AL>(a, n))
+        sub_t<AL>(a, a, n);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- *  Montgomery multiplication
+ *  Montgomery multiplication (templated)
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* Compute −n⁻¹ mod 2⁶⁴  (Newton's method on the lowest limb).
-   Requires n odd. */
+   Requires n odd.  Independent of limb count. */
 __device__ static __forceinline__
 uint64_t compute_ninv(uint64_t n0)
 {
-    /* x ≡ n0⁻¹ (mod 2^k), doubling k each iteration.
-       Start: n0 × 1 ≡ n0 (mod 2) ≡ 1 (mod 2) since n0 is odd. */
     uint64_t x = 1;
-    for (int i = 0; i < 6; i++)          /* 6 iters: 1→2→4→8→16→32→64 bits */
+    for (int i = 0; i < 6; i++)
         x *= 2 - n0 * x;
-    return ~x + 1;                        /* −x mod 2^64 */
+    return ~x + 1;
 }
 
-/* r = R mod n,  where R = 2^(64×NL).
-   Computed by 64×NL modular doublings of 1. */
+/* r = R mod n,  where R = 2^(64×AL).
+   Computed by 64×AL modular doublings of 1. */
+template<int AL>
 __device__ static
-void compute_rmodn(uint64_t *r, const uint64_t *n)
+void compute_rmodn_t(uint64_t *r, const uint64_t *n)
 {
-    for (int i = 0; i < NL; i++) r[i] = 0;
+    for (int i = 0; i < AL; i++) r[i] = 0;
     r[0] = 1;
-    /* After k doublings: r = 2^k mod n.  After 64*NL: r = R mod n. */
     #pragma unroll 1
-    for (int i = 0; i < 64 * NL; i++)
-        moddbl(r, n);
+    for (int i = 0; i < 64 * AL; i++)
+        moddbl_t<AL>(r, n);
 }
 
 /* Montgomery multiplication:  r = a · b · R⁻¹ mod n
    CIOS (Coarsely Integrated Operand Scanning) form.
    Requires n odd, 0 ≤ a,b < n < R. */
+template<int AL>
 __device__ static
-void montmul(uint64_t *      __restrict__ r,
-             const uint64_t * __restrict__ a,
-             const uint64_t * __restrict__ b,
-             const uint64_t * __restrict__ n,
-             uint64_t ninv)
+void montmul_t(uint64_t *      __restrict__ r,
+               const uint64_t * __restrict__ a,
+               const uint64_t * __restrict__ b,
+               const uint64_t * __restrict__ n,
+               uint64_t ninv)
 {
-    uint64_t t[NL + 2];
-    #pragma unroll
-    for (int i = 0; i < NL + 2; i++) t[i] = 0;
+    uint64_t t[AL + 2];
+    for (int i = 0; i < AL + 2; i++) t[i] = 0;
 
-    for (int i = 0; i < NL; i++) {
-        /* Step 1: t += a[i] × b */
+    for (int i = 0; i < AL; i++) {
         uint64_t c = 0;
-        for (int j = 0; j < NL; j++)
+        for (int j = 0; j < AL; j++)
             c = mac(&t[j], a[i], b[j], c);
-        uint64_t old = t[NL];
-        t[NL] += c;
-        t[NL + 1] += (t[NL] < old);
+        uint64_t old = t[AL];
+        t[AL] += c;
+        t[AL + 1] += (t[AL] < old);
 
-        /* Step 2: Montgomery reduce — m = t[0] × ninv;  t += m × n */
         uint64_t m = t[0] * ninv;
         c = 0;
-        for (int j = 0; j < NL; j++)
+        for (int j = 0; j < AL; j++)
             c = mac(&t[j], m, n[j], c);
-        old = t[NL];
-        t[NL] += c;
-        t[NL + 1] += (t[NL] < old);
+        old = t[AL];
+        t[AL] += c;
+        t[AL + 1] += (t[AL] < old);
 
-        /* Step 3: shift right one limb (t[0] is now 0 mod 2^64) */
-        for (int j = 0; j < NL + 1; j++)
+        for (int j = 0; j < AL + 1; j++)
             t[j] = t[j + 1];
-        t[NL + 1] = 0;
+        t[AL + 1] = 0;
     }
 
-    /* Final reduction: if t ≥ n then t −= n */
-    if (t[NL] || gte(t, n))
-        sub(r, t, n);
+    if (t[AL] || gte_t<AL>(t, n))
+        sub_t<AL>(r, t, n);
     else
-        for (int i = 0; i < NL; i++) r[i] = t[i];
+        for (int i = 0; i < AL; i++) r[i] = t[i];
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- *  Fermat test kernel
+ *  Templated Fermat test kernel
+ *  AL = arithmetic width (limbs actually used).
+ *  stride = storage width per candidate in memory (= GPU_NLIMBS).
  * ═══════════════════════════════════════════════════════════════════ */
 
-__global__ void fermat_kernel(const uint64_t * __restrict__ cands,
-                              uint8_t        * __restrict__ results,
-                              uint32_t count)
+template<int AL>
+__global__ void fermat_kernel_t(const uint64_t * __restrict__ cands,
+                                uint8_t        * __restrict__ results,
+                                uint32_t count, int stride)
 {
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
 
-    /* ── Load candidate n ── */
-    uint64_t n[NL];
-    const uint64_t *src = &cands[(size_t)idx * NL];
-    for (int i = 0; i < NL; i++) n[i] = src[i];
+    uint64_t n[AL];
+    const uint64_t *src = &cands[(size_t)idx * stride];
+    for (int i = 0; i < AL; i++) n[i] = src[i];
 
-    /* Quick reject: even numbers */
     if ((n[0] & 1) == 0) { results[idx] = 0; return; }
 
-    /* ── Montgomery setup ── */
     uint64_t ninv = compute_ninv(n[0]);
 
-    /* one_m = R mod n  (= 1 in Montgomery form) */
-    uint64_t one_m[NL];
-    compute_rmodn(one_m, n);
+    uint64_t one_m[AL];
+    compute_rmodn_t<AL>(one_m, n);
 
-    /* base_m = 2R mod n  (= 2 in Montgomery form) */
-    uint64_t base_m[NL];
-    for (int i = 0; i < NL; i++) base_m[i] = one_m[i];
-    moddbl(base_m, n);
+    uint64_t base_m[AL];
+    for (int i = 0; i < AL; i++) base_m[i] = one_m[i];
+    moddbl_t<AL>(base_m, n);
 
-    /* ── Exponent: e = n − 1  (n is odd → no borrow) ── */
-    uint64_t e[NL];
-    for (int i = 0; i < NL; i++) e[i] = n[i];
+    uint64_t e[AL];
+    for (int i = 0; i < AL; i++) e[i] = n[i];
     e[0] -= 1;
 
-    /* Find highest set bit */
-    int top = NL - 1;
+    int top = AL - 1;
     while (top > 0 && e[top] == 0) top--;
     int msb = 63 - __clzll(e[top]);
 
-    /* ── Left-to-right binary exponentiation ──
-       Result starts as base_m (= 2 in Montgomery form), having consumed
-       the MSB of the exponent (which is always 1). */
-    uint64_t res[NL];
-    for (int i = 0; i < NL; i++) res[i] = base_m[i];
+    uint64_t res[AL];
+    for (int i = 0; i < AL; i++) res[i] = base_m[i];
 
     for (int limb = top; limb >= 0; limb--) {
         int start = (limb == top) ? msb - 1 : 63;
         for (int bit = start; bit >= 0; bit--) {
-            montmul(res, res, res, n, ninv);               /* square */
+            montmul_t<AL>(res, res, res, n, ninv);
             if ((e[limb] >> bit) & 1)
-                montmul(res, res, base_m, n, ninv);        /* multiply */
+                montmul_t<AL>(res, res, base_m, n, ninv);
         }
     }
 
-    /* ── Convert back from Montgomery form ── */
-    uint64_t one[NL];
-    for (int i = 0; i < NL; i++) one[i] = 0;
+    uint64_t one[AL];
+    for (int i = 0; i < AL; i++) one[i] = 0;
     one[0] = 1;
-    montmul(res, res, one, n, ninv);
+    montmul_t<AL>(res, res, one, n, ninv);
 
-    /* ── Check result == 1 ── */
     int ok = (res[0] == 1);
-    for (int i = 1; i < NL; i++)
+    for (int i = 1; i < AL; i++)
         ok &= (res[i] == 0);
 
     results[idx] = ok ? 1 : 0;
+}
+
+/* ── Kernel dispatch: launch the narrowest specialization that fits ──
+   Candidates are stored with NL limbs each, but the kernel only
+   operates on AL limbs.  Speedup ≈ (NL/AL)² from Montgomery mul.
+
+   Specializations: 5, 6, 8, 10, 12, 16 (and 20 if NL ≥ 20).
+   E.g. shift 43 → AL=5 → montmul does 5²=25 ops vs 16²=256.       */
+static void launch_fermat(int al, cudaStream_t stream,
+                          const uint64_t *d_cands, uint8_t *d_results,
+                          uint32_t count)
+{
+    int block = 128;
+    int grid  = (int)((count + block - 1) / block);
+
+#define FERMAT_DISPATCH(W) \
+    fermat_kernel_t<W><<<grid, block, 0, stream>>>(d_cands, d_results, count, NL); return
+
+#if NL >= 5
+    if (al <= 5)  { FERMAT_DISPATCH(5);  }
+#endif
+#if NL >= 6
+    if (al <= 6)  { FERMAT_DISPATCH(6);  }
+#endif
+#if NL >= 8
+    if (al <= 8)  { FERMAT_DISPATCH(8);  }
+#endif
+#if NL >= 10
+    if (al <= 10) { FERMAT_DISPATCH(10); }
+#endif
+#if NL >= 12
+    if (al <= 12) { FERMAT_DISPATCH(12); }
+#endif
+#if NL >= 16
+    if (al <= 16) { FERMAT_DISPATCH(16); }
+#endif
+#if NL >= 20
+    if (al <= 20) { FERMAT_DISPATCH(20); }
+#endif
+    /* Fallback: compile-time maximum */
+    FERMAT_DISPATCH(NL);
+
+#undef FERMAT_DISPATCH
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -233,6 +276,7 @@ __global__ void fermat_kernel(const uint64_t * __restrict__ cands,
 struct gpu_fermat_ctx {
     int       device_id;
     size_t    max_batch;
+    int       active_limbs;    /* arithmetic width (≤ NL); 0 = use NL  */
     /* Double-buffered async pipeline: 2 slots for overlap */
     cudaStream_t stream[2];
     uint64_t *d_cands[2];      /* device candidate buffers  */
@@ -263,6 +307,7 @@ gpu_fermat_ctx *gpu_fermat_init(int device_id, size_t max_batch)
 
     ctx->device_id = device_id;
     ctx->max_batch = max_batch;
+    ctx->active_limbs = NL;   /* default: full width; call set_limbs() to narrow */
 
     /* Allocate double-buffered device + pinned host memory */
     for (int s = 0; s < 2; s++) {
@@ -336,11 +381,9 @@ int gpu_fermat_submit(gpu_fermat_ctx *ctx, int slot,
                           cudaMemcpyHostToDevice, ctx->stream[slot]);
     if (err != cudaSuccess) return -1;
 
-    /* Launch kernel on stream[slot] */
-    int block = 128;
-    int grid  = (int)((count + block - 1) / block);
-    fermat_kernel<<<grid, block, 0, ctx->stream[slot]>>>(
-        ctx->d_cands[slot], ctx->d_results[slot], (uint32_t)count);
+    /* Launch kernel — dispatch to narrowest matching specialization */
+    launch_fermat(ctx->active_limbs, ctx->stream[slot],
+                  ctx->d_cands[slot], ctx->d_results[slot], (uint32_t)count);
 
     /* Async D→H on stream[slot] */
     err = cudaMemcpyAsync(ctx->h_results[slot], ctx->d_results[slot],
@@ -397,6 +440,14 @@ int gpu_fermat_test_batch(gpu_fermat_ctx *ctx,
 const char *gpu_fermat_device_name(gpu_fermat_ctx *ctx)
 {
     return ctx ? ctx->dev_name : "";
+}
+
+void gpu_fermat_set_limbs(gpu_fermat_ctx *ctx, int limbs)
+{
+    if (!ctx) return;
+    if (limbs < 1)  limbs = NL;
+    if (limbs > NL) limbs = NL;
+    ctx->active_limbs = limbs;
 }
 
 void gpu_fermat_destroy(gpu_fermat_ctx *ctx)

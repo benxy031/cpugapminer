@@ -77,6 +77,13 @@ int gpu_fermat_collect(gpu_fermat_ctx *ctx, int slot,
 /* Return the CUDA device name (for logging).  Returns "" on error. */
 const char *gpu_fermat_device_name(gpu_fermat_ctx *ctx);
 
+/* Set the arithmetic limb count for this context.
+   active_limbs = ceil((256 + shift) / 64) for Gapcoin.
+   Reduces Montgomery multiplication from O(GPU_NLIMBS²) to O(active²).
+   At shift 43: active=5, speedup ≈ (16/5)² ≈ 10×.
+   Must be called before submitting work.  Clamped to [1, GPU_NLIMBS]. */
+void gpu_fermat_set_limbs(gpu_fermat_ctx *ctx, int limbs);
+
 /* Free GPU resources. */
 void gpu_fermat_destroy(gpu_fermat_ctx *ctx);
 

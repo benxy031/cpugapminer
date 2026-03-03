@@ -5128,6 +5128,20 @@ int main(int argc, char **argv) {
         if (g_gpu_count == 0) {
             fprintf(stderr, "No CUDA devices initialized. Falling back to CPU.\n");
             use_cuda = 0;
+        } else {
+            /* Set arithmetic limb count based on shift.
+               candidates = h256(256 bits) << shift → (256 + shift) bits.
+               active_limbs = ceil((256 + shift) / 64).
+               This lets the GPU kernel use AL-width Montgomery multiplication
+               instead of full GPU_NLIMBS width.  Speedup ≈ (NL/AL)².
+               E.g. shift 43 → AL=5 → (16/5)² ≈ 10× faster kernel. */
+            int candidate_bits = 256 + shift;
+            int active_limbs   = (candidate_bits + 63) / 64;
+            for (int gi = 0; gi < g_gpu_count; gi++)
+                gpu_fermat_set_limbs(g_gpu_ctx[gi], active_limbs);
+            log_msg("CUDA: active_limbs=%d (%d-bit candidates, compiled NL=%d)\n",
+                    active_limbs < GPU_NLIMBS ? active_limbs : GPU_NLIMBS,
+                    candidate_bits, GPU_NLIMBS);
         }
     }
 #else
