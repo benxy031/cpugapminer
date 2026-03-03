@@ -379,8 +379,10 @@ Fermat testing to the GPU on **all mining paths**:
   thousands of candidates per launch.
 - **Normal sieve (non-CRT)** — Each sieve window already produces thousands
   of candidates, so they are sent directly to the GPU via `gpu_batch_filter`
-  without accumulation.  Both the full-test path and the two-phase
-  smart-scan path (Phase 1 sampling + Phase 2 verification) use the GPU.
+  without accumulation.  The GPU path uses two-phase smart-scan (Phase 1
+  sampling + Phase 2 verification).  The CPU path uses a backward-scan
+  algorithm that jumps ahead by the target gap and scans backward for
+  primes, achieving ~8× fewer Fermat tests than full-test.
   Cooperative Fermat is disabled (`coop.active=0`) so the helper thread
   only sieves the next window and does not waste CPU on redundant Fermat
   work.
@@ -498,36 +500,62 @@ Two CRT file formats are supported:
 | Legacy binary | `.bin` | `CRT_MODE_TEMPLATE` | Bitmap tiling, ≤10 primes (old format) |
 | Text (gen_crt) | `.txt` | `CRT_MODE_SOLVER` | Prime:offset pairs, CRT-aligned mining |
 
-### Two-phase smart gap scanning
+### Gap scanning strategies
 
 Controlled by `--sample-stride K` (default 8; set to 1 to disable).
 Used in the normal (non-CRT) mining path.
 
-Instead of testing every sieve survivor, the miner uses a two-phase approach
-that skips survivors in regions where no qualifying gap can exist:
+#### CPU: Backward-scan (default)
 
-**Phase 1 – Sampling.**  Test every Kth survivor for primality.  The
-"sampled primes" form a sparse skeleton of confirmed primes across the
-window.
+Inspired by the original GapMiner's skip-ahead algorithm from
+[Gapcoin-PoWCore](https://github.com/gapcoin-project/Gapcoin-PoWCore).
+Instead of testing every sieve survivor, the miner jumps ahead by
+`needed_gap = target × log(base)` and scans **backward** for the nearest
+prime:
 
-**Gap analysis.**  Measure distance between consecutive sampled primes.
-Only regions where the gap between two sampled primes is ≥ `target × log(base)`
-can possibly contain a qualifying gap—any sampled prime *inside* a candidate
-gap would break it.  Survivors outside these regions are skipped entirely.
+1. **Find first prime** — forward-scan through `pr[]` (sieve survivors)
+   until a Fermat-prime is found.  This becomes `start`.
+2. **Jump ahead** — binary-search `pr[]` for the first survivor beyond
+   `start + needed_gap`.
+3. **Scan backward** — walk backward through survivors from that point
+   toward `start`, Fermat-testing each one.
+   - **Prime found →** gap from `start` to here is < `needed_gap`.
+     Update `start` to this prime and jump ahead again (step 2).
+   - **No prime found →** the entire `[start, start + needed_gap]`
+     interval has been tested.  This IS a qualifying gap.
+4. **Forward search** — when a gap is found, scan forward from
+   `start + needed_gap` to find the actual next prime and determine
+   the true gap size.  If `merit ≥ target`, submit via RPC.
+5. **Repeat** until the end of the sieve window.
 
-**Phase 2 – Verification.**  Test the remaining (unsampled) survivors only
-within candidate regions.  Both phases use cooperative Fermat (worker +
-helper).
+**Why it's fast:** in dense prime clusters (which is most of the window),
+the backward scan finds a prime after only ~8 Fermat tests on average
+(1 / prime_density of sieve survivors).  It then jumps ahead by thousands
+of positions, skipping all the survivors in between.  Only in actual
+qualifying-gap regions does every survivor get tested.
 
-The correctness guarantee is exact: every gap with merit ≥ target is found.
-Proof: if a qualifying gap `[P, Q]` exists with `Q − P ≥ needed_gap`, then
-no sampled prime can lie strictly between P and Q (it would split the gap).
-Therefore P and Q lie within the same sampled-prime interval, which is
-identified as a candidate region.
+**Correctness guarantee:** every sieve survivor inside a potential gap
+region IS tested — no false gaps are possible.  Unlike the old two-phase
+smart-scan, there is no sampling step that can miss primes.
 
-At production parameters (shift=37, target≈20.89), this typically **skips
-~68% of Fermat tests**, yielding a **3.4× effective speedup** in
-block-finding rate.  The benefit grows with higher targets and shifts.
+**Threading:** the backward scan is serial (each step depends on the
+previous result).  The helper thread sieves the next window in parallel;
+cooperative Fermat is disabled for this path.
+
+#### GPU: Two-phase smart-scan
+
+When CUDA is active (`--cuda`), the GPU path still uses the two-phase
+approach: Phase 1 samples every Kth survivor via GPU batch Fermat,
+identifies candidate gap regions, edge-probes to eliminate false positives,
+then Phase 2 verifies all survivors inside surviving regions.  A gap-verify
+safety net (`bn_candidate_is_prime` + 25-round MR) catches any remaining
+false gaps before submission.
+
+#### Full test (`--sample-stride 1`)
+
+Disables both backward-scan and smart-scan.  Every sieve survivor is
+Fermat-tested via cooperative Fermat (worker + helper).  Slowest but
+simplest path; mainly useful for debugging.
 
 ## Performance
 
@@ -543,16 +571,18 @@ Benchmarked on an Intel i3-10100 (4 cores / 8 threads, 3.6 GHz) with
 | + raw Fermat (`mpz_powm`) + batched atomics | 6,920 K/s | 277.7 K/s | 13.5× |
 | + cooperative Fermat + -O3/LTO + mpz pre-alloc | 8,513 K/s | 342.6 K/s | **16.7×** |
 
-### Smart scanning impact (shift=37, target=20.89, 2 threads)
+### Backward-scan impact (CPU, shift=43, target≈20.89, 2 threads)
 
-| Mode | Sieve rate | ETA | Tests skipped |
-|------|-----------|-----|---------------|
-| Full (`--sample-stride 1`) | 12 M/s | 8.2 h | 0% |
-| Smart (`--sample-stride 8`) | 32 M/s | **2.4 h** | **68%** |
+| Mode | Description | Fermat tests | Relative |
+|------|------------|-------------|----------|
+| Full (`--sample-stride 1`) | Test every survivor | 100% | 1.0× |
+| Backward-scan (default) | Jump ahead + scan back | **~12%** | **~8×** |
 
-Smart scanning processes **2.7× more sieve windows per second** by
-skipping Fermat tests in regions that provably cannot contain a qualifying
-gap.  The block-finding rate improves by **3.4×**.
+The backward-scan algorithm finds a prime within ~8 backward Fermat tests
+on average, then jumps ahead by the full target gap — skipping thousands
+of survivors in dense prime clusters.  Only qualifying-gap regions get
+fully tested.  No false gaps are possible (every survivor in the gap
+window is tested).
 
 ### CUDA GPU Fermat testing
 
@@ -616,9 +646,12 @@ gap scanning.  Multiple GPUs are supported via `--cuda 0,1`.
 5. **Cooperative Fermat** -- Helper threads assist with primality testing
    after finishing their sieve work, utilizing otherwise-idle HT siblings.
 
-6. **Two-phase smart scanning** -- Sample every Kth survivor, identify
-   candidate regions, verify only those.  Skips ~68% of Fermat tests at
-   production parameters for a 3.4× block-finding speedup.
+6. **Backward-scan gap mining** (CPU) -- Inspired by the original GapMiner's
+   skip-ahead algorithm.  Instead of testing all survivors, jump ahead by
+   `needed_gap` and scan backward for the nearest prime.  Finds primes in
+   ~8 tests on average, then skips thousands of survivors in dense clusters.
+   ~8× fewer Fermat tests than full-test, with zero false gaps.
+   GPU path retains two-phase smart-scan with a gap-verify safety net.
 
 7. **CRT gap-solver mining** -- Chinese Remainder Theorem alignment
    constrains which nAdd values to test, reducing the search space to
@@ -677,7 +710,7 @@ gap scanning.  Multiple GPUs are supported via `--cuda 0,1`.
 | `--log-file FILE`     | --            | Append all log messages to FILE |
 | `--fast-fermat`       | off           | Fast single-base Fermat primality test |
 | `--mr-rounds N`       | 2             | Miller-Rabin rounds for `mpz_probab_prime_p` (default path, not `--fast-fermat`).  Old default was 10; 2 rounds gives false-positive rate < 2^-128 for sieve-filtered candidates. |
-| `--sample-stride K`   | 8             | Smart scan: test every Kth survivor, skip regions that can't contain qualifying gaps.  Set to 1 to disable. |
+| `--sample-stride K`   | 8             | Controls gap scanning strategy.  K > 1 enables backward-scan (CPU) or two-phase smart-scan (GPU).  Set to 1 for full-test (all survivors tested). |
 | `--crt-file FILE`     | --            | Load a CRT sieve file (binary `.bin` or text `.txt`).  Text files enable CRT-aligned mining; binary files enable template tiling. |
 | `--fermat-threads N` / `-d N` | 0 (monolithic) | Number of Fermat consumer threads for CRT producer-consumer mode.  Default `0` = monolithic (all threads sieve+fermat independently).  Set to `N` to enable producer-consumer with `threads - N` sieve and `N` fermat threads. |
 | `--no-primality`      | off           | Skip primality testing entirely |

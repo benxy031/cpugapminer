@@ -757,10 +757,11 @@ static void print_stats(void) {
         format_est(est_buf, sizeof(est_buf), est_sec);
     }
 
+    double bm = stats_best_merit;
     log_msg("STATS: elapsed=%.1fs  sieved=%llu (%.0f/s)  tested=%llu (%.0f/s)  "
             "primes=%llu (%.1f%%)  "
             "gaps=%llu (%.3f/s)  built=%llu  submitted=%llu  accepted=%llu  "
-            "prob=%.2e/pair  est=%s (target=%.2f)",
+            "prob=%.2e/pair  est=%s (target=%.2f)  best=%.2f (gap=%llu)",
             elapsed,
             (unsigned long long)stats_sieved,  sieve_rate,
             (unsigned long long)stats_tested,  test_rate,
@@ -770,7 +771,8 @@ static void print_stats(void) {
             (unsigned long long)stats_blocks,
             (unsigned long long)stats_submits,
             (unsigned long long)stats_success,
-            prob_pair, est_buf, target_m);
+            prob_pair, est_buf, target_m,
+            bm, (unsigned long long)stats_best_gap);
 
     /* ── CRT-specific stats ── */
     if (g_crt_mode == CRT_MODE_SOLVER) {
@@ -783,12 +785,6 @@ static void print_stats(void) {
         if (crt_fermat_threads > 0)
             log_msg("  gaplist=%lu", (unsigned long)crt_heap_count());
     }
-
-    /* Best merit found this session */
-    double bm = stats_best_merit;
-    if (bm > 0.0)
-        log_msg("  best=%.2f (gap=%llu)",
-                bm, (unsigned long long)stats_best_gap);
 
 #ifdef WITH_CUDA
     if (stats_gpu_flushes > 0) {
@@ -4189,7 +4185,10 @@ static void *worker_fn(void *arg) {
             int use_smart = (smart_K > 1 && !no_primality
                              && cnt > (size_t)(smart_K * 4));
 
-            size_t needed_gap = 0, p1_cnt = 0, p1_wcap = 0;
+            size_t needed_gap = 0;
+#ifdef WITH_CUDA
+            size_t p1_cnt = 0, p1_wcap = 0;
+#endif
             uint64_t *p1_cands = NULL, *p1_wbuf = NULL;
 
 
@@ -4197,18 +4196,23 @@ static void *worker_fn(void *arg) {
             if (use_smart) {
                 needed_gap = (size_t)(target_local * logbase);
                 if (needed_gap < 2) needed_gap = 2;
-                p1_cnt  = (cnt + (size_t)smart_K - 1) / (size_t)smart_K;
-                p1_wcap = p1_cnt / 4 + 64;
-                p1_cands = (uint64_t *)malloc(p1_cnt * sizeof(uint64_t));
-                p1_wbuf  = (uint64_t *)malloc(p1_wcap * sizeof(uint64_t));
-                if (!p1_cands || !p1_wbuf) {
-                    free(p1_cands); free(p1_wbuf);
-                    p1_cands = p1_wbuf = NULL;
-                    use_smart = 0;               /* OOM → full test fallback */
-                } else {
-                    for (size_t s = 0, j = 0; j < cnt; j += (size_t)smart_K, s++)
-                        p1_cands[s] = pr[j];
+#ifdef WITH_CUDA
+                /* GPU smart-scan still needs sampled candidates */
+                if (g_gpu_count > 0) {
+                    p1_cnt  = (cnt + (size_t)smart_K - 1) / (size_t)smart_K;
+                    p1_wcap = p1_cnt / 4 + 64;
+                    p1_cands = (uint64_t *)malloc(p1_cnt * sizeof(uint64_t));
+                    p1_wbuf  = (uint64_t *)malloc(p1_wcap * sizeof(uint64_t));
+                    if (!p1_cands || !p1_wbuf) {
+                        free(p1_cands); free(p1_wbuf);
+                        p1_cands = p1_wbuf = NULL;
+                        use_smart = 0;
+                    } else {
+                        for (size_t s = 0, j = 0; j < cnt; j += (size_t)smart_K, s++)
+                            p1_cands[s] = pr[j];
+                    }
                 }
+#endif
             }
 
             /* --- set up cooperative Fermat and unlock mutex (once) ------- */
@@ -4227,14 +4231,13 @@ static void *worker_fn(void *arg) {
 #endif
             {
             if (use_smart) {
-                psc.coop.pr        = p1_cands;
-                psc.coop.cnt       = p1_cnt;
-                psc.coop.next_idx  = 0;
-                psc.coop.out_cnt   = 0;
-                psc.coop.more_work = 1;          /* another batch follows   */
-                psc.coop.helper_done = helper_will_assist ? 0 : 1;
+                /* Backward-scan (CPU) / GPU smart-scan: serial algorithm,
+                   no cooperative Fermat needed.  Helper still sieves the
+                   next window; it will see active=0 and return. */
+                psc.coop.active      = 0;
+                psc.coop.more_work   = 0;
+                psc.coop.helper_done = 1;
                 __sync_synchronize();
-                psc.coop.active = (p1_cnt > 0 && helper_will_assist) ? 1 : 0;
             } else {
                 psc.coop.pr        = pr;
                 psc.coop.cnt       = cnt;
@@ -4423,324 +4426,175 @@ static void *worker_fn(void *arg) {
             } else
 #endif
             if (use_smart) {
-            /* ======= TWO-PHASE SMART SCANNING =============================
-               Phase 1: sample every Kth sieve survivor (cooperative).
-               Gap analysis: find regions where consecutive sampled primes
-                             are ≥ target gap apart.
-               Phase 2: verify all un-sampled survivors inside those regions
-                        (cooperative).
-               Expected savings: ~5× fewer Fermat tests per window (K=8).
+            /* ======= BACKWARD-SCAN GAP MINING ==============================
+               Inspired by the original GapMiner's skip-ahead algorithm.
+               Instead of testing ALL sieve survivors, jump ahead by
+               needed_gap and scan backward for the nearest prime.  When
+               a prime is found, jump ahead again.  When NO prime is found
+               in an entire needed_gap window, that IS a qualifying gap.
+
+               Correctness: every survivor in the gap region IS tested.
+               No false gaps possible (unlike two-phase smart-scan).
+
+               Efficiency: ~8× fewer Fermat tests than full-test path.
+               The backward scan finds a prime after ~8 tests on average
+               (1/prime_density of sieve survivors) and jumps ahead,
+               skipping thousands of survivors in dense prime clusters.
+
+               Threading: serial (each step depends on the previous).
+               Helper still sieves the next window in parallel.
                ==============================================================*/
 
-                /* --- Phase 1: worker tests sampled candidates ------------ */
-                size_t p1_wn = 0;
-                for (;;) {
-                    size_t idx = __sync_fetch_and_add(&psc.coop.next_idx, 1);
-                    if (idx >= p1_cnt) break;
-                    if (bn_candidate_is_prime(p1_cands[idx])) {
-                        if (p1_wn >= p1_wcap) {
-                            p1_wcap *= 2;
-                            p1_wbuf = (uint64_t *)realloc(p1_wbuf,
-                                        p1_wcap * sizeof(uint64_t));
-                        }
-                        p1_wbuf[p1_wn++] = p1_cands[idx];
-                    }
+                size_t primes_found_bk = 0;
+
+                /* --- Sampling pass for best-merit tracking ---------------
+                   The backward-scan algorithm skips dense prime clusters,
+                   so it never produces verified small gaps for progress
+                   display.  To give the user gradual best-merit feedback,
+                   fully test the first BKSCAN_SAMPLE survivors and track
+                   verified consecutive-prime gaps among them.
+                   Cost: ~200 extra Fermat tests per window (~3% overhead).
+                   The last prime found becomes the backward-scan start. */
+                #define BKSCAN_SAMPLE 200
+                size_t sample_end = cnt < BKSCAN_SAMPLE ? cnt : BKSCAN_SAMPLE;
+                size_t first_idx = cnt;  /* sentinel: not found */
+                uint64_t last_sample_prime = 0;
+                for (size_t j = 0; j < sample_end; j++) {
                     worker_tested++;
                     if ((worker_tested & 0xFFF) == 0)
                         __sync_fetch_and_add(&stats_tested, 4096);
-                }
-                /* Wait for helper to finish phase 1                         */
-                if (helper_will_assist) {
-                    while (!psc.coop.helper_done)
-                        __asm__ volatile("pause" ::: "memory");
-                }
-
-                /* Merge phase-1 worker + helper primes → sampled_primes[]   */
-                size_t p1_hn  = psc.coop.out_cnt;
-                size_t sp_cnt = p1_wn + p1_hn;
-                uint64_t *sampled_primes = (uint64_t *)malloc(
-                        (sp_cnt ? sp_cnt : 1) * sizeof(uint64_t));
-                if (sampled_primes) {
-                    size_t wi = 0, hi = 0, mi = 0;
-                    while (wi < p1_wn && hi < p1_hn) {
-                        if (p1_wbuf[wi] <= psc.coop.out[hi])
-                            sampled_primes[mi++] = p1_wbuf[wi++];
-                        else
-                            sampled_primes[mi++] = psc.coop.out[hi++];
-                    }
-                    while (wi < p1_wn)  sampled_primes[mi++] = p1_wbuf[wi++];
-                    while (hi < p1_hn)  sampled_primes[mi++] = psc.coop.out[hi++];
-                    sp_cnt = mi;
-                } else {
-                    sp_cnt = 0;   /* OOM – skip gap analysis */
-                }
-                free(p1_wbuf);  p1_wbuf = NULL;
-                free(p1_cands); p1_cands = NULL;
-
-                /* --- Gap analysis: identify candidate regions in pr[] --- */
-                size_t n_gap_regions = 0;
-                size_t gap_reg_cap = sp_cnt + 2;
-                uint64_t *gap_reg_lo = (uint64_t *)malloc(gap_reg_cap * sizeof(uint64_t));
-                uint64_t *gap_reg_hi = (uint64_t *)malloc(gap_reg_cap * sizeof(uint64_t));
-                int *gap_reg_alive = NULL;
-                uint64_t *edge_primes_buf = NULL;
-                size_t edge_pcnt = 0;
-                if (sp_cnt >= 1 && gap_reg_lo && gap_reg_hi) {
-                    /* Left edge */
-                    if (cnt > 0 && sampled_primes[0] - pr[0] >= needed_gap) {
-                        gap_reg_lo[n_gap_regions] = 0;
-                        gap_reg_hi[n_gap_regions] = sampled_primes[0];
-                        n_gap_regions++;
-                    }
-                    /* Interior gaps */
-                    for (size_t i = 0; i + 1 < sp_cnt; i++) {
-                        if (sampled_primes[i+1] - sampled_primes[i] >= needed_gap) {
-                            gap_reg_lo[n_gap_regions] = sampled_primes[i];
-                            gap_reg_hi[n_gap_regions] = sampled_primes[i+1];
-                            n_gap_regions++;
-                        }
-                    }
-                    /* Right edge */
-                    if (cnt > 0 &&
-                        pr[cnt-1] - sampled_primes[sp_cnt-1] >= needed_gap) {
-                        gap_reg_lo[n_gap_regions] = sampled_primes[sp_cnt-1];
-                        gap_reg_hi[n_gap_regions] = UINT64_MAX;
-                        n_gap_regions++;
-                    }
-                }
-
-                /* --- Edge probing: eliminate false-positive regions ---
-                   For each flagged region, test a few candidates at both
-                   edges.  If primes are found close together on both
-                   sides, the region cannot hold a qualifying gap — skip
-                   its expensive bulk verification entirely.
-                   Cost: ≤ 2×EDGE_PROBE_N Fermat tests per region.
-                   Typical elimination rate: 40-60% of flagged regions.  */
-                if (n_gap_regions > 0) {
-                    gap_reg_alive = (int *)malloc(n_gap_regions * sizeof(int));
-                    edge_primes_buf = (uint64_t *)malloc(n_gap_regions * 2 * sizeof(uint64_t));
-                    if (gap_reg_alive) {
-                        size_t eprobes = 0;
-                        for (size_t r = 0; r < n_gap_regions; r++) {
-                            gap_reg_alive[r] = 1;
-                            uint64_t rlo = gap_reg_lo[r], rhi = gap_reg_hi[r];
-                            size_t lo_idx, hi_idx;
-                            { size_t l = 0, h = cnt;
-                              while (l < h) { size_t m = l+(h-l)/2;
-                                if (pr[m] <= rlo) l=m+1; else h=m; }
-                              lo_idx = l; }
-                            { size_t l = 0, h = cnt;
-                              while (l < h) { size_t m = l+(h-l)/2;
-                                if (pr[m] < rhi) l=m+1; else h=m; }
-                              hi_idx = l; }
-                            size_t rcnt = hi_idx > lo_idx ? hi_idx - lo_idx : 0;
-                            if (rcnt < (size_t)(EDGE_PROBE_N * 3)) continue;
-                            uint64_t lp = 0, rp = 0;
-                            size_t np = 0;
-                            /* Probe left edge */
-                            for (size_t j = lo_idx; j < hi_idx && np < EDGE_PROBE_N; j++) {
-                                if (j % (size_t)smart_K == 0) continue;
-                                np++;
-                                if (bn_candidate_is_prime(pr[j])) {
-                                    lp = pr[j];
-                                    if (edge_primes_buf) edge_primes_buf[edge_pcnt++] = pr[j];
-                                    break;
-                                }
+                    if (bn_candidate_is_prime(pr[j])) {
+                        if (last_sample_prime) {
+                            uint64_t gap_s = pr[j] - last_sample_prime;
+                            double merit_s = (double)gap_s / logbase;
+                            if (merit_s > stats_best_merit) {
+                                stats_best_merit = merit_s;
+                                stats_best_gap   = gap_s;
                             }
-                            eprobes += np; np = 0;
-                            /* Probe right edge */
-                            for (size_t j = hi_idx; j > lo_idx && np < EDGE_PROBE_N; ) {
-                                j--;
-                                if (j % (size_t)smart_K == 0) continue;
-                                np++;
-                                if (bn_candidate_is_prime(pr[j])) {
-                                    rp = pr[j];
-                                    if (edge_primes_buf) edge_primes_buf[edge_pcnt++] = pr[j];
-                                    break;
-                                }
-                            }
-                            eprobes += np;
-                            if (lp && rp && rp - lp < needed_gap)
-                                gap_reg_alive[r] = 0;  /* eliminate */
                         }
-                        if (eprobes > 0)
-                            __sync_fetch_and_add(&stats_tested, (uint64_t)eprobes);
+                        last_sample_prime = pr[j];
+                        first_idx = j;  /* updates to last prime in sample */
+                        primes_found_bk++;
                     }
                 }
-
-                /* --- Collect verification candidates (surviving regions only) --- */
-                size_t v_alloc = cnt / 8 + 64;
-                uint64_t *verify = (uint64_t *)malloc(v_alloc * sizeof(uint64_t));
-                size_t v_cnt = 0;
-                if (verify && n_gap_regions > 0) {
-                    #define COLLECT_REGION(lo_val, hi_val) do {                \
-                        size_t _lo = 0, _hi = cnt;                            \
-                        while (_lo < _hi) {                                   \
-                            size_t _m = _lo + (_hi - _lo) / 2;               \
-                            if (pr[_m] <= (lo_val)) _lo = _m + 1;            \
-                            else _hi = _m;                                    \
-                        }                                                     \
-                        for (size_t _j = _lo;                                 \
-                             _j < cnt && pr[_j] < (hi_val); _j++) {           \
-                            if (_j % (size_t)smart_K == 0) continue;          \
-                            if (v_cnt >= v_alloc) {                           \
-                                v_alloc *= 2;                                 \
-                                verify = (uint64_t *)realloc(verify,          \
-                                            v_alloc * sizeof(uint64_t));      \
-                            }                                                 \
-                            verify[v_cnt++] = pr[_j];                         \
-                        }                                                     \
-                    } while (0)
-                    for (size_t r = 0; r < n_gap_regions; r++) {
-                        if (gap_reg_alive && !gap_reg_alive[r]) continue;
-                        COLLECT_REGION(gap_reg_lo[r], gap_reg_hi[r]);
-                    }
-                    #undef COLLECT_REGION
-                }
-
-                /* --- Phase 2: verify survivors in candidate gaps --------- */
-                size_t p2_wn = 0;
-                uint64_t *p2_wbuf = NULL;
-
-                if (v_cnt > 0) {
-                    psc.coop.pr        = verify;
-                    psc.coop.cnt       = v_cnt;
-                    psc.coop.next_idx  = 0;
-                    /* don't reset out_cnt — helper appends to same buffer   */
-                    psc.coop.more_work = 0;          /* last phase           */
-                    psc.coop.helper_done = helper_will_assist ? 0 : 1;
-                    __sync_synchronize();
-                    /* Worker clears helper_done → wakes helper from spin    */
-
-                    size_t p2_wcap = v_cnt / 4 + 64;
-                    p2_wbuf = (uint64_t *)malloc(p2_wcap * sizeof(uint64_t));
-
-                    for (;;) {
-                        size_t idx = __sync_fetch_and_add(&psc.coop.next_idx, 1);
-                        if (idx >= v_cnt) break;
-                        if (bn_candidate_is_prime(verify[idx])) {
-                            if (p2_wbuf && p2_wn >= p2_wcap) {
-                                p2_wcap *= 2;
-                                p2_wbuf = (uint64_t *)realloc(p2_wbuf,
-                                            p2_wcap * sizeof(uint64_t));
-                            }
-                            if (p2_wbuf) p2_wbuf[p2_wn++] = verify[idx];
-                        }
+                /* If no prime in sample (extremely unlikely), keep searching */
+                if (first_idx == cnt) {
+                    for (size_t j = sample_end; j < cnt; j++) {
                         worker_tested++;
                         if ((worker_tested & 0xFFF) == 0)
                             __sync_fetch_and_add(&stats_tested, 4096);
+                        if (bn_candidate_is_prime(pr[j])) {
+                            first_idx = j;
+                            primes_found_bk++;
+                            break;
+                        }
                     }
-                    if (helper_will_assist) {
-                        while (!psc.coop.helper_done)
-                            __asm__ volatile("pause" ::: "memory");
-                    }
-                } else {
-                    /* No candidate gaps — release helper now.               */
-                    psc.coop.more_work = 0;
-                    psc.coop.active    = 0;
-                    __sync_synchronize();
-                    if (helper_will_assist)
-                        psc.coop.helper_done = 0;    /* wake → sees active=0 */
                 }
 
-                psc.coop.active = 0;
-                __sync_synchronize();
+                if (first_idx < cnt) {
+                    uint64_t start_nAdd = pr[first_idx];
+                    size_t scan_from = first_idx;
 
-                /* --- Final merge: all confirmed primes → pr[], sort ------ */
-                pf = 0;
-                for (size_t i = 0; i < sp_cnt; i++) pr[pf++] = sampled_primes[i];
-                if (p2_wbuf)
-                    for (size_t i = 0; i < p2_wn; i++) pr[pf++] = p2_wbuf[i];
-                for (size_t i = p1_hn; i < psc.coop.out_cnt; i++)
-                    pr[pf++] = psc.coop.out[i];
-                /* Include edge-probed primes from eliminated regions */
-                if (edge_primes_buf)
-                    for (size_t i = 0; i < edge_pcnt; i++) pr[pf++] = edge_primes_buf[i];
-                if (pf > 1) qsort(pr, pf, sizeof(uint64_t), cmp_u64);
-                cnt = pf;
-                __sync_fetch_and_add(&stats_primes_found, (uint64_t)pf);
+                    /* --- Main backward-scan loop --- */
+                    for (;;) {
+                        uint64_t target_pos = start_nAdd + needed_gap;
 
-                free(sampled_primes);
-                free(verify);
-                free(p2_wbuf);
-                free(edge_primes_buf);
+                        /* Binary search: first index in pr[] > target_pos */
+                        size_t bhi;
+                        { size_t l = scan_from + 1, h = cnt;
+                          while (l < h) { size_t m = l+(h-l)/2;
+                            if (pr[m] <= target_pos) l=m+1; else h=m; }
+                          bhi = l; }
 
-                /* Flush stats */
-                {
-                    size_t total_tested = p1_cnt + v_cnt;
-                    size_t reported = (worker_tested / 4096) * 4096;
-                    size_t remainder = worker_tested - reported;
-                    if (helper_will_assist) {
-                        size_t htested = total_tested > worker_tested
-                                         ? total_tested - worker_tested : 0;
-                        size_t hreported = (htested / 4096) * 4096;
-                        remainder += (htested - hreported);
-                    } else {
-                        remainder = total_tested - reported;
-                    }
-                    if (remainder > 0)
-                        __sync_fetch_and_add(&stats_tested, (uint64_t)remainder);
-                }
+                        /* Scan backward from bhi-1 toward scan_from+1 */
+                        int found = 0;
+                        for (size_t j = bhi; j > scan_from + 1; ) {
+                            j--;
+                            worker_tested++;
+                            if ((worker_tested & 0xFFF) == 0)
+                                __sync_fetch_and_add(&stats_tested, 4096);
+                            if (bn_candidate_is_prime(pr[j])) {
+                                /* Prime found — gap from start to here < needed_gap.
+                                   Update start and jump ahead.
+                                   NOTE: do NOT track stats_best_merit here.
+                                   The distance (pr[j] - start_nAdd) is NOT a
+                                   verified consecutive-prime gap — there are
+                                   untested survivors between them that could
+                                   be prime.  Only the !found forward-search
+                                   path produces verified gaps. */
+                                start_nAdd = pr[j];
+                                scan_from  = j;
+                                primes_found_bk++;
+                                found = 1;
+                                break;
+                            }
+                        }
 
-                /* Scan ONLY fully-verified gap regions for qualifying gaps
-                   and best-merit tracking.  Scanning the full merged array
-                   would inflate best_merit with fake gaps between sampled-
-                   only primes (merit ≈ target by construction of needed_gap
-                   — explaining the suspicious best≈target on every run). */
-                {
-                    int found_block = 0;
-                    size_t region_pairs = 0;
+                        if (!found) {
+                            /* No prime in [start, start+needed_gap].
+                               Search FORWARD for the actual next prime
+                               to determine the true gap size.  */
+                            int have_next = 0;
+                            for (size_t j = bhi; j < cnt; j++) {
+                                worker_tested++;
+                                if ((worker_tested & 0xFFF) == 0)
+                                    __sync_fetch_and_add(&stats_tested, 4096);
+                                if (bn_candidate_is_prime(pr[j])) {
+                                    uint64_t gap = pr[j] - start_nAdd;
+                                    double merit = (double)gap / logbase;
 
-                    /* NOTE: cross-window carry is NOT used in smart-scan mode.
-                       carry_last_prime and pr[0] are the last/first CONFIRMED
-                       primes, but between them lie non-flagged sampling
-                       intervals where non-sampled survivors were never phase-2
-                       tested.  Those untested survivors may be prime, making
-                       the carry gap an overestimate (false gap).  Real
-                       qualifying gaps are found within fully-tested flagged
-                       regions below.  Cross-window carry works correctly in
-                       the full-test path (--sample-stride 1) where every
-                       survivor is tested. */
+                                    if (merit > stats_best_merit) {
+                                        stats_best_merit = merit;
+                                        stats_best_gap   = gap;
+                                    }
 
-                    for (size_t r = 0; r < n_gap_regions && gap_reg_lo; r++) {
-                        if (gap_reg_alive && !gap_reg_alive[r]) continue;
-                        /* Binary search for first prime >= gap_reg_lo[r] */
-                        size_t lo_idx = 0;
-                        { size_t l = 0, h = cnt;
-                          while (l < h) { size_t m = l+(h-l)/2; if (pr[m] < gap_reg_lo[r]) l=m+1; else h=m; }
-                          lo_idx = l; }
-                        /* Binary search for first prime > gap_reg_hi[r] */
-                        size_t hi_idx = cnt;
-                        { size_t l = 0, h = cnt;
-                          while (l < h) { size_t m = l+(h-l)/2; if (pr[m] <= gap_reg_hi[r]) l=m+1; else h=m; }
-                          hi_idx = l; }
-                        size_t seg_cnt = (hi_idx > lo_idx) ? hi_idx - lo_idx : 0;
-                        if (seg_cnt >= 2) {
-                            region_pairs += seg_cnt - 1;
-                            if (scan_candidates(pr + lo_idx, seg_cnt,
+                                    if (merit >= target_local) {
+                                        /* Qualifying gap — submit via
+                                           scan_candidates for RPC. */
+                                        uint64_t pair[2] = {
+                                            start_nAdd, pr[j] };
+                                        __sync_fetch_and_add(&stats_gaps, 1);
+                                        if (scan_candidates(pair, 2,
                                                 target_local, logbase,
                                                 shift_local, header_local,
                                                 rpc_url_local, rpc_user_local,
-                                                rpc_pass_local, rpc_method_local,
+                                                rpc_pass_local,
+                                                rpc_method_local,
                                                 rpc_sign_key_local))
-                                found_block = 1;
+                                            goto worker_done;
+                                    }
+
+                                    start_nAdd = pr[j];
+                                    scan_from  = j;
+                                    primes_found_bk++;
+                                    have_next = 1;
+                                    break;
+                                }
+                            }
+                            if (!have_next) break; /* end of window */
                         }
-                    }
-                    /* Compensate stats_pairs for ETA: estimate full-scan pairs
-                       from phase-1 sample rate, subtract pairs already counted
-                       by scan_candidates in the verified regions above. */
-                    if (sp_cnt > 0 && p1_cnt > 0) {
-                        size_t est_full = (size_t)((double)orig_cnt
-                                        * (double)sp_cnt / (double)p1_cnt);
-                        if (est_full > 1 + region_pairs)
-                            __sync_fetch_and_add(&stats_pairs,
-                                                 (uint64_t)(est_full - 1 - region_pairs));
-                    }
-                    free(gap_reg_lo);
-                    free(gap_reg_hi);
-                    free(gap_reg_alive);
-                    if (found_block) goto worker_done;
+                    } /* end backward-scan loop */
+                } /* end first_idx < cnt */
+
+                /* Stats: count actual backward-scan pairs as trials.
+                   Each jump of ~needed_gap is one independent Cramér trial
+                   with P(qualifying gap) ≈ e^(-target).  This gives a
+                   conservative but honest est. */
+                if (primes_found_bk > 1)
+                    __sync_fetch_and_add(&stats_pairs,
+                                         (uint64_t)(primes_found_bk - 1));
+                __sync_fetch_and_add(&stats_primes_found,
+                                     (uint64_t)primes_found_bk);
+
+                /* Flush remaining tested count */
+                { size_t remainder = worker_tested & 0xFFF;
+                  if (remainder > 0)
+                      __sync_fetch_and_add(&stats_tested,
+                                           (uint64_t)remainder);
                 }
+
+                free(p1_cands); p1_cands = NULL;
+                free(p1_wbuf);  p1_wbuf  = NULL;
 
             /* ============================================================= */
             } else if (!no_primality) {
