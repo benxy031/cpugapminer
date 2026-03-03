@@ -2605,25 +2605,20 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
                             log_msg(">>> stratum submit FAILED\n");
                         print_stats();
                     } else {
-                        pthread_mutex_lock(&sq_lock);
-                        int sq_busy = (sq_count > 0);
-                        pthread_mutex_unlock(&sq_lock);
-                        if (!sq_busy) {
-                            struct submit_job _job;
-                            memset(&_job, 0, sizeof(_job));
-                            strncpy(_job.url, rpc_url, sizeof(_job.url)-1);
-                            strncpy(_job.user, rpc_user ? rpc_user : "",
-                                    sizeof(_job.user)-1);
-                            strncpy(_job.pass, rpc_pass ? rpc_pass : "",
-                                    sizeof(_job.pass)-1);
-                            strncpy(_job.method, "getwork",
-                                    sizeof(_job.method)-1);
-                            memcpy(_job.hex, blockhex, sizeof(_job.hex));
-                            _job.retries = rpc_default_retries;
-                            enqueue_job(&_job);
-                            log_msg(">>> QUEUED for async submit\n");
-                            print_stats();
-                        }
+                        struct submit_job _job;
+                        memset(&_job, 0, sizeof(_job));
+                        strncpy(_job.url, rpc_url, sizeof(_job.url)-1);
+                        strncpy(_job.user, rpc_user ? rpc_user : "",
+                                sizeof(_job.user)-1);
+                        strncpy(_job.pass, rpc_pass ? rpc_pass : "",
+                                sizeof(_job.pass)-1);
+                        strncpy(_job.method, "getwork",
+                                sizeof(_job.method)-1);
+                        memcpy(_job.hex, blockhex, sizeof(_job.hex));
+                        _job.retries = rpc_default_retries;
+                        enqueue_job(&_job);
+                        log_msg(">>> QUEUED for async submit\n");
+                        print_stats();
                     }
                 }
             } else {
@@ -3147,11 +3142,6 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
                                 hmac_sha256_hex(rpc_sign_key_local, blockhex, sig);
                                 log_msg("    signature: %s\n", sig);
                             }
-                            /* Only one submission per block round */
-                            pthread_mutex_lock(&sq_lock);
-                            int sq_busy = (sq_count > 0);
-                            pthread_mutex_unlock(&sq_lock);
-                            if (sq_busy) continue;
                             struct submit_job _job;
                             memset(&_job, 0, sizeof(_job));
                             strncpy(_job.url,    rpc_url_local,                     sizeof(_job.url)-1);
@@ -3509,30 +3499,25 @@ static void *worker_fn(void *arg) {
                                                     " FAILED\n");
                                         print_stats();
                                     } else {
-                                        pthread_mutex_lock(&sq_lock);
-                                        int sq_busy = (sq_count > 0);
-                                        pthread_mutex_unlock(&sq_lock);
-                                        if (!sq_busy) {
-                                            struct submit_job _job;
-                                            memset(&_job, 0, sizeof(_job));
-                                            strncpy(_job.url, rpc_url_local,
-                                                    sizeof(_job.url)-1);
-                                            strncpy(_job.user,
-                                                    rpc_user_local ? rpc_user_local : "",
-                                                    sizeof(_job.user)-1);
-                                            strncpy(_job.pass,
-                                                    rpc_pass_local ? rpc_pass_local : "",
-                                                    sizeof(_job.pass)-1);
-                                            strncpy(_job.method, "getwork",
-                                                    sizeof(_job.method)-1);
-                                            memcpy(_job.hex, blockhex,
-                                                   sizeof(_job.hex));
-                                            _job.retries = rpc_default_retries;
-                                            enqueue_job(&_job);
-                                            log_msg(">>> QUEUED for async"
-                                                    " submit\n");
-                                            print_stats();
-                                        }
+                                        struct submit_job _job;
+                                        memset(&_job, 0, sizeof(_job));
+                                        strncpy(_job.url, rpc_url_local,
+                                                sizeof(_job.url)-1);
+                                        strncpy(_job.user,
+                                                rpc_user_local ? rpc_user_local : "",
+                                                sizeof(_job.user)-1);
+                                        strncpy(_job.pass,
+                                                rpc_pass_local ? rpc_pass_local : "",
+                                                sizeof(_job.pass)-1);
+                                        strncpy(_job.method, "getwork",
+                                                sizeof(_job.method)-1);
+                                        memcpy(_job.hex, blockhex,
+                                               sizeof(_job.hex));
+                                        _job.retries = rpc_default_retries;
+                                        enqueue_job(&_job);
+                                        log_msg(">>> QUEUED for async"
+                                                " submit\n");
+                                        print_stats();
                                     }
                                 }
                             } else {
@@ -3872,30 +3857,25 @@ static void *worker_fn(void *arg) {
                                                             " FAILED\n");
                                                 print_stats();
                                             } else {
-                                                pthread_mutex_lock(&sq_lock);
-                                                int sq_busy = (sq_count > 0);
-                                                pthread_mutex_unlock(&sq_lock);
-                                                if (!sq_busy) {
-                                                    struct submit_job _job;
-                                                    memset(&_job, 0, sizeof(_job));
-                                                    strncpy(_job.url, rpc_url_local,
-                                                            sizeof(_job.url)-1);
-                                                    strncpy(_job.user,
-                                                            rpc_user_local ? rpc_user_local : "",
-                                                            sizeof(_job.user)-1);
-                                                    strncpy(_job.pass,
-                                                            rpc_pass_local ? rpc_pass_local : "",
-                                                            sizeof(_job.pass)-1);
-                                                    strncpy(_job.method, "getwork",
-                                                            sizeof(_job.method)-1);
-                                                    memcpy(_job.hex, blockhex,
-                                                           sizeof(_job.hex));
-                                                    _job.retries = rpc_default_retries;
-                                                    enqueue_job(&_job);
-                                                    log_msg(">>> QUEUED for async"
-                                                            " submit\n");
-                                                    print_stats();
-                                                }
+                                                struct submit_job _job;
+                                                memset(&_job, 0, sizeof(_job));
+                                                strncpy(_job.url, rpc_url_local,
+                                                        sizeof(_job.url)-1);
+                                                strncpy(_job.user,
+                                                        rpc_user_local ? rpc_user_local : "",
+                                                        sizeof(_job.user)-1);
+                                                strncpy(_job.pass,
+                                                        rpc_pass_local ? rpc_pass_local : "",
+                                                        sizeof(_job.pass)-1);
+                                                strncpy(_job.method, "getwork",
+                                                        sizeof(_job.method)-1);
+                                                memcpy(_job.hex, blockhex,
+                                                       sizeof(_job.hex));
+                                                _job.retries = rpc_default_retries;
+                                                enqueue_job(&_job);
+                                                log_msg(">>> QUEUED for async"
+                                                        " submit\n");
+                                                print_stats();
                                             }
                                         }
                                     } else {
@@ -4614,6 +4594,27 @@ static void *worker_fn(void *arg) {
                 {
                     int found_block = 0;
                     size_t region_pairs = 0;
+
+                    /* Cross-window carry: check if the last confirmed prime
+                       from the previous window forms a qualifying gap with the
+                       first confirmed prime in this window.  The gap cannot
+                       underestimate because pr[0] >= the first sieve survivor
+                       and no primes exist before it (sieve-eliminated).  When
+                       the pair is submitted, the node independently verifies
+                       the gap by searching forward from carry. */
+                    if (carry_last_prime && cnt >= 1
+                        && carry_last_prime < pr[0]
+                        && pr[0] - carry_last_prime >= needed_gap) {
+                        uint64_t xw_pair[2] = { carry_last_prime, pr[0] };
+                        if (scan_candidates(xw_pair, 2,
+                                            target_local, logbase,
+                                            shift_local, header_local,
+                                            rpc_url_local, rpc_user_local,
+                                            rpc_pass_local, rpc_method_local,
+                                            rpc_sign_key_local))
+                            found_block = 1;
+                    }
+
                     for (size_t r = 0; r < n_gap_regions && gap_reg_lo; r++) {
                         if (gap_reg_alive && !gap_reg_alive[r]) continue;
                         /* Binary search for first prime >= gap_reg_lo[r] */
@@ -5763,6 +5764,20 @@ int main(int argc, char **argv) {
                     /* Scan only fully-verified gap regions (same fix as cooperative path) */
                     {
                         size_t region_pairs_st = 0;
+
+                        /* Cross-window carry for smart-scan path */
+                        if (st_carry_last && cnt >= 1
+                            && st_carry_last < pr[0]
+                            && pr[0] - st_carry_last >= needed) {
+                            uint64_t xw_pair[2] = { st_carry_last, pr[0] };
+                            if (scan_candidates(xw_pair, 2,
+                                               target, logbase, shift,
+                                               header, rpc_url, rpc_user,
+                                               rpc_pass, rpc_method,
+                                               rpc_sign_key))
+                                return 0;
+                        }
+
                         for (size_t r = 0; r < n_greg_st && greg_lo_st; r++) {
                             if (greg_alive_st && !greg_alive_st[r]) continue;
                             size_t lo_idx = 0;
