@@ -1,0 +1,14 @@
+; gpu_fermat.def — Export definitions for gpu_fermat.dll
+;
+; Used by both MSVC link.exe (to mark DLL exports) and MinGW dlltool
+; (to create an import library).  All symbols are extern "C" so no
+; name decoration is needed.
+LIBRARY gpu_fermat
+EXPORTS
+    gpu_fermat_init
+    gpu_fermat_test_batch
+    gpu_fermat_submit
+    gpu_fermat_collect
+    gpu_fermat_device_name
+    gpu_fermat_set_limbs
+    gpu_fermat_destroy

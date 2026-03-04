@@ -111,34 +111,30 @@ jobs:
           cuda: '12.4.0'
           method: network
 
-      - name: Compile CUDA kernel (nvcc + MSVC)
+      - name: Build CUDA DLL (nvcc + MSVC link)
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
           nvcc --version
-          nvcc -O3 -arch=sm_61 -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_86,code=sm_86 -gencode=arch=compute_89,code=sm_89 -DGPU_NLIMBS=16 -Xcompiler "/GS- /Zl" -c src\gpu_fermat.cu -o src\gpu_fermat.o
+          nvcc -O3 -arch=sm_61 -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_86,code=sm_86 -gencode=arch=compute_89,code=sm_89 -DGPU_NLIMBS=16 -c src\gpu_fermat.cu -o src\gpu_fermat.obj
+          link /DLL /OUT:src\gpu_fermat.dll /DEF:src\gpu_fermat.def /IMPLIB:src\gpu_fermat.lib src\gpu_fermat.obj cudart.lib /LIBPATH:"%CUDA_PATH%\lib\x64"
+          dir src\gpu_fermat.*
 
-      - name: Build (CPU + RPC, link CUDA object)
+      - name: Build (CPU + RPC, link CUDA DLL)
         shell: msys2 {0}
         run: |
           if [ -z "$CUDA_PATH" ]; then
             echo "ERROR: CUDA_PATH env var is not set"
             exit 1
           fi
-          CUDA_M=$(cygpath -m "$CUDA_PATH")
-          echo "CUDA_PATH (mixed)=$CUDA_M"
 
-          # The MSVC-compiled CUDA object contains .drectve sections with
-          # MSVC-specific /DEFAULTLIB: directives that corrupt MinGW's
-          # linker and break CRT symbol resolution.  Strip them.
-          objcopy --remove-section .drectve src/gpu_fermat.o
+          # Create MinGW import library from DLL export definitions
+          dlltool -d src/gpu_fermat.def -l src/libgpu_fermat.a -D gpu_fermat.dll
 
-          # gpu_fermat.o was already compiled by nvcc+MSVC in the previous step.
-          # Build everything else and link.  Make will skip the .cu rule because
-          # the .o is already present and newer than the source.
-          # NO_LTO=1 — MinGW's LTO cannot process MSVC COFF objects.
-          make -f Makefile.mingw WITH_RPC=1 WITH_CUDA=1 \
-            CUDA_PATH="$CUDA_M" NO_LTO=1
+          # Build everything and link against the CUDA DLL import library.
+          # CUDA_DLL=1 uses the import lib instead of a raw MSVC .obj,
+          # avoiding all MSVC/MinGW COFF incompatibilities.
+          make -f Makefile.mingw WITH_RPC=1 WITH_CUDA=1 CUDA_DLL=1 NO_LTO=1
 
       - name: Build gen_crt
         run: make -f Makefile.mingw gen_crt
@@ -183,6 +179,9 @@ jobs:
               [ -f "$f" ] && cp "$f" dist/
             done
           fi
+
+          # GPU Fermat DLL (built by MSVC toolchain)
+          cp src/gpu_fermat.dll dist/
 
       - name: Upload artefact
         uses: actions/upload-artifact@v4

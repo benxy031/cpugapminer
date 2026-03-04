@@ -58,18 +58,26 @@ else
 endif
 
 ifdef WITH_CUDA
+	GPU_BITS ?= 1024
+	GPU_NLIMBS := $(shell echo '$(GPU_BITS) / 64' | bc)
+	CFLAGS+=-DWITH_CUDA -DGPU_NLIMBS=$(GPU_NLIMBS)
+ifdef CUDA_DLL
+	# DLL mode (Windows CI): link against pre-built import library.
+	# The DLL is built with the MSVC toolchain — see build-windows.yml.
+	# This avoids all MSVC/MinGW COFF incompatibilities.
+	CUDA_OBJ=$(SRCDIR)/libgpu_fermat.a
+else
 	NVCC ?= nvcc
 	CUDA_ARCH ?= -arch=sm_86
 	CUDA_PATH ?= C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4
-	GPU_BITS ?= 1024
-	GPU_NLIMBS := $(shell echo '$(GPU_BITS) / 64' | bc)
 	CUDA_OBJ=$(SRCDIR)/gpu_fermat.o
-	CFLAGS+=-DWITH_CUDA -DGPU_NLIMBS=$(GPU_NLIMBS) -I"$(CUDA_PATH)/include"
+	CFLAGS+=-I"$(CUDA_PATH)/include"
 	NVCC_FLAGS=-DGPU_NLIMBS=$(GPU_NLIMBS)
 	LIBS+=-lcudart -L"$(CUDA_PATH)/lib/x64"
 	# nvcc/MSVC objects reference CRT symbols (fprintf etc.) that MinGW GCC 15+
 	# (UCRT default) doesn't auto-link.  Append -lucrt so the linker resolves them.
 	LIBS+=-lucrt
+endif
 else
 	CUDA_OBJ=
 endif
