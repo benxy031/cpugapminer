@@ -2372,6 +2372,26 @@ static __thread mpz_t  tls_two_mpz;        /* constant 2 (Fermat base)  */
 static __thread mpz_t  tls_exp_mpz;        /* n-1 exponent for Fermat   */
 static __thread mpz_t  tls_res_mpz;        /* powm result               */
 static __thread int    tls_gmp_inited = 0;  /* 0 until first init       */
+/* Last offset represented by tls_cand_mpz.  Lets us update candidate with
+    a cheap +delta when offsets are monotonic (common in sieve scans). */
+static __thread uint64_t tls_cand_last_offset = 0;
+static __thread int      tls_cand_last_valid  = 0;
+
+/* Per-thread primality memoization cache (direct-mapped).
+    Caches bn_candidate_is_prime(offset) results for the current base.
+    Reset cheaply via epoch bump in set_base_bn(). */
+#define PRIME_CACHE_BITS 13
+#define PRIME_CACHE_SIZE (1u << PRIME_CACHE_BITS)
+#define PRIME_CACHE_MASK (PRIME_CACHE_SIZE - 1u)
+static __thread uint64_t tls_prime_cache_key[PRIME_CACHE_SIZE];
+static __thread uint8_t  tls_prime_cache_val[PRIME_CACHE_SIZE];
+static __thread uint32_t tls_prime_cache_gen[PRIME_CACHE_SIZE];
+static __thread uint32_t tls_prime_cache_epoch = 1;
+
+static inline uint32_t prime_cache_slot(uint64_t offset) {
+     uint64_t h = offset * 11400714819323198485ull;
+     return (uint32_t)((h >> (64 - PRIME_CACHE_BITS)) & PRIME_CACHE_MASK);
+}
 
 static void ensure_gmp_tls(void) {
     if (__builtin_expect(!tls_gmp_inited, 0)) {
@@ -2397,6 +2417,14 @@ static void set_base_bn(const uint8_t h256[32], int shift) {
     /* Import h256 (big-endian, MSB first) into GMP */
     mpz_import(tls_base_mpz, 32, 1, 1, 1, 0, h256);
     mpz_mul_2exp(tls_base_mpz, tls_base_mpz, (unsigned long)shift);
+    tls_cand_last_valid = 0;
+
+    /* Invalidate per-thread primality memoization for the new base. */
+    tls_prime_cache_epoch++;
+    if (tls_prime_cache_epoch == 0) {
+        memset(tls_prime_cache_gen, 0, sizeof(tls_prime_cache_gen));
+        tls_prime_cache_epoch = 1;
+    }
 
     /* ── Precompute CRT base residue once per pass ── */
     if (g_crt_mode == CRT_MODE_TEMPLATE && g_crt_primorial > 0)
@@ -2442,20 +2470,44 @@ static void set_base_bn(const uint8_t h256[32], int shift) {
  *  B. Full: mpz_probab_prime_p(n, 10) — 10 MR rounds.
  */
 static int bn_candidate_is_prime(uint64_t offset) {
+    /* Fast memoization hit: same offset for current base. */
+    {
+        uint32_t slot = prime_cache_slot(offset);
+        if (tls_prime_cache_gen[slot] == tls_prime_cache_epoch &&
+            tls_prime_cache_key[slot] == offset)
+            return (int)tls_prime_cache_val[slot];
+    }
+
     /* --- Trial-division pre-filter (disabled when TD_EXTRA_CNT=0) --- */
     for (int i = 0; i < td_extra_count; i++) {
         uint32_t p   = td_extra_primes[i];
         uint32_t rem = (uint32_t)(((uint64_t)tls_td_residues[i]
                                    + (uint64_t)(offset % p)) % p);
-        if (rem == 0) return 0;
+        if (rem == 0) {
+            uint32_t slot = prime_cache_slot(offset);
+            tls_prime_cache_key[slot] = offset;
+            tls_prime_cache_val[slot] = 0;
+            tls_prime_cache_gen[slot] = tls_prime_cache_epoch;
+            return 0;
+        }
     }
 
     ensure_gmp_tls();
-    /* candidate = base + offset.  mpz_add_ui is O(1) for small offsets
-       (only touches the lowest GMP limb). */
-    mpz_set(tls_cand_mpz, tls_base_mpz);
-    mpz_add_ui(tls_cand_mpz, tls_cand_mpz, (unsigned long)offset);
+    /* candidate = base + offset.
+       Monotonic fast path: if this thread previously tested a smaller
+       offset, update tls_cand_mpz by +delta instead of rebuilding from base. */
+    if (tls_cand_last_valid && offset >= tls_cand_last_offset) {
+        uint64_t delta = offset - tls_cand_last_offset;
+        if (delta)
+            mpz_add_ui(tls_cand_mpz, tls_cand_mpz, (unsigned long)delta);
+    } else {
+        mpz_set(tls_cand_mpz, tls_base_mpz);
+        mpz_add_ui(tls_cand_mpz, tls_cand_mpz, (unsigned long)offset);
+    }
+    tls_cand_last_offset = offset;
+    tls_cand_last_valid  = 1;
 
+    int is_prime;
     if (use_fast_fermat) {
         /* Raw base-2 Fermat test: 2^(n-1) mod n == 1?
            Skips GMP's redundant internal trial-division (~700 primes
@@ -2463,13 +2515,21 @@ static int bn_candidate_is_prime(uint64_t offset) {
            For sieve-filtered 284-bit candidates, this saves ~10-15%. */
         mpz_sub_ui(tls_exp_mpz, tls_cand_mpz, 1);
         mpz_powm(tls_res_mpz, tls_two_mpz, tls_exp_mpz, tls_cand_mpz);
-        return mpz_cmp_ui(tls_res_mpz, 1) == 0;
+        is_prime = (mpz_cmp_ui(tls_res_mpz, 1) == 0);
     } else {
         /* Probable-prime: cli_mr_rounds MR rounds (default 2; old = 10).
            2 rounds is effectively deterministic for sieve-filtered
            candidates at mining sizes (false-positive < 2^-128).     */
-        return mpz_probab_prime_p(tls_cand_mpz, cli_mr_rounds) > 0;
+        is_prime = (mpz_probab_prime_p(tls_cand_mpz, cli_mr_rounds) > 0);
     }
+
+    {
+        uint32_t slot = prime_cache_slot(offset);
+        tls_prime_cache_key[slot] = offset;
+        tls_prime_cache_val[slot] = (uint8_t)is_prime;
+        tls_prime_cache_gen[slot] = tls_prime_cache_epoch;
+    }
+    return is_prime;
 }
 
 #ifdef WITH_CUDA
