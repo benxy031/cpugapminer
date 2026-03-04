@@ -168,19 +168,19 @@ void montmul_t(uint64_t *      __restrict__ r,
 /* ═══════════════════════════════════════════════════════════════════
  *  Templated Fermat test kernel
  *  AL = arithmetic width (limbs actually used).
- *  stride = storage width per candidate in memory (= GPU_NLIMBS).
+ *  Storage width per candidate is compile-time NL (= GPU_NLIMBS).
  * ═══════════════════════════════════════════════════════════════════ */
 
 template<int AL>
 __global__ void fermat_kernel_t(const uint64_t * __restrict__ cands,
                                 uint8_t        * __restrict__ results,
-                                uint32_t count, int stride)
+                                uint32_t count)
 {
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
 
     uint64_t n[AL];
-    const uint64_t *src = &cands[(size_t)idx * stride];
+    const uint64_t *src = &cands[(size_t)idx * NL];
     for (int i = 0; i < AL; i++) n[i] = src[i];
 
     if ((n[0] & 1) == 0) { results[idx] = 0; return; }
@@ -232,15 +232,27 @@ __global__ void fermat_kernel_t(const uint64_t * __restrict__ cands,
 
    Specializations: 5, 6, 8, 10, 12, 16 (and 20 if NL ≥ 20).
    E.g. shift 43 → AL=5 → montmul does 5²=25 ops vs 16²=256.       */
-static void launch_fermat(int al, cudaStream_t stream,
-                          const uint64_t *d_cands, uint8_t *d_results,
-                          uint32_t count)
+static __host__ __forceinline__
+int fermat_block_size_for_al(int al)
 {
-    int block = 128;
+    /* AL-aware launch tuning hook:
+       narrower arithmetic uses fewer registers/thread, so we can run
+       larger blocks for better occupancy. Keep conservative defaults. */
+    if (al <= 6)  return 256;
+    if (al <= 10) return 192;
+    return 128;
+}
+
+static cudaError_t launch_fermat(int al, cudaStream_t stream,
+                                 const uint64_t *d_cands, uint8_t *d_results,
+                                 uint32_t count)
+{
+    int block = fermat_block_size_for_al(al);
     int grid  = (int)((count + block - 1) / block);
 
 #define FERMAT_DISPATCH(W) \
-    fermat_kernel_t<W><<<grid, block, 0, stream>>>(d_cands, d_results, count, NL); return
+    fermat_kernel_t<W><<<grid, block, 0, stream>>>(d_cands, d_results, count); \
+    return cudaPeekAtLastError()
 
 #if NL >= 5
     if (al <= 5)  { FERMAT_DISPATCH(5);  }
@@ -382,8 +394,10 @@ int gpu_fermat_submit(gpu_fermat_ctx *ctx, int slot,
     if (err != cudaSuccess) return -1;
 
     /* Launch kernel — dispatch to narrowest matching specialization */
-    launch_fermat(ctx->active_limbs, ctx->stream[slot],
-                  ctx->d_cands[slot], ctx->d_results[slot], (uint32_t)count);
+    err = launch_fermat(ctx->active_limbs, ctx->stream[slot],
+                        ctx->d_cands[slot], ctx->d_results[slot],
+                        (uint32_t)count);
+    if (err != cudaSuccess) return -1;
 
     /* Async D→H on stream[slot] */
     err = cudaMemcpyAsync(ctx->h_results[slot], ctx->d_results[slot],
