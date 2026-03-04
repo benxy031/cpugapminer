@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdatomic.h>
 #include <math.h>
 #include <time.h>
 #include "compat_win32.h"
@@ -256,7 +257,7 @@ static pthread_cond_t  crt_heap_cv   = PTHREAD_COND_INITIALIZER;
 static volatile uint64_t crt_heap_gen   = 0;  /* incremented on template change */
 static volatile int    crt_fermat_threads = 0; /* number of fermat threads (0 = monolithic) */
 static int             crt_fermat_explicit = 0; /* 1 if user passed --fermat-threads */
-static volatile int    crt_heap_shutdown = 0;    /* 1 = all threads should exit */
+static _Atomic int     crt_heap_shutdown = 0;    /* 1 = all threads should exit */
 
 /* Allocate a work item with mpz_t's initialized */
 static struct crt_work_item *crt_work_alloc(void) {
@@ -385,8 +386,11 @@ static void crt_heap_flush(void) {
 
 /* Get current heap size (for stats display) */
 static size_t crt_heap_count(void) {
-    /* No lock needed — just an approximate display value */
-    return crt_heap_size;
+    size_t n;
+    pthread_mutex_lock(&crt_heap_mtx);
+    n = crt_heap_size;
+    pthread_mutex_unlock(&crt_heap_mtx);
+    return n;
 }
 
 /* shared current-work state so any thread can detect a new block */
@@ -394,7 +398,7 @@ static char     g_prevhash[65]  = {0};
 static pthread_mutex_t g_work_lock = PTHREAD_MUTEX_INITIALIZER;
 /* set to 1 by thread-0 when a new block is detected; all workers break their
    adder loop and the main thread restarts the pass with fresh work */
-static volatile int g_abort_pass = 0;
+static _Atomic int g_abort_pass = 0;
 
 #ifdef WITH_RPC
 /* Pre-built mining pass: set once per getwork fetch, read-only during a pass.
@@ -418,7 +422,7 @@ static struct pass_state g_pass = {0};
 /* by default the miner continues searching even after a valid block is
    submitted.  Historically `--keep-going` enabled this behavior, but it is now
    the default; use --stop-after-block to request the old behaviour. */
-static volatile int keep_going = 1;    /* default == continue mining */
+static _Atomic int keep_going = 1;    /* default == continue mining */
 static volatile int debug_force = 0;    /* if nonzero, pretend any header meets target */
 /* if nonzero the miner uses a lightweight Fermat test (bases 2 & 3) instead of
    the full deterministic Miller‑Rabin.  This is faster but may misclassify a
@@ -808,7 +812,7 @@ static void print_stats(void) {
    the user always sees fresh rates regardless of how long a single sieve
    call takes (which can be several seconds for large --sieve-size values). */
 #define STATS_INTERVAL_MS 5000
-static volatile int stats_thread_running = 0;
+static _Atomic int stats_thread_running = 0;
 static pthread_t stats_thread;
 
 static void *stats_thread_fn(void *arg) {
@@ -824,10 +828,12 @@ static void *stats_thread_fn(void *arg) {
 
 static void start_stats_thread(void) {
     stats_thread_running = 1;
-    pthread_create(&stats_thread, NULL, stats_thread_fn, NULL);
+    if (pthread_create(&stats_thread, NULL, stats_thread_fn, NULL) != 0)
+        stats_thread_running = 0;
 }
 
 static void stop_stats_thread(void) {
+    if (!stats_thread_running) return;
     stats_thread_running = 0;
     pthread_join(stats_thread, NULL);
 }
@@ -3418,11 +3424,14 @@ struct presieve_ctx {
     struct coop_fermat coop;     /* cooperative Fermat testing state     */
 };
 
-static void presieve_buf_ensure(struct presieve_buf *b, size_t need) {
-    if (b->cap >= need) return;
+static int presieve_buf_ensure(struct presieve_buf *b, size_t need) {
+    if (b->cap >= need) return 0;
     size_t nc = need + (need >> 1) + 64;
-    b->pr  = realloc(b->pr, nc * sizeof(uint64_t));
+    uint64_t *tmp = realloc(b->pr, nc * sizeof(uint64_t));
+    if (!tmp) return -1;
+    b->pr  = tmp;
     b->cap = nc;
+    return 0;
 }
 
 /* Helper: assist with Fermat testing from the shared cooperative work queue.
@@ -3444,7 +3453,13 @@ static void coop_fermat_assist(struct presieve_ctx *ctx) {
                 /* Store confirmed prime in helper's private output buffer */
                 if (co->out_cnt >= co->out_cap) {
                     size_t nc = co->out_cap ? co->out_cap * 2 : 256;
-                    co->out = realloc(co->out, nc * sizeof(uint64_t));
+                    uint64_t *tmp = realloc(co->out, nc * sizeof(uint64_t));
+                    if (!tmp) {
+                        __sync_synchronize();
+                        co->helper_done = 1;
+                        return;
+                    }
+                    co->out = tmp;
                     co->out_cap = nc;
                 }
                 co->out[co->out_cnt++] = co->pr[idx];
@@ -3497,8 +3512,9 @@ static void *presieve_helper_fn(void *arg) {
             pthread_mutex_lock(&ctx->mu);
             struct presieve_buf *b = &ctx->bufs[slot];
             if (ctx->state != -1) {
-                presieve_buf_ensure(b, cnt);
-                if (cnt && pr_tls)
+                if (presieve_buf_ensure(b, cnt) < 0)
+                    cnt = 0;
+                if (cnt && pr_tls && b->pr)
                     memcpy(b->pr, pr_tls, cnt * sizeof(uint64_t));
                 b->cnt = cnt;
                 ctx->state = 2;
@@ -4450,7 +4466,7 @@ static void *worker_fn(void *arg) {
                         }
                     }
                     /* Collect verification candidates from surviving regions */
-                    size_t v_alloc = cnt / 8 + 64;
+                    size_t v_alloc = cnt > 0 ? cnt : 1;
                     uint64_t *verify = (uint64_t *)malloc(v_alloc * sizeof(uint64_t));
                     size_t v_cnt = 0;
                     if (verify && n_gap_regions > 0) {
@@ -4464,11 +4480,7 @@ static void *worker_fn(void *arg) {
                             for (size_t _j = _lo;                             \
                                  _j < cnt && pr[_j] < (hi_val); _j++) {       \
                                 if (_j % (size_t)smart_K == 0) continue;      \
-                                if (v_cnt >= v_alloc) {                       \
-                                    v_alloc *= 2;                             \
-                                    verify = (uint64_t *)realloc(verify,      \
-                                                v_alloc * sizeof(uint64_t));  \
-                                }                                             \
+                                if (v_cnt >= v_alloc) break;                  \
                                 verify[v_cnt++] = pr[_j];                     \
                             }                                                 \
                         } while (0)
@@ -5718,7 +5730,7 @@ int main(int argc, char **argv) {
                     }
 
                     /* Collect verification candidates (surviving regions only) */
-                    size_t v_alloc = cnt / 4 + 64, v_cnt = 0;
+                    size_t v_alloc = cnt > 0 ? cnt : 1, v_cnt = 0;
                     uint64_t *verify = (uint64_t *)malloc(v_alloc * sizeof(uint64_t));
                     if (!verify) { free(sampled); free(greg_lo_st); free(greg_hi_st); free(greg_alive_st); use_smart_st = 0; goto st_full; }
 
@@ -5732,11 +5744,7 @@ int main(int argc, char **argv) {
                         for (size_t _j = _lo;                                   \
                              _j < cnt && pr[_j] < (hi_val); _j++) {             \
                             if (_j % (size_t)smart_K_st == 0) continue;         \
-                            if (v_cnt >= v_alloc) {                             \
-                                v_alloc *= 2;                                   \
-                                verify = (uint64_t *)realloc(verify,            \
-                                            v_alloc * sizeof(uint64_t));        \
-                            }                                                   \
+                            if (v_cnt >= v_alloc) break;                        \
                             verify[v_cnt++] = pr[_j];                           \
                         }                                                       \
                     } while (0)
