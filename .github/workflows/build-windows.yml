@@ -9,6 +9,11 @@ name: Windows Build
 
 on:
   workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
 
 jobs:
   # ───────────────────────── CPU-only build ─────────────────────────
@@ -186,3 +191,28 @@ jobs:
         with:
           name: gap_miner-win64-cuda
           path: dist/
+
+  # ───────────────────────── Release publishing ─────────────────────────
+  publish-release-assets:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    needs: [build-cpu, build-cuda]
+    steps:
+      - name: Download CPU artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: gap_miner-win64-cpu
+          path: release-assets/gap_miner-win64-cpu
+
+      - name: Download CUDA artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: gap_miner-win64-cuda
+          path: release-assets/gap_miner-win64-cuda
+
+      - name: Upload assets to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/gap_miner-win64-cpu/**
+            release-assets/gap_miner-win64-cuda/**
