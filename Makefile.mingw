@@ -19,8 +19,12 @@ LDFLAGS=
 SRCDIR=src
 BINDIR=bin
 
-# LTO (link-time optimisation).  Disable with NO_LTO=1 when linking
-# MSVC-compiled CUDA objects, since MinGW's LTO can't process MSVC COFF.
+# LTO (link-time optimisation).  Auto-disabled when CUDA is enabled because
+# nvcc produces MSVC COFF objects that MinGW's LTO cannot process.
+# Can also be explicitly disabled with NO_LTO=1.
+ifdef WITH_CUDA
+  NO_LTO=1
+endif
 ifndef NO_LTO
   CFLAGS+=-flto
   CXXFLAGS+=-flto
@@ -63,6 +67,9 @@ ifdef WITH_CUDA
 	CFLAGS+=-DWITH_CUDA -DGPU_NLIMBS=$(GPU_NLIMBS) -I"$(CUDA_PATH)/include"
 	NVCC_FLAGS=-DGPU_NLIMBS=$(GPU_NLIMBS)
 	LIBS+=-lcudart -L"$(CUDA_PATH)/lib/x64"
+	# nvcc/MSVC objects reference CRT symbols (fprintf etc.) that MinGW GCC 15+
+	# (UCRT default) doesn't auto-link.  Append -lucrt so the linker resolves them.
+	LIBS+=-lucrt
 else
 	CUDA_OBJ=
 endif
