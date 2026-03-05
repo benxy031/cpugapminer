@@ -2580,87 +2580,171 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
     /* Allocate flat candidate buffer: cnt × GPU_NLIMBS limbs */
     size_t batch = cnt;
     if (batch > GPU_MAX_BATCH) batch = GPU_MAX_BATCH;
-    uint64_t *cands = (uint64_t *)malloc(batch * GPU_NLIMBS * sizeof(uint64_t));
-    uint8_t  *res   = (uint8_t  *)malloc(batch);
-    if (!cands || !res) { free(cands); free(res); return 0; }
+
+    /* Reuse per-thread staging buffers to avoid malloc/free in hot path. */
+    static __thread uint64_t *tls_cands[2] = {NULL, NULL};
+    static __thread size_t    tls_cands_cap = 0;   /* candidates per buffer */
+    static __thread uint8_t  *tls_res = NULL;
+    static __thread size_t    tls_res_cap = 0;
+
+    if (tls_cands_cap < batch) {
+        uint64_t *n0 = (uint64_t *)realloc(tls_cands[0],
+                                           batch * GPU_NLIMBS * sizeof(uint64_t));
+        if (!n0) return 0;
+        tls_cands[0] = n0;
+
+        uint64_t *n1 = (uint64_t *)realloc(tls_cands[1],
+                                           batch * GPU_NLIMBS * sizeof(uint64_t));
+        if (!n1) return 0;
+        tls_cands[1] = n1;
+        tls_cands_cap = batch;
+    }
+    if (tls_res_cap < batch) {
+        uint8_t *nr = (uint8_t *)realloc(tls_res, batch);
+        if (!nr) {
+            free(tls_cands[0]); tls_cands[0] = NULL;
+            free(tls_cands[1]); tls_cands[1] = NULL;
+            tls_cands_cap = 0;
+            free(tls_res); tls_res = NULL;
+            tls_res_cap = 0;
+            return 0;
+        }
+        tls_res = nr;
+        tls_res_cap = batch;
+    }
 
     size_t pf = 0;  /* prime-filtered count */
 
-    /* ── Double-buffered async pipeline ──
-       When cnt > batch (multiple chunks), overlap GPU compute of chunk N
-       with CPU candidate preparation for chunk N+1.
+    /* ── Double-buffered async pipeline with build-ahead ──
+       Submit chunk N, immediately build N+1 while N runs, then collect N-1.
+       This reduces GPU idle gaps between chunk submissions. */
+    size_t next_i = 0;
+    int submit_slot = 0;
+    int build_buf = 0;
 
-       gpu_fermat_submit() copies candidates into pinned staging and returns
-       immediately (GPU works via async stream).  We then build the next
-       chunk on CPU, collect previous results, and submit again.
-       For a single chunk, this degrades to a simple submit+collect. */
-    size_t i = 0;
-    int slot = 0;                  /* current GPU slot (0 or 1) */
-    int prev_slot = -1;            /* slot with pending results */
+    int cur_valid = 0;
+    size_t cur_start = 0, cur_size = 0;
+
+    int prev_valid = 0;
+    int prev_slot = -1;
     size_t prev_start = 0, prev_size = 0;
 
-    while (i < cnt) {
-        size_t chunk = cnt - i;
-        if (chunk > batch) chunk = batch;
-
-        /* Build candidate limbs: base + offset */
-        for (size_t j = 0; j < chunk; j++) {
+    /* Build first chunk before entering the pipeline. */
+    if (next_i < cnt) {
+        cur_start = next_i;
+        cur_size = cnt - next_i;
+        if (cur_size > batch) cur_size = batch;
+        uint64_t *cands = tls_cands[build_buf];
+        for (size_t j = 0; j < cur_size; j++) {
             uint64_t *dst = &cands[j * GPU_NLIMBS];
             for (int k = 0; k < GPU_NLIMBS; k++) dst[k] = base_limbs[k];
-            uint64_t carry = 0;
-            dst[0] += offsets[i + j];
-            carry = (dst[0] < offsets[i + j]);
+            dst[0] += offsets[cur_start + j];
+            uint64_t carry = (dst[0] < offsets[cur_start + j]);
             for (int k = 1; k < GPU_NLIMBS && carry; k++) {
                 dst[k] += carry;
                 carry = (dst[k] == 0);
             }
         }
+        next_i += cur_size;
+        cur_valid = 1;
+    }
 
-        /* Submit this chunk (async — returns immediately) */
-        if (gpu_fermat_submit(ctx, slot, cands, chunk) < 0) {
-            /* GPU error: fall back to CPU for this chunk */
-            for (size_t j = 0; j < chunk; j++)
-                if (bn_candidate_is_prime(offsets[i + j]))
-                    offsets[pf++] = offsets[i + j];
-            i += chunk;
+    while (cur_valid) {
+        uint64_t *cur_cands = tls_cands[build_buf];
+        int this_slot = submit_slot;
+
+        if (gpu_fermat_submit(ctx, this_slot, cur_cands, cur_size) < 0) {
+            for (size_t j = 0; j < cur_size; j++)
+                if (bn_candidate_is_prime(offsets[cur_start + j]))
+                    offsets[pf++] = offsets[cur_start + j];
+        } else {
+            /* Build next chunk now while current chunk is running. */
+            int next_valid = 0;
+            int next_buf = 1 - build_buf;
+            size_t next_start = 0, next_size = 0;
+            if (next_i < cnt) {
+                next_start = next_i;
+                next_size = cnt - next_i;
+                if (next_size > batch) next_size = batch;
+                uint64_t *next_cands = tls_cands[next_buf];
+                for (size_t j = 0; j < next_size; j++) {
+                    uint64_t *dst = &next_cands[j * GPU_NLIMBS];
+                    for (int k = 0; k < GPU_NLIMBS; k++) dst[k] = base_limbs[k];
+                    dst[0] += offsets[next_start + j];
+                    uint64_t carry = (dst[0] < offsets[next_start + j]);
+                    for (int k = 1; k < GPU_NLIMBS && carry; k++) {
+                        dst[k] += carry;
+                        carry = (dst[k] == 0);
+                    }
+                }
+                next_i += next_size;
+                next_valid = 1;
+            }
+
+            if (prev_valid) {
+                int np = gpu_fermat_collect(ctx, prev_slot, tls_res, prev_size);
+                if (np < 0) {
+                    for (size_t j = 0; j < prev_size; j++)
+                        if (bn_candidate_is_prime(offsets[prev_start + j]))
+                            offsets[pf++] = offsets[prev_start + j];
+                } else {
+                    for (size_t j = 0; j < prev_size; j++)
+                        if (tls_res[j]) offsets[pf++] = offsets[prev_start + j];
+                }
+            }
+
+            prev_valid = 1;
+            prev_slot = this_slot;
+            prev_start = cur_start;
+            prev_size = cur_size;
+
+            submit_slot = 1 - submit_slot;
+            cur_valid = next_valid;
+            cur_start = next_start;
+            cur_size = next_size;
+            build_buf = next_buf;
             continue;
         }
 
-        /* Collect PREVIOUS chunk's results (if any) while GPU works on current */
-        if (prev_slot >= 0) {
-            int np = gpu_fermat_collect(ctx, prev_slot, res, prev_size);
+        /* Submit failed for current: collect any previous pending chunk and
+           continue with CPU fallback for remaining chunks. */
+        if (prev_valid) {
+            int np = gpu_fermat_collect(ctx, prev_slot, tls_res, prev_size);
             if (np < 0) {
                 for (size_t j = 0; j < prev_size; j++)
                     if (bn_candidate_is_prime(offsets[prev_start + j]))
                         offsets[pf++] = offsets[prev_start + j];
             } else {
                 for (size_t j = 0; j < prev_size; j++)
-                    if (res[j]) offsets[pf++] = offsets[prev_start + j];
+                    if (tls_res[j]) offsets[pf++] = offsets[prev_start + j];
             }
+            prev_valid = 0;
         }
 
-        prev_slot  = slot;
-        prev_start = i;
-        prev_size  = chunk;
-        slot       = 1 - slot;   /* alternate slots */
-        i         += chunk;
+        while (next_i < cnt) {
+            size_t left = cnt - next_i;
+            size_t n = (left > batch) ? batch : left;
+            for (size_t j = 0; j < n; j++)
+                if (bn_candidate_is_prime(offsets[next_i + j]))
+                    offsets[pf++] = offsets[next_i + j];
+            next_i += n;
+        }
+        cur_valid = 0;
     }
 
     /* Collect final chunk */
-    if (prev_slot >= 0) {
-        int np = gpu_fermat_collect(ctx, prev_slot, res, prev_size);
+    if (prev_valid) {
+        int np = gpu_fermat_collect(ctx, prev_slot, tls_res, prev_size);
         if (np < 0) {
             for (size_t j = 0; j < prev_size; j++)
                 if (bn_candidate_is_prime(offsets[prev_start + j]))
                     offsets[pf++] = offsets[prev_start + j];
         } else {
             for (size_t j = 0; j < prev_size; j++)
-                if (res[j]) offsets[pf++] = offsets[prev_start + j];
+                if (tls_res[j]) offsets[pf++] = offsets[prev_start + j];
         }
     }
 
-    free(cands);
-    free(res);
     if (pf > 0)
         __sync_fetch_and_add(&stats_primes_found, (uint64_t)pf);
     return pf;
