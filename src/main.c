@@ -2393,6 +2393,18 @@ static inline uint32_t prime_cache_slot(uint64_t offset) {
      return (uint32_t)((h >> (64 - PRIME_CACHE_BITS)) & PRIME_CACHE_MASK);
 }
 
+/* Must be called whenever tls_base_mpz changes.
+   The primality cache is keyed by offset only and is valid only for the
+   current base.  Changing base without invalidation can produce false gaps. */
+static inline void prime_cache_invalidate_base(void) {
+    tls_cand_last_valid = 0;
+    tls_prime_cache_epoch++;
+    if (tls_prime_cache_epoch == 0) {
+        memset(tls_prime_cache_gen, 0, sizeof(tls_prime_cache_gen));
+        tls_prime_cache_epoch = 1;
+    }
+}
+
 static void ensure_gmp_tls(void) {
     if (__builtin_expect(!tls_gmp_inited, 0)) {
         /* Pre-allocate all mpz to 384 bits (6 limbs) — enough for 284-bit
@@ -2417,14 +2429,7 @@ static void set_base_bn(const uint8_t h256[32], int shift) {
     /* Import h256 (big-endian, MSB first) into GMP */
     mpz_import(tls_base_mpz, 32, 1, 1, 1, 0, h256);
     mpz_mul_2exp(tls_base_mpz, tls_base_mpz, (unsigned long)shift);
-    tls_cand_last_valid = 0;
-
-    /* Invalidate per-thread primality memoization for the new base. */
-    tls_prime_cache_epoch++;
-    if (tls_prime_cache_epoch == 0) {
-        memset(tls_prime_cache_gen, 0, sizeof(tls_prime_cache_gen));
-        tls_prime_cache_epoch = 1;
-    }
+    prime_cache_invalidate_base();
 
     /* ── Precompute CRT base residue once per pass ── */
     if (g_crt_mode == CRT_MODE_TEMPLATE && g_crt_primorial > 0)
@@ -3169,6 +3174,7 @@ static int __attribute__((unused)) bn_is_prime_mpz(mpz_t candidate) {
    given mpz_t base position (typically a confirmed CRT prime). */
 static void rebase_for_gap_check(mpz_t new_base) {
     mpz_set(tls_base_mpz, new_base);
+    prime_cache_invalidate_base();
     /* Recompute sieve prime residues */
     pthread_once(&small_primes_once, populate_small_primes_cache);
     if (tls_base_mod_p && small_primes_cache) {
@@ -3693,6 +3699,7 @@ static void *worker_fn(void *arg) {
 
                 /* Set thread-local base for Fermat testing */
                 mpz_set(tls_base_mpz, w->base);
+                prime_cache_invalidate_base();
 
                 /* Fermat-test ALL survivors to find primes */
                 size_t pf = 0;
@@ -3971,6 +3978,7 @@ static void *worker_fn(void *arg) {
                     if (!crt_first_win) {
                         mpz_add(tls_base_mpz, tls_base_mpz,
                                 g_crt_primorial_mpz);
+                            prime_cache_invalidate_base();
                         if (prim_mod_sieve && tls_base_mod_p) {
                             for (size_t pi = 0; pi < prim_mod_count; pi++) {
                                 tls_base_mod_p[pi] += prim_mod_sieve[pi];
@@ -5483,6 +5491,7 @@ int main(int argc, char **argv) {
                             /* Incremental rebase */
                             mpz_add(tls_base_mpz, tls_base_mpz,
                                     g_crt_primorial_mpz);
+                            prime_cache_invalidate_base();
                             if (st_prim_mod && tls_base_mod_p) {
                                 for (size_t pi = 0; pi < st_prim_cnt; pi++) {
                                     tls_base_mod_p[pi] += st_prim_mod[pi];
