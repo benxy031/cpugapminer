@@ -4175,22 +4175,24 @@ static void *worker_fn(void *arg) {
 
                     mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
                 } /* end CRT candidate loop */
-#ifdef WITH_CUDA
-                /* Flush + collect any remaining accumulated GPU windows */
-                if (tls_gpu_accum) {
-                    if (g_abort_pass)
-                        gpu_accum_reset(tls_gpu_accum);
-                    else {
-                        gpu_accum_flush(tls_gpu_accum);
-                        gpu_accum_collect(tls_gpu_accum);
-                    }
-                }
-#endif
-
                 nonce_cur += (uint32_t)nth_local;
                 if (nonce_cur < (uint32_t)nth_local) break;
 
             } /* end nonce loop */
+
+#ifdef WITH_CUDA
+            /* Drain any remaining accumulated GPU work once per nonce-loop
+               exit (not once per nonce).  This allows cross-nonce batching,
+               significantly increasing effective gpu_batch in CRT mode. */
+            if (tls_gpu_accum) {
+                if (g_abort_pass)
+                    gpu_accum_reset(tls_gpu_accum);
+                else {
+                    gpu_accum_flush(tls_gpu_accum);
+                    gpu_accum_collect(tls_gpu_accum);
+                }
+            }
+#endif
 
             mpz_clears(nAdd, candidate, orig_base_crt, crt_end, NULL);
             free(prim_mod_sieve);
@@ -5658,20 +5660,22 @@ int main(int argc, char **argv) {
 
                         mpz_add(nAdd_st, nAdd_st, g_crt_primorial_mpz);
                     } /* end CRT candidate loop */
-#ifdef WITH_CUDA
-                    /* Flush + collect any remaining accumulated GPU windows */
-                    if (tls_gpu_accum) {
-                        if (g_abort_pass)
-                            gpu_accum_reset(tls_gpu_accum);
-                        else {
-                            gpu_accum_flush(tls_gpu_accum);
-                            gpu_accum_collect(tls_gpu_accum);
-                        }
-                    }
-#endif
-
                     nonce_st++;
                 } /* end nonce loop */
+
+#ifdef WITH_CUDA
+                /* Drain any remaining accumulated GPU work once per nonce-loop
+                   exit (not once per nonce).  This allows cross-nonce batching,
+                   significantly increasing effective gpu_batch in CRT mode. */
+                if (tls_gpu_accum) {
+                    if (g_abort_pass)
+                        gpu_accum_reset(tls_gpu_accum);
+                    else {
+                        gpu_accum_flush(tls_gpu_accum);
+                        gpu_accum_collect(tls_gpu_accum);
+                    }
+                }
+#endif
 
                 mpz_clears(crt_end, nAdd_st, cand_st, orig_base_st, NULL);
                 free(st_prim_mod);
