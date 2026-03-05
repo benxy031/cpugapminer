@@ -379,8 +379,11 @@ Fermat testing to the GPU on **all mining paths**:
   thousands of candidates per launch.
 - **Normal sieve (non-CRT)** — Each sieve window already produces thousands
   of candidates, so they are sent directly to the GPU via `gpu_batch_filter`
-  without accumulation.  The GPU path uses two-phase smart-scan (Phase 1
-  sampling + Phase 2 verification).  The CPU path uses a backward-scan
+  without accumulation.  The host pipeline uses double-buffered async
+  submit/collect with build-ahead chunk preparation and thread-local staging
+  buffer reuse to reduce allocator overhead and improve stream overlap.
+  The GPU path uses two-phase smart-scan (Phase 1 sampling + Phase 2
+  verification).  The CPU path uses a backward-scan
   algorithm that jumps ahead by the target gap and scans backward for
   primes, achieving ~8× fewer Fermat tests than full-test.
   Cooperative Fermat is disabled (`coop.active=0`) so the helper thread
