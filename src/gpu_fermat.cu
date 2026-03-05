@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <cuda_runtime.h>
 
 #define NL GPU_NLIMBS   /* shorthand for loop bounds */
@@ -297,12 +298,20 @@ struct gpu_fermat_ctx {
     uint8_t  *h_results[2];    /* pinned host staging res   */
     size_t    pending[2];      /* candidates in-flight per slot (0=idle) */
     char      dev_name[256];
+    pthread_mutex_t mu;        /* guards pending/slot buffers for thread-safe use */
+    int       mu_inited;
 };
 
 gpu_fermat_ctx *gpu_fermat_init(int device_id, size_t max_batch)
 {
     gpu_fermat_ctx *ctx = (gpu_fermat_ctx *)calloc(1, sizeof(*ctx));
     if (!ctx) return NULL;
+
+    if (pthread_mutex_init(&ctx->mu, NULL) != 0) {
+        free(ctx);
+        return NULL;
+    }
+    ctx->mu_inited = 1;
 
     cudaError_t err = cudaSetDevice(device_id);
     if (err != cudaSuccess) {
@@ -379,8 +388,14 @@ int gpu_fermat_submit(gpu_fermat_ctx *ctx, int slot,
     if (slot < 0 || slot > 1) return -1;
     if (count > ctx->max_batch) count = ctx->max_batch;
 
+    pthread_mutex_lock(&ctx->mu);
+    if (ctx->pending[slot] != 0) {
+        pthread_mutex_unlock(&ctx->mu);
+        return -1; /* slot busy: caller must collect first */
+    }
+
     cudaError_t err = cudaSetDevice(ctx->device_id);
-    if (err != cudaSuccess) return -1;
+    if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->mu); return -1; }
 
     /* Copy candidates into pinned staging buffer.
        After this memcpy the caller's buffer can be reused. */
@@ -391,13 +406,13 @@ int gpu_fermat_submit(gpu_fermat_ctx *ctx, int slot,
     err = cudaMemcpyAsync(ctx->d_cands[slot], ctx->h_cands[slot],
                           count * NL * sizeof(uint64_t),
                           cudaMemcpyHostToDevice, ctx->stream[slot]);
-    if (err != cudaSuccess) return -1;
+    if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->mu); return -1; }
 
     /* Launch kernel — dispatch to narrowest matching specialization */
     err = launch_fermat(ctx->active_limbs, ctx->stream[slot],
                         ctx->d_cands[slot], ctx->d_results[slot],
                         (uint32_t)count);
-    if (err != cudaSuccess) return -1;
+    if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->mu); return -1; }
 
     /* Async D→H on stream[slot] */
     err = cudaMemcpyAsync(ctx->h_results[slot], ctx->d_results[slot],
@@ -406,6 +421,7 @@ int gpu_fermat_submit(gpu_fermat_ctx *ctx, int slot,
     if (err != cudaSuccess) return -1;
 
     ctx->pending[slot] = count;
+    pthread_mutex_unlock(&ctx->mu);
     return 0;
 }
 
@@ -414,17 +430,22 @@ int gpu_fermat_collect(gpu_fermat_ctx *ctx, int slot,
 {
     if (!ctx || !results) return -1;
     if (slot < 0 || slot > 1) return -1;
-    if (ctx->pending[slot] == 0) return 0;
+
+    pthread_mutex_lock(&ctx->mu);
+    if (ctx->pending[slot] == 0) {
+        pthread_mutex_unlock(&ctx->mu);
+        return 0;
+    }
 
     size_t n = ctx->pending[slot];
     if (count < n) n = count;
 
     cudaError_t err = cudaSetDevice(ctx->device_id);
-    if (err != cudaSuccess) return -1;
+    if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->mu); return -1; }
 
     /* Wait for all operations on this stream */
     err = cudaStreamSynchronize(ctx->stream[slot]);
-    if (err != cudaSuccess) return -1;
+    if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->mu); return -1; }
 
     /* Results are already in pinned host buffer — copy to user */
     memcpy(results, ctx->h_results[slot], n);
@@ -434,6 +455,7 @@ int gpu_fermat_collect(gpu_fermat_ctx *ctx, int slot,
         primes += results[i];
 
     ctx->pending[slot] = 0;
+    pthread_mutex_unlock(&ctx->mu);
     return primes;
 }
 
@@ -459,14 +481,17 @@ const char *gpu_fermat_device_name(gpu_fermat_ctx *ctx)
 void gpu_fermat_set_limbs(gpu_fermat_ctx *ctx, int limbs)
 {
     if (!ctx) return;
+    pthread_mutex_lock(&ctx->mu);
     if (limbs < 1)  limbs = NL;
     if (limbs > NL) limbs = NL;
     ctx->active_limbs = limbs;
+    pthread_mutex_unlock(&ctx->mu);
 }
 
 void gpu_fermat_destroy(gpu_fermat_ctx *ctx)
 {
     if (!ctx) return;
+    if (ctx->mu_inited) pthread_mutex_lock(&ctx->mu);
     cudaSetDevice(ctx->device_id);
     for (int s = 0; s < 2; s++) {
         if (ctx->pending[s] && ctx->stream[s])
@@ -476,6 +501,10 @@ void gpu_fermat_destroy(gpu_fermat_ctx *ctx)
         if (ctx->h_cands[s])   cudaFreeHost(ctx->h_cands[s]);
         if (ctx->h_results[s]) cudaFreeHost(ctx->h_results[s]);
         if (ctx->stream[s])    cudaStreamDestroy(ctx->stream[s]);
+    }
+    if (ctx->mu_inited) {
+        pthread_mutex_unlock(&ctx->mu);
+        pthread_mutex_destroy(&ctx->mu);
     }
     free(ctx);
 }
