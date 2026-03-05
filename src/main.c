@@ -34,7 +34,8 @@ static stratum_ctx *g_stratum = NULL;   /* non-NULL when mining via stratum pool
 #endif
 #define GPU_MAX_DEVS  8
 static int             g_gpu_batch_size = 0;  /* --gpu-batch; 0 = use default (4096) */
-#ifdef WITH_CUDA
+#if defined(WITH_CUDA) || defined(WITH_OPENCL)
+#define WITH_GPU_FERMAT 1
 #include "gpu_fermat.h"
 #define GPU_MAX_BATCH (1 << 20)   /* 1M candidates per batch */
 static gpu_fermat_ctx *g_gpu_ctx[GPU_MAX_DEVS];
@@ -790,7 +791,7 @@ static void print_stats(void) {
             log_msg("  gaplist=%lu", (unsigned long)crt_heap_count());
     }
 
-#ifdef WITH_CUDA
+#ifdef WITH_GPU_FERMAT
     if (stats_gpu_flushes > 0) {
         double avg_batch = (double)stats_gpu_batched / (double)stats_gpu_flushes;
         log_msg("  gpu_batch=%.0f", avg_batch);
@@ -2537,7 +2538,7 @@ static int bn_candidate_is_prime(uint64_t offset) {
     return is_prime;
 }
 
-#ifdef WITH_CUDA
+#ifdef WITH_GPU_FERMAT
 /* GPU batch primality filter.
    Takes the thread-local base (tls_base_mpz) and an array of uint64
    offsets.  Sends (base + offset[i]) for each i to the GPU for Fermat
@@ -2749,9 +2750,9 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
         __sync_fetch_and_add(&stats_primes_found, (uint64_t)pf);
     return pf;
 }
-#endif /* WITH_CUDA */
+#endif /* WITH_GPU_FERMAT */
 
-#ifdef WITH_CUDA
+#ifdef WITH_GPU_FERMAT
 /* ── Scan gap results for one window ──
    After Fermat testing, scan consecutive prime survivors for qualifying
    gaps.  Updates global stats, logs gaps, submits qualifying blocks. */
@@ -3096,7 +3097,7 @@ static void gpu_accum_flush(struct gpu_accum *a) {
     a->fill = 1 - a->fill;
     /* The other buffer should be clean (was reset in collect or init) */
 }
-#endif /* WITH_CUDA — accumulator */
+#endif /* WITH_GPU_FERMAT — accumulator */
 
 // Produce hex of SHA256(header) (useful as a simple header encoding)
 static void sha256_hex(const char *s, char out[65]) __attribute__((unused));
@@ -3787,7 +3788,7 @@ static void *worker_fn(void *arg) {
 
                 /* Fermat-test ALL survivors to find primes */
                 size_t pf = 0;
-#ifdef WITH_CUDA
+#ifdef WITH_GPU_FERMAT
                 if (g_gpu_count > 0) {
                     pf = gpu_batch_filter(w->survivors, w->surv_cnt);
                     __sync_fetch_and_add(&stats_tested, (uint64_t)w->surv_cnt);
@@ -4113,7 +4114,7 @@ static void *worker_fn(void *arg) {
 
                     /* ── Monolithic: Fermat-test ── */
                     size_t pf = 0;
-#ifdef WITH_CUDA
+#ifdef WITH_GPU_FERMAT
                     if (g_gpu_count > 0) {
                         /* Lazy-init thread-local GPU accumulator */
                         if (!tls_gpu_accum) {
@@ -4264,7 +4265,7 @@ static void *worker_fn(void *arg) {
 
             } /* end nonce loop */
 
-#ifdef WITH_CUDA
+#ifdef WITH_GPU_FERMAT
             /* Drain any remaining accumulated GPU work once per nonce-loop
                exit (not once per nonce).  This allows cross-nonce batching,
                significantly increasing effective gpu_batch in CRT mode. */
@@ -4283,7 +4284,7 @@ static void *worker_fn(void *arg) {
         }
 
         /* ── CRT cleanup ── */
-#ifdef WITH_CUDA
+#ifdef WITH_GPU_FERMAT
         if (tls_gpu_accum) {
             gpu_accum_destroy(tls_gpu_accum);
             tls_gpu_accum = NULL;
@@ -4467,7 +4468,7 @@ static void *worker_fn(void *arg) {
                              && cnt > (size_t)(smart_K * 4));
 
             size_t needed_gap = 0;
-#ifdef WITH_CUDA
+#ifdef WITH_GPU_FERMAT
             size_t p1_cnt = 0, p1_wcap = 0;
 #endif
             uint64_t *p1_cands = NULL, *p1_wbuf = NULL;
@@ -4477,7 +4478,7 @@ static void *worker_fn(void *arg) {
             if (use_smart) {
                 needed_gap = (size_t)(target_local * logbase);
                 if (needed_gap < 2) needed_gap = 2;
-#ifdef WITH_CUDA
+#ifdef WITH_GPU_FERMAT
                 /* GPU smart-scan still needs sampled candidates */
                 if (g_gpu_count > 0) {
                     p1_cnt  = (cnt + (size_t)smart_K - 1) / (size_t)smart_K;
@@ -4497,7 +4498,7 @@ static void *worker_fn(void *arg) {
             }
 
             /* --- set up cooperative Fermat and unlock mutex (once) ------- */
-#ifdef WITH_CUDA
+#ifdef WITH_GPU_FERMAT
             /* When GPU handles Fermat, disable cooperative assist — the GPU
                replaces all CPU Fermat work.  Helper still sieves the next
                window but skips coop_fermat_assist (active=0).               */
@@ -4538,7 +4539,7 @@ static void *worker_fn(void *arg) {
             }
 
             /* ============================================================= */
-#ifdef WITH_CUDA
+#ifdef WITH_GPU_FERMAT
             if (gpu_fermat_path && !no_primality) {
             /* ======= GPU FERMAT PATH (non-CRT) ============================
                Send all candidates to the GPU in one batch.  No cooperative
@@ -4940,7 +4941,7 @@ worker_done:
        Without this, every pass (new block) leaks ~103 MB per worker:
        tls_pr (~80 MB) + tls_base_mod_p (~22 MB) + tls_bits (~1.25 MB).
        With 14 threads that's ~1.45 GB leaked per block, causing OOM. */
-#ifdef WITH_CUDA
+#ifdef WITH_GPU_FERMAT
     if (tls_gpu_accum) {
         gpu_accum_destroy(tls_gpu_accum);
         tls_gpu_accum = NULL;
@@ -5025,6 +5026,8 @@ int main(int argc, char **argv) {
         printf("      --rpc-rate MS     getwork poll interval ms  (default: 5000)\n");
         printf("      --rpc-retries N   submit retries\n");
         printf("      --cuda [DEV,...]  use CUDA GPU(s) for Fermat testing (e.g. --cuda 0,1)\n");
+        printf("      --opencl [DEV,...] use OpenCL GPU(s) for Fermat testing scaffold (e.g. --opencl 0)\n");
+        printf("      --opencl-platform N OpenCL platform index (default: 0)\n");
         printf("      --gpu-batch N     accumulate N candidates before GPU flush (default: 4096)\n");
         return 1;
     }
@@ -5053,9 +5056,16 @@ int main(int argc, char **argv) {
     int no_opreturn = 0;
     int num_threads = 1;
     int use_cuda = 0;
+    int use_opencl = 0;
     int cuda_devices[GPU_MAX_DEVS];
     int cuda_ndevs = 0;
-    (void)cuda_devices; (void)cuda_ndevs;  /* suppress warning when WITH_CUDA not set */
+    int opencl_devices[GPU_MAX_DEVS];
+    int opencl_ndevs = 0;
+    int opencl_platform = 0;
+    int opencl_platform_set = 0;
+    (void)cuda_devices; (void)cuda_ndevs;
+    (void)opencl_devices; (void)opencl_ndevs;
+    (void)opencl_platform; (void)opencl_platform_set;
     uint64_t build_p = 0, build_q = 0;
     for (int i=1;i<argc;i++) {
         if (!strcmp(argv[i],"--header") && i+1<argc) header = argv[++i];
@@ -5098,6 +5108,23 @@ int main(int argc, char **argv) {
             }
             if (cuda_ndevs == 0) cuda_devices[cuda_ndevs++] = 0;
         }
+        else if (!strcmp(argv[i],"--opencl")) {
+            use_opencl = 1;
+            if (i+1 < argc && argv[i+1][0] != '-') {
+                char *devarg = argv[++i];
+                char *tok = strtok(devarg, ",");
+                while (tok && opencl_ndevs < GPU_MAX_DEVS) {
+                    opencl_devices[opencl_ndevs++] = atoi(tok);
+                    tok = strtok(NULL, ",");
+                }
+            }
+            if (opencl_ndevs == 0) opencl_devices[opencl_ndevs++] = 0;
+        }
+        else if (!strcmp(argv[i],"--opencl-platform") && i+1<argc) {
+            opencl_platform = atoi(argv[++i]);
+            if (opencl_platform < 0) opencl_platform = 0;
+            opencl_platform_set = 1;
+        }
         else if (!strcmp(argv[i],"--gpu-batch") && i+1<argc) {
             g_gpu_batch_size = atoi(argv[++i]);
             if (g_gpu_batch_size < 64) g_gpu_batch_size = 64;
@@ -5130,6 +5157,10 @@ int main(int argc, char **argv) {
                found */
             keep_going = 0;
         }
+    }
+    if (use_cuda && use_opencl) {
+        fprintf(stderr, "Use either --cuda or --opencl, not both in one run.\n");
+        return 2;
     }
     /* Build rpc_url from --host / --port if not given explicitly.
        Defaults: host=127.0.0.1, port=31397 (Gapcoin mainnet). */
@@ -5222,8 +5253,8 @@ int main(int argc, char **argv) {
        Only adjust if the user didn't pass --sieve-primes explicitly. */
     if (g_crt_mode == CRT_MODE_SOLVER && !cli_sieve_explicit) {
         uint64_t new_count;
-#ifdef WITH_CUDA
-        if (use_cuda) {
+#ifdef WITH_GPU_FERMAT
+    if (use_cuda || use_opencl) {
             /* GPU Fermat: keep sieve primes low to feed larger batches.
                At 300K primes the gap-check sieve keeps the same
                primes/window as 500K–3M but the sieve runs ~30% faster,
@@ -5249,8 +5280,8 @@ int main(int argc, char **argv) {
             log_msg("CRT auto-tune: sieve-primes %llu -> %llu (shift=%d%s)\n",
                     (unsigned long long)cli_sieve_prime_count,
                     (unsigned long long)new_count, shift,
-#ifdef WITH_CUDA
-                    use_cuda ? ", cuda" : ""
+#ifdef WITH_GPU_FERMAT
+                    use_cuda ? ", cuda" : (use_opencl ? ", opencl" : "")
 #else
                     ""
 #endif
@@ -5320,6 +5351,42 @@ int main(int argc, char **argv) {
 #else
     if (use_cuda) {
         fprintf(stderr, "--cuda requires building with WITH_CUDA=1\n");
+        return 2;
+    }
+#endif
+
+    /* ── OpenCL GPU initialization scaffolding ── */
+#ifdef WITH_OPENCL
+    if (use_opencl) {
+        if (opencl_platform_set) {
+            char pbuf[32];
+            snprintf(pbuf, sizeof(pbuf), "%d", opencl_platform);
+#ifdef _WIN32
+            _putenv_s("GAP_OPENCL_PLATFORM", pbuf);
+#else
+            setenv("GAP_OPENCL_PLATFORM", pbuf, 1);
+#endif
+        }
+        for (int gi = 0; gi < opencl_ndevs; gi++) {
+            g_gpu_ctx[g_gpu_count] = gpu_fermat_init(opencl_devices[gi], GPU_MAX_BATCH);
+            if (!g_gpu_ctx[g_gpu_count]) {
+                fprintf(stderr, "OpenCL init failed (platform %d, device %d). Skipping.\n",
+                        opencl_platform, opencl_devices[gi]);
+            } else {
+                log_msg("OpenCL: using %s (platform %d, device %d) for Fermat testing\n",
+                        gpu_fermat_device_name(g_gpu_ctx[g_gpu_count]),
+                        opencl_platform, opencl_devices[gi]);
+                g_gpu_count++;
+            }
+        }
+        if (g_gpu_count == 0) {
+            fprintf(stderr, "No OpenCL devices initialized. Falling back to CPU.\n");
+            use_opencl = 0;
+        }
+    }
+#else
+    if (use_opencl) {
+        fprintf(stderr, "--opencl requires building with WITH_OPENCL=1\n");
         return 2;
     }
 #endif
@@ -5604,7 +5671,7 @@ int main(int argc, char **argv) {
 
                         /* Fermat-test ALL survivors */
                         size_t pf = 0;
-#ifdef WITH_CUDA
+#ifdef WITH_GPU_FERMAT
                         if (g_gpu_count > 0) {
                             /* Lazy-init thread-local GPU accumulator */
                             if (!tls_gpu_accum) {
@@ -5747,7 +5814,7 @@ int main(int argc, char **argv) {
                     nonce_st++;
                 } /* end nonce loop */
 
-#ifdef WITH_CUDA
+#ifdef WITH_GPU_FERMAT
                 /* Drain any remaining accumulated GPU work once per nonce-loop
                    exit (not once per nonce).  This allows cross-nonce batching,
                    significantly increasing effective gpu_batch in CRT mode. */
@@ -5799,7 +5866,7 @@ int main(int argc, char **argv) {
                         for (size_t j = 0, k = 0; j < cnt; j += (size_t)smart_K_st)
                             p1_arr[k++] = pr[j];
                     }
-#ifdef WITH_CUDA
+#ifdef WITH_GPU_FERMAT
                     if (g_gpu_count > 0 && p1_arr) {
                         sp = gpu_batch_filter(p1_arr, p1n);
                         memcpy(sampled, p1_arr, sp * sizeof(uint64_t));
@@ -5914,7 +5981,7 @@ int main(int argc, char **argv) {
                     /* --- Phase 2: test verification candidates ------------ */
                     pf = sp;
                     memcpy(pr, sampled, sp * sizeof(uint64_t));
-#ifdef WITH_CUDA
+#ifdef WITH_GPU_FERMAT
                     if (g_gpu_count > 0 && v_cnt > 0) {
                         size_t vp = gpu_batch_filter(verify, v_cnt);
                         for (size_t i = 0; i < vp; i++)
@@ -5988,7 +6055,7 @@ int main(int argc, char **argv) {
                 st_full:
                     if (!no_primality) {
                         size_t test_cnt = cnt;
-#ifdef WITH_CUDA
+#ifdef WITH_GPU_FERMAT
                         if (g_gpu_count > 0) {
                             pf = gpu_batch_filter(pr, cnt);
                         } else
@@ -6154,7 +6221,7 @@ int main(int argc, char **argv) {
     if (rpc_url && !g_stratum) stop_submit_thread();
     if (g_stratum) stratum_disconnect(g_stratum);
 #endif
-#ifdef WITH_CUDA
+#ifdef WITH_GPU_FERMAT
     for (int gi = 0; gi < g_gpu_count; gi++)
         gpu_fermat_destroy(g_gpu_ctx[gi]);
 #endif

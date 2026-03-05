@@ -34,19 +34,35 @@ else
 endif
 
 # enable WITH_CUDA=1 to include GPU Fermat testing via CUDA
+# enable WITH_OPENCL=1 to build OpenCL host scaffolding backend
 # optional: GPU_BITS=768 (default, shift ≤ 512), 1024 (shift ≤ 768), etc.
+ifdef WITH_CUDA
+ifdef WITH_OPENCL
+$(error WITH_CUDA and WITH_OPENCL cannot be enabled together)
+endif
+endif
+
+GPU_BITS ?= 1024
+GPU_NLIMBS := $(shell echo '$(GPU_BITS) / 64' | bc)
+
 ifdef WITH_CUDA
 	NVCC ?= nvcc
 	CUDA_ARCH ?= -arch=sm_86
 	CUDA_PATH ?= /usr/local/cuda
-	GPU_BITS ?= 1024
-	GPU_NLIMBS := $(shell echo '$(GPU_BITS) / 64' | bc)
-	CUDA_OBJ=$(SRCDIR)/gpu_fermat.o
+	GPU_OBJ=$(SRCDIR)/gpu_fermat.o
 	CFLAGS+=-DWITH_CUDA -DGPU_NLIMBS=$(GPU_NLIMBS) -I$(CUDA_PATH)/include
 	NVCC_FLAGS=-DGPU_NLIMBS=$(GPU_NLIMBS)
 	LIBS+=-lcudart -L$(CUDA_PATH)/lib64
-else
-	CUDA_OBJ=
+endif
+
+ifdef WITH_OPENCL
+	GPU_OBJ=$(SRCDIR)/gpu_fermat_opencl.o
+	CFLAGS+=-DWITH_OPENCL -DGPU_NLIMBS=$(GPU_NLIMBS)
+	LIBS+=-lOpenCL
+endif
+
+ifndef GPU_OBJ
+	GPU_OBJ=
 endif
 
 all: $(TARGET)
@@ -68,8 +84,8 @@ $(SRCDIR)/%.o: $(SRCDIR)/%.cpp
 $(SRCDIR)/gpu_fermat.o: $(SRCDIR)/gpu_fermat.cu $(SRCDIR)/gpu_fermat.h
 	$(NVCC) -O3 $(CUDA_ARCH) $(NVCC_FLAGS) -c $< -o $@
 
-$(TARGET): $(BINDIR) $(SRCDIR)/main.o $(RPC_OBJS) $(STRATUM_OBJ) $(CUDA_OBJ)
-	$(LINKER) -o $@ $(SRCDIR)/main.o $(RPC_OBJS) $(STRATUM_OBJ) $(CUDA_OBJ) $(LDFLAGS) $(LIBS)
+$(TARGET): $(BINDIR) $(SRCDIR)/main.o $(RPC_OBJS) $(STRATUM_OBJ) $(GPU_OBJ)
+	$(LINKER) -o $@ $(SRCDIR)/main.o $(RPC_OBJS) $(STRATUM_OBJ) $(GPU_OBJ) $(LDFLAGS) $(LIBS)
 
 clean:
 	rm -rf $(BINDIR) $(SRCDIR)/*.o

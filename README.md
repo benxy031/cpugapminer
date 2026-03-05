@@ -118,6 +118,18 @@ make clean
 make WITH_RPC=1 WITH_CUDA=1
 ```
 
+Build with OpenCL host scaffolding enabled (CLI + device/platform selection):
+
+```sh
+make clean
+make WITH_RPC=1 WITH_OPENCL=1
+```
+
+Current status: OpenCL backend is experimental and functional for batch Fermat
+testing.  It now uses CUDA-style arithmetic-limb dispatch (AL=5/6/8/10/12/16,
+plus NL fallback) and vectorized limb loads (`ulong4`/`ulong2`) when aligned.
+Performance is still generally behind the CUDA backend.
+
 To target a specific GPU architecture (default `sm_61`):
 
 ```sh
@@ -228,6 +240,12 @@ flushes them to the GPU in large batches (default 4096) for efficient SM
 utilization.  In non-CRT mode, each sieve window already produces
 thousands of candidates, so they are sent directly to the GPU without
 accumulation.
+
+OpenCL scaffolding can be selected with `--opencl [DEV,...]` and
+`--opencl-platform N`; this enables the OpenCL Fermat backend.
+
+For high shifts in offline-header mode, pass `--adder-max` explicitly.
+Example: `--shift 122 --adder-max 134217728`.
 
 ```sh
 bin/gap_miner \
