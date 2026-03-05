@@ -247,6 +247,52 @@ OpenCL scaffolding can be selected with `--opencl [DEV,...]` and
 For high shifts in offline-header mode, pass `--adder-max` explicitly.
 Example: `--shift 122 --adder-max 134217728`.
 
+OpenCL single-device example:
+
+```sh
+bin/gap_miner \
+  -o 127.0.0.1 -p 31397 -u USER --pass PASS \
+  --shift 122 \
+  --threads 1 \
+  --fast-fermat \
+  --opencl 0
+```
+
+OpenCL with explicit platform + device:
+
+```sh
+bin/gap_miner \
+  -o 127.0.0.1 -p 31397 -u USER --pass PASS \
+  --shift 122 \
+  --threads 1 \
+  --fast-fermat \
+  --opencl-platform 0 \
+  --opencl 0
+```
+
+OpenCL multi-device list:
+
+```sh
+bin/gap_miner \
+  -o 127.0.0.1 -p 31397 -u USER --pass PASS \
+  --shift 122 \
+  --threads 2 \
+  --fast-fermat \
+  --opencl 0,1
+```
+
+OpenCL equivalent of a CUDA baseline-style run (`shift=122`, non-CRT):
+
+```sh
+./bin/gap_miner \
+  -o 127.0.0.1 -p 31397 -u USER --pass PASS \
+  -s 122 \
+  --threads 2 \
+  --opencl 0 \
+  --fast-fermat \
+  --sieve-primes 100000
+```
+
 ```sh
 bin/gap_miner \
   -o 127.0.0.1 -p 31397 -u USER --pass PASS \
