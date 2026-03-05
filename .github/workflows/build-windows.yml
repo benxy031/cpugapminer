@@ -52,31 +52,42 @@ jobs:
           cp bin/gen_crt.exe dist/
           # Copy CRT sieve files
           cp -r crt dist/ 2>/dev/null || true
-          # Copy required MinGW runtime DLLs
+
+          # Auto-copy all transitive runtime DLL dependencies for built binaries.
           MINGW=/mingw64/bin
-          for dll in \
-            libgmp-10.dll \
-            libcurl-4.dll \
-            libjansson-4.dll \
-            libssl-3-x64.dll \
-            libcrypto-3-x64.dll \
-            libgcc_s_seh-1.dll \
-            libstdc++-6.dll \
-            libwinpthread-1.dll \
-            zlib1.dll \
-            libbrotlidec.dll \
-            libbrotlicommon.dll \
-            libiconv-2.dll \
-            libidn2-0.dll \
-            libintl-8.dll \
-            libnghttp2-14.dll \
-            libpsl-5.dll \
-            libssh2-1.dll \
-            libunistring-5.dll \
-            libzstd.dll \
-            ; do
-            [ -f "$MINGW/$dll" ] && cp "$MINGW/$dll" dist/
-          done
+          CUDA_UNIX=""
+
+          resolve_and_copy_deps() {
+            local queue=("$@")
+            local seen=""
+            while [ ${#queue[@]} -gt 0 ]; do
+              local pe="${queue[0]}"
+              queue=("${queue[@]:1}")
+              [ -f "$pe" ] || continue
+
+              while IFS= read -r dll; do
+                [ -n "$dll" ] || continue
+                case " $seen " in
+                  *" $dll "*) continue ;;
+                esac
+                seen="$seen $dll"
+
+                local src=""
+                if [ -f "$MINGW/$dll" ]; then
+                  src="$MINGW/$dll"
+                elif [ -n "$CUDA_UNIX" ] && [ -f "$CUDA_UNIX/bin/$dll" ]; then
+                  src="$CUDA_UNIX/bin/$dll"
+                else
+                  continue
+                fi
+
+                cp -n "$src" dist/
+                queue+=("dist/$dll")
+              done < <(objdump -p "$pe" 2>/dev/null | sed -n 's/^[[:space:]]*DLL Name: //p')
+            done
+          }
+
+          resolve_and_copy_deps dist/gap_miner.exe dist/gen_crt.exe
 
       - name: Upload artefact
         uses: actions/upload-artifact@v4
@@ -148,43 +159,47 @@ jobs:
           cp bin/gap_miner.exe dist/
           cp bin/gen_crt.exe dist/
           cp -r crt dist/ 2>/dev/null || true
+          cp src/gpu_fermat.dll dist/
 
-          # MinGW runtime DLLs
           MINGW=/mingw64/bin
-          for dll in \
-            libgmp-10.dll \
-            libcurl-4.dll \
-            libjansson-4.dll \
-            libssl-3-x64.dll \
-            libcrypto-3-x64.dll \
-            libgcc_s_seh-1.dll \
-            libstdc++-6.dll \
-            libwinpthread-1.dll \
-            zlib1.dll \
-            libbrotlidec.dll \
-            libbrotlicommon.dll \
-            libiconv-2.dll \
-            libidn2-0.dll \
-            libintl-8.dll \
-            libnghttp2-14.dll \
-            libpsl-5.dll \
-            libssh2-1.dll \
-            libunistring-5.dll \
-            libzstd.dll \
-            ; do
-            [ -f "$MINGW/$dll" ] && cp "$MINGW/$dll" dist/
-          done
 
-          # CUDA runtime DLL
+          # Auto-copy all transitive runtime DLL dependencies for built binaries.
+          CUDA_UNIX=""
           if [ -n "$CUDA_PATH" ]; then
             CUDA_UNIX=$(cygpath -u "$CUDA_PATH")
-            for f in "$CUDA_UNIX"/bin/cudart64_*.dll; do
-              [ -f "$f" ] && cp "$f" dist/
-            done
           fi
 
-          # GPU Fermat DLL (built by MSVC toolchain)
-          cp src/gpu_fermat.dll dist/
+          resolve_and_copy_deps() {
+            local queue=("$@")
+            local seen=""
+            while [ ${#queue[@]} -gt 0 ]; do
+              local pe="${queue[0]}"
+              queue=("${queue[@]:1}")
+              [ -f "$pe" ] || continue
+
+              while IFS= read -r dll; do
+                [ -n "$dll" ] || continue
+                case " $seen " in
+                  *" $dll "*) continue ;;
+                esac
+                seen="$seen $dll"
+
+                local src=""
+                if [ -f "$MINGW/$dll" ]; then
+                  src="$MINGW/$dll"
+                elif [ -n "$CUDA_UNIX" ] && [ -f "$CUDA_UNIX/bin/$dll" ]; then
+                  src="$CUDA_UNIX/bin/$dll"
+                else
+                  continue
+                fi
+
+                cp -n "$src" dist/
+                queue+=("dist/$dll")
+              done < <(objdump -p "$pe" 2>/dev/null | sed -n 's/^[[:space:]]*DLL Name: //p')
+            done
+          }
+
+          resolve_and_copy_deps dist/gap_miner.exe dist/gen_crt.exe dist/gpu_fermat.dll
 
       - name: Upload artefact
         uses: actions/upload-artifact@v4
