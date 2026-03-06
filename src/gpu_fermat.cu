@@ -175,13 +175,14 @@ void montmul_t(uint64_t *      __restrict__ r,
 template<int AL>
 __global__ void fermat_kernel_t(const uint64_t * __restrict__ cands,
                                 uint8_t        * __restrict__ results,
-                                uint32_t count)
+                                uint32_t count,
+                                uint32_t stride)
 {
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
 
     uint64_t n[AL];
-    const uint64_t *src = &cands[(size_t)idx * NL];
+    const uint64_t *src = &cands[(size_t)idx * stride];
     for (int i = 0; i < AL; i++) n[i] = src[i];
 
     if ((n[0] & 1) == 0) { results[idx] = 0; return; }
@@ -246,13 +247,13 @@ int fermat_block_size_for_al(int al)
 
 static cudaError_t launch_fermat(int al, cudaStream_t stream,
                                  const uint64_t *d_cands, uint8_t *d_results,
-                                 uint32_t count)
+                                 uint32_t count, uint32_t stride)
 {
     int block = fermat_block_size_for_al(al);
     int grid  = (int)((count + block - 1) / block);
 
 #define FERMAT_DISPATCH(W) \
-    fermat_kernel_t<W><<<grid, block, 0, stream>>>(d_cands, d_results, count); \
+    fermat_kernel_t<W><<<grid, block, 0, stream>>>(d_cands, d_results, count, stride); \
     return cudaPeekAtLastError()
 
 #if NL >= 5
@@ -420,22 +421,26 @@ int gpu_fermat_submit(gpu_fermat_ctx *ctx, int slot,
     if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->slot_mu[slot]); return -1; }
 
     int active_limbs = __atomic_load_n(&ctx->active_limbs, __ATOMIC_RELAXED);
+    /* Use compact stride: callers now pack candidates at active_limbs
+       width instead of full NL.  This cuts CPU build time, memcpy, and
+       H2D transfer by NL/AL (e.g. 2.67× at shift=128). */
+    int stride = active_limbs;
+    size_t bytes = count * (size_t)stride * sizeof(uint64_t);
 
     /* Copy candidates into pinned staging buffer.
        After this memcpy the caller's buffer can be reused. */
-    memcpy(ctx->h_cands[slot], candidates,
-           count * NL * sizeof(uint64_t));
+    memcpy(ctx->h_cands[slot], candidates, bytes);
 
     /* Async H→D on stream[slot] */
     err = cudaMemcpyAsync(ctx->d_cands[slot], ctx->h_cands[slot],
-                          count * NL * sizeof(uint64_t),
+                          bytes,
                           cudaMemcpyHostToDevice, ctx->stream[slot]);
     if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->slot_mu[slot]); return -1; }
 
     /* Launch kernel — dispatch to narrowest matching specialization */
     err = launch_fermat(active_limbs, ctx->stream[slot],
                         ctx->d_cands[slot], ctx->d_results[slot],
-                        (uint32_t)count);
+                        (uint32_t)count, (uint32_t)stride);
     if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->slot_mu[slot]); return -1; }
 
     /* Async D→H on stream[slot] */
@@ -508,6 +513,13 @@ void gpu_fermat_set_limbs(gpu_fermat_ctx *ctx, int limbs)
     if (limbs < 1)  limbs = NL;
     if (limbs > NL) limbs = NL;
     __atomic_store_n(&ctx->active_limbs, limbs, __ATOMIC_RELAXED);
+}
+
+int gpu_fermat_get_limbs(gpu_fermat_ctx *ctx)
+{
+    if (!ctx) return NL;
+    int al = __atomic_load_n(&ctx->active_limbs, __ATOMIC_RELAXED);
+    return (al >= 1 && al <= NL) ? al : NL;
 }
 
 void gpu_fermat_destroy(gpu_fermat_ctx *ctx)

@@ -2641,13 +2641,17 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
     memset(base_limbs, 0, sizeof(base_limbs));
     size_t nexp = 0;
     mpz_export(base_limbs, &nexp, -1, 8, 0, 0, tls_base_mpz);
-    if (nexp > GPU_NLIMBS) {
+    /* Use compact stride: only active_limbs per candidate instead of
+       full GPU_NLIMBS.  This reduces CPU build time, memcpy, and H2D
+       transfer by NL/AL (e.g. 2.67× at shift=128). */
+    int gpu_al = gpu_fermat_get_limbs(ctx);
+    if ((int)nexp > gpu_al) {
         static int warned = 0;
         if (!warned) {
             fprintf(stderr, "gpu_batch_filter: candidate needs %lu limbs "
-                    "but GPU_NLIMBS=%d — falling back to CPU.  "
+                    "but active_limbs=%d — falling back to CPU.  "
                     "Rebuild with GPU_BITS=%lu or higher.\n",
-                    (unsigned long)nexp, GPU_NLIMBS, (unsigned long)(nexp * 64));
+                    (unsigned long)nexp, gpu_al, (unsigned long)(nexp * 64));
             warned = 1;
         }
         /* CPU fallback */
@@ -2658,24 +2662,25 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
         return pf;
     }
 
-    /* Allocate flat candidate buffer: cnt × GPU_NLIMBS limbs */
+    /* Allocate flat candidate buffer: cnt × gpu_al limbs */
     size_t batch = cnt;
     if (batch > GPU_MAX_BATCH) batch = GPU_MAX_BATCH;
 
     /* Reuse per-thread staging buffers to avoid malloc/free in hot path.
        These are file-scope TLS so free_sieve_buffers() releases them on
        thread exit, preventing the per-thread 256 MB+ leak in GPU mode. */
-    if (tls_gpu_cands_cap < batch) {
+    size_t needed_cap = batch * (size_t)gpu_al;
+    if (tls_gpu_cands_cap < needed_cap) {
         uint64_t *n0 = (uint64_t *)realloc(tls_gpu_cands[0],
-                                           batch * GPU_NLIMBS * sizeof(uint64_t));
+                                           needed_cap * sizeof(uint64_t));
         if (!n0) return 0;
         tls_gpu_cands[0] = n0;
 
         uint64_t *n1 = (uint64_t *)realloc(tls_gpu_cands[1],
-                                           batch * GPU_NLIMBS * sizeof(uint64_t));
+                                           needed_cap * sizeof(uint64_t));
         if (!n1) return 0;
         tls_gpu_cands[1] = n1;
-        tls_gpu_cands_cap = batch;
+        tls_gpu_cands_cap = needed_cap;
     }
     if (tls_gpu_res_cap < batch) {
         uint8_t *nr = (uint8_t *)realloc(tls_gpu_res, batch);
@@ -2714,11 +2719,11 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
         if (cur_size > batch) cur_size = batch;
         uint64_t *cands = tls_gpu_cands[build_buf];
         for (size_t j = 0; j < cur_size; j++) {
-            uint64_t *dst = &cands[j * GPU_NLIMBS];
-            for (int k = 0; k < GPU_NLIMBS; k++) dst[k] = base_limbs[k];
+            uint64_t *dst = &cands[j * gpu_al];
+            for (int k = 0; k < gpu_al; k++) dst[k] = base_limbs[k];
             dst[0] += offsets[cur_start + j];
             uint64_t carry = (dst[0] < offsets[cur_start + j]);
-            for (int k = 1; k < GPU_NLIMBS && carry; k++) {
+            for (int k = 1; k < gpu_al && carry; k++) {
                 dst[k] += carry;
                 carry = (dst[k] == 0);
             }
@@ -2746,11 +2751,11 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
                 if (next_size > batch) next_size = batch;
                 uint64_t *next_cands = tls_gpu_cands[next_buf];
                 for (size_t j = 0; j < next_size; j++) {
-                    uint64_t *dst = &next_cands[j * GPU_NLIMBS];
-                    for (int k = 0; k < GPU_NLIMBS; k++) dst[k] = base_limbs[k];
+                    uint64_t *dst = &next_cands[j * gpu_al];
+                    for (int k = 0; k < gpu_al; k++) dst[k] = base_limbs[k];
                     dst[0] += offsets[next_start + j];
                     uint64_t carry = (dst[0] < offsets[next_start + j]);
-                    for (int k = 1; k < GPU_NLIMBS && carry; k++) {
+                    for (int k = 1; k < gpu_al && carry; k++) {
                         dst[k] += carry;
                         carry = (dst[k] == 0);
                     }
@@ -2974,13 +2979,15 @@ struct gpu_accum {
     int       inflight;              /* 0 or 1 or -1: buf with GPU work   */
     int       threshold;             /* flush when total >= this          */
     gpu_fermat_ctx *ctx;             /* assigned GPU context              */
+    int       slot_base;             /* 0 or 1: fixed GPU slot for this accum */
+    int       stride;                /* limbs per candidate (= active_limbs) */
 };
 
 static __thread struct gpu_accum *tls_gpu_accum;
 
-static int gpu_accum_buf_init(struct gpu_accum_buf *b, size_t cap) {
+static int gpu_accum_buf_init(struct gpu_accum_buf *b, size_t cap, int stride) {
     b->capacity = cap;
-    b->limbs = (uint64_t *)malloc(cap * GPU_NLIMBS * sizeof(uint64_t));
+    b->limbs = (uint64_t *)malloc(cap * (size_t)stride * sizeof(uint64_t));
     b->win_cap = 256;
     b->wins = (struct gpu_accum_win *)malloc(b->win_cap * sizeof(b->wins[0]));
     b->res_cap = cap;
@@ -3007,16 +3014,23 @@ static void gpu_accum_buf_free(struct gpu_accum_buf *b) {
     free(b->results); b->results = NULL;
 }
 
+/* Assign each accumulator a distinct GPU slot so two threads sharing
+   the same gpu_fermat_ctx never collide.  With 2 GPU slots, accum 0
+   uses slot 0 and accum 1 uses slot 1. */
+static volatile int g_accum_slot_counter = 0;
+
 static struct gpu_accum *gpu_accum_create(gpu_fermat_ctx *ctx, int threshold) {
     struct gpu_accum *a = (struct gpu_accum *)calloc(1, sizeof(*a));
     if (!a) return NULL;
     a->threshold = threshold > 0 ? threshold : GPU_ACCUM_DEFAULT;
     a->ctx = ctx;
+    a->slot_base = __sync_fetch_and_add(&g_accum_slot_counter, 1) % 2;
+    a->stride = gpu_fermat_get_limbs(ctx);
     a->fill = 0;
     a->inflight = -1;
     size_t cap = (size_t)a->threshold + 1024;
-    if (gpu_accum_buf_init(&a->buf[0], cap) < 0 ||
-        gpu_accum_buf_init(&a->buf[1], cap) < 0) {
+    if (gpu_accum_buf_init(&a->buf[0], cap, a->stride) < 0 ||
+        gpu_accum_buf_init(&a->buf[1], cap, a->stride) < 0) {
         gpu_accum_buf_free(&a->buf[0]);
         gpu_accum_buf_free(&a->buf[1]);
         free(a);
@@ -3058,11 +3072,12 @@ static int gpu_accum_add(struct gpu_accum *a,
     if (!a || cnt == 0) return 0;
     struct gpu_accum_buf *b = &a->buf[a->fill];
 
+    int gpu_al = a->stride;
     /* Grow limbs buffer if needed */
     if (b->total + cnt > b->capacity) {
         size_t new_cap = (b->total + cnt) * 2;
         uint64_t *nl = (uint64_t *)realloc(b->limbs,
-            new_cap * GPU_NLIMBS * sizeof(uint64_t));
+            new_cap * (size_t)gpu_al * sizeof(uint64_t));
         if (!nl) return 0;
         b->limbs = nl;
         b->capacity = new_cap;
@@ -3082,13 +3097,13 @@ static int gpu_accum_add(struct gpu_accum *a,
         b->wins = nw;
         b->win_cap = nwc;
     }
-    /* Convert candidates: base + offset → limbs */
+    /* Convert candidates: base + offset → limbs (compact AL-stride) */
     for (size_t j = 0; j < cnt; j++) {
-        uint64_t *dst = &b->limbs[(b->total + j) * GPU_NLIMBS];
-        for (int k = 0; k < GPU_NLIMBS; k++) dst[k] = base_limbs[k];
+        uint64_t *dst = &b->limbs[(b->total + j) * gpu_al];
+        for (int k = 0; k < gpu_al; k++) dst[k] = base_limbs[k];
         dst[0] += offsets[j];
         uint64_t carry = (dst[0] < offsets[j]);
-        for (int k = 1; k < GPU_NLIMBS && carry; k++) {
+        for (int k = 1; k < gpu_al && carry; k++) {
             dst[k] += carry;
             carry = (dst[k] == 0);
         }
@@ -3118,8 +3133,9 @@ static int gpu_accum_add(struct gpu_accum *a,
 /* Collect results from the in-flight GPU batch, process gap scanning. */
 static void gpu_accum_collect(struct gpu_accum *a) {
     if (!a || a->inflight < 0) return;
-    int slot = a->inflight;
-    struct gpu_accum_buf *b = &a->buf[slot];
+    int buf_idx = a->inflight;  /* buffer that was submitted */
+    int slot = a->slot_base;    /* GPU slot it was submitted to */
+    struct gpu_accum_buf *b = &a->buf[buf_idx];
     if (b->total == 0) { a->inflight = -1; return; }
 
     /* Wait for GPU results */
@@ -3163,18 +3179,28 @@ static void gpu_accum_flush(struct gpu_accum *a) {
     if (a->inflight >= 0)
         gpu_accum_collect(a);
 
-    /* Submit current fill buffer to GPU asynchronously */
+    /* Submit current fill buffer to GPU asynchronously.
+       Use this accumulator's fixed slot to avoid collisions when
+       multiple threads share the same gpu_fermat_ctx.  Each accum
+       gets a dedicated slot (0 or 1) assigned at creation time. */
     __sync_fetch_and_add(&stats_gpu_flushes, 1);
     __sync_fetch_and_add(&stats_gpu_batched, b->total);
-    int slot = a->fill;    /* GPU slot matches buffer index */
-    gpu_fermat_submit(a->ctx, slot, b->limbs, b->total);
+    int slot = a->slot_base;
+    int rc = gpu_fermat_submit(a->ctx, slot, b->limbs, b->total);
+    if (rc < 0) {
+        /* Slot busy (should not happen with dedicated slots) — discard batch */
+        gpu_accum_buf_reset(b);
+        return;
+    }
 
-    /* Mark this buffer as in-flight */
-    a->inflight = slot;
+    /* Mark the buffer index as in-flight */
+    a->inflight = a->fill;
 
-    /* Swap fill to the other buffer — CPU continues sieving here */
+    /* Swap fill to the other buffer — CPU continues sieving here.
+       Note: with dedicated slots there is no async overlap between
+       two buffers of the same accum, but the GPU still overlaps
+       with the OTHER thread's accum. */
     a->fill = 1 - a->fill;
-    /* The other buffer should be clean (was reset in collect or init) */
 }
 #endif /* WITH_GPU_FERMAT — accumulator */
 
@@ -5640,6 +5666,32 @@ int main(int argc, char **argv) {
         log_fp = fopen(log_file, "a");
         if (!log_fp) fprintf(stderr, "Failed to open log file %s\n", log_file);
     }
+    /* ── CRT + GPU: cap sieve primes for the tiny gap-check bitmap ──
+       In CRT solver mode the sieve bitmap is only gap_scan_max/2 bits
+       (~732 bytes at merit 22).  Sieve primes much larger than the
+       bitmap rarely mark any position, yet their per-prime overhead
+       (residue update + sieve loop iteration) dominates wall-clock time
+       and starves the GPU of candidates.  Cap at gap_scan_max × 4 so
+       only primes with a meaningful hit probability are sieved on CPU;
+       the GPU handles the extra survivors easily. */
+#ifdef WITH_GPU_FERMAT
+    if (g_crt_mode == CRT_MODE_SOLVER && g_gpu_count > 0 &&
+        g_crt_gap_target > 0) {
+        uint64_t gap_scan = (uint64_t)g_crt_gap_target * 2;
+        if (gap_scan < 10000) gap_scan = 10000;
+        uint64_t crt_limit = gap_scan * 4;
+        if (cli_sieve_prime_limit > crt_limit) {
+            log_msg("CRT+GPU: capping sieve-prime-limit %llu -> %llu "
+                    "(gap_scan=%llu, bitmap=%llu bytes)\n",
+                    (unsigned long long)cli_sieve_prime_limit,
+                    (unsigned long long)crt_limit,
+                    (unsigned long long)gap_scan,
+                    (unsigned long long)((gap_scan / 2 + 7) / 8));
+            cli_sieve_prime_limit = crt_limit;
+        }
+    }
+#endif
+
     stats_start_ms = now_ms();
     start_stats_thread();
     /* Trigger sieve cache population so we can log its stats. */

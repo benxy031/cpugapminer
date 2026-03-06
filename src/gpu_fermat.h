@@ -84,6 +84,10 @@ const char *gpu_fermat_device_name(gpu_fermat_ctx *ctx);
    Must be called before submitting work.  Clamped to [1, GPU_NLIMBS]. */
 void gpu_fermat_set_limbs(gpu_fermat_ctx *ctx, int limbs);
 
+/* Get the current active limb count (storage stride per candidate).
+   Callers should pack candidates at this width for submit(). */
+int gpu_fermat_get_limbs(gpu_fermat_ctx *ctx);
+
 /* Free GPU resources. */
 void gpu_fermat_destroy(gpu_fermat_ctx *ctx);
 

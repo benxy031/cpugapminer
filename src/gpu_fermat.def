@@ -11,4 +11,5 @@ EXPORTS
     gpu_fermat_collect
     gpu_fermat_device_name
     gpu_fermat_set_limbs
+    gpu_fermat_get_limbs
     gpu_fermat_destroy
