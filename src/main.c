@@ -1016,6 +1016,16 @@ static __thread size_t    tls_base_mod_p_cap = 0;
    current pass.  Reset to 0 at start of each new pass (set_base_bn call). */
 static __thread int       tls_base_mod_p_ready = 0;
 
+/* GPU batch-filter double-buffer (used by gpu_batch_filter).  Kept at
+   file scope so free_sieve_buffers() can release them when the thread exits,
+   eliminating the per-thread 256 MB+ leak in non-CRT GPU mining. */
+#ifdef WITH_GPU_FERMAT
+static __thread uint64_t *tls_gpu_cands[2] = {NULL, NULL};
+static __thread size_t    tls_gpu_cands_cap = 0;
+static __thread uint8_t  *tls_gpu_res = NULL;
+static __thread size_t    tls_gpu_res_cap = 0;
+#endif
+
 static void free_sieve_buffers(void) {
     free(tls_pr);
     free(tls_bits);
@@ -1030,6 +1040,13 @@ static void free_sieve_buffers(void) {
     tls_base_mod_p_cap = 0;
     tls_sp_start_cap = 0;
     tls_base_mod_p_ready = 0;
+#ifdef WITH_GPU_FERMAT
+    free(tls_gpu_cands[0]); tls_gpu_cands[0] = NULL;
+    free(tls_gpu_cands[1]); tls_gpu_cands[1] = NULL;
+    tls_gpu_cands_cap = 0;
+    free(tls_gpu_res); tls_gpu_res = NULL;
+    tls_gpu_res_cap = 0;
+#endif
 }
 
 /* sieve_range: segmented odd-only sieve over RELATIVE offsets [L, R) from
@@ -2582,36 +2599,33 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
     size_t batch = cnt;
     if (batch > GPU_MAX_BATCH) batch = GPU_MAX_BATCH;
 
-    /* Reuse per-thread staging buffers to avoid malloc/free in hot path. */
-    static __thread uint64_t *tls_cands[2] = {NULL, NULL};
-    static __thread size_t    tls_cands_cap = 0;   /* candidates per buffer */
-    static __thread uint8_t  *tls_res = NULL;
-    static __thread size_t    tls_res_cap = 0;
-
-    if (tls_cands_cap < batch) {
-        uint64_t *n0 = (uint64_t *)realloc(tls_cands[0],
+    /* Reuse per-thread staging buffers to avoid malloc/free in hot path.
+       These are file-scope TLS so free_sieve_buffers() releases them on
+       thread exit, preventing the per-thread 256 MB+ leak in GPU mode. */
+    if (tls_gpu_cands_cap < batch) {
+        uint64_t *n0 = (uint64_t *)realloc(tls_gpu_cands[0],
                                            batch * GPU_NLIMBS * sizeof(uint64_t));
         if (!n0) return 0;
-        tls_cands[0] = n0;
+        tls_gpu_cands[0] = n0;
 
-        uint64_t *n1 = (uint64_t *)realloc(tls_cands[1],
+        uint64_t *n1 = (uint64_t *)realloc(tls_gpu_cands[1],
                                            batch * GPU_NLIMBS * sizeof(uint64_t));
         if (!n1) return 0;
-        tls_cands[1] = n1;
-        tls_cands_cap = batch;
+        tls_gpu_cands[1] = n1;
+        tls_gpu_cands_cap = batch;
     }
-    if (tls_res_cap < batch) {
-        uint8_t *nr = (uint8_t *)realloc(tls_res, batch);
+    if (tls_gpu_res_cap < batch) {
+        uint8_t *nr = (uint8_t *)realloc(tls_gpu_res, batch);
         if (!nr) {
-            free(tls_cands[0]); tls_cands[0] = NULL;
-            free(tls_cands[1]); tls_cands[1] = NULL;
-            tls_cands_cap = 0;
-            free(tls_res); tls_res = NULL;
-            tls_res_cap = 0;
+            free(tls_gpu_cands[0]); tls_gpu_cands[0] = NULL;
+            free(tls_gpu_cands[1]); tls_gpu_cands[1] = NULL;
+            tls_gpu_cands_cap = 0;
+            free(tls_gpu_res); tls_gpu_res = NULL;
+            tls_gpu_res_cap = 0;
             return 0;
         }
-        tls_res = nr;
-        tls_res_cap = batch;
+        tls_gpu_res = nr;
+        tls_gpu_res_cap = batch;
     }
 
     size_t pf = 0;  /* prime-filtered count */
@@ -2635,7 +2649,7 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
         cur_start = next_i;
         cur_size = cnt - next_i;
         if (cur_size > batch) cur_size = batch;
-        uint64_t *cands = tls_cands[build_buf];
+        uint64_t *cands = tls_gpu_cands[build_buf];
         for (size_t j = 0; j < cur_size; j++) {
             uint64_t *dst = &cands[j * GPU_NLIMBS];
             for (int k = 0; k < GPU_NLIMBS; k++) dst[k] = base_limbs[k];
@@ -2651,7 +2665,7 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
     }
 
     while (cur_valid) {
-        uint64_t *cur_cands = tls_cands[build_buf];
+        uint64_t *cur_cands = tls_gpu_cands[build_buf];
         int this_slot = submit_slot;
 
         if (gpu_fermat_submit(ctx, this_slot, cur_cands, cur_size) < 0) {
@@ -2667,7 +2681,7 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
                 next_start = next_i;
                 next_size = cnt - next_i;
                 if (next_size > batch) next_size = batch;
-                uint64_t *next_cands = tls_cands[next_buf];
+                uint64_t *next_cands = tls_gpu_cands[next_buf];
                 for (size_t j = 0; j < next_size; j++) {
                     uint64_t *dst = &next_cands[j * GPU_NLIMBS];
                     for (int k = 0; k < GPU_NLIMBS; k++) dst[k] = base_limbs[k];
@@ -2683,14 +2697,14 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
             }
 
             if (prev_valid) {
-                int np = gpu_fermat_collect(ctx, prev_slot, tls_res, prev_size);
+                int np = gpu_fermat_collect(ctx, prev_slot, tls_gpu_res, prev_size);
                 if (np < 0) {
                     for (size_t j = 0; j < prev_size; j++)
                         if (bn_candidate_is_prime(offsets[prev_start + j]))
                             offsets[pf++] = offsets[prev_start + j];
                 } else {
                     for (size_t j = 0; j < prev_size; j++)
-                        if (tls_res[j]) offsets[pf++] = offsets[prev_start + j];
+                        if (tls_gpu_res[j]) offsets[pf++] = offsets[prev_start + j];
                 }
             }
 
@@ -2710,14 +2724,14 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
         /* Submit failed for current: collect any previous pending chunk and
            continue with CPU fallback for remaining chunks. */
         if (prev_valid) {
-            int np = gpu_fermat_collect(ctx, prev_slot, tls_res, prev_size);
+            int np = gpu_fermat_collect(ctx, prev_slot, tls_gpu_res, prev_size);
             if (np < 0) {
                 for (size_t j = 0; j < prev_size; j++)
                     if (bn_candidate_is_prime(offsets[prev_start + j]))
                         offsets[pf++] = offsets[prev_start + j];
             } else {
                 for (size_t j = 0; j < prev_size; j++)
-                    if (tls_res[j]) offsets[pf++] = offsets[prev_start + j];
+                    if (tls_gpu_res[j]) offsets[pf++] = offsets[prev_start + j];
             }
             prev_valid = 0;
         }
@@ -2735,14 +2749,14 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
 
     /* Collect final chunk */
     if (prev_valid) {
-        int np = gpu_fermat_collect(ctx, prev_slot, tls_res, prev_size);
+        int np = gpu_fermat_collect(ctx, prev_slot, tls_gpu_res, prev_size);
         if (np < 0) {
             for (size_t j = 0; j < prev_size; j++)
                 if (bn_candidate_is_prime(offsets[prev_start + j]))
                     offsets[pf++] = offsets[prev_start + j];
         } else {
             for (size_t j = 0; j < prev_size; j++)
-                if (tls_res[j]) offsets[pf++] = offsets[prev_start + j];
+                if (tls_gpu_res[j]) offsets[pf++] = offsets[prev_start + j];
         }
     }
 
