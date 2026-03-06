@@ -418,6 +418,46 @@ struct pass_state {
     volatile uint64_t pass_seq;  /* incremented on every new mining pass        */
 };
 static struct pass_state g_pass = {0};
+
+/* ── Per-pass stratum dedup ─────────────────────────────────────────────
+   Workers loop back over the same adder range and rediscover identical
+   (nonce, nAdd) pairs → identical blockhex → pool rejects as duplicate.
+   Track FNV-1a 64-bit hash of every submitted blockhex; auto-reset on
+   new block (g_pass.pass_seq change). */
+#define DEDUP_STRATUM_MAX 512
+static uint64_t        g_dedup_hashes[DEDUP_STRATUM_MAX];
+static int             g_dedup_count  = 0;
+static uint64_t        g_dedup_pass   = 0;
+static pthread_mutex_t g_dedup_lock   = PTHREAD_MUTEX_INITIALIZER;
+
+static int stratum_dedup(const char *blockhex) {
+    uint64_t h = 14695981039346656037ULL;
+    for (const char *p = blockhex; *p; p++) {
+        h ^= (uint8_t)*p;
+        h *= 1099511628211ULL;
+    }
+    pthread_mutex_lock(&g_dedup_lock);
+    uint64_t cur_seq = g_pass.pass_seq;
+    if (cur_seq != g_dedup_pass) {
+        g_dedup_count = 0;
+        g_dedup_pass  = cur_seq;
+    }
+    for (int i = 0; i < g_dedup_count; i++) {
+        if (g_dedup_hashes[i] == h) {
+            pthread_mutex_unlock(&g_dedup_lock);
+            return 1;
+        }
+    }
+    if (g_dedup_count < DEDUP_STRATUM_MAX) {
+        g_dedup_hashes[g_dedup_count++] = h;
+    } else {
+        memmove(g_dedup_hashes, g_dedup_hashes + 1,
+                (DEDUP_STRATUM_MAX - 1) * sizeof(g_dedup_hashes[0]));
+        g_dedup_hashes[DEDUP_STRATUM_MAX - 1] = h;
+    }
+    pthread_mutex_unlock(&g_dedup_lock);
+    return 0;
+}
 #endif
 
 /* by default the miner continues searching even after a valid block is
@@ -2310,6 +2350,29 @@ static int build_mining_pass_stratum(const char *data_hex, uint64_t ndiff, int s
                   h256[0], h256[1], h256[2], h256[3], prevhex);
     return 1;
 }
+/* Advance to the next valid nonce (SHA256d[31] >= 0x80) without changing
+   the header.  Updates g_pass.nonce, g_pass.h256, and bumps pass_seq.
+   Returns 1 on success, 0 if the nonce space is exhausted (2^32 wrap). */
+static int advance_nonce(void) {
+    uint8_t hdr84[84], sha_raw[32];
+    uint32_t nonce = g_pass.nonce + 1;
+    if (nonce == 0) return 0;  /* wrapped around 2^32 */
+    memcpy(hdr84, g_pass.hdr80, 80);
+    for (;;) {
+        memcpy(hdr84 + 80, &nonce, 4);
+        double_sha256(hdr84, 84, sha_raw);
+        if (sha_raw[31] >= 0x80) break;
+        if (++nonce == 0) return 0;
+    }
+    uint8_t h256[32];
+    for (int k = 0; k < 32; k++) h256[k] = sha_raw[31 - k];
+    memcpy(g_pass.h256, h256, 32);
+    g_pass.nonce = nonce;
+    __sync_fetch_and_add(&g_pass.pass_seq, 1);
+    log_msg("[nonce] advanced to nonce=%u  h256[0..3]=%02x%02x%02x%02x\n",
+            nonce, h256[0], h256[1], h256[2], h256[3]);
+    return 1;
+}
 #endif /* WITH_RPC — build_mining_pass / assemble_mining_block */
 
 /* check whether the block should be forwarded to the node for PoW validation.
@@ -2821,6 +2884,8 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
                     if (g_stratum) {
                         if (!verify_pow_hex(blockhex)) {
                             log_msg(">>> SKIPPING invalid PoW (stale pass)\n");
+                        } else if (stratum_dedup(blockhex)) {
+                            log_msg(">>> SKIPPING duplicate share\n");
                         } else if (stratum_submit(g_stratum, blockhex))
                             log_msg(">>> SUBMITTED via stratum\n");
                         else
@@ -3387,6 +3452,8 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
                             /* Submit via stratum (non-blocking) */
                             if (!verify_pow_hex(blockhex)) {
                                 log_msg(">>> SKIPPING invalid PoW (stale pass)\n");
+                            } else if (stratum_dedup(blockhex)) {
+                                log_msg(">>> SKIPPING duplicate share\n");
                             } else if (stratum_submit(g_stratum, blockhex)) {
                                 log_msg(">>> SUBMITTED via stratum\n");
                             } else {
@@ -3875,6 +3942,9 @@ static void *worker_fn(void *arg) {
                                         if (!verify_pow_hex(blockhex))
                                             log_msg(">>> SKIPPING invalid"
                                                     " PoW (stale pass)\n");
+                                        else if (stratum_dedup(blockhex))
+                                            log_msg(">>> SKIPPING duplicate"
+                                                    " share\n");
                                         else if (stratum_submit(g_stratum,
                                                 blockhex))
                                             log_msg(">>> SUBMITTED via"
@@ -4234,6 +4304,9 @@ static void *worker_fn(void *arg) {
                                                 if (!verify_pow_hex(blockhex))
                                                     log_msg(">>> SKIPPING invalid"
                                                             " PoW (stale pass)\n");
+                                                else if (stratum_dedup(blockhex))
+                                                    log_msg(">>> SKIPPING duplicate"
+                                                            " share\n");
                                                 else if (stratum_submit(g_stratum,
                                                         blockhex))
                                                     log_msg(">>> SUBMITTED via"
@@ -4934,6 +5007,54 @@ static void *worker_fn(void *arg) {
             if (cnt >= 1)
                 carry_last_prime = pr[cnt - 1];
         } /* end window loop */
+
+#ifdef WITH_RPC
+        /* Adder range exhausted.  In stratum mode, do NOT re-mine the
+           same slice (which would rediscover identical gaps → duplicate
+           share rejections).  Thread 0 (rpc_thread) checks for new work
+           from the pool; if none, advances to the next nonce and signals
+           all threads to restart.  Non-rpc threads just wait.             */
+        if (g_stratum) {
+            if (rpc_thread_local) {
+                /* Check for new stratum work first */
+                char sdata[161]; uint64_t sndiff = 0;
+                if (stratum_poll_new_work(g_stratum, sdata, &sndiff)) {
+                    build_mining_pass_stratum(sdata, sndiff, shift_local);
+                    log_msg("\n*** NEW BLOCK (stratum)  prevhash=%.16s..."
+                            "  mining on top ***\n\n",
+                            g_pass.prevhex);
+                    pthread_mutex_lock(&g_work_lock);
+                    strncpy(g_prevhash, g_pass.prevhex, 64);
+                    g_prevhash[64] = '\0';
+                    pthread_mutex_unlock(&g_work_lock);
+                } else {
+                    /* No new block — advance to next valid nonce. */
+                    advance_nonce();
+                }
+                g_abort_pass = 1;
+            } else {
+                /* Non-RPC threads: wait for thread 0 to set g_abort_pass */
+                while (keep_going && !g_abort_pass) {
+                    struct timespec ts = {0, 100000000L};
+                    nanosleep(&ts, NULL);
+                }
+            }
+            break; /* exit outer loop — main loop will respawn with new h256 */
+        } else if (rpc_url_local) {
+            /* RPC (non-stratum): adder range exhausted.  Advance nonce so
+               we don't re-mine the same search space.                      */
+            if (rpc_thread_local) {
+                advance_nonce();
+                g_abort_pass = 1;
+            } else {
+                while (keep_going && !g_abort_pass) {
+                    struct timespec ts = {0, 100000000L};
+                    nanosleep(&ts, NULL);
+                }
+            }
+            break;
+        }
+#endif
         /* Pass complete without abort: loop back and mine the same slice */
     } /* end continuous mining outer loop */
 
@@ -5786,6 +5907,9 @@ int main(int argc, char **argv) {
                                                 if (!verify_pow_hex(blockhex))
                                                     log_msg(">>> SKIPPING invalid"
                                                             " PoW (stale pass)\n");
+                                                else if (stratum_dedup(blockhex))
+                                                    log_msg(">>> SKIPPING duplicate"
+                                                            " share\n");
                                                 else if (stratum_submit(g_stratum,
                                                         blockhex))
                                                     log_msg(">>> SUBMITTED via"

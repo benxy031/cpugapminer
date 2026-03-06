@@ -45,9 +45,11 @@ struct stratum_ctx {
     int              msg_id;
     pthread_mutex_t  send_lock;
 
-    /* Track the last submit id so we can distinguish share responses
-       from getwork responses when result is null.  -1 = none pending. */
-    volatile int     last_submit_id;
+    /* Ring of pending submit IDs so we can distinguish share responses
+       from getwork responses even with multiple in-flight submits. */
+#define SUBMIT_ID_RING 32
+    int              submit_ids[SUBMIT_ID_RING];
+    int              submit_id_count;
 
     /* latest work (protected by work_lock) */
     pthread_mutex_t  work_lock;
@@ -190,18 +192,41 @@ static int stratum_recv_line(stratum_ctx *ctx, char **out) {
 
 /* ──────────────── protocol: send getwork ──────────────── */
 
+/* Register a submit ID in the ring (called under send_lock). */
+static void submit_id_push(stratum_ctx *ctx, int id) {
+    if (ctx->submit_id_count < SUBMIT_ID_RING)
+        ctx->submit_ids[ctx->submit_id_count++] = id;
+    /* else ring full — oldest entry lost; acceptable for stats */
+}
+
+/* Check if resp_id is a pending submit and remove it (called from recv thread). */
+static int submit_id_check(stratum_ctx *ctx, int resp_id) {
+    pthread_mutex_lock(&ctx->send_lock);
+    for (int i = 0; i < ctx->submit_id_count; i++) {
+        if (ctx->submit_ids[i] == resp_id) {
+            /* Remove by shifting tail */
+            ctx->submit_id_count--;
+            for (int j = i; j < ctx->submit_id_count; j++)
+                ctx->submit_ids[j] = ctx->submit_ids[j + 1];
+            pthread_mutex_unlock(&ctx->send_lock);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&ctx->send_lock);
+    return 0;
+}
+
 static int stratum_send_getwork(stratum_ctx *ctx) {
     char buf[512];
-    int id;
 
     pthread_mutex_lock(&ctx->send_lock);
-    id = ctx->msg_id++;
-    pthread_mutex_unlock(&ctx->send_lock);
-
+    int id = ctx->msg_id++;
     int len = snprintf(buf, sizeof(buf),
         "{\"id\":%d,\"method\":\"mining.request\","
         "\"params\":[\"%s\",\"%s\"]}\n",
         id, ctx->user, ctx->pass);
+    if (len < 0 || (size_t)len >= sizeof(buf)) len = (int)sizeof(buf) - 1;
+    pthread_mutex_unlock(&ctx->send_lock);
 
     fprintf(stderr, "[stratum] requesting work (id=%d)\n", id);
     return stratum_send(ctx, buf, (size_t)len);
@@ -291,7 +316,7 @@ static void *recv_thread_fn(void *arg) {
         /* ── Response to our request (id is integer) ── */
         if (json_is_integer(j_id)) {
             int resp_id = (int)json_integer_value(j_id);
-            int is_submit = (resp_id == ctx->last_submit_id);
+            int is_submit = submit_id_check(ctx, resp_id);
             json_t *result = json_object_get(root, "result");
 
             /* Share response: result is boolean */
@@ -366,7 +391,7 @@ stratum_ctx *stratum_connect(const char *host, const char *port,
     ctx->shift = shift;
     ctx->running = 1;
     ctx->msg_id = 1;
-    ctx->last_submit_id = -1;
+    ctx->submit_id_count = 0;
 
     pthread_mutex_init(&ctx->send_lock, NULL);
     pthread_mutex_init(&ctx->work_lock, NULL);
@@ -375,6 +400,9 @@ stratum_ctx *stratum_connect(const char *host, const char *port,
     /* Connect */
     stratum_reconnect(ctx);
     if (!ctx->connected) {
+        pthread_mutex_destroy(&ctx->send_lock);
+        pthread_mutex_destroy(&ctx->work_lock);
+        pthread_cond_destroy(&ctx->work_cond);
         free(ctx);
         return NULL;
     }
@@ -417,17 +445,20 @@ int stratum_poll_new_work(stratum_ctx *ctx, char data_hex[161], uint64_t *ndiff)
 }
 
 int stratum_submit(stratum_ctx *ctx, const char *block_hex) {
-    char *buf;
-    int id;
-
-    pthread_mutex_lock(&ctx->send_lock);
-    id = ctx->msg_id++;
-    pthread_mutex_unlock(&ctx->send_lock);
-
-    ctx->last_submit_id = id;
+    if (!ctx->connected) {
+        fprintf(stderr, "[stratum] submit skipped (not connected)\n");
+        return 0;
+    }
 
     /* Compute required buffer size: fixed JSON overhead + variable hex length */
     size_t hex_len = strlen(block_hex);
+
+    /* Allocate id and register as pending submit under one lock */
+    pthread_mutex_lock(&ctx->send_lock);
+    int id = ctx->msg_id++;
+    submit_id_push(ctx, id);
+    pthread_mutex_unlock(&ctx->send_lock);
+
     fprintf(stderr, "[stratum] submitting share id=%d hex_len=%zu bytes=%zu\n",
             id, hex_len, hex_len / 2);
     /* Log first 180 and last 20 hex chars for diagnostics */
@@ -439,13 +470,14 @@ int stratum_submit(stratum_ctx *ctx, const char *block_hex) {
     }
 
     size_t buf_size = 256 + strlen(ctx->user) + strlen(ctx->pass) + hex_len;
-    buf = (char *)malloc(buf_size);
+    char *buf = (char *)malloc(buf_size);
     if (!buf) return 0;
 
     int len = snprintf(buf, buf_size,
         "{\"id\":%d,\"method\":\"mining.submit\","
         "\"params\":[\"%s\",\"%s\",\"%s\"]}\n",
         id, ctx->user, ctx->pass, block_hex);
+    if (len < 0 || (size_t)len >= buf_size) len = (int)buf_size - 1;
 
     int ret = stratum_send(ctx, buf, (size_t)len);
     free(buf);
