@@ -18,8 +18,12 @@ src/
   crt_heap.h / .c   - CRT producer-consumer heap queue and work-item helpers
   presieve_utils.h/.c
                     - pre-sieve buffer utilities for helper/worker pipeline
+  block_utils.h / .c- block serialization/encoding helpers (LE writes,
+                      varint/pushdata, hex, double-SHA256)
   uint256_utils.h/.c
                     - 256-bit hash helpers and small-mod/log approximations
+  primality_utils.h/.c
+                    - 64-bit fast primality helpers (Montgomery MR/Fermat)
   rpc_cwrap.cpp     - C-callable wrapper around the C++ RPC layer
   rpc_globals.cpp   - shared RPC state (URL, credentials, rate limiting)
   rpc_stubs.cpp     - stub implementations for optional RPC paths
