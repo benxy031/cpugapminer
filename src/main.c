@@ -16,10 +16,7 @@
 #ifndef M_LN2
 #define M_LN2 0.693147180559945309417232121458
 #endif
-/* Forward declarations for 256-bit arithmetic helpers defined later */
-static void     hash_to_256(const char *s, int is_hex, uint8_t out[32]);
-static uint64_t uint256_mod_small(const uint8_t h[32], int shift, uint64_t p);
-static double   uint256_log_approx(const uint8_t h[32], int shift);
+/* Forward declarations for helpers defined later */
 static void     set_base_bn(const uint8_t h256[32], int shift);
 static int      bn_candidate_is_prime(uint64_t offset);
 #ifdef WITH_RPC
@@ -41,6 +38,12 @@ static int             g_gpu_batch_size = 0;  /* --gpu-batch; 0 = use default (4
 static gpu_fermat_ctx *g_gpu_ctx[GPU_MAX_DEVS];
 static int             g_gpu_count = 0;
 #endif
+#include "stats.h"
+#include "sieve_cache.h"
+#include "gap_scan.h"
+#include "crt_heap.h"
+#include "presieve_utils.h"
+#include "uint256_utils.h"
 
 // logging helper (used in both RPC and non-RPC builds)
 static FILE *log_fp = NULL;
@@ -102,296 +105,11 @@ static int rpc_rate_ms = 0;
 static int rpc_default_retries = 3;
 #endif
 
-// Default sieve prime COUNT matching GapMiner (--sieve-primes N = N primes).
-// The VALUE limit is computed from the count via PNT upper bound after arg parsing.
-#define DEFAULT_SIEVE_PRIME_COUNT 900000
-static uint64_t cli_sieve_prime_limit = 0;   /* computed from count; 0 = not yet set */
-static uint64_t cli_sieve_prime_count = DEFAULT_SIEVE_PRIME_COUNT;
-
-// cache of small primes used for segmented sieving (allocated once)
-static uint64_t *small_primes_cache = NULL;
-static size_t small_primes_count = 0;
-static size_t small_primes_cap = 0;
-static pthread_once_t small_primes_once = PTHREAD_ONCE_INIT;
-
-/* Trial-division pre-filter: primes just above the sieve prime limit.
-   The sieve already eliminates factors <= cli_sieve_prime_limit; these extra
-   primes catch remaining small-factor composites cheaply, before the expensive
-   Miller-Rabin test.  Cost per candidate: ~TD_EXTRA_CNT × 5 ns.
-   NOTE: With GMP's fast mpz_probab_prime_p (~7 µs for 284-bit), TD overhead
-   exceeds the savings.  Benchmarked: TD=0 → 151K tests/s, TD=1024 → 113K/s.
-   Set to 0 to disable; increase only if MR cost rises (e.g. more rounds). */
-#define TD_EXTRA_CNT 0
-static uint32_t td_extra_primes[TD_EXTRA_CNT];
-static int      td_extra_count = 0;
-static pthread_once_t td_extra_once = PTHREAD_ONCE_INIT;
-/* forward declaration — populate_small_primes_cache defined below */
-static void populate_small_primes_cache(void);
-
-/* Populate td_extra_primes[] with the first TD_EXTRA_CNT primes above
-   the sieve prime limit.  Called once (via pthread_once); requires
-   small_primes_cache to already be populated. */
-static void populate_td_extra_primes(void) {
-    /* Ensure the main sieve cache is ready. */
-    pthread_once(&small_primes_once, populate_small_primes_cache);
-    if (!small_primes_cache) return;
-
-    /* Segmented sieve over [lo, hi) to find primes just above the sieve limit. */
-    uint64_t lo = (uint64_t)cli_sieve_prime_limit + 1;
-    if ((lo & 1) == 0) lo++; /* start on odd */
-    /* A window of 200 000 odd numbers (~11 000 primes) is more than enough. */
-    uint64_t hi = lo + 400000ULL; /* covers ~22 000 primes */
-    size_t   sz = (hi - lo) / 2 + 1;
-    uint8_t *sieve = (uint8_t *)calloc(sz, 1);
-    if (!sieve) return;
-
-    for (size_t idx = 1; idx < small_primes_count; idx++) {
-        uint64_t p = small_primes_cache[idx];
-        if (p * p > hi) break;
-        /* first odd multiple of p >= lo */
-        uint64_t rem = lo % p;
-        uint64_t start = rem ? lo + (p - rem) : lo;
-        if ((start & 1) == 0) start += p;
-        for (uint64_t j = start; j < hi; j += 2 * p)
-            sieve[(j - lo) / 2] = 1;
-    }
-    td_extra_count = 0;
-    for (uint64_t n = lo; n < hi && td_extra_count < TD_EXTRA_CNT; n += 2)
-        if (!sieve[(n - lo) / 2])
-            td_extra_primes[td_extra_count++] = (uint32_t)n;
-    free(sieve);
-}
-
-static void populate_small_primes_cache(void) {
-    /* Generate all primes up to cli_sieve_prime_limit (already set from
-       COUNT via PNT upper bound before this function is called). */
-    size_t maxp = (size_t)cli_sieve_prime_limit + 1;
-    if (maxp < 100) maxp = 100;  /* sanity floor */
-    unsigned char *is_small = calloc(maxp, 1);
-    if (!is_small) { free(is_small); return; }
-    small_primes_cap = 80000;
-    small_primes_cache = malloc(sizeof(uint64_t) * small_primes_cap);
-    if (!small_primes_cache) { free(is_small); small_primes_cache = NULL; small_primes_cap = 0; return; }
-    small_primes_count = 0;
-    /* include 2 so the cache can be used for primality tests */
-    if (small_primes_count < small_primes_cap)
-        small_primes_cache[small_primes_count++] = 2;
-    for (uint64_t i = 3; i < maxp; i += 2) {
-        if (!is_small[i]) {
-            if (small_primes_count + 1 > small_primes_cap) {
-                size_t ncap = small_primes_cap * 2;
-                uint64_t *tmp = realloc(small_primes_cache, ncap * sizeof(uint64_t));
-                if (tmp) { small_primes_cache = tmp; small_primes_cap = ncap; }
-                else { break; }
-            }
-            small_primes_cache[small_primes_count++] = i;
-            if (i * i < maxp) {
-                for (uint64_t j = i * i; j < maxp; j += 2 * i) is_small[j] = 1;
-            }
-        }
-    }
-    free(is_small);
-}
-
 // helper returning current time in milliseconds since epoch
 static uint64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
-/* mining/statistics globals */
-static volatile uint64_t stats_sieved = 0;        /* total numbers fed through sieve */
-static volatile uint64_t stats_tested = 0;         /* total primality tests run */
-static volatile uint64_t stats_gaps = 0;           /* qualifying gaps found */
-static volatile uint64_t stats_pairs = 0;          /* total consecutive prime pairs scanned */
-static volatile uint64_t stats_blocks = 0;         /* blocks built */
-static volatile uint64_t stats_submits = 0;        /* shares submitted */
-static volatile uint64_t stats_success = 0;        /* shares accepted */
-static volatile uint64_t stats_crt_windows = 0;    /* CRT windows fully tested */
-static volatile uint64_t stats_primes_found = 0;   /* primes found (for primes/window) */
-static uint64_t stats_start_ms = 0;                /* time mining started */
-static volatile double   g_mining_target = 20.0;   /* merit threshold for block-prob display */
-static volatile double   stats_best_merit = 0.0;   /* best gap merit seen this session */
-static volatile uint64_t stats_best_gap   = 0;     /* gap size for best merit */
-static volatile uint64_t stats_gpu_flushes = 0;    /* GPU accumulator flushes */
-static volatile uint64_t stats_gpu_batched = 0;    /* total candidates sent in GPU flushes */
-
-/* ── Rolling rate window for responsive est ──
-   Store snapshots every STATS_INTERVAL_MS; use the oldest snapshot
-   to compute a sliding-window rate that responds within ~30s. */
-#define RATE_RING_SLOTS 6           /* 6 × 5s = 30s sliding window */
-static struct { uint64_t pairs; uint64_t ms; } rate_ring[RATE_RING_SLOTS];
-static int rate_ring_idx = 0;
-static int rate_ring_full = 0;
-
-/* ══════════════════════════════════════════════════════════════════════
-   CRT Producer-Consumer Heap  (gaplist)
-   ══════════════════════════════════════════════════════════════════════
-   Sieve threads produce CRT windows, push to a min-heap (keyed by
-   survivor count — fewer survivors = larger expected gaps = higher
-   priority).  Fermat threads pop the best windows and test them.
-
-   The heap is bounded: when full, new items replace the worst (most
-   survivors) entry if better, otherwise are discarded.  This keeps
-   memory bounded while continuously improving heap quality.
-   ══════════════════════════════════════════════════════════════════════ */
-
-struct crt_work_item {
-    mpz_t    base;        /* sieve base for Fermat testing (tls_base_mpz snapshot)  */
-    mpz_t    nAdd;        /* nAdd for block assembly                                */
-    uint64_t *survivors;  /* heap-allocated copy of sieve survivor offsets           */
-    size_t   surv_cnt;    /* number of survivors (heap key: lower = better)          */
-    uint32_t nonce;       /* nonce for block assembly                                */
-    int      cand_odd;    /* whether CRT candidate was odd (for nAdd adjustment)    */
-    double   logbase;     /* log(base) for merit calculation                         */
-    uint64_t generation;  /* pass generation — discard stale items                   */
-    uint8_t  hdr80[80];   /* snapshot of header at time of sieving                   */
-    uint16_t nshift;      /* snapshot of shift at time of sieving                    */
-};
-
-#define CRT_HEAP_CAP 4096
-static struct crt_work_item *crt_heap[CRT_HEAP_CAP]; /* min-heap by surv_cnt */
-static size_t          crt_heap_size = 0;
-static pthread_mutex_t crt_heap_mtx  = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  crt_heap_cv   = PTHREAD_COND_INITIALIZER;
-static volatile uint64_t crt_heap_gen   = 0;  /* incremented on template change */
-static volatile int    crt_fermat_threads = 0; /* number of fermat threads (0 = monolithic) */
-static int             crt_fermat_explicit = 0; /* 1 if user passed --fermat-threads */
-static _Atomic int     crt_heap_shutdown = 0;    /* 1 = all threads should exit */
-
-/* Allocate a work item with mpz_t's initialized */
-static struct crt_work_item *crt_work_alloc(void) {
-    struct crt_work_item *w = calloc(1, sizeof(*w));
-    if (!w) return NULL;
-    mpz_init2(w->base, 1024);
-    mpz_init2(w->nAdd, 1024);
-    return w;
-}
-
-/* Free a work item */
-static void crt_work_free(struct crt_work_item *w) {
-    if (!w) return;
-    mpz_clear(w->base);
-    mpz_clear(w->nAdd);
-    free(w->survivors);
-    free(w);
-}
-
-/* ── Min-heap operations (by surv_cnt) ── */
-static void crt_heap_sift_up(size_t i) {
-    while (i > 0) {
-        size_t parent = (i - 1) / 2;
-        if (crt_heap[parent]->surv_cnt <= crt_heap[i]->surv_cnt) break;
-        struct crt_work_item *tmp = crt_heap[parent];
-        crt_heap[parent] = crt_heap[i];
-        crt_heap[i] = tmp;
-        i = parent;
-    }
-}
-
-static void crt_heap_sift_down(size_t i, size_t n) {
-    while (1) {
-        size_t smallest = i;
-        size_t left = 2 * i + 1, right = 2 * i + 2;
-        if (left < n && crt_heap[left]->surv_cnt < crt_heap[smallest]->surv_cnt)
-            smallest = left;
-        if (right < n && crt_heap[right]->surv_cnt < crt_heap[smallest]->surv_cnt)
-            smallest = right;
-        if (smallest == i) break;
-        struct crt_work_item *tmp = crt_heap[smallest];
-        crt_heap[smallest] = crt_heap[i];
-        crt_heap[i] = tmp;
-        i = smallest;
-    }
-}
-
-/* Push a work item into the heap.
-   If heap is full and item is better than the worst, replace worst.
-   Otherwise discard the item.  Returns 1 if item was kept, 0 if discarded. */
-static int crt_heap_push(struct crt_work_item *w) {
-    pthread_mutex_lock(&crt_heap_mtx);
-    if (crt_heap_size < CRT_HEAP_CAP) {
-        /* Room available: insert */
-        crt_heap[crt_heap_size] = w;
-        crt_heap_sift_up(crt_heap_size);
-        crt_heap_size++;
-        pthread_cond_signal(&crt_heap_cv);
-        pthread_mutex_unlock(&crt_heap_mtx);
-        return 1;
-    }
-    /* Heap full: find the maximum element (worst) among leaves */
-    size_t first_leaf = crt_heap_size / 2;
-    size_t max_idx = first_leaf;
-    for (size_t i = first_leaf + 1; i < crt_heap_size; i++) {
-        if (crt_heap[i]->surv_cnt > crt_heap[max_idx]->surv_cnt)
-            max_idx = i;
-    }
-    if (w->surv_cnt < crt_heap[max_idx]->surv_cnt) {
-        /* New item is better — replace worst */
-        crt_work_free(crt_heap[max_idx]);
-        crt_heap[max_idx] = w;
-        /* Restore heap: might need sift-up or sift-down */
-        crt_heap_sift_up(max_idx);
-        crt_heap_sift_down(max_idx, crt_heap_size);
-        pthread_cond_signal(&crt_heap_cv);
-        pthread_mutex_unlock(&crt_heap_mtx);
-        return 1;
-    }
-    /* New item is worse — discard */
-    pthread_mutex_unlock(&crt_heap_mtx);
-    crt_work_free(w);
-    return 0;
-}
-
-/* Pop the best (fewest survivors) work item from the heap.
-   Blocks until an item is available or g_abort_pass is set.
-   Returns NULL if g_abort_pass is set (caller should exit). */
-static struct crt_work_item *crt_heap_pop(void) {
-    pthread_mutex_lock(&crt_heap_mtx);
-    while (crt_heap_size == 0 && !crt_heap_shutdown) {
-        /* Wait with timeout so we can check shutdown periodically */
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += 100000000L; /* 100ms */
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
-        }
-        pthread_cond_timedwait(&crt_heap_cv, &crt_heap_mtx, &ts);
-    }
-    if (crt_heap_size == 0 || crt_heap_shutdown) {
-        pthread_mutex_unlock(&crt_heap_mtx);
-        return NULL;
-    }
-    /* Extract min (root) */
-    struct crt_work_item *best = crt_heap[0];
-    crt_heap_size--;
-    if (crt_heap_size > 0) {
-        crt_heap[0] = crt_heap[crt_heap_size];
-        crt_heap_sift_down(0, crt_heap_size);
-    }
-    pthread_mutex_unlock(&crt_heap_mtx);
-    return best;
-}
-
-/* Flush all items from the heap (called on template change) */
-static void crt_heap_flush(void) {
-    pthread_mutex_lock(&crt_heap_mtx);
-    for (size_t i = 0; i < crt_heap_size; i++)
-        crt_work_free(crt_heap[i]);
-    crt_heap_size = 0;
-    pthread_cond_broadcast(&crt_heap_cv); /* wake waiting fermat threads */
-    pthread_mutex_unlock(&crt_heap_mtx);
-}
-
-/* Get current heap size (for stats display) */
-static size_t crt_heap_count(void) {
-    size_t n;
-    pthread_mutex_lock(&crt_heap_mtx);
-    n = crt_heap_size;
-    pthread_mutex_unlock(&crt_heap_mtx);
-    return n;
 }
 
 /* shared current-work state so any thread can detect a new block */
@@ -846,37 +564,6 @@ static void print_stats(void) {
     }
 #endif
     log_msg("\n");
-}
-
-/* ---------- periodic stats thread ----------
-   Wakes every `stats_interval_ms` milliseconds and calls print_stats() so
-   the user always sees fresh rates regardless of how long a single sieve
-   call takes (which can be several seconds for large --sieve-size values). */
-#define STATS_INTERVAL_MS 5000
-static _Atomic int stats_thread_running = 0;
-static pthread_t stats_thread;
-
-static void *stats_thread_fn(void *arg) {
-    (void)arg;
-    while (stats_thread_running) {
-        struct timespec ts = { STATS_INTERVAL_MS / 1000,
-                               (long)(STATS_INTERVAL_MS % 1000) * 1000000L };
-        nanosleep(&ts, NULL);
-        if (stats_thread_running) print_stats();
-    }
-    return NULL;
-}
-
-static void start_stats_thread(void) {
-    stats_thread_running = 1;
-    if (pthread_create(&stats_thread, NULL, stats_thread_fn, NULL) != 0)
-        stats_thread_running = 0;
-}
-
-static void stop_stats_thread(void) {
-    if (!stats_thread_running) return;
-    stats_thread_running = 0;
-    pthread_join(stats_thread, NULL);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2384,54 +2071,6 @@ static int header_meets_target_hex(const char *blockhex) {
     return 1;
 }
 
-/* Convert a header string to a 256-bit (32-byte) big-endian integer.
-   is_hex=1: decode up to 64 hex chars directly (prevhash from GBT).
-   is_hex=0: SHA-256 the string and use the digest. */
-static void hash_to_256(const char *s, int is_hex, uint8_t out[32]) {
-    memset(out, 0, 32);
-    if (is_hex) {
-        size_t len = strlen(s);
-        if (len > 64) len = 64;
-        for (size_t i = 0; i < len / 2; i++) {
-            char hi = s[2*i], lo = s[2*i+1];
-            int vh = (hi>='0'&&hi<='9')?(hi-'0'):(hi>='a'&&hi<='f')?(10+hi-'a'):(10+hi-'A');
-            int vl = (lo>='0'&&lo<='9')?(lo-'0'):(lo>='a'&&lo<='f')?(10+lo-'a'):(10+lo-'A');
-            out[i] = (uint8_t)((vh << 4) | vl);
-        }
-    } else {
-        unsigned char md[SHA256_DIGEST_LENGTH];
-        SHA256((const unsigned char*)s, strlen(s), md);
-        memcpy(out, md, 32);
-    }
-}
-
-/* Compute (h << shift) % p  where h is a 32-byte big-endian integer and p
-   fits in uint64_t.  Uses __uint128_t for intermediate reductions. */
-static uint64_t uint256_mod_small(const uint8_t h[32], int shift, uint64_t p) {
-    if (p <= 1) return 0;
-    /* Step 1: h % p via schoolbook big-endian byte reduction */
-    __uint128_t rem = 0;
-    for (int i = 0; i < 32; i++)
-        rem = (rem * 256 + h[i]) % p;
-    /* Step 2: 2^shift % p via repeated doubling */
-    __uint128_t pow2 = 1 % p;
-    for (int i = 0; i < shift; i++)
-        pow2 = pow2 * 2 % p;
-    return (uint64_t)((__uint128_t)rem * pow2 % p);
-}
-
-/* Approximate log(h << shift) for merit calculation.
-   h is big-endian 32 bytes (256-bit hash), prime = h*2^shift + nAdd.
-   Since nAdd << h*2^shift, log(prime) ≈ log(h) + shift*log(2).
-   We approximate log(h) using its 8 most-significant bytes. */
-static double uint256_log_approx(const uint8_t h[32], int shift) {
-    uint64_t leading = 0;
-    for (int i = 0; i < 8; i++) leading = (leading << 8) | h[i];
-    if (leading == 0) return (double)(192 + shift) * M_LN2;
-    /* h ≈ leading * 2^192, so log(h<<shift) ≈ log(leading) + (192+shift)*ln2 */
-    return log((double)leading) + (double)(192 + shift) * M_LN2;
-}
-
 /* Thread-local GMP state for 256+shift-bit primality testing.
    set_base_bn() precomputes base = h256 << shift once per mining pass.
    bn_candidate_is_prime() tests base + offset.
@@ -3534,127 +3173,12 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
    uses its own thread-local sieve buffers (TLS is per-thread), so
    sieve_range is safe to call concurrently from both threads. */
 
-struct presieve_buf {
-    uint64_t *pr;
-    size_t    cap;
-    size_t    cnt;
-    uint64_t  L, R;
-};
-
 /* Cooperative Fermat work-sharing: after the helper finishes sieving
    the next window, it joins the worker to test the CURRENT window's
    candidates.  Both threads pull from a shared atomic index.
    On an 8-thread CPU with 6 workers + 6 helpers, this uses the otherwise-
    idle HT siblings for useful work — effectively doubling Fermat throughput
    per worker without increasing thread count.                              */
-
-/* Backward-scan result struct — returned by backward_scan_segment(). */
-struct bkscan_result {
-    size_t   tested;           /* Fermat tests performed                   */
-    size_t   primes_found;     /* primes discovered (jumps + 1)            */
-    double   best_merit;       /* best verified gap merit seen             */
-    uint64_t best_gap;         /* best verified gap size                   */
-    uint64_t first_prime;      /* first prime found in segment (0=none)    */
-    uint64_t last_prime;       /* last prime found in segment  (0=none)    */
-    /* Qualifying gaps to submit (stored, not submitted directly by helper) */
-    uint64_t qual_pairs[64][2]; /* [start_nAdd, end_nAdd] pairs            */
-    size_t   qual_cnt;          /* number of qualifying gaps found         */
-};
-
-/* Standalone backward-scan on a segment of pr[lo..hi-1].
-   Called by both worker and helper threads independently.
-   Returns results in *res.  Does NOT call scan_candidates or touch
-   stats_* globals (caller merges results).                               */
-static void backward_scan_segment(
-        const uint64_t *pr, size_t lo, size_t hi,
-        size_t needed_gap, double logbase, double target,
-        struct bkscan_result *res)
-{
-    res->tested = 0;
-    res->primes_found = 0;
-    res->best_merit = 0.0;
-    res->best_gap   = 0;
-    res->first_prime = 0;
-    res->last_prime  = 0;
-    res->qual_cnt    = 0;
-    if (lo >= hi) return;
-
-    /* Find first Fermat-prime in segment (forward scan) */
-    size_t first_idx = hi;  /* sentinel: not found */
-    for (size_t j = lo; j < hi; j++) {
-        res->tested++;
-        if (bn_candidate_is_prime(pr[j])) {
-            first_idx = j;
-            res->primes_found++;
-            res->first_prime = pr[j];
-            res->last_prime  = pr[j];
-            break;
-        }
-    }
-    if (first_idx >= hi) return;
-
-    uint64_t start_nAdd = pr[first_idx];
-    size_t scan_from = first_idx;
-
-    /* --- Main backward-scan loop --- */
-    for (;;) {
-        uint64_t target_pos = start_nAdd + needed_gap;
-
-        /* Binary search: first index in pr[lo..hi-1] > target_pos */
-        size_t bhi;
-        { size_t l = scan_from + 1, h = hi;
-          while (l < h) { size_t m = l+(h-l)/2;
-            if (pr[m] <= target_pos) l=m+1; else h=m; }
-          bhi = l; }
-
-        /* Scan backward from bhi-1 toward scan_from+1 */
-        int found = 0;
-        for (size_t j = bhi; j > scan_from + 1; ) {
-            j--;
-            res->tested++;
-            if (bn_candidate_is_prime(pr[j])) {
-                start_nAdd = pr[j];
-                scan_from  = j;
-                res->primes_found++;
-                res->last_prime = pr[j];
-                found = 1;
-                break;
-            }
-        }
-
-        if (!found) {
-            /* No prime in [start, start+needed_gap].
-               Search FORWARD for the actual next prime. */
-            int have_next = 0;
-            for (size_t j = bhi; j < hi; j++) {
-                res->tested++;
-                if (bn_candidate_is_prime(pr[j])) {
-                    uint64_t gap = pr[j] - start_nAdd;
-                    double merit = (double)gap / logbase;
-
-                    if (merit > res->best_merit) {
-                        res->best_merit = merit;
-                        res->best_gap   = gap;
-                    }
-
-                    if (merit >= target && res->qual_cnt < 64) {
-                        res->qual_pairs[res->qual_cnt][0] = start_nAdd;
-                        res->qual_pairs[res->qual_cnt][1] = pr[j];
-                        res->qual_cnt++;
-                    }
-
-                    start_nAdd = pr[j];
-                    scan_from  = j;
-                    res->primes_found++;
-                    res->last_prime = pr[j];
-                    have_next = 1;
-                    break;
-                }
-            }
-            if (!have_next) break; /* end of segment */
-        }
-    } /* end backward-scan loop */
-}
 
 struct coop_fermat {
     uint64_t       *pr;          /* shared candidate array (current window) */
@@ -3681,16 +3205,6 @@ struct presieve_ctx {
     int            shift;        /* bit shift for prime size             */
     struct coop_fermat coop;     /* cooperative Fermat testing state     */
 };
-
-static int presieve_buf_ensure(struct presieve_buf *b, size_t need) {
-    if (b->cap >= need) return 0;
-    size_t nc = need + (need >> 1) + 64;
-    uint64_t *tmp = realloc(b->pr, nc * sizeof(uint64_t));
-    if (!tmp) return -1;
-    b->pr  = tmp;
-    b->cap = nc;
-    return 0;
-}
 
 /* Helper: assist with Fermat testing from the shared cooperative work queue.
    Called after the helper finishes sieving; runs until all candidates consumed.
@@ -3801,20 +3315,6 @@ static void *presieve_helper_fn(void *arg) {
     }
     free(ctx->coop.out);  /* release coop output buffer */
     return NULL;
-}
-
-/* Compute the L/R range for window index widx. Returns 0 if empty. */
-static int presieve_window(int64_t widx, uint64_t base,
-                           uint64_t sieve_size, uint64_t adder_max,
-                           uint64_t *out_L, uint64_t *out_R) {
-    uint64_t L = base + (uint64_t)widx * sieve_size;
-    if ((L & 1) == 0) L++;
-    uint64_t R = L + sieve_size;
-    uint64_t cap = base + adder_max;
-    if (R > cap) R = cap;
-    if (R <= L) return 0;
-    *out_L = L; *out_R = R;
-    return 1;
 }
 
 static void *worker_fn(void *arg) {
@@ -4087,8 +3587,7 @@ static void *worker_fn(void *arg) {
                             build_mining_pass_stratum(data_hex, ndiff,
                                                      shift_local);
                             g_abort_pass = 1;
-                            crt_heap_shutdown = 1;
-                            pthread_cond_broadcast(&crt_heap_cv);
+                            crt_heap_signal_shutdown();
                             break;
                         }
                       } else {
@@ -4113,8 +3612,7 @@ static void *worker_fn(void *arg) {
                                     pthread_mutex_unlock(&g_work_lock);
                                     free(resp);
                                     g_abort_pass = 1;
-                                    crt_heap_shutdown = 1;
-                                    pthread_cond_broadcast(&crt_heap_cv);
+                                    crt_heap_signal_shutdown();
                                     break;
                                 }
                             }
@@ -4891,6 +4389,7 @@ static void *worker_fn(void *arg) {
                     struct bkscan_result res_w;
                     backward_scan_segment(pr, first_idx, cnt,
                                           needed_gap, logbase, target_local,
+                                          bn_candidate_is_prime,
                                           &res_w);
                     primes_found_bk += res_w.primes_found;
                     worker_bk_tests += res_w.tested;
@@ -5693,7 +5192,7 @@ int main(int argc, char **argv) {
 #endif
 
     stats_start_ms = now_ms();
-    start_stats_thread();
+    start_stats_thread(print_stats);
     /* Trigger sieve cache population so we can log its stats. */
     pthread_once(&small_primes_once, populate_small_primes_cache);
     log_msg("C miner starting (shift=%d sieve=%llu sieve-primes=%lu [up to %llu])\n",
@@ -6319,9 +5818,9 @@ int main(int argc, char **argv) {
             g_abort_pass = 0;
             /* Flush stale heap items from previous pass and bump generation */
             if (crt_fermat_threads > 0) {
-                crt_heap_shutdown = 0;
+                crt_heap_clear_shutdown();
                 crt_heap_flush();
-                __sync_fetch_and_add(&crt_heap_gen, 1);
+                crt_heap_next_generation();
             }
             pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);
             struct worker_args *wargs = malloc(sizeof(struct worker_args) * num_threads);

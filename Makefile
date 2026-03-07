@@ -84,8 +84,8 @@ $(SRCDIR)/%.o: $(SRCDIR)/%.cpp
 $(SRCDIR)/gpu_fermat.o: $(SRCDIR)/gpu_fermat.cu $(SRCDIR)/gpu_fermat.h
 	$(NVCC) -O3 $(CUDA_ARCH) $(NVCC_FLAGS) -c $< -o $@
 
-$(TARGET): $(BINDIR) $(SRCDIR)/main.o $(RPC_OBJS) $(STRATUM_OBJ) $(GPU_OBJ)
-	$(LINKER) -o $@ $(SRCDIR)/main.o $(RPC_OBJS) $(STRATUM_OBJ) $(GPU_OBJ) $(LDFLAGS) $(LIBS)
+$(TARGET): $(BINDIR) $(SRCDIR)/main.o $(SRCDIR)/stats.o $(SRCDIR)/sieve_cache.o $(SRCDIR)/gap_scan.o $(SRCDIR)/crt_heap.o $(SRCDIR)/presieve_utils.o $(SRCDIR)/uint256_utils.o $(RPC_OBJS) $(STRATUM_OBJ) $(GPU_OBJ)
+	$(LINKER) -o $@ $(SRCDIR)/main.o $(SRCDIR)/stats.o $(SRCDIR)/sieve_cache.o $(SRCDIR)/gap_scan.o $(SRCDIR)/crt_heap.o $(SRCDIR)/presieve_utils.o $(SRCDIR)/uint256_utils.o $(RPC_OBJS) $(STRATUM_OBJ) $(GPU_OBJ) $(LDFLAGS) $(LIBS)
 
 clean:
 	rm -rf $(BINDIR) $(SRCDIR)/*.o

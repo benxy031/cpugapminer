@@ -10,8 +10,16 @@ every raw block byte sequence is saved to `/tmp` for forensic inspection.
 
 ```
 src/
-  main.c            - core miner: sieve, primality, gap scan, CRT mining,
-                      block assembly
+  main.c            - core miner orchestration, worker loops, CLI/runtime
+                      policy, block assembly glue
+  stats.h / .c      - shared mining statistics counters and stats thread
+  sieve_cache.h / .c- sieve-prime and trial-division cache management
+  gap_scan.h / .c   - gap scanning helpers (backward scan/interior checks)
+  crt_heap.h / .c   - CRT producer-consumer heap queue and work-item helpers
+  presieve_utils.h/.c
+                    - pre-sieve buffer utilities for helper/worker pipeline
+  uint256_utils.h/.c
+                    - 256-bit hash helpers and small-mod/log approximations
   rpc_cwrap.cpp     - C-callable wrapper around the C++ RPC layer
   rpc_globals.cpp   - shared RPC state (URL, credentials, rate limiting)
   rpc_stubs.cpp     - stub implementations for optional RPC paths
@@ -86,6 +94,18 @@ make
 ```
 
 The binary is placed at `bin/gap_miner`.
+
+### Stable checkpoint build matrix
+
+Before committing refactor slices, validate from a clean object state so
+feature-flag object reuse cannot mask issues:
+
+```sh
+make clean
+make -j4
+make clean
+make WITH_RPC=1 WITH_CUDA=1 -j4
+```
 
 ### Custom GMP build (optional)
 
