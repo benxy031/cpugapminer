@@ -34,7 +34,7 @@ static int             g_gpu_batch_size = 0;  /* --gpu-batch; 0 = use default (4
 #if defined(WITH_CUDA) || defined(WITH_OPENCL)
 #define WITH_GPU_FERMAT 1
 #include "gpu_fermat.h"
-#define GPU_MAX_BATCH (1 << 20)   /* 1M candidates per batch */
+#define GPU_MAX_BATCH (1 << 21)   /* 2M candidates per batch */
 static gpu_fermat_ctx *g_gpu_ctx[GPU_MAX_DEVS];
 static int             g_gpu_count = 0;
 #endif
@@ -2165,6 +2165,10 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
                 if (bn_candidate_is_prime(offsets[cur_start + j]))
                     offsets[pf++] = offsets[cur_start + j];
         } else {
+            /* Non-CRT direct GPU path: count each successful submit chunk. */
+            __sync_fetch_and_add(&stats_gpu_flushes, 1);
+            __sync_fetch_and_add(&stats_gpu_batched, (uint64_t)cur_size);
+
             /* Build next chunk now while current chunk is running. */
             int next_valid = 0;
             int next_buf = 1 - build_buf;
