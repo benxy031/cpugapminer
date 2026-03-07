@@ -44,6 +44,8 @@ static int             g_gpu_count = 0;
 #include "crt_heap.h"
 #include "presieve_utils.h"
 #include "uint256_utils.h"
+#include "block_utils.h"
+#include "primality_utils.h"
 
 // logging helper (used in both RPC and non-RPC builds)
 static FILE *log_fp = NULL;
@@ -552,7 +554,10 @@ static void print_stats(void) {
 #ifdef WITH_GPU_FERMAT
     if (stats_gpu_flushes > 0) {
         double avg_batch = (double)stats_gpu_batched / (double)stats_gpu_flushes;
-        log_msg("  gpu_batch=%.0f", avg_batch);
+        log_msg("  gpu_flushes=%llu  gpu_batched=%llu  gpu_batch=%.0f",
+                (unsigned long long)stats_gpu_flushes,
+                (unsigned long long)stats_gpu_batched,
+                avg_batch);
     }
 #endif
 
@@ -564,156 +569,6 @@ static void print_stats(void) {
     }
 #endif
     log_msg("\n");
-}
-
-// ------------------------------------------------------------------------------------------------
-// Modular arithmetic
-// ------------------------------------------------------------------------------------------------
-
-/* (a * b) % mod, using __uint128_t to avoid overflow.  Kept for use outside
-   the hot primality path (e.g. selftest, sieve helpers). */
-static inline uint64_t modmul(uint64_t a, uint64_t b, uint64_t mod) {
-    return (uint64_t)((__uint128_t)a * b % mod);
-}
-
-/* modular exponentiation: a^e % m  (non-Montgomery fallback, kept for
-   reference / selftest; hot path now uses Montgomery strong_mrt) */
-static uint64_t modpow(uint64_t a, uint64_t e, uint64_t m) __attribute__((unused));
-static uint64_t modpow(uint64_t a, uint64_t e, uint64_t m) {
-    uint64_t res = 1 % m;
-    a %= m;
-    while (e) {
-        if (e & 1) res = modmul(res, a, m);
-        a = modmul(a, a, m);
-        e >>= 1;
-    }
-    return res;
-}
-
-/* ═══════════════════════════════════════════════════════════════
-   Montgomery modular arithmetic — eliminates the hardware DIVQ
-   instruction from every modmul in the hot primality path.
-
-   On Intel Xeon E5 (and most x86-64):
-     Regular modmul via __uint128_t % n : ~43 cycles  (1× MUL + 1× DIV)
-     Montgomery mont_mul                : ~14 cycles  (2× MUL + adds)
-   → ~3× faster per multiply, ~5-7× faster per primality test overall
-
-   R = 2^64 (implicit),  n must be odd.
-   ═══════════════════════════════════════════════════════════════ */
-
-/* n_prime = -(n^{-1}) mod 2^64 for odd n.
-   Newton lifting: each step doubles the number of correct bits.
-   6 steps cover all 64 bits.  Satisfies  n * n_prime ≡ -1 (mod 2^64). */
-static inline uint64_t mont_ninv(uint64_t n) {
-    uint64_t x = 1;
-    x *= 2 - n * x;   /* good mod 2^2  */
-    x *= 2 - n * x;   /* good mod 2^4  */
-    x *= 2 - n * x;   /* good mod 2^8  */
-    x *= 2 - n * x;   /* good mod 2^16 */
-    x *= 2 - n * x;   /* good mod 2^32 */
-    x *= 2 - n * x;   /* good mod 2^64 */
-    return -x;         /* n * (-x) ≡ -1 (mod 2^64) */
-}
-
-/* Montgomery product: a * b * R^{-1} mod n.
-   Splits into explicit 64-bit halves so no 128-bit overflow occurs
-   even when n > 2^63 (our mining range can reach ~2^63.5).
-   Result is in [0, n). */
-static inline uint64_t mont_mul(uint64_t a, uint64_t b,
-                                uint64_t n, uint64_t np) {
-    __uint128_t ab = (__uint128_t)a * b;
-    uint64_t ab_lo = (uint64_t)ab;
-    uint64_t ab_hi = (uint64_t)(ab >> 64);
-    uint64_t m     = ab_lo * np;             /* low 64 bits; implicit mod 2^64 */
-    __uint128_t mn = (__uint128_t)m * n;
-    uint64_t mn_lo = (uint64_t)mn;
-    uint64_t mn_hi = (uint64_t)(mn >> 64);
-    uint64_t carry = (ab_lo + mn_lo) < ab_lo ? 1u : 0u;
-    uint64_t u     = ab_hi + mn_hi + carry;
-    return u >= n ? u - n : u;
-}
-
-/* R^2 mod n = 2^128 mod n.  Computed once per candidate via the cheap
-   identity  2^64 mod n = (-(uint64_t)n) % n  and one __uint128_t square.
-   Used to convert values into Montgomery form. */
-static inline uint64_t mont_R2(uint64_t n) {
-    uint64_t r = (-(uint64_t)n) % n;              /* 2^64 mod n */
-    return (uint64_t)(((__uint128_t)r * r) % n);  /* 2^128 mod n */
-}
-
-/* Montgomery exponentiation: base^exp mod n (result in normal form).
-   np = mont_ninv(n),  R2 = mont_R2(n).
-   Available for callers that need a full modular exponentiation via
-   Montgomery; the primality tests use strong_mrt directly. */
-static uint64_t mont_pow(uint64_t base, uint64_t exp,
-                         uint64_t n, uint64_t np, uint64_t R2) __attribute__((unused));
-static uint64_t mont_pow(uint64_t base, uint64_t exp,
-                         uint64_t n, uint64_t np, uint64_t R2) {
-    uint64_t b = mont_mul(base % n, R2, n, np);  /* base → Montgomery form */
-    uint64_t r = mont_mul(1,        R2, n, np);  /* 1    → Montgomery form */
-    while (exp) {
-        if (exp & 1) r = mont_mul(r, b, n, np);
-        b = mont_mul(b, b, n, np);
-        exp >>= 1;
-    }
-    return mont_mul(r, 1, n, np);  /* result ← normal form */
-}
-
-/* Strong (Miller-Rabin) pseudoprime test for base a modulo n.
-   n-1 = d * 2^s  (d odd).  np and R2 are Montgomery constants.
-   Returns 1 if n is a strong probable prime to base a, 0 if composite.
-   Operates entirely in Montgomery form to keep all multiplications fast. */
-static int strong_mrt(uint64_t n, uint64_t a,
-                      uint64_t np, uint64_t R2,
-                      uint64_t d, int s) {
-    uint64_t one_m = mont_mul(1,     R2, n, np);  /* Mont(1)   = R mod n */
-    uint64_t nm1_m = mont_mul(n - 1, R2, n, np);  /* Mont(n-1) */
-    /* Compute a^d in Montgomery form */
-    uint64_t b = mont_mul(a % n, R2, n, np);
-    uint64_t x = one_m;
-    uint64_t e = d;
-    while (e) {
-        if (e & 1) x = mont_mul(x, b, n, np);
-        b = mont_mul(b, b, n, np);
-        e >>= 1;
-    }
-    if (x == one_m || x == nm1_m) return 1;
-    /* Square up to s-1 times looking for ≡ -1 (mod n) */
-    for (int r = 1; r < s; r++) {
-        x = mont_mul(x, x, n, np);
-        if (x == nm1_m) return 1;
-    }
-    return 0;  /* definitely composite */
-}
-
-/* forward declaration for the fast primality test used in worker threads */
-static int fast_fermat_test(uint64_t n);
-
-/* Deterministic Miller-Rabin for 64-bit integers.
-   Uses the 7-base set {2,325,9375,28178,450775,9780504,1795265022} proven
-   sufficient for all n < 2^64, now accelerated with Montgomery arithmetic.
-   The np/R2 precomputation is amortised over all 7 base tests. */
-static int miller_rabin(uint64_t n) {
-    if (n < 2) return 0;
-    if (n == 2 || n == 3) return 1;
-    if (!(n & 1) || n % 3 == 0) return 0;
-    static const uint64_t small[] = {5,7,11,13,17,19,23,29,31,37};
-    for (size_t i = 0; i < sizeof(small)/sizeof(*small); ++i) {
-        if (n == small[i]) return 1;
-        if (n % small[i] == 0) return 0;
-    }
-    uint64_t d = n - 1; int s = 0;
-    while (!(d & 1)) { d >>= 1; s++; }
-    uint64_t np = mont_ninv(n);
-    uint64_t R2 = mont_R2(n);
-    static const uint64_t bases[] = {2,325,9375,28178,450775,9780504,1795265022};
-    for (size_t i = 0; i < 7; i++) {
-        uint64_t a = bases[i] % n;
-        if (a == 0) continue;
-        if (!strong_mrt(n, a, np, R2, d, s)) return 0;
-    }
-    return 1;
 }
 
 /* simple segmented odd-only sieve for [L,R).  The implementation now
@@ -1150,20 +1005,6 @@ static void sq_drain(void) {
 
 // ----------------- encode_pow_header_binary -----------------
 // Minimal binary encoding: sha256(header) || le64(p) || le64(q)
-static void u64_to_le(uint64_t v, unsigned char out[8]) __attribute__((unused));
-static void u64_to_le(uint64_t v, unsigned char out[8]) {
-    for (int i=0;i<8;i++) out[i] = (unsigned char)(v & 0xff), v >>= 8;
-}
-
-static void bytes_to_hex(const unsigned char *bytes, size_t len, char *out) __attribute__((unused));
-static void bytes_to_hex(const unsigned char *bytes, size_t len, char *out) {
-    static const char hex[] = "0123456789abcdef";
-    for (size_t i=0;i<len;i++) {
-        out[i*2] = hex[(bytes[i] >> 4) & 0xf];
-        out[i*2+1] = hex[bytes[i] & 0xf];
-    }
-    out[len*2] = '\0';
-}
 
 // RPC-only helpers
 #ifdef WITH_RPC
@@ -1189,57 +1030,6 @@ static void hmac_sha256_hex(const char *key, const char *data, char outhex[65]) 
 }
 #endif
 // Build coinbase tx with OP_RETURN payload (hex string). Returns serialized tx buffer (caller frees) and sets out_len.
-static void write_u32_le(unsigned char **p, uint32_t v) {
-    for (int i = 0; i < 4; ++i) { **p = (unsigned char)(v & 0xff); *p += 1; v >>= 8; }
-}
-static void write_u64_le(unsigned char **p, uint64_t v) {
-    for (int i = 0; i < 8; ++i) { **p = (unsigned char)(v & 0xff); *p += 1; v >>= 8; }
-}
-static void write_byte(unsigned char **p, unsigned char b) { **p = b; *p += 1; }
-
-// write push-data opcode(s) and data
-static size_t push_opcode_size(size_t len) {
-    if (len <= 75) return 1 + len;
-    if (len <= 0xFF) return 2 + len; // OP_PUSHDATA1
-    if (len <= 0xFFFF) return 3 + len; // OP_PUSHDATA2
-    return 5 + len; // OP_PUSHDATA4
-}
-static void write_push_data(unsigned char **p, const unsigned char *data, size_t len) {
-    if (len <= 75) {
-        write_byte(p, (unsigned char)len);
-    } else if (len <= 0xFF) {
-        write_byte(p, 0x4c);
-        write_byte(p, (unsigned char)len);
-    } else if (len <= 0xFFFF) {
-        write_byte(p, 0x4d);
-        unsigned short le = (unsigned short)len;
-        memcpy(*p, &le, 2); *p += 2;
-    } else {
-        write_byte(p, 0x4e);
-        unsigned int le = (unsigned int)len;
-        memcpy(*p, &le, 4); *p += 4;
-    }
-    if (len) { memcpy(*p, data, len); *p += len; }
-}
-
-// write CompactSize (Bitcoin varint) into buffer pointer
-static void write_compact_size(unsigned char **p, uint64_t v) {
-    if (v < 0xFD) {
-        write_byte(p, (unsigned char)v);
-    } else if (v <= 0xFFFF) {
-        write_byte(p, 0xFD);
-        unsigned short le = (unsigned short)v;
-        memcpy(*p, &le, 2); *p += 2;
-    } else if (v <= 0xFFFFFFFF) {
-        write_byte(p, 0xFE);
-        unsigned int le = (unsigned int)v;
-        memcpy(*p, &le, 4); *p += 4;
-    } else {
-        write_byte(p, 0xFF);
-        unsigned long long le = (unsigned long long)v;
-        memcpy(*p, &le, 8); *p += 8;
-    }
-}
 
 // Build a minimal coinbase tx with OP_RETURN. Returns serialized tx buffer (caller frees) and sets out_len.
 // Build a minimal coinbase tx with OP_RETURN (or alternative). Returns serialized tx buffer (caller frees) and sets out_len.
@@ -1358,11 +1148,6 @@ static unsigned char *build_coinbase_tx_minimal(uint64_t value_satoshis, uint64_
     log_file_only("DEBUG coinbase minimal: scriptsig_len=%lu extranonce_len=%lu pk_script_len=%lu tx_len=%lu\n",
             (unsigned long)scriptsig_len, (unsigned long)extranonce_len, (unsigned long)pk_script_len, (unsigned long)*out_len);
     return tx;
-}
-
-static void double_sha256(const unsigned char *data, size_t len, unsigned char out[32]) __attribute__((unused));
-static void double_sha256(const unsigned char *data, size_t len, unsigned char out[32]) {
-    unsigned char tmp[32]; SHA256(data, len, tmp); SHA256(tmp, 32, out);
 }
 
 // Build a full block hex from the GBT JSON and our header payload (we place payload in coinbase OP_RETURN).
@@ -4622,41 +4407,6 @@ worker_done:
 
 
 
-/* Fast probable-prime test used in the --fast-fermat hot path.
-
-   Replaces two-base Fermat with Montgomery-accelerated strong
-   (Miller-Rabin style) pseudoprime tests for bases 2 and 3.
-
-   Why this is faster than the old Fermat:
-   ┌────────────────────────────────────────────────────────┐
-   │ Old: modpow(2,n-1,n) + modpow(3,n-1,n)                │
-   │   = 2 × ~95 mulmod × ~43 cycles  ≈  8 170 cycles      │
-   │                                                        │
-   │ New: strong_mrt(2) + strong_mrt(3) with Montgomery     │
-   │   = 2 × (d_bits + s squarings) × ~14 cycles           │
-   │   ≈  2 × 63 × 14  ≈  1 760 cycles   (~5× faster)      │
-   │                                                        │
-   │ BONUS: strong test also catches Carmichael numbers     │
-   │ → fewer false positives reaching scan_candidates       │
-   └────────────────────────────────────────────────────────┘
-
-   Bases {2,3}: no known 64-bit pseudoprimes for this pair below
-   3.2 × 10^18, well beyond our mining range.  Effectively
-   deterministic for sieve survivors in the Gapcoin prime space. */
-static int fast_fermat_test(uint64_t n) {
-    if (n < 4)  return n >= 2;   /* 2 and 3 are prime */
-    if (!(n & 1)) return 0;      /* even → composite  */
-    /* Factor out trailing zeros from n-1: n-1 = d << s */
-    uint64_t d = n - 1;  int s = 0;
-    while (!(d & 1)) { d >>= 1; s++; }
-    /* Precompute Montgomery constants once; reused for both base tests */
-    uint64_t np = mont_ninv(n);
-    uint64_t R2 = mont_R2(n);
-    if (!strong_mrt(n, 2, np, R2, d, s)) return 0;
-    if (!strong_mrt(n, 3, np, R2, d, s)) return 0;
-    return 1;
-}
-
 int main(int argc, char **argv) {
     if (argc < 2) {
         printf("Usage: %s [options]\n", argv[0]);
@@ -5056,8 +4806,8 @@ int main(int argc, char **argv) {
         uint64_t tests[] = {2,3,4,17,18,19,20,0};
         for (int ii = 0; tests[ii]; ii++) {
             uint64_t v = tests[ii];
-            int ff = fast_fermat_test(v);
-            int mr = miller_rabin(v);
+            int ff = primality_fast_fermat_u64(v);
+            int mr = primality_miller_rabin_u64(v);
             log_msg("  %llu -> fast=%d mr=%d\n", (unsigned long long)v, ff, mr);
         }
         return 0;
