@@ -481,6 +481,24 @@ static void format_est(char *buf, size_t sz, double est_sec) {
         snprintf(buf, sz, "%.1fd", est_sec / 86400.0);
 }
 
+static double ndiff_to_merit(uint64_t ndiff) {
+    return (double)ndiff / (double)(1ULL << 48);
+}
+
+/* Keep runtime target in sync with current pass difficulty unless user
+   explicitly overrode --target. */
+static void refresh_target_from_ndiff(int target_explicit, double *target,
+                                      uint64_t ndiff) {
+    if (!target || target_explicit || ndiff == 0) return;
+    double net_merit = ndiff_to_merit(ndiff);
+    if (fabs(*target - net_merit) > 1e-12) {
+        *target = net_merit;
+        g_mining_target = net_merit;
+        log_msg("network difficulty: %.6f merit (nDifficulty=%llu)\n",
+                net_merit, (unsigned long long)ndiff);
+    }
+}
+
 static void print_stats(void) {
     uint64_t now = now_ms();
     double elapsed = stats_start_ms ? (double)(now - stats_start_ms) / 1000.0 : 0.0;
@@ -4899,13 +4917,7 @@ int main(int argc, char **argv) {
              *   merit = nDifficulty / 2^48
              * Use this as the minimum merit threshold unless the user
              * explicitly set --target to override it. */
-            if (!target_explicit && g_pass.ndiff > 0) {
-                double net_merit = (double)g_pass.ndiff / (double)(1ULL << 48);
-                target = net_merit;
-                g_mining_target = target;
-                log_msg("network difficulty: %.4f merit (nDifficulty=%llu)\n",
-                        net_merit, (unsigned long long)g_pass.ndiff);
-            }
+            refresh_target_from_ndiff(target_explicit, &target, g_pass.ndiff);
         }
     }
 #endif
@@ -5541,6 +5553,7 @@ int main(int argc, char **argv) {
                 char sdata[161]; uint64_t sndiff;
                 if (stratum_poll_new_work(g_stratum, sdata, &sndiff)) {
                     build_mining_pass_stratum(sdata, sndiff, shift);
+                    refresh_target_from_ndiff(target_explicit, &target, g_pass.ndiff);
                     memcpy(h256, g_pass.h256, 32);
                     free((char*)header);
                     header = strdup(g_pass.prevhex);
@@ -5551,6 +5564,7 @@ int main(int argc, char **argv) {
               } else {
                 sq_drain();
                 if (build_mining_pass(rpc_url, rpc_user, rpc_pass, shift)) {
+                    refresh_target_from_ndiff(target_explicit, &target, g_pass.ndiff);
                     memcpy(h256, g_pass.h256, 32);
                     if (g_pass.prevhex[0] && strcmp(g_pass.prevhex, header ? header : "") != 0) {
                         free((char*)header);
@@ -5634,6 +5648,7 @@ int main(int argc, char **argv) {
                 char sdata[161]; uint64_t sndiff;
                 if (stratum_poll_new_work(g_stratum, sdata, &sndiff)) {
                     build_mining_pass_stratum(sdata, sndiff, shift);
+                    refresh_target_from_ndiff(target_explicit, &target, g_pass.ndiff);
                     memcpy(h256, g_pass.h256, 32);
                     free((char*)header);
                     header = strdup(g_pass.prevhex);
@@ -5644,6 +5659,7 @@ int main(int argc, char **argv) {
                 /* Drain submit queue before getwork to keep mapNewBlock consistent. */
                 sq_drain();
                 if (build_mining_pass(rpc_url, rpc_user, rpc_pass, shift)) {
+                    refresh_target_from_ndiff(target_explicit, &target, g_pass.ndiff);
                     memcpy(h256, g_pass.h256, 32);
                     if (g_pass.prevhex[0] && strcmp(g_pass.prevhex, header ? header : "") != 0) {
                         free((char*)header);
