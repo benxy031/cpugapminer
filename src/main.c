@@ -523,10 +523,10 @@ static void print_stats(void) {
     }
 
     double bm = stats_best_merit;
-    log_msg("STATS: elapsed=%.1fs  sieved=%llu (%.0f/s)  tested=%llu (%.0f/s)  "
+        log_msg("STATS: elapsed=%.1fs  sieved=%llu (%.0f/s)  tested=%llu (%.0f/s)  "
             "primes=%llu (%.1f%%)  "
             "gaps=%llu (%.3f/s)  built=%llu  submitted=%llu  accepted=%llu  "
-            "prob=%.2e/pair  est=%s (target=%.2f)  best=%.2f (gap=%llu)",
+            "prob=%.2e/pair  est=%s (target=%.4f)  best=%.2f (gap=%llu)",
             elapsed,
             (unsigned long long)stats_sieved,  sieve_rate,
             (unsigned long long)stats_tested,  test_rate,
