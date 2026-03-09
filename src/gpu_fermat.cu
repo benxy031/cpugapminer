@@ -113,15 +113,37 @@ uint64_t compute_ninv(uint64_t n0)
 }
 
 /* r = R mod n,  where R = 2^(64×AL).
-   Computed by 64×AL modular doublings of 1. */
+   Fast top-down computation: start from the highest bit of R (bit 64*AL)
+   and reduce downward.  Since R = 2^(64*AL) has exactly one bit set,
+   we scan from bit (64*AL-1) down to 0, doubling r each step.
+   We begin with r = 2^topbit mod n where topbit = highest bit of n,
+   so r = 2^topbit - n (since 2^topbit >= n > 2^(topbit-1)).
+   Then we double r for each remaining bit position, taking mod n
+   at each step.  Total: (64*AL - topbit) doublings instead of 64*AL.
+   For 976-bit candidates in 1024-bit R, this saves ~48 doublings (~5%). */
 template<int AL>
 __device__ static
 void compute_rmodn_t(uint64_t *r, const uint64_t *n)
 {
+    /* Find topbit = floor(log2(n)). */
+    int top_limb = AL - 1;
+    while (top_limb > 0 && n[top_limb] == 0) top_limb--;
+    int top_bit_in_limb = 63 - __clzll(n[top_limb]);
+    int topbit = top_limb * 64 + top_bit_in_limb;
+
+    /* r = 2^topbit - n  (this is R' mod n where R' = 2^topbit; since
+       2^topbit >= n but 2^topbit < 2*n, R' mod n = 2^topbit - n). */
+    /* Compute 2^topbit */
     for (int i = 0; i < AL; i++) r[i] = 0;
-    r[0] = 1;
+    r[top_limb] = 1ULL << top_bit_in_limb;
+    /* r = 2^topbit - n */
+    sub_t<AL>(r, r, n);
+
+    /* Double r for each remaining bit from topbit+1 to 64*AL-1.
+       After this loop, r = 2^(64*AL) mod n = R mod n. */
+    int remaining = 64 * AL - 1 - topbit;
     #pragma unroll 1
-    for (int i = 0; i < 64 * AL; i++)
+    for (int i = 0; i < remaining; i++)
         moddbl_t<AL>(r, n);
 }
 

@@ -247,6 +247,29 @@ static int            g_crt_primorial_mpz_init = 0; /* 1 once mpz_init'd        
 /* Per-thread CRT base residue (base mod primorial), set in set_base_bn(). */
 static __thread uint64_t tls_crt_base_residue = 0;
 
+/* ── CRT post-sieve filter: extra primes beyond the sieve limit ──
+   After sieve_range returns survivors, test each against additional
+   primes in [sieve_limit+1, crt_filter_limit].  For a prime p in this
+   range, (base + offset) mod p == 0 iff offset == (-base mod p).
+   Since p > gap_scan and survivors are sorted, a binary search gives
+   O(log S) per prime where S = |survivors|.  The primes and their
+   primorial-residues are cached so per-window cost is 1 add + 1 cmp
+   per prime for the incremental update, plus 1 binary search.       */
+static uint32_t      *g_crt_filter_primes = NULL; /* prime table             */
+static size_t         g_crt_filter_count  = 0;    /* number of filter primes */
+static uint64_t      *g_crt_filter_prim_mod = NULL; /* primorial mod p[i]    */
+
+/* Per-thread residue cache for incremental updates */
+static __thread uint64_t *tls_crt_filt_rmod = NULL; /* base mod p[i]         */
+static __thread size_t    tls_crt_filt_cap  = 0;
+static __thread int       tls_crt_filt_ready = 0;
+
+/* Forward declarations — defined after tls_base_mpz */
+static void   build_crt_filter_table(uint64_t filter_limit);
+static void   crt_filter_init_residues(void);
+static inline void crt_filter_step_residues(void);
+static size_t crt_filter_survivors(uint64_t *surv, size_t cnt);
+
 /* Load a legacy binary CRT file (CRT1 format, ≤10 primes).
    File format: 4-byte magic "CRT1", uint32 n_primes, uint64 primorial,
    uint64 n_candidates, then n_candidates × uint32 sorted odd offsets.      */
@@ -1987,6 +2010,138 @@ static void set_base_bn(const uint8_t h256[32], int shift) {
                                                      (unsigned long)td_extra_primes[i]);
 }
 
+/* ── CRT post-sieve filter: function definitions ──────────────────────────
+   These use tls_base_mpz (declared above) and the globals / TLS vars
+   declared near the top of the file.                                      */
+
+/*  Build a table of primes in (sieve_limit, filter_limit] that do NOT
+ *  divide the primorial.  For each such prime p we also precompute
+ *  primorial mod p so the per-window incremental update is a single
+ *  modular add + compare.                                                 */
+static void build_crt_filter_table(uint64_t filter_limit) {
+    uint64_t lo = cli_sieve_prime_limit + 1;
+    if (filter_limit <= lo) return;
+
+    /* Rough upper-bound on count: π(hi) - π(lo) ≈ hi/ln(hi). */
+    size_t est = (size_t)(filter_limit / 10);
+    if (est < 1024) est = 1024;
+    uint32_t *primes  = (uint32_t *)malloc(est * sizeof(uint32_t));
+    uint64_t *pmod    = (uint64_t *)malloc(est * sizeof(uint64_t));
+    if (!primes || !pmod) { free(primes); free(pmod); return; }
+
+    /* Simple segmented sieve to enumerate primes in (lo, filter_limit]. */
+    size_t cnt = 0;
+    const size_t seg = 1u << 18;                     /* 256 K segment       */
+    uint8_t *sieve_buf = (uint8_t *)calloc(seg, 1);
+    if (!sieve_buf) { free(primes); free(pmod); return; }
+
+    for (uint64_t base = lo; base <= filter_limit; base += seg) {
+        uint64_t hi = base + seg - 1;
+        if (hi > filter_limit) hi = filter_limit;
+        size_t len = (size_t)(hi - base + 1);
+        memset(sieve_buf, 0, len);
+
+        /* Sieve with small primes from cache. */
+        for (size_t si = 0; si < small_primes_count; si++) {
+            uint64_t p = small_primes_cache[si];
+            if (p * p > hi) break;
+            uint64_t start = ((base + p - 1) / p) * p;
+            if (start < p * p && base <= p) start = p * p;
+            for (uint64_t j = start; j <= hi; j += p)
+                sieve_buf[j - base] = 1;
+        }
+        /* Collect survivors that don't divide the primorial. */
+        for (size_t k = 0; k < len; k++) {
+            if (sieve_buf[k]) continue;
+            uint64_t p = base + k;
+            if (p < 2) continue;
+            /* Skip primes that divide the primorial (already handled). */
+            if (g_crt_primorial_mpz_init &&
+                mpz_fdiv_ui(g_crt_primorial_mpz, (unsigned long)p) == 0)
+                continue;
+            if (cnt >= est) {
+                est *= 2;
+                uint32_t *tp = (uint32_t *)realloc(primes, est * sizeof(uint32_t));
+                uint64_t *tm = (uint64_t *)realloc(pmod,   est * sizeof(uint64_t));
+                if (!tp || !tm) { free(tp ? (void*)tp : (void*)primes);
+                                  free(tm ? (void*)tm : (void*)pmod); cnt = 0; goto done; }
+                primes = tp; pmod = tm;
+            }
+            primes[cnt] = (uint32_t)p;
+            pmod[cnt]   = g_crt_primorial_mpz_init
+                        ? mpz_fdiv_ui(g_crt_primorial_mpz, (unsigned long)p)
+                        : 0;
+            cnt++;
+        }
+    }
+done:
+    free(sieve_buf);
+    g_crt_filter_primes   = primes;
+    g_crt_filter_count    = cnt;
+    g_crt_filter_prim_mod = pmod;
+    if (cnt > 0)
+        log_msg("CRT filter: %zu extra primes in (%llu, %llu]\n",
+                cnt,
+                (unsigned long long)cli_sieve_prime_limit,
+                (unsigned long long)filter_limit);
+}
+
+/*  Per-thread: compute base mod p for every filter prime.  Called once
+ *  after set_base_bn() establishes tls_base_mpz for a new nonce.         */
+static void crt_filter_init_residues(void) {
+    size_t n = g_crt_filter_count;
+    if (n == 0) return;
+    if (tls_crt_filt_cap < n) {
+        free(tls_crt_filt_rmod);
+        tls_crt_filt_cap = n + 64;
+        tls_crt_filt_rmod = (uint64_t *)malloc(tls_crt_filt_cap * sizeof(uint64_t));
+        if (!tls_crt_filt_rmod) { tls_crt_filt_cap = 0; return; }
+    }
+    for (size_t i = 0; i < n; i++)
+        tls_crt_filt_rmod[i] = mpz_fdiv_ui(tls_base_mpz,
+                                            (unsigned long)g_crt_filter_primes[i]);
+    tls_crt_filt_ready = 1;
+}
+
+/*  Per-window: advance residues by one primorial step.                    */
+static inline void crt_filter_step_residues(void) {
+    size_t n = g_crt_filter_count;
+    for (size_t i = 0; i < n; i++) {
+        uint64_t r = tls_crt_filt_rmod[i] + g_crt_filter_prim_mod[i];
+        uint64_t p = g_crt_filter_primes[i];
+        if (r >= p) r -= p;
+        tls_crt_filt_rmod[i] = r;
+    }
+}
+
+/*  Remove survivors from the sorted array that are divisible by any
+ *  filter prime.  For filter prime p, the unique hit in [0, gap_scan)
+ *  is  hit = (p - base_mod_p) % p.  Binary-search surv[] for hit and
+ *  memmove to delete.  Returns the new count.                             */
+static size_t crt_filter_survivors(uint64_t *surv, size_t cnt) {
+    if (!tls_crt_filt_ready || g_crt_filter_count == 0) return cnt;
+    size_t n = g_crt_filter_count;
+    for (size_t i = 0; i < n && cnt > 0; i++) {
+        uint64_t p   = g_crt_filter_primes[i];
+        uint64_t r   = tls_crt_filt_rmod[i];
+        uint64_t hit = (r == 0) ? 0 : p - r;
+
+        /* Binary search for hit in surv[0..cnt-1]. */
+        size_t lo = 0, hi = cnt;
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            if (surv[mid] < hit) lo = mid + 1;
+            else                 hi = mid;
+        }
+        if (lo < cnt && surv[lo] == hit) {
+            cnt--;
+            if (lo < cnt)
+                memmove(&surv[lo], &surv[lo + 1], (cnt - lo) * sizeof(uint64_t));
+        }
+    }
+    return cnt;
+}
+
 
 /* Return 1 if (tls_base_mpz + offset) is probably prime.
  *
@@ -3470,6 +3625,7 @@ static void *worker_fn(void *arg) {
                 int cand_odd = mpz_odd_p(candidate);
                 if (cand_odd) mpz_sub_ui(candidate, candidate, 1);
                 rebase_for_gap_check(candidate);
+                crt_filter_init_residues();
                 int crt_first_win = 1;
 
                 while (mpz_cmp(nAdd, crt_end) < 0 &&
@@ -3488,6 +3644,7 @@ static void *worker_fn(void *arg) {
                                         small_primes_cache[pi];
                             }
                         }
+                        crt_filter_step_residues();
                     }
                     crt_first_win = 0;
 
@@ -3497,6 +3654,10 @@ static void *worker_fn(void *arg) {
                     uint64_t *surv = sieve_range(gap_L, gap_R,
                                                  &surv_cnt, NULL, 0);
                     __sync_fetch_and_add(&stats_sieved, gap_R - gap_L);
+
+                    /* Post-sieve trial division with extended primes */
+                    if (surv && surv_cnt > 0)
+                        surv_cnt = crt_filter_survivors(surv, surv_cnt);
 
                     if (!surv || surv_cnt == 0) {
                         mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
@@ -4933,18 +5094,21 @@ int main(int argc, char **argv) {
     }
     /* ── CRT + GPU: cap sieve primes for the tiny gap-check bitmap ──
        In CRT solver mode the sieve bitmap is only gap_scan_max/2 bits
-       (~732 bytes at merit 22).  Sieve primes much larger than the
-       bitmap rarely mark any position, yet their per-prime overhead
-       (residue update + sieve loop iteration) dominates wall-clock time
-       and starves the GPU of candidates.  Cap at gap_scan_max × 4 so
-       only primes with a meaningful hit probability are sieved on CPU;
-       the GPU handles the extra survivors easily. */
+       (~1.7 KB at merit 21).  For each sieve prime p the cost is:
+         CPU: one residue update + one bounds-check + one bit-set  (~10 ns)
+         GPU: each survivor NOT filtered costs a full Fermat test (~1.5 µs)
+       For a prime p the probability of eliminating a survivor is
+         P ≈ (gap_scan / (2p)) × survival_rate.
+       Break-even: p ≈ gap_scan × survival_rate × gpu_cost / (2 × cpu_cost).
+       With typical numbers this is ~19 × gap_scan, but we cap at 500 000
+       to keep the sieve prime cache and residue array reasonable.      */
 #ifdef WITH_GPU_FERMAT
     if (g_crt_mode == CRT_MODE_SOLVER && g_gpu_count > 0 &&
         g_crt_gap_target > 0) {
         uint64_t gap_scan = (uint64_t)g_crt_gap_target * 2;
         if (gap_scan < 10000) gap_scan = 10000;
-        uint64_t crt_limit = gap_scan * 4;
+        uint64_t crt_limit = gap_scan * 19;
+        if (crt_limit > 500000) crt_limit = 500000;
         if (cli_sieve_prime_limit > crt_limit) {
             log_msg("CRT+GPU: capping sieve-prime-limit %llu -> %llu "
                     "(gap_scan=%llu, bitmap=%llu bytes)\n",
@@ -4961,6 +5125,19 @@ int main(int argc, char **argv) {
     start_stats_thread(print_stats);
     /* Trigger sieve cache population so we can log its stats. */
     pthread_once(&small_primes_once, populate_small_primes_cache);
+
+    /* Build CRT post-sieve filter table (primes beyond sieve limit up to 2M).
+       These primes are too large for the tiny CRT bitmap but cheap to check
+       via direct trial division on the sorted survivor array. */
+#ifdef WITH_GPU_FERMAT
+    if (g_crt_mode == CRT_MODE_SOLVER && g_gpu_count > 0 &&
+        g_crt_primorial_mpz_init) {
+        uint64_t filt_limit = 2000000;
+        if (filt_limit > cli_sieve_prime_limit)
+            build_crt_filter_table(filt_limit);
+    }
+#endif
+
     log_msg("C miner starting (shift=%d sieve=%llu sieve-primes=%lu [up to %llu])\n",
             shift, (unsigned long long)sieve_size,
             (unsigned long)small_primes_count,
@@ -5089,6 +5266,7 @@ int main(int argc, char **argv) {
                     int st_odd = mpz_odd_p(cand_st);
                     if (st_odd) mpz_sub_ui(cand_st, cand_st, 1);
                     rebase_for_gap_check(cand_st);
+                    crt_filter_init_residues();
                     int st_first_win = 1;
 
                     while (mpz_cmp(nAdd_st, crt_end) < 0 && keep_going && !g_abort_pass) {
@@ -5106,6 +5284,7 @@ int main(int argc, char **argv) {
                                             small_primes_cache[pi];
                                 }
                             }
+                            crt_filter_step_residues();
                         }
                         st_first_win = 0;
 
@@ -5115,6 +5294,10 @@ int main(int argc, char **argv) {
                         uint64_t *surv = sieve_range(gap_L, gap_R,
                                                      &surv_cnt, NULL, 0);
                         __sync_fetch_and_add(&stats_sieved, gap_R - gap_L);
+
+                        /* Post-sieve trial division with extended primes */
+                        if (surv && surv_cnt > 0)
+                            surv_cnt = crt_filter_survivors(surv, surv_cnt);
 
                         if (!surv || surv_cnt == 0) {
                             mpz_add(nAdd_st, nAdd_st, g_crt_primorial_mpz);
