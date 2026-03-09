@@ -4414,7 +4414,6 @@ static void *worker_fn(void *arg) {
                     for (size_t qi = 0; qi < res_w.qual_cnt; qi++) {
                         uint64_t pair[2] = { res_w.qual_pairs[qi][0],
                                              res_w.qual_pairs[qi][1] };
-                        __sync_fetch_and_add(&stats_gaps, 1);
                         if (scan_candidates(pair, 2,
                                 target_local, logbase,
                                 shift_local, header_local,
