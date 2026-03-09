@@ -3631,6 +3631,60 @@ static void *worker_fn(void *arg) {
                 while (mpz_cmp(nAdd, crt_end) < 0 &&
                        keep_going && !g_abort_pass) {
 
+#ifdef WITH_RPC
+                    /* Poll for new work inside the inner window loop.
+                       At shift=720 a single nonce has ~32K windows (~2 min),
+                       so polling only at the nonce boundary is too slow. */
+                    if (rpc_thread_local && rpc_url_local) {
+                        uint64_t now = now_ms();
+                        if (now - gbt_last_ms >= 5000) {
+                          if (g_stratum) {
+                            char data_hex_w[161];
+                            uint64_t ndiff_w;
+                            if (stratum_poll_new_work(g_stratum, data_hex_w,
+                                                     &ndiff_w)) {
+                                log_msg("\n*** STRATUM NEW BLOCK ***\n\n");
+                                build_mining_pass_stratum(data_hex_w, ndiff_w,
+                                                         shift_local);
+                                g_abort_pass = 1;
+                                crt_heap_signal_shutdown();
+                                break;
+                            }
+                          } else {
+                            char *resp_w = rpc_call(rpc_url_local,
+                                rpc_user_local, rpc_pass_local,
+                                "getbestblockhash", NULL);
+                            if (resp_w) {
+                                const char *q1w = strchr(resp_w, '"');
+                                if (q1w) q1w = strchr(q1w+1, '"');
+                                if (q1w) q1w = strchr(q1w+1, '"');
+                                const char *q2w = q1w ? strchr(q1w+1, '"') : NULL;
+                                if (q1w && q2w && (q2w-q1w-1) == 64) {
+                                    char best_w[65];
+                                    memcpy(best_w, q1w+1, 64); best_w[64] = '\0';
+                                    if (g_pass.prevhex[0] &&
+                                        strcmp(best_w, g_pass.prevhex) != 0) {
+                                        log_msg("\n*** NEW BLOCK  prevhash=%.16s..."
+                                                "  mining on top ***\n\n", best_w);
+                                        pthread_mutex_lock(&g_work_lock);
+                                        strncpy(g_prevhash, best_w, 64);
+                                        g_prevhash[64] = '\0';
+                                        pthread_mutex_unlock(&g_work_lock);
+                                        free(resp_w);
+                                        g_abort_pass = 1;
+                                        crt_heap_signal_shutdown();
+                                        break;
+                                    }
+                                }
+                                free(resp_w);
+                            }
+                          }
+                          gbt_last_ms = now_ms();
+                        }
+                    }
+                    if (g_abort_pass) break;
+#endif
+
                     if (!crt_first_win) {
                         mpz_add(tls_base_mpz, tls_base_mpz,
                                 g_crt_primorial_mpz);
