@@ -268,7 +268,6 @@ static __thread int       tls_crt_filt_ready = 0;
 static void   build_crt_filter_table(uint64_t filter_limit);
 static void   crt_filter_init_residues(void);
 static inline void crt_filter_step_residues(void);
-static size_t crt_filter_survivors(uint64_t *surv, size_t cnt);
 
 /* Load a legacy binary CRT file (CRT1 format, ≤10 primes).
    File format: 4-byte magic "CRT1", uint32 n_primes, uint64 primorial,
@@ -837,6 +836,28 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
             for (uint64_t m = start; m < R; m += 2 * p) {
                 uint64_t pos = (m - L) / 2;
                 bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+            }
+        }
+    }
+
+    /* ── Phase 3: CRT post-sieve filter — direct bitmap marking ──
+       When the CRT filter is active (primes beyond the sieve limit),
+       mark their composites directly in the bitmap before extraction.
+       Each filter prime p > gap_scan has at most ONE hit in [L, R),
+       so this is O(1) per prime — vastly faster than the old approach
+       of binary-searching the extracted survivor array O(log S).       */
+    if (tls_crt_filt_ready && g_crt_filter_count > 0) {
+        for (size_t fi = 0; fi < g_crt_filter_count; fi++) {
+            uint64_t p = g_crt_filter_primes[fi];
+            uint64_t r = tls_crt_filt_rmod[fi];
+            /* Same start-position logic as the main sieve */
+            uint64_t lrem = (r + L % p) % p;
+            uint64_t start = L + (lrem == 0 ? 0 : p - lrem);
+            if ((start & 1) == 0) start += p;  /* odd-only sieve */
+            if (start < R) {
+                uint64_t pos = (start - L) / 2;
+                if (pos < seg_size)
+                    bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
             }
         }
     }
@@ -2113,35 +2134,6 @@ static inline void crt_filter_step_residues(void) {
         tls_crt_filt_rmod[i] = r;
     }
 }
-
-/*  Remove survivors from the sorted array that are divisible by any
- *  filter prime.  For filter prime p, the unique hit in [0, gap_scan)
- *  is  hit = (p - base_mod_p) % p.  Binary-search surv[] for hit and
- *  memmove to delete.  Returns the new count.                             */
-static size_t crt_filter_survivors(uint64_t *surv, size_t cnt) {
-    if (!tls_crt_filt_ready || g_crt_filter_count == 0) return cnt;
-    size_t n = g_crt_filter_count;
-    for (size_t i = 0; i < n && cnt > 0; i++) {
-        uint64_t p   = g_crt_filter_primes[i];
-        uint64_t r   = tls_crt_filt_rmod[i];
-        uint64_t hit = (r == 0) ? 0 : p - r;
-
-        /* Binary search for hit in surv[0..cnt-1]. */
-        size_t lo = 0, hi = cnt;
-        while (lo < hi) {
-            size_t mid = lo + (hi - lo) / 2;
-            if (surv[mid] < hit) lo = mid + 1;
-            else                 hi = mid;
-        }
-        if (lo < cnt && surv[lo] == hit) {
-            cnt--;
-            if (lo < cnt)
-                memmove(&surv[lo], &surv[lo + 1], (cnt - lo) * sizeof(uint64_t));
-        }
-    }
-    return cnt;
-}
-
 
 /* Return 1 if (tls_base_mpz + offset) is probably prime.
  *
@@ -3708,10 +3700,6 @@ static void *worker_fn(void *arg) {
                     uint64_t *surv = sieve_range(gap_L, gap_R,
                                                  &surv_cnt, NULL, 0);
                     __sync_fetch_and_add(&stats_sieved, gap_R - gap_L);
-
-                    /* Post-sieve trial division with extended primes */
-                    if (surv && surv_cnt > 0)
-                        surv_cnt = crt_filter_survivors(surv, surv_cnt);
 
                     if (!surv || surv_cnt == 0) {
                         mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
@@ -5342,10 +5330,6 @@ int main(int argc, char **argv) {
                         uint64_t *surv = sieve_range(gap_L, gap_R,
                                                      &surv_cnt, NULL, 0);
                         __sync_fetch_and_add(&stats_sieved, gap_R - gap_L);
-
-                        /* Post-sieve trial division with extended primes */
-                        if (surv && surv_cnt > 0)
-                            surv_cnt = crt_filter_survivors(surv, surv_cnt);
 
                         if (!surv || surv_cnt == 0) {
                             mpz_add(nAdd_st, nAdd_st, g_crt_primorial_mpz);
