@@ -5092,25 +5092,23 @@ int main(int argc, char **argv) {
         log_fp = fopen(log_file, "a");
         if (!log_fp) fprintf(stderr, "Failed to open log file %s\n", log_file);
     }
-    /* ── CRT + GPU: cap sieve primes for the tiny gap-check bitmap ──
+    /* ── CRT: cap sieve primes for the tiny gap-check bitmap ──
        In CRT solver mode the sieve bitmap is only gap_scan_max/2 bits
        (~1.7 KB at merit 21).  For each sieve prime p the cost is:
          CPU: one residue update + one bounds-check + one bit-set  (~10 ns)
-         GPU: each survivor NOT filtered costs a full Fermat test (~1.5 µs)
+         Fermat test per unfiltered survivor                       (~1.5 µs GPU / ~ms CPU)
        For a prime p the probability of eliminating a survivor is
          P ≈ (gap_scan / (2p)) × survival_rate.
-       Break-even: p ≈ gap_scan × survival_rate × gpu_cost / (2 × cpu_cost).
+       Break-even: p ≈ gap_scan × survival_rate × test_cost / (2 × cpu_cost).
        With typical numbers this is ~19 × gap_scan, but we cap at 500 000
        to keep the sieve prime cache and residue array reasonable.      */
-#ifdef WITH_GPU_FERMAT
-    if (g_crt_mode == CRT_MODE_SOLVER && g_gpu_count > 0 &&
-        g_crt_gap_target > 0) {
+    if (g_crt_mode == CRT_MODE_SOLVER && g_crt_gap_target > 0) {
         uint64_t gap_scan = (uint64_t)g_crt_gap_target * 2;
         if (gap_scan < 10000) gap_scan = 10000;
         uint64_t crt_limit = gap_scan * 19;
         if (crt_limit > 500000) crt_limit = 500000;
         if (cli_sieve_prime_limit > crt_limit) {
-            log_msg("CRT+GPU: capping sieve-prime-limit %llu -> %llu "
+            log_msg("CRT: capping sieve-prime-limit %llu -> %llu "
                     "(gap_scan=%llu, bitmap=%llu bytes)\n",
                     (unsigned long long)cli_sieve_prime_limit,
                     (unsigned long long)crt_limit,
@@ -5119,7 +5117,6 @@ int main(int argc, char **argv) {
             cli_sieve_prime_limit = crt_limit;
         }
     }
-#endif
 
     stats_start_ms = now_ms();
     start_stats_thread(print_stats);
@@ -5129,14 +5126,11 @@ int main(int argc, char **argv) {
     /* Build CRT post-sieve filter table (primes beyond sieve limit up to 2M).
        These primes are too large for the tiny CRT bitmap but cheap to check
        via direct trial division on the sorted survivor array. */
-#ifdef WITH_GPU_FERMAT
-    if (g_crt_mode == CRT_MODE_SOLVER && g_gpu_count > 0 &&
-        g_crt_primorial_mpz_init) {
+    if (g_crt_mode == CRT_MODE_SOLVER && g_crt_primorial_mpz_init) {
         uint64_t filt_limit = 2000000;
         if (filt_limit > cli_sieve_prime_limit)
             build_crt_filter_table(filt_limit);
     }
-#endif
 
     log_msg("C miner starting (shift=%d sieve=%llu sieve-primes=%lu [up to %llu])\n",
             shift, (unsigned long long)sieve_size,
