@@ -4678,7 +4678,6 @@ int main(int argc, char **argv) {
     double target = 20.0;
     int target_explicit = 0;  /* set to 1 if user passes --target */
     int cli_sieve_explicit = 0; /* set to 1 if user passes --sieve-primes */
-    int sieve_size_explicit = 0; /* set to 1 if user passes --sieve-size */
     const char *rpc_url = NULL, *rpc_user = NULL, *rpc_pass = NULL, *rpc_method = "getwork";
     const char *stratum_arg = NULL; /* "host:port" for stratum pool connection */
     const char *rpc_sign_key = NULL;
@@ -4708,7 +4707,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--shift") && i+1<argc) shift = atoi(argv[++i]);
         else if (!strcmp(argv[i],"-s") && i+1<argc) shift = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--adder-max") && i+1<argc) adder_max = (int64_t)atoll(argv[++i]);
-        else if (!strcmp(argv[i],"--sieve-size") && i+1<argc) { sieve_size = strtoull(argv[++i], NULL, 10); sieve_size_explicit = 1; }
+        else if (!strcmp(argv[i],"--sieve-size") && i+1<argc) sieve_size = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i],"--sieve-primes") && i+1<argc) {
             cli_sieve_prime_count = strtoull(argv[++i], NULL, 10);
             cli_sieve_explicit = 1;
@@ -4858,30 +4857,6 @@ int main(int argc, char **argv) {
     if (shift <= 62 && adder_max > ((int64_t)1 << shift)) {
         fprintf(stderr, "--adder-max (%lld) must be at most 2^shift (%lld)\n", (long long)adder_max, (long long)((int64_t)1 << shift));
         return 2;
-    }
-
-    /* ── Auto-tune sieve-size for CPU at low/medium shifts ──
-       Each sieve window pays an O(sieve_primes) init cost to compute
-       starting offsets.  At low shifts the default 32 M window creates
-       many windows and the cumulative init overhead dominates.  Increase
-       the window to 256 M (bitmap ≈ 16 MB / thread, fits L3) to cut
-       window count — and init overhead — by 8×.  L1-cache-blocking in
-       the sieve loop keeps marking efficient regardless of bitmap size.
-       Skip the adjustment for CRT solver (uses its own gap-check sieve)
-       and when the user set --sieve-size explicitly. */
-    if (!sieve_size_explicit && g_crt_mode != CRT_MODE_SOLVER) {
-        uint64_t auto_ss = 268435456ULL;        /* 256 M */
-        if ((uint64_t)adder_max < auto_ss)
-            auto_ss = (uint64_t)adder_max;      /* don't exceed work range */
-        if (auto_ss > sieve_size) {
-            log_msg("auto sieve-size %llu -> %llu  (shift=%d, %llu windows)\n",
-                    (unsigned long long)sieve_size,
-                    (unsigned long long)auto_ss,
-                    shift,
-                    (unsigned long long)(((uint64_t)adder_max + auto_ss - 1)
-                                         / auto_ss));
-            sieve_size = auto_ss;
-        }
     }
 
     /* Compute sieve prime VALUE limit from COUNT using PNT upper bound:
