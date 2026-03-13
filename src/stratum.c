@@ -55,7 +55,8 @@ struct stratum_ctx {
     pthread_mutex_t  work_lock;
     pthread_cond_t   work_cond;
     char             work_data[161];   /* 160 hex + NUL */
-    uint64_t         work_ndiff;
+    uint64_t         work_ndiff;       /* share target from pool JSON */
+    uint64_t         work_net_ndiff;   /* network nDifficulty from header bytes 72-79 */
     int              work_ready;       /* 1 = initial work received */
     int              work_new;         /* 1 = new work since last poll */
 
@@ -234,9 +235,32 @@ static int stratum_send_getwork(stratum_ctx *ctx) {
 
 /* ──────────────── protocol: parse work ──────────────── */
 
+/* Extract nDifficulty from header bytes 72-79 (little-endian uint64_t).
+   data_hex points to the 160-char hex string of the 80-byte header. */
+static uint64_t extract_net_ndiff(const char *data_hex)
+{
+    /* bytes 72..79 → hex chars 144..159 */
+    uint64_t nd = 0;
+    for (int i = 7; i >= 0; i--) {
+        unsigned int bv = 0;
+        sscanf(data_hex + (72 + i) * 2, "%2x", &bv);
+        nd = (nd << 8) | bv;
+    }
+    return nd;
+}
+
 /* Parse {"data":"hex160","difficulty":N} from a JSON object.
-   Updates ctx->work_data/work_ndiff and signals work_cond. */
+   Updates ctx->work_data/work_ndiff and signals work_cond.
+   "difficulty" from pool JSON = share target.
+   nDifficulty from header bytes 72-79 = network difficulty. */
 static void parse_work(stratum_ctx *ctx, json_t *obj) {
+    /* Dump all JSON keys for diagnostics */
+    {
+        char *raw = json_dumps(obj, JSON_COMPACT);
+        fprintf(stderr, "[stratum] work JSON: %s\n", raw ? raw : "?");
+        free(raw);
+    }
+
     json_t *jdata = json_object_get(obj, "data");
     json_t *jdiff = json_object_get(obj, "difficulty");
 
@@ -259,18 +283,25 @@ static void parse_work(stratum_ctx *ctx, json_t *obj) {
                    ? (uint64_t)json_integer_value(jdiff)
                    : (uint64_t)json_number_value(jdiff);
 
+    /* Extract network nDifficulty from header bytes 72-79 */
+    uint64_t net_ndiff = extract_net_ndiff(data);
+
     pthread_mutex_lock(&ctx->work_lock);
     memcpy(ctx->work_data, data, 160);
     ctx->work_data[160] = '\0';
     ctx->work_ndiff = ndiff;
+    ctx->work_net_ndiff = net_ndiff;
     ctx->work_ready = 1;
     ctx->work_new   = 1;
     pthread_cond_signal(&ctx->work_cond);
     pthread_mutex_unlock(&ctx->work_lock);
 
-    double merit = (double)ndiff / (double)(1ULL << 48);
-    fprintf(stderr, "[stratum] new work: difficulty=%.4f merit (nDifficulty=%llu)\n",
-            merit, (unsigned long long)ndiff);
+    double share_merit = (double)ndiff / (double)(1ULL << 48);
+    double net_merit = (double)net_ndiff / (double)(1ULL << 48);
+    fprintf(stderr, "[stratum] new work: target=%.6f @ %.6f network"
+            " (share_ndiff=%llu, net_ndiff=%llu)\n",
+            share_merit, net_merit,
+            (unsigned long long)ndiff, (unsigned long long)net_ndiff);
 }
 
 /* ──────────────── recv thread ──────────────── */
@@ -363,9 +394,65 @@ static void *recv_thread_fn(void *arg) {
         }
         /* ── Server push notification (id is null) ── */
         else {
+            json_t *j_method = json_object_get(root, "method");
+            const char *method = json_is_string(j_method)
+                               ? json_string_value(j_method) : "";
             json_t *params = json_object_get(root, "params");
-            if (json_is_object(params)) {
-                /* blockchain.block.new notification */
+
+            if (strcmp(method, "mining.set_difficulty") == 0 ||
+                strcmp(method, "mining.target") == 0) {
+                /* Dump raw params for diagnostics */
+                {
+                    char *raw = json_dumps(params, JSON_COMPACT);
+                    fprintf(stderr, "[stratum] %s params: %s\n", method, raw ? raw : "?");
+                    free(raw);
+                }
+                /* Pool dynamically updating share target.
+                   params can be [ndiff] array or {"difficulty":N} object.
+                   Some pools send [share_target, network_diff] as 2 elements. */
+                uint64_t new_ndiff = 0;
+                uint64_t new_net_ndiff = 0;
+                int got = 0, got_net = 0;
+                if (json_is_array(params) && json_array_size(params) >= 1) {
+                    json_t *v = json_array_get(params, 0);
+                    if (json_is_integer(v)) { new_ndiff = (uint64_t)json_integer_value(v); got = 1; }
+                    else if (json_is_number(v)) { new_ndiff = (uint64_t)json_number_value(v); got = 1; }
+                    /* Second element = network difficulty? */
+                    if (json_array_size(params) >= 2) {
+                        json_t *v2 = json_array_get(params, 1);
+                        if (json_is_integer(v2)) { new_net_ndiff = (uint64_t)json_integer_value(v2); got_net = 1; }
+                        else if (json_is_number(v2)) { new_net_ndiff = (uint64_t)json_number_value(v2); got_net = 1; }
+                    }
+                } else if (json_is_object(params)) {
+                    json_t *v = json_object_get(params, "difficulty");
+                    if (!v) v = json_object_get(params, "target");
+                    if (json_is_integer(v)) { new_ndiff = (uint64_t)json_integer_value(v); got = 1; }
+                    else if (json_is_number(v)) { new_ndiff = (uint64_t)json_number_value(v); got = 1; }
+                    /* Check for network difficulty field */
+                    json_t *vn = json_object_get(params, "network_difficulty");
+                    if (!vn) vn = json_object_get(params, "network");
+                    if (!vn) vn = json_object_get(params, "ndiff");
+                    if (vn && json_is_integer(vn)) { new_net_ndiff = (uint64_t)json_integer_value(vn); got_net = 1; }
+                    else if (vn && json_is_number(vn)) { new_net_ndiff = (uint64_t)json_number_value(vn); got_net = 1; }
+                }
+                if (got && new_ndiff > 0) {
+                    pthread_mutex_lock(&ctx->work_lock);
+                    ctx->work_ndiff = new_ndiff;
+                    if (got_net && new_net_ndiff > 0)
+                        ctx->work_net_ndiff = new_net_ndiff;
+                    ctx->work_new = 1;
+                    pthread_cond_signal(&ctx->work_cond);
+                    pthread_mutex_unlock(&ctx->work_lock);
+                    double m = (double)new_ndiff / (double)(1ULL << 48);
+                    if (got_net && new_net_ndiff > 0) {
+                        double mn = (double)new_net_ndiff / (double)(1ULL << 48);
+                        fprintf(stderr, "[stratum] pool set target: %.6f @ %.6f network\n", m, mn);
+                    } else {
+                        fprintf(stderr, "[stratum] pool set share target: %.6f merit\n", m);
+                    }
+                }
+            } else if (json_is_object(params)) {
+                /* blockchain.block.new or generic work notification */
                 parse_work(ctx, params);
             }
         }
@@ -442,6 +529,14 @@ int stratum_poll_new_work(stratum_ctx *ctx, char data_hex[161], uint64_t *ndiff)
     ctx->work_new = 0;
     pthread_mutex_unlock(&ctx->work_lock);
     return 1;
+}
+
+uint64_t stratum_get_net_ndiff(stratum_ctx *ctx) {
+    if (!ctx) return 0;
+    pthread_mutex_lock(&ctx->work_lock);
+    uint64_t nd = ctx->work_net_ndiff;
+    pthread_mutex_unlock(&ctx->work_lock);
+    return nd;
 }
 
 int stratum_submit(stratum_ctx *ctx, const char *block_hex) {

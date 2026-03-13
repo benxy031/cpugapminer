@@ -132,7 +132,8 @@ struct pass_state {
     uint8_t  hdr80[80];   /* 80-byte header from getwork (no nNonce field)     */
     uint32_t nonce;       /* nNonce value making sha_raw[31] >= 0x80           */
     uint16_t nshift;
-    uint64_t ndiff;       /* nDifficulty from getwork response                 */
+    uint64_t ndiff;       /* share target from pool (or nDifficulty for solo)  */
+    uint64_t net_ndiff;   /* network nDifficulty from header bytes 72-79       */
     char     prevhex[65]; /* previous block hash for change detection          */
     uint64_t height;      /* reserved (not available from getwork header)      */
     volatile uint64_t pass_seq;  /* incremented on every new mining pass        */
@@ -1592,6 +1593,7 @@ static int build_mining_pass(const char *url, const char *user, const char *pass
     g_pass.nonce  = nonce;
     g_pass.nshift = (uint16_t)shift;
     g_pass.ndiff  = ndiff;
+    g_pass.net_ndiff = ndiff;  /* solo: share target = network difficulty */
     strncpy(g_pass.prevhex, prevhex, 64);
     g_pass.prevhex[64] = '\0';
     g_pass.height = 0; /* not available from getwork header */
@@ -1871,6 +1873,13 @@ static int build_mining_pass_stratum(const char *data_hex, uint64_t ndiff, int s
     g_pass.nonce  = nonce;
     g_pass.nshift = (uint16_t)shift;
     g_pass.ndiff  = ndiff;
+    /* Extract network nDifficulty from header bytes 72-79 (LE uint64_t) */
+    {
+        uint64_t net_nd = 0;
+        for (int i = 7; i >= 0; i--)
+            net_nd = (net_nd << 8) | hdr80[72 + i];
+        g_pass.net_ndiff = net_nd;
+    }
     strncpy(g_pass.prevhex, prevhex, 64);
     g_pass.prevhex[64] = '\0';
     g_pass.height = 0;
@@ -1879,8 +1888,8 @@ static int build_mining_pass_stratum(const char *data_hex, uint64_t ndiff, int s
        This closes the race window between g_pass update and the caller's
        g_abort_pass = 1 (which is now redundant but harmless). */
     g_abort_pass = 1;
-    log_file_only("build_mining_pass_stratum: nonce=%u ndiff=%llu h256[0..3]=%02x%02x%02x%02x prevhex=%.16s...\n",
-                  nonce, (unsigned long long)ndiff,
+    log_file_only("build_mining_pass_stratum: nonce=%u ndiff=%llu net_ndiff=%llu h256[0..3]=%02x%02x%02x%02x prevhex=%.16s...\n",
+                  nonce, (unsigned long long)ndiff, (unsigned long long)g_pass.net_ndiff,
                   h256[0], h256[1], h256[2], h256[3], prevhex);
     return 1;
 }
@@ -2484,10 +2493,13 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
                             log_msg(">>> SKIPPING invalid PoW (stale pass)\n");
                         } else if (stratum_dedup(blockhex)) {
                             log_msg(">>> SKIPPING duplicate share\n");
-                        } else if (stratum_submit(g_stratum, blockhex))
-                            log_msg(">>> SUBMITTED via stratum\n");
-                        else
+                        } else if (stratum_submit(g_stratum, blockhex)) {
+                            double net_m = ndiff_to_merit(g_pass.net_ndiff);
+                            log_msg(">>> SUBMITTED via stratum%s  merit=%.6f  (net=%.6f)\n",
+                                    (merit >= net_m && net_m > 0) ? " (block)" : "", merit, net_m);
+                        } else {
                             log_msg(">>> stratum submit FAILED\n");
+                        }
                         print_stats();
                     } else {
                         /* Local PoW verification before sending to node */
@@ -3074,7 +3086,9 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
                             } else if (stratum_dedup(blockhex)) {
                                 log_msg(">>> SKIPPING duplicate share\n");
                             } else if (stratum_submit(g_stratum, blockhex)) {
-                                log_msg(">>> SUBMITTED via stratum\n");
+                                double net_m = ndiff_to_merit(g_pass.net_ndiff);
+                                log_msg(">>> SUBMITTED via stratum%s  merit=%.6f  (net=%.6f)\n",
+                                        (merit >= net_m && net_m > 0) ? " (block)" : "", merit, net_m);
                             } else {
                                 log_msg(">>> stratum submit FAILED\n");
                             }
@@ -3426,12 +3440,14 @@ static void *worker_fn(void *arg) {
                                             log_msg(">>> SKIPPING duplicate"
                                                     " share\n");
                                         else if (stratum_submit(g_stratum,
-                                                blockhex))
-                                            log_msg(">>> SUBMITTED via"
-                                                    " stratum\n");
-                                        else
+                                                blockhex)) {
+                                            double net_m = ndiff_to_merit(g_pass.net_ndiff);
+                                            log_msg(">>> SUBMITTED via stratum%s  merit=%.6f  (net=%.6f)\n",
+                                                    (merit >= net_m && net_m > 0) ? " (block)" : "", merit, net_m);
+                                        } else {
                                             log_msg(">>> stratum submit"
                                                     " FAILED\n");
+                                        }
                                         print_stats();
                                     } else {
                                         struct submit_job _job;
@@ -3842,12 +3858,14 @@ static void *worker_fn(void *arg) {
                                                     log_msg(">>> SKIPPING duplicate"
                                                             " share\n");
                                                 else if (stratum_submit(g_stratum,
-                                                        blockhex))
-                                                    log_msg(">>> SUBMITTED via"
-                                                            " stratum\n");
-                                                else
+                                                        blockhex)) {
+                                                    double net_m = ndiff_to_merit(g_pass.net_ndiff);
+                                                    log_msg(">>> SUBMITTED via stratum%s  merit=%.6f  (net=%.6f)\n",
+                                                            (merit >= net_m && net_m > 0) ? " (block)" : "", merit, net_m);
+                                                } else {
                                                     log_msg(">>> stratum submit"
                                                             " FAILED\n");
+                                                }
                                                 print_stats();
                                             } else {
                                                 struct submit_job _job;
@@ -5442,12 +5460,14 @@ int main(int argc, char **argv) {
                                                     log_msg(">>> SKIPPING duplicate"
                                                             " share\n");
                                                 else if (stratum_submit(g_stratum,
-                                                        blockhex))
-                                                    log_msg(">>> SUBMITTED via"
-                                                            " stratum\n");
-                                                else
+                                                        blockhex)) {
+                                                    double net_m = ndiff_to_merit(g_pass.net_ndiff);
+                                                    log_msg(">>> SUBMITTED via stratum%s  merit=%.6f  (net=%.6f)\n",
+                                                            (merit >= net_m && net_m > 0) ? " (block)" : "", merit, net_m);
+                                                } else {
                                                     log_msg(">>> stratum submit"
                                                             " FAILED\n");
+                                                }
                                                 print_stats();
                                             } else {
                                                 struct submit_job _job;

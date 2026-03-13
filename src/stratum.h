@@ -48,6 +48,11 @@ int stratum_poll_new_work(stratum_ctx *ctx, char data_hex[161], uint64_t *ndiff)
    Returns 1 on success (queued), 0 on failure. */
 int stratum_submit(stratum_ctx *ctx, const char *block_hex);
 
+/* Get the network nDifficulty extracted from the block header (bytes 72-79).
+   This is the difficulty required for a valid block (may differ from the
+   pool's share target returned by get_work/poll_new_work). */
+uint64_t stratum_get_net_ndiff(stratum_ctx *ctx);
+
 /* Get cumulative accepted/rejected share counts. */
 void stratum_get_stats(stratum_ctx *ctx, uint64_t *accepted, uint64_t *rejected);
 
