@@ -3520,7 +3520,7 @@ static void *worker_fn(void *arg) {
                             crt_fermat_threads,
                             (unsigned long)prim_bits, shift_local, gap_scan_max,
                             crt_bytes, (double)crt_bytes / 1024.0,
-                            CRT_HEAP_CAP);
+                            (int)crt_heap_cap);
                 else
                     log_msg("CRT mining (%dT): primorial~2^%lu  shift=%d"
                             "  gap_scan=%d  sieve_bitmap=%zu bytes (%.1f KB)\n",
@@ -4671,6 +4671,7 @@ int main(int argc, char **argv) {
         printf("      --crt-file FILE   load CRT sieve file (binary template or text gap-solver)\n");
         printf("      --fermat-threads N  number of Fermat testing threads for CRT producer-consumer\n");
         printf("                          default: auto = threads-1 for CRT solver with threads>=3\n");
+        printf("      --heap N          max pending CRT windows in heap (default: 4096)\n");
         printf("      --keep-going      continue after block found (default on)\n");
         printf("      --stop-after-block  exit after first valid block\n");
         printf("      --log-file FILE   append messages to FILE\n");
@@ -4797,6 +4798,10 @@ int main(int argc, char **argv) {
         else if ((!strcmp(argv[i],"--fermat-threads") || !strcmp(argv[i],"-d")) && i+1<argc) {
             crt_fermat_threads = atoi(argv[++i]);
             crt_fermat_explicit = 1;
+        }
+        else if (!strcmp(argv[i],"--heap") && i+1<argc) {
+            int hv = atoi(argv[++i]);
+            if (hv > 0) crt_heap_init((size_t)hv);
         }
         else if (!strcmp(argv[i],"--p") && i+1<argc) build_p = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i],"--q") && i+1<argc) build_q = strtoull(argv[++i], NULL, 10);
@@ -4965,6 +4970,9 @@ int main(int argc, char **argv) {
         log_msg("clamped fermat-threads=%d (need at least 1 sieve thread)\n",
                 crt_fermat_threads);
     }
+    /* Ensure heap is allocated (crt_heap_init may not have been called yet) */
+    if (g_crt_mode == CRT_MODE_SOLVER && crt_fermat_threads > 0)
+        crt_heap_init(crt_heap_cap);
 
     /* ── CUDA GPU initialization ── */
 #ifdef WITH_CUDA

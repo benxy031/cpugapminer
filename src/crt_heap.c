@@ -8,8 +8,9 @@
 #include <stdlib.h>
 #include <time.h>
 
-static struct crt_work_item *crt_heap[CRT_HEAP_CAP];
+static struct crt_work_item **crt_heap = NULL;
 static size_t crt_heap_size = 0;
+size_t crt_heap_cap = CRT_HEAP_CAP;
 static pthread_mutex_t crt_heap_mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t crt_heap_cv = PTHREAD_COND_INITIALIZER;
 
@@ -17,6 +18,22 @@ volatile uint64_t crt_heap_gen = 0;
 volatile int crt_fermat_threads = 0;
 int crt_fermat_explicit = 0;
 _Atomic int crt_heap_shutdown = 0;
+
+void crt_heap_init(size_t cap) {
+    pthread_mutex_lock(&crt_heap_mtx);
+    if (cap == 0) cap = CRT_HEAP_CAP;
+    if (crt_heap) {
+        /* already allocated — flush and resize */
+        for (size_t i = 0; i < crt_heap_size; i++)
+            crt_work_free(crt_heap[i]);
+        crt_heap_size = 0;
+        free(crt_heap);
+    }
+    crt_heap_cap = cap;
+    crt_heap = (struct crt_work_item **)calloc(crt_heap_cap,
+                                               sizeof(struct crt_work_item *));
+    pthread_mutex_unlock(&crt_heap_mtx);
+}
 
 struct crt_work_item *crt_work_alloc(void) {
     struct crt_work_item *w = calloc(1, sizeof(*w));
@@ -63,7 +80,13 @@ static void crt_heap_sift_down(size_t i, size_t n) {
 
 int crt_heap_push(struct crt_work_item *w) {
     pthread_mutex_lock(&crt_heap_mtx);
-    if (crt_heap_size < CRT_HEAP_CAP) {
+    /* lazy init in case crt_heap_init() was never called */
+    if (!crt_heap) {
+        crt_heap = (struct crt_work_item **)calloc(crt_heap_cap,
+                                                   sizeof(struct crt_work_item *));
+        if (!crt_heap) { pthread_mutex_unlock(&crt_heap_mtx); crt_work_free(w); return 0; }
+    }
+    if (crt_heap_size < crt_heap_cap) {
         crt_heap[crt_heap_size] = w;
         crt_heap_sift_up(crt_heap_size);
         crt_heap_size++;

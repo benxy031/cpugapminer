@@ -6,7 +6,9 @@
 #include <stddef.h>
 #include <gmp.h>
 
-#define CRT_HEAP_CAP 4096
+#define CRT_HEAP_CAP 4096   /* default; override with crt_heap_init() */
+
+extern size_t crt_heap_cap;   /* effective capacity (set by crt_heap_init) */
 
 struct crt_work_item {
     mpz_t    base;
@@ -26,6 +28,7 @@ extern volatile int crt_fermat_threads;
 extern int crt_fermat_explicit;
 extern _Atomic int crt_heap_shutdown;
 
+void crt_heap_init(size_t cap);   /* call once before mining; 0 = use default */
 struct crt_work_item *crt_work_alloc(void);
 void crt_work_free(struct crt_work_item *w);
 int crt_heap_push(struct crt_work_item *w);
