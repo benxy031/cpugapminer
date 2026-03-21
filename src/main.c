@@ -500,15 +500,21 @@ static void tile_crt_template(uint8_t *sieve, size_t sieve_bytes,
 
 /* ── Pre-sieve template: init + tile ── */
 static void presieve_template_init(void) {
-    g_presieve_bytes = (PRESIEVE_PERIOD + 7) / 8;
+    /* The bit-level period is 255255 (odd → not a multiple of 8).
+       A single-period template (31907 bytes = 255256 bits) drifts by 1 bit
+       every byte-level wrap, corrupting the sieve after ~130 wraps.
+       Fix: store 8 copies of the period → 8×255255 = 2042040 bits = 255255
+       bytes exactly.  Byte-level tiling now wraps with zero drift. */
+    g_presieve_bytes = PRESIEVE_PERIOD;   /* 255255 bytes = 8 bit-periods */
     g_presieve_tmpl = (uint8_t *)calloc(1, g_presieve_bytes);
     if (!g_presieve_tmpl) return;
     static const uint64_t ps[] = {3, 5, 7, 11, 13, 17};
+    const uint64_t total_bits = (uint64_t)PRESIEVE_PERIOD * 8;
     for (int i = 0; i < 6; i++) {
         uint64_t p = ps[i];
         /* Position j represents odd value (2j+1).
            (2j+1) ≡ 0 (mod p) ⟺ j ≡ (p-1)/2 (mod p). */
-        for (uint64_t j = (p - 1) / 2; j < PRESIEVE_PERIOD; j += p)
+        for (uint64_t j = (p - 1) / 2; j < total_bits; j += p)
             g_presieve_tmpl[j >> 3] |= (uint8_t)(1u << (j & 7));
     }
 }
