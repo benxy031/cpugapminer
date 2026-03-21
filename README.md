@@ -49,11 +49,10 @@ scripts/
   inspect_tx.py     - Python utility to decode raw block/transaction hex
                       files written to /tmp by the miner
 crt/
-  crt_s64_m21.txt   - production CRT file: 15 primes, shift 64, merit 21
+  crt_s*_m*.txt      - CRT sieve files: shifts 25–1024, merit targets 21–25
+                      (e.g. crt_s128_m22.txt = shift 128, merit 22)
   crt_7.bin          - legacy binary CRT template (7 primes)
   crt_8.bin          - legacy binary CRT template (8 primes)
-  crt_s512_m22.txt   - CRT file: 75 primes, shift 512, merit 22
-  crt_s640_m22.txt   - CRT file: 89 primes, shift 640, merit 22
 Makefile
 ```
 
@@ -421,8 +420,11 @@ When `adder` reaches `adder-max` the loop wraps and continues (default
 ### Sieve and gap scan
 
 The segmented sieve pre-filters candidates using up to `--sieve-primes` small
-primes (default 900 000).  The sieve reuses a thread-local buffer for
-primes and their logarithms to avoid repeated allocation overhead.
+primes (default 900 000).  A precomputed **presieve template** eliminates
+multiples of the first 6 odd primes (3–17) via a single byte-level tile
+copy, then the remaining sieve primes are applied on top.  The sieve
+reuses a thread-local buffer for primes and their logarithms to avoid
+repeated allocation overhead.
 
 Qualifying candidates are passed to `scan_candidates()`, which:
 
@@ -790,6 +792,13 @@ gap scanning.  Multiple GPUs are supported via `--cuda 0,1`.
     send entire sieve windows directly to the GPU.  Cooperative Fermat
     is disabled when GPU is active so the helper thread only sieves.
     Multiple GPUs supported via `--cuda 0,1` with round-robin dispatch.
+
+11. **Presieve template** -- A 249 KB precomputed bitmap marks all
+    multiples of {3, 5, 7, 11, 13, 17} (product = 510 510, bit-period
+    255 255).  The template stores 8 bit-periods so that byte-level
+    `memcpy` tiling wraps with zero bit-drift.  Replaces 6 per-prime
+    sieve passes with a single `memcpy` + shift, cutting sieve setup
+    time for each window.
 
 > **Historical note:** an earlier Barrett-reduction path for fast modular
 > exponentiation contained a correctness bug for large moduli and was
