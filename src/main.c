@@ -190,6 +190,7 @@ static volatile int debug_force = 0;    /* if nonzero, pretend any header meets 
    the full deterministic Miller‑Rabin.  This is faster but may misclassify a
    tiny number of composites as primes; use with --fast-fermat. */
 static volatile int use_fast_fermat = 0;
+static volatile int use_mr_verify = 0;   /* MR base-3 verify Fermat survivors */
 static volatile int no_primality = 0;   /* skip all probable‑prime filtering */
 static volatile int selftest = 0;        /* run a quick internal test then exit */
 
@@ -2046,6 +2047,9 @@ static __thread mpz_t  tls_cand_mpz;       /* candidate = base + offset */
 static __thread mpz_t  tls_two_mpz;        /* constant 2 (Fermat base)  */
 static __thread mpz_t  tls_exp_mpz;        /* n-1 exponent for Fermat   */
 static __thread mpz_t  tls_res_mpz;        /* powm result               */
+static __thread mpz_t  tls_mr_d;           /* MR: odd part of n-1       */
+static __thread mpz_t  tls_mr_x;           /* MR: witness accumulator   */
+static __thread mpz_t  tls_mr_nm1;         /* MR: n-1                   */
 static __thread int    tls_gmp_inited = 0;  /* 0 until first init       */
 /* Last offset represented by tls_cand_mpz.  Lets us update candidate with
     a cheap +delta when offsets are monotonic (common in sieve scans). */
@@ -2089,6 +2093,9 @@ static void ensure_gmp_tls(void) {
         mpz_init_set_ui(tls_two_mpz, 2);
         mpz_init2(tls_exp_mpz, 384);
         mpz_init2(tls_res_mpz, 384);
+        mpz_init2(tls_mr_d, 384);
+        mpz_init2(tls_mr_x, 384);
+        mpz_init2(tls_mr_nm1, 384);
         tls_gmp_inited = 1;
     }
 }
@@ -2252,6 +2259,29 @@ static inline void crt_filter_step_residues(void) {
  *     redundant — our candidates already survived a million-prime sieve).
  *  B. Full: mpz_probab_prime_p(n, 10) — 10 MR rounds.
  */
+/* Single-round Miller-Rabin with base 3 on tls_cand_mpz.
+   Call after tls_cand_mpz is set to the candidate.
+   Returns 1 if probably prime, 0 if definitely composite. */
+static int mr_verify_cand(void) {
+    mpz_sub_ui(tls_mr_nm1, tls_cand_mpz, 1);
+    unsigned long s = mpz_scan1(tls_mr_nm1, 0);
+    mpz_tdiv_q_2exp(tls_mr_d, tls_mr_nm1, s);
+    mpz_set_ui(tls_mr_x, 3);
+    mpz_powm(tls_mr_x, tls_mr_x, tls_mr_d, tls_cand_mpz);
+    if (mpz_cmp_ui(tls_mr_x, 1) == 0 ||
+        mpz_cmp(tls_mr_x, tls_mr_nm1) == 0)
+        return 1;
+    for (unsigned long i = 1; i < s; i++) {
+        mpz_mul(tls_mr_x, tls_mr_x, tls_mr_x);
+        mpz_mod(tls_mr_x, tls_mr_x, tls_cand_mpz);
+        if (mpz_cmp(tls_mr_x, tls_mr_nm1) == 0)
+            return 1;
+        if (mpz_cmp_ui(tls_mr_x, 1) == 0)
+            return 0;
+    }
+    return 0;
+}
+
 static int bn_candidate_is_prime(uint64_t offset) {
     /* Fast memoization hit: same offset for current base. */
     {
@@ -2299,6 +2329,9 @@ static int bn_candidate_is_prime(uint64_t offset) {
         mpz_sub_ui(tls_exp_mpz, tls_cand_mpz, 1);
         mpz_powm(tls_res_mpz, tls_two_mpz, tls_exp_mpz, tls_cand_mpz);
         is_prime = (mpz_cmp_ui(tls_res_mpz, 1) == 0);
+        /* MR base-3 verification catches Fermat pseudoprimes */
+        if (is_prime && use_mr_verify)
+            is_prime = mr_verify_cand();
     } else {
         /* Probable-prime: cli_mr_rounds MR rounds (default 2; old = 10).
            2 rounds is effectively deterministic for sieve-filtered
@@ -2316,6 +2349,7 @@ static int bn_candidate_is_prime(uint64_t offset) {
 }
 
 #ifdef WITH_GPU_FERMAT
+
 /* GPU batch primality filter.
    Takes the thread-local base (tls_base_mpz) and an array of uint64
    offsets.  Sends (base + offset[i]) for each i to the GPU for Fermat
@@ -2613,6 +2647,19 @@ static size_t crt_bkscan_and_submit(
             uint64_t gap = end_off - start_off;
             double merit = (double)gap / logbase;
 
+            /* MR base-3 boundary verification for CRT backward-scan path */
+            if (use_mr_verify) {
+                ensure_gmp_tls();
+                mpz_set(tls_cand_mpz, tls_base_mpz);
+                mpz_add_ui(tls_cand_mpz, tls_cand_mpz, start_off);
+                tls_cand_last_valid = 0;
+                if (!mr_verify_cand()) continue;
+                mpz_set(tls_cand_mpz, tls_base_mpz);
+                mpz_add_ui(tls_cand_mpz, tls_cand_mpz, end_off);
+                tls_cand_last_valid = 0;
+                if (!mr_verify_cand()) continue;
+            }
+
             __sync_fetch_and_add(&stats_gaps, 1);
 
             mpz_t nAdd_prime;
@@ -2733,6 +2780,24 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
             stats_best_gap   = gap;
         }
         if (merit < target) continue;
+
+        /* MR base-3 boundary verification for CRT GPU path */
+        if (use_mr_verify) {
+            ensure_gmp_tls();
+            /* Verify gap start prime: nAdd + primes[i] */
+            mpz_set(tls_cand_mpz, nAdd);
+            mpz_add_ui(tls_cand_mpz, tls_cand_mpz, primes[i]);
+            if (cand_odd) mpz_sub_ui(tls_cand_mpz, tls_cand_mpz, 1);
+            tls_cand_last_valid = 0;
+            if (!mr_verify_cand()) continue;
+            /* Verify gap end prime: nAdd + primes[i+1] */
+            mpz_set(tls_cand_mpz, nAdd);
+            mpz_add_ui(tls_cand_mpz, tls_cand_mpz, primes[i + 1]);
+            if (cand_odd) mpz_sub_ui(tls_cand_mpz, tls_cand_mpz, 1);
+            tls_cand_last_valid = 0;
+            if (!mr_verify_cand()) continue;
+        }
+
         __sync_fetch_and_add(&stats_gaps, 1);
         mpz_t nAdd_prime;
         mpz_init(nAdd_prime);
@@ -3031,6 +3096,7 @@ static void gpu_accum_collect(struct gpu_accum *a) {
             mpz_clear(w->nAdd);
             continue;
         }
+        ensure_gmp_tls();
         size_t pf = 0;
         for (size_t j = 0; j < w->cand_count; j++) {
             if (b->results[w->cand_start + j])
@@ -3330,6 +3396,29 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
             }
         }
 
+        /* MR base-3 boundary verification: confirm both gap endpoints
+           are truly prime, not Fermat pseudoprimes that split a real gap.
+           Only ~2-4 MR calls per qualifying gap — zero GPU overhead. */
+        if (use_mr_verify) {
+            ensure_gmp_tls();
+            mpz_set(tls_cand_mpz, tls_base_mpz);
+            mpz_add_ui(tls_cand_mpz, tls_cand_mpz, prev);
+            tls_cand_last_valid = 0;
+            if (!mr_verify_cand()) {
+                log_msg("[mr_verify] pseudoprime at gap start nAdd=%llu\n",
+                        (unsigned long long)prev);
+                continue;
+            }
+            mpz_set(tls_cand_mpz, tls_base_mpz);
+            mpz_add_ui(tls_cand_mpz, tls_cand_mpz, q);
+            tls_cand_last_valid = 0;
+            if (!mr_verify_cand()) {
+                log_msg("[mr_verify] pseudoprime at gap end nAdd=%llu\n",
+                        (unsigned long long)q);
+                continue;
+            }
+        }
+
         __sync_fetch_and_add(&stats_gaps, 1);
         /* nAdd = relative offset = prev (prime = base + nAdd). */
         uint64_t nadd_sc = prev;
@@ -3555,6 +3644,9 @@ static void *presieve_helper_fn(void *arg) {
         mpz_clear(tls_two_mpz);
         mpz_clear(tls_exp_mpz);
         mpz_clear(tls_res_mpz);
+        mpz_clear(tls_mr_d);
+        mpz_clear(tls_mr_x);
+        mpz_clear(tls_mr_nm1);
         tls_gmp_inited = 0;
     }
     free(ctx->coop.out);  /* release coop output buffer */
@@ -3656,6 +3748,9 @@ static void *worker_fn(void *arg) {
                 mpz_clear(tls_two_mpz);
                 mpz_clear(tls_exp_mpz);
                 mpz_clear(tls_res_mpz);
+                mpz_clear(tls_mr_d);
+                mpz_clear(tls_mr_x);
+                mpz_clear(tls_mr_nm1);
                 tls_gmp_inited = 0;
             }
             return NULL;
@@ -4012,6 +4107,9 @@ static void *worker_fn(void *arg) {
             mpz_clear(tls_two_mpz);
             mpz_clear(tls_exp_mpz);
             mpz_clear(tls_res_mpz);
+            mpz_clear(tls_mr_d);
+            mpz_clear(tls_mr_x);
+            mpz_clear(tls_mr_nm1);
             tls_gmp_inited = 0;
         }
         return NULL;
@@ -4187,8 +4285,6 @@ static void *worker_fn(void *arg) {
             size_t p1_cnt = 0, p1_wcap = 0;
 #endif
             uint64_t *p1_cands = NULL, *p1_wbuf = NULL;
-
-
 
             if (use_smart) {
                 needed_gap = (size_t)(target_local * logbase);
@@ -4717,6 +4813,9 @@ worker_done:
         mpz_clear(tls_two_mpz);
         mpz_clear(tls_exp_mpz);
         mpz_clear(tls_res_mpz);
+        mpz_clear(tls_mr_d);
+        mpz_clear(tls_mr_x);
+        mpz_clear(tls_mr_nm1);
         tls_gmp_inited = 0;
     }
     return NULL;
@@ -4744,6 +4843,7 @@ int main(int argc, char **argv) {
         printf("      --fast-fermat     fast primality (fewer Miller-Rabin rounds)\n");
         printf("      --sample-stride K smart scan: test every Kth survivor (default: 8, 1=off)\n");
         printf("      --mr-rounds N     Miller-Rabin rounds for primality  (default: 2)\n");
+        printf("      --mr-verify       MR base-3 verify Fermat/GPU survivors (catches pseudoprimes)\n");
         printf("      --crt-file FILE   load CRT sieve file (binary template or text gap-solver)\n");
         printf("      --fermat-threads N  number of Fermat testing threads for CRT producer-consumer\n");
         printf("                          default: auto = threads-1 for CRT solver with threads>=3\n");
@@ -4824,6 +4924,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--no-opreturn")) no_opreturn = 1;
         else if (!strcmp(argv[i],"--force-solution")) debug_force = 1;
         else if (!strcmp(argv[i],"--fast-fermat")) use_fast_fermat = 1;
+        else if (!strcmp(argv[i],"--mr-verify")) use_mr_verify = 1;
         else if (!strcmp(argv[i],"--cuda")) {
             use_cuda = 1;
             if (i+1 < argc && argv[i+1][0] != '-') {
@@ -5287,7 +5388,8 @@ int main(int argc, char **argv) {
     else
         log_msg("miner configured to exit when a valid block is found\n");
     if (use_fast_fermat)
-        log_msg("fast Fermat: GMP mpz_powm base-2 (--fast-fermat)\n");
+        log_msg("fast Fermat: GMP mpz_powm base-2 (--fast-fermat)%s\n",
+                use_mr_verify ? " + MR base-3 verify (--mr-verify)" : "");
     else
         log_msg("Miller-Rabin rounds: %d (--mr-rounds to change)\n", cli_mr_rounds);
 
