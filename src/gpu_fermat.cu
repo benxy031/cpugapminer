@@ -251,10 +251,13 @@ __global__ void fermat_kernel_t(const uint64_t * __restrict__ cands,
 }
 
 /* ── Kernel dispatch: launch the narrowest specialization that fits ──
-   Candidates are stored with NL limbs each, but the kernel only
+   Candidates are stored at active_limbs stride, and the kernel
    operates on AL limbs.  Speedup ≈ (NL/AL)² from Montgomery mul.
 
-   Specializations: 5, 6, 8, 10, 12, 16 (and 20 if NL ≥ 20).
+   Specializations: every integer from 5 to 20 (and NL as fallback).
+   IMPORTANT: stride == active_limbs, so every possible AL value must
+   have an exact dispatch entry.  A gap (e.g. AL=7 dispatching to
+   template<8>) would read past each candidate into the next one's data.
    E.g. shift 43 → AL=5 → montmul does 5²=25 ops vs 16²=256.       */
 static __host__ __forceinline__
 int fermat_block_size_for_al(int al)
@@ -284,17 +287,44 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
 #if NL >= 6
     if (al <= 6)  { FERMAT_DISPATCH(6);  }
 #endif
+#if NL >= 7
+    if (al <= 7)  { FERMAT_DISPATCH(7);  }
+#endif
 #if NL >= 8
     if (al <= 8)  { FERMAT_DISPATCH(8);  }
+#endif
+#if NL >= 9
+    if (al <= 9)  { FERMAT_DISPATCH(9);  }
 #endif
 #if NL >= 10
     if (al <= 10) { FERMAT_DISPATCH(10); }
 #endif
+#if NL >= 11
+    if (al <= 11) { FERMAT_DISPATCH(11); }
+#endif
 #if NL >= 12
     if (al <= 12) { FERMAT_DISPATCH(12); }
 #endif
+#if NL >= 13
+    if (al <= 13) { FERMAT_DISPATCH(13); }
+#endif
+#if NL >= 14
+    if (al <= 14) { FERMAT_DISPATCH(14); }
+#endif
+#if NL >= 15
+    if (al <= 15) { FERMAT_DISPATCH(15); }
+#endif
 #if NL >= 16
     if (al <= 16) { FERMAT_DISPATCH(16); }
+#endif
+#if NL >= 17
+    if (al <= 17) { FERMAT_DISPATCH(17); }
+#endif
+#if NL >= 18
+    if (al <= 18) { FERMAT_DISPATCH(18); }
+#endif
+#if NL >= 19
+    if (al <= 19) { FERMAT_DISPATCH(19); }
 #endif
 #if NL >= 20
     if (al <= 20) { FERMAT_DISPATCH(20); }
