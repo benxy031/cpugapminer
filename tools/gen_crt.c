@@ -193,6 +193,109 @@ static int local_search_one(int *offsets, int n_primes, int gap_size,
     return changed;
 }
 
+/* ------------------------------------------------------------------ */
+/* Pair local search: jointly optimise two primes (idx_a, idx_b).     */
+/* For every candidate offset of prime a, finds the best offset of    */
+/* prime b given the remaining primes.  Keeps the (a, b) pair that    */
+/* minimises total uncovered positions.  Returns 1 if any changed.    */
+/* Uses two caller-owned buffers: base_buf and work_buf.              */
+/* ------------------------------------------------------------------ */
+static int local_search_pair(int *offsets, int n_primes, int gap_size,
+                             int idx_a, int idx_b,
+                             uint8_t *base_buf, uint8_t *work_buf) {
+    int pa = PRIMES[idx_a], pb = PRIMES[idx_b];
+
+    /* build base coverage excluding both idx_a and idx_b */
+    memset(base_buf, 0, (size_t)(gap_size + 1));
+    for (int i = 0; i < n_primes; i++) {
+        if (i == idx_a || i == idx_b) continue;
+        int p = PRIMES[i];
+        int o = offsets[i] % p;
+        for (int d = (o ? o : p); d <= gap_size; d += p)
+            base_buf[d] = 1;
+    }
+
+    int best_oa = offsets[idx_a];
+    int best_ob = offsets[idx_b];
+    int best_uncov = INT_MAX;
+
+    for (int oa = 0; oa < pa; oa++) {
+        /* overlay prime a onto base coverage */
+        memcpy(work_buf, base_buf, (size_t)(gap_size + 1));
+        for (int d = (oa ? oa : pa); d <= gap_size; d += pa)
+            work_buf[d] = 1;
+
+        /* find best offset for prime b given base + a */
+        int local_best_ob = 0, local_best_new = -1;
+        for (int ob = 0; ob < pb; ob++) {
+            int cnt = 0;
+            for (int d = (ob ? ob : pb); d <= gap_size; d += pb)
+                if (!work_buf[d]) cnt++;
+            if (cnt > local_best_new) {
+                local_best_new = cnt;
+                local_best_ob  = ob;
+            }
+        }
+
+        /* count total uncovered = positions not hit by base + a + best_b */
+        int uncov = 0;
+        for (int d = 1; d <= gap_size; d++) {
+            if (!work_buf[d]) {
+                /* check if prime b covers this position */
+                if (d % pb != local_best_ob)
+                    uncov++;
+            }
+        }
+
+        if (uncov < best_uncov) {
+            best_uncov = uncov;
+            best_oa = oa;
+            best_ob = local_best_ob;
+        }
+    }
+
+    int changed = (best_oa != offsets[idx_a] || best_ob != offsets[idx_b]);
+    offsets[idx_a] = best_oa;
+    offsets[idx_b] = best_ob;
+    return changed;
+}
+
+/* ------------------------------------------------------------------ */
+/* Full single-prime sweep: optimise every non-fixed prime in order,   */
+/* repeating until no offset changes.  Returns total changes made.     */
+/* ------------------------------------------------------------------ */
+static int local_search_sweep(int *offsets, int n_primes, int gap_size,
+                              int fixed, uint8_t *buf) {
+    int total = 0;
+    for (;;) {
+        int changed = 0;
+        for (int i = fixed; i < n_primes; i++)
+            changed += local_search_one(offsets, n_primes, gap_size, i, buf);
+        total += changed;
+        if (!changed) break;
+    }
+    return total;
+}
+
+/* ------------------------------------------------------------------ */
+/* Exhaustive pair sweep: try all C(nfree, 2) pairs, repeating until  */
+/* no pair improves.  Returns total changes made.                      */
+/* ------------------------------------------------------------------ */
+static int pair_search_sweep(int *offsets, int n_primes, int gap_size,
+                             int fixed, uint8_t *buf, uint8_t *buf2) {
+    int total = 0;
+    for (;;) {
+        int changed = 0;
+        for (int i = fixed; i < n_primes; i++)
+            for (int j = i + 1; j < n_primes; j++)
+                changed += local_search_pair(offsets, n_primes, gap_size,
+                                             i, j, buf, buf2);
+        total += changed;
+        if (!changed) break;
+    }
+    return total;
+}
+
 /* forward declarations (needed by evolve) */
 static int evaluate(const int *offsets, int n_primes, int gap_size,
                     uint8_t *buf);
@@ -200,6 +303,13 @@ static void greedy_solve(int *offsets, int n_primes, int gap_size,
                          uint8_t *buf);
 static int local_search_one(int *offsets, int n_primes, int gap_size,
                             int idx, uint8_t *buf);
+static int local_search_pair(int *offsets, int n_primes, int gap_size,
+                             int idx_a, int idx_b,
+                             uint8_t *base_buf, uint8_t *work_buf);
+static int local_search_sweep(int *offsets, int n_primes, int gap_size,
+                              int fixed, uint8_t *buf);
+static int pair_search_sweep(int *offsets, int n_primes, int gap_size,
+                             int fixed, uint8_t *buf, uint8_t *buf2);
 
 /* ------------------------------------------------------------------ */
 /* Evolutionary algorithm                                              */
@@ -210,7 +320,8 @@ static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
                    int fixed, int max_gens) {
     int     *child = (int *)malloc((size_t)n_primes * sizeof(int));
     uint8_t *buf   = (uint8_t *)calloc((size_t)(gap_size + 1), 1);
-    if (!child || !buf) { perror("alloc"); exit(1); }
+    uint8_t *buf2  = (uint8_t *)calloc((size_t)(gap_size + 1), 1);
+    if (!child || !buf || !buf2) { perror("alloc"); exit(1); }
 
     int best_ever = INT_MAX;
     for (int i = 0; i < pop_size; i++)
@@ -235,16 +346,27 @@ static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
                                          : pop[p2].offsets[i];
         }
 
-        /* random mutation: ~2/n probability per non-fixed prime */
+        /* random mutation: adaptive rate — ramp up when stale */
+        int mut_thresh = (stale > 10000) ? n_primes / 2 : 2;
         for (int i = fixed; i < n_primes; i++) {
-            if (rand() % n_primes < 2)
+            if (rand() % n_primes < mut_thresh)
                 child[i] = rand() % PRIMES[i];
         }
 
         /* local-search refinement (10% of generations) */
         if (rand() % 10 == 0 && fixed < n_primes) {
-            int idx = fixed + rand() % (n_primes - fixed);
-            local_search_one(child, n_primes, gap_size, idx, buf);
+            int nfree = n_primes - fixed;
+            if (nfree >= 2 && rand() % 2 == 0) {
+                /* pair search: jointly optimise two random primes */
+                int ia = fixed + rand() % nfree;
+                int ib = fixed + rand() % nfree;
+                while (ib == ia) ib = fixed + rand() % nfree;
+                local_search_pair(child, n_primes, gap_size,
+                                  ia, ib, buf, buf2);
+            } else {
+                int idx = fixed + rand() % nfree;
+                local_search_one(child, n_primes, gap_size, idx, buf);
+            }
         }
 
         /* evaluate */
@@ -282,6 +404,7 @@ static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
     fprintf(stderr, "\n");
     free(child);
     free(buf);
+    free(buf2);
 }
 
 /* ------------------------------------------------------------------ */
@@ -520,6 +643,86 @@ int main(int argc, char **argv) {
             if (gens > 2000000) gens = 2000000;
 
             evolve(pop, pop_size, np, gs, adj_fixed, gens);
+        }
+
+        /* ---- Phase 3: Iterated Local Search (ILS) ---- */
+        /* Take the best solution, apply full sweeps + pair sweeps,     */
+        /* then repeatedly perturb 3-5 offsets and re-sweep.            */
+        {
+            uint8_t *ils_buf  = (uint8_t *)calloc((size_t)(gs + 1), 1);
+            uint8_t *ils_buf2 = (uint8_t *)calloc((size_t)(gs + 1), 1);
+            int     *ils_work = (int *)malloc((size_t)np * sizeof(int));
+            if (!ils_buf || !ils_buf2 || !ils_work) {
+                perror("alloc"); exit(1);
+            }
+
+            /* find current best */
+            int bi = 0;
+            for (int i = 1; i < pop_size; i++)
+                if (pop[i].n_candidates < pop[bi].n_candidates)
+                    bi = i;
+
+            /* initial full sweep + pair sweep on best */
+            local_search_sweep(pop[bi].offsets, np, gs,
+                               ctr_fixed < np ? ctr_fixed : np, ils_buf);
+            pair_search_sweep(pop[bi].offsets, np, gs,
+                              ctr_fixed < np ? ctr_fixed : np,
+                              ils_buf, ils_buf2);
+            pop[bi].n_candidates = evaluate(pop[bi].offsets, np, gs, ils_buf);
+
+            int ils_best = pop[bi].n_candidates;
+            int ils_fixed = ctr_fixed < np ? ctr_fixed : np;
+            int nfree = np - ils_fixed;
+
+            /* ILS rounds: perturb + re-sweep */
+            int ils_rounds = nfree * nfree * 20;
+            if (ils_rounds < 500)    ils_rounds = 500;
+            if (ils_rounds > 100000) ils_rounds = 100000;
+            int ils_stale = 0;
+
+            for (int r = 0; r < ils_rounds; r++) {
+                /* copy best solution */
+                memcpy(ils_work, pop[bi].offsets,
+                       (size_t)np * sizeof(int));
+
+                /* perturb 3-5 random non-fixed offsets */
+                int nkick = 3 + rand() % 3;
+                if (nkick > nfree) nkick = nfree;
+                for (int k = 0; k < nkick; k++) {
+                    int idx = ils_fixed + rand() % nfree;
+                    ils_work[idx] = rand() % PRIMES[idx];
+                }
+
+                /* re-sweep: single then pair */
+                local_search_sweep(ils_work, np, gs, ils_fixed, ils_buf);
+                pair_search_sweep(ils_work, np, gs, ils_fixed,
+                                  ils_buf, ils_buf2);
+                int nc = evaluate(ils_work, np, gs, ils_buf);
+
+                if (nc < ils_best) {
+                    memcpy(pop[bi].offsets, ils_work,
+                           (size_t)np * sizeof(int));
+                    pop[bi].n_candidates = nc;
+                    ils_best = nc;
+                    ils_stale = 0;
+                } else {
+                    ils_stale++;
+                }
+
+                if ((r + 1) % 50 == 0 || r == ils_rounds - 1) {
+                    fprintf(stderr,
+                        "\r  ILS: %d/%d rounds  best=%d  stale=%d     ",
+                        r + 1, ils_rounds, ils_best, ils_stale);
+                    fflush(stderr);
+                }
+
+                if (ils_stale > ils_rounds / 3 && ils_stale > 200) break;
+            }
+            fprintf(stderr, "\n");
+
+            free(ils_work);
+            free(ils_buf2);
+            free(ils_buf);
         }
 
         /* ---- find best in population ---- */
