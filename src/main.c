@@ -655,8 +655,23 @@ static void print_stats(void) {
         uint64_t crt_p = stats_primes_found;
         double win_rate = (elapsed > 0.001) ? (double)crt_w / elapsed : 0.0;
         double ppw = (crt_w > 0) ? (double)crt_p / (double)crt_w : 0.0;
-        log_msg("  windows=%llu (%.1f/s)  primes/win=%.1f",
-                (unsigned long long)crt_w, win_rate, ppw);
+        /* CRT ETA: Cramér model — same as network ETA but targeting
+           CRT merit instead of network difficulty.
+           P(gap ≥ G between consecutive primes near N) = e^{-G/ln(N)}
+           = e^{-merit}.  Each window has ~ppw primes giving ~ppw pairs,
+           so pairs_rate already captures CRT throughput.
+           ETA = 1 / (pairs_rate × e^{-crt_merit}).  */
+        char crt_est_buf[64] = "n/a";
+        if (pairs_rate > 0 && g_crt_merit > 0) {
+            double crt_prob = exp(-g_crt_merit);
+            if (crt_prob > 0) {
+                double crt_est_sec = 1.0 / (pairs_rate * crt_prob);
+                format_est(crt_est_buf, sizeof(crt_est_buf), crt_est_sec);
+            }
+        }
+        log_msg("  windows=%llu (%.1f/s)  primes/win=%.1f  crt_est=%s (merit>=%.1f)",
+                (unsigned long long)crt_w, win_rate, ppw,
+                crt_est_buf, g_crt_merit);
         if (crt_fermat_threads > 0)
             log_msg("  gaplist=%lu", (unsigned long)crt_heap_count());
     }
