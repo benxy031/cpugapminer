@@ -9,17 +9,24 @@ CRT files pre-compute optimal prime offsets so the miner can constrain
 which `nAdd` values to test, replacing the normal windowed sieve with
 a much smaller set of CRT-aligned candidates.
 
-The `gen_crt` tool uses a two-phase algorithm:
+The `gen_crt` tool uses a three-phase algorithm compatible with GapMiner --calc-ctr parameters:
 
 1. **Greedy phase** — assigns each CRT prime an offset that covers the
    most uncovered positions in the target gap range. Repeated many times
    with random tie-breaking (`--ctr-strength`).
 2. **Evolutionary phase** — refines the greedy population through
    tournament selection, crossover, mutation, and local-search
-   (`--ctr-evolution`).
+   (`--ctr-evolution`).  Includes pair local-search (jointly optimises
+   two free primes at once) in 50% of refinement steps.
+3. **Iterated Local Search (ILS)** — takes the best solution from phase 2,
+   applies full single-prime and pair sweep passes, then repeatedly
+   perturbs 3–5 random offsets and re-sweeps.  Typically shaves a further
+   5–20 candidates off the evolutionary best.  Runs automatically after
+   evolution; no extra flag needed.
 
 The output is a text file listing `prime offset` pairs, which the miner
-loads via `--crt-file`.
+loads via `--crt-file`.  The header also records `shift`, `gap_target`,
+and `n_candidates` for reference.
 
 ### How CRT mining works
 
@@ -55,20 +62,26 @@ Where `N#` is the primorial (product of the first N primes).
 
 ## Parameter Reference Table
 
-| Shift | Primes | Largest Prime | log2(primorial) | ctr-bits | Gap (m=22) | Gap (m=25) |
-|------:|-------:|--------------:|----------------:|---------:|-----------:|-----------:|
-|    64 |     15 |            47 |            59.1 |        4 |       4880 |       5546 |
-|    96 |     21 |            73 |            95.0 |        0 |       5368 |       6100 |
-|   128 |     26 |           101 |           127.5 |        0 |       5856 |       6655 |
-|   160 |     30 |           113 |           154.5 |        5 |       6344 |       7209 |
-|   192 |     35 |           149 |           189.9 |        2 |       6832 |       7764 |
-|   256 |     43 |           191 |           249.2 |        6 |       7808 |       8873 |
-|   384 |     60 |           281 |           383.3 |        0 |       9760 |      11091 |
-|   512 |     75 |           379 |           509.0 |        2 |      11712 |      13309 |
-|   640 |     89 |           461 |           631.2 |        8 |      13664 |      15527 |
-|   768 |    104 |           569 |           766.2 |        1 |      15616 |      17745 |
-|   896 |    118 |           647 |           895.8 |        0 |      17568 |      19963 |
-|  1024 |    131 |           739 |          1018.5 |        5 |      19520 |      22181 |
+| Shift | Primes | Largest Prime | log2(primorial) | ctr-bits | Gap (m=21) | Gap (m=22) | Gap (m=25) |
+|------:|-------:|--------------:|----------------:|---------:|-----------:|-----------:|-----------:|
+|    26 |      8 |            19 |            23.2 |        2 |       4105 |       4299 |       4887 |
+|    37 |     10 |            29 |            32.6 |        4 |       4265 |       4467 |       5074 |
+|    64 |     15 |            47 |            59.1 |        4 |       4658 |       4880 |       5546 |
+|    68 |     16 |            53 |            64.8 |        3 |       4717 |       4941 |       5615 |
+|    96 |     21 |            73 |            95.0 |        0 |       5124 |       5368 |       6100 |
+|   110 |     23 |            83 |           107.7 |        2 |       5328 |       5582 |       6343 |
+|   128 |     26 |           101 |           127.5 |        0 |       5592 |       5856 |       6655 |
+|   133 |     26 |           101 |           127.5 |        5 |       5663 |       5932 |       6741 |
+|   160 |     30 |           113 |           154.5 |        5 |       6052 |       6344 |       7209 |
+|   192 |     35 |           149 |           189.9 |        2 |       6512 |       6832 |       7764 |
+|   256 |     43 |           191 |           249.2 |        6 |       7432 |       7808 |       8873 |
+|   384 |     60 |           281 |           383.3 |        0 |       9312 |       9760 |      11091 |
+|   512 |     75 |           379 |           509.0 |        2 |      11168 |      11712 |      13309 |
+|   640 |     89 |           461 |           631.2 |        8 |      13028 |      13664 |      15527 |
+|   720 |     98 |           521 |           711.6 |        8 |      14207 |      14884 |      16913 |
+|   768 |    104 |           569 |           766.2 |        1 |      14888 |      15616 |      17745 |
+|   896 |    118 |           647 |           895.8 |        0 |      16748 |      17568 |      19963 |
+|  1024 |    131 |           739 |          1018.5 |        5 |      18632 |      19520 |      22181 |
 
 **Primes** = maximum CRT primes that fit in the shift.
 **ctr-bits** = shift - ceil(log2(primorial)), the leftover bits.
@@ -114,16 +127,74 @@ With 58 primes: log2(58#) ≈ 367.1, so ctr-bits = 384 - 368 = 16.
 
 ## Ready-to-Use Commands
 
+### Shift 26 (merit 21)
+
+Filename convention: `crt_s25_m21.txt` (shift is 26 due to ceil rounding).
+
+```bash
+./bin/gen_crt --calc-ctr \
+  --ctr-primes 8 --ctr-merit 21 --ctr-bits 2 \
+  --ctr-strength 10000 --ctr-evolution --ctr-fixed 8 --ctr-ivs 1000 \
+  --ctr-file crt/crt_s25_m21.txt
+```
+
+Expected: ~690 candidates.
+
+### Shift 37 (merit 21)
+
+Filename convention: `crt_s34_m21.txt` (shift is 37 due to ceil rounding).
+
+```bash
+./bin/gen_crt --calc-ctr \
+  --ctr-primes 10 --ctr-merit 21 --ctr-bits 4 \
+  --ctr-strength 10000 --ctr-evolution --ctr-fixed 8 --ctr-ivs 1000 \
+  --ctr-file crt/crt_s34_m21.txt
+```
+
+Expected: ~655 candidates.
+
+### Shift 64 (merit 21)
+
+```bash
+./bin/gen_crt --calc-ctr \
+  --ctr-primes 15 --ctr-merit 21 --ctr-bits 4 \
+  --ctr-strength 10000 --ctr-evolution --ctr-fixed 8 --ctr-ivs 1000 \
+  --ctr-file crt/crt_s64_m21.txt
+```
+
+Expected: ~610 candidates.
+
 ### Shift 64 (merit 22)
 
 ```bash
 ./bin/gen_crt --calc-ctr \
   --ctr-primes 15 --ctr-merit 22 --ctr-bits 4 \
   --ctr-strength 10000 --ctr-evolution --ctr-fixed 8 --ctr-ivs 1000 \
-  --ctr-file crt_s64_m22.txt
+  --ctr-file crt/crt_s64_m22.txt
 ```
 
 Expected: ~640 candidates.
+
+### Shift 68 (merit 22–30)
+
+16 primes fit in shift 68 (log₂(16#) ≈ 64.8, ctr-bits=3).
+
+```bash
+./bin/gen_crt --calc-ctr \
+  --ctr-primes 16 --ctr-merit 22 --ctr-bits 3 \
+  --ctr-strength 10000 --ctr-evolution --ctr-fixed 8 --ctr-ivs 1000 \
+  --ctr-file crt/crt_s68_m22.txt
+```
+
+Expected: ~630 candidates.  For other merit targets, replace `--ctr-merit`:
+
+| Merit | `--ctr-merit` | Expected candidates |
+|------:|:-------------:|--------------------:|
+|    22 | 22            | ~630                |
+|    24 | 24            | ~692                |
+|    26 | 26            | ~754                |
+|    28 | 28            | ~813                |
+|    30 | 30            | ~873                |
 
 ### Shift 96 (merit 22)
 
@@ -131,10 +202,21 @@ Expected: ~640 candidates.
 ./bin/gen_crt --calc-ctr \
   --ctr-primes 21 --ctr-merit 22 --ctr-bits 0 \
   --ctr-strength 10000 --ctr-evolution --ctr-fixed 8 --ctr-ivs 1000 \
-  --ctr-file crt_s96_m22.txt
+  --ctr-file crt/crt_s96_m22.txt
 ```
 
 Expected: ~620 candidates.
+
+### Shift 110 (merit 21)
+
+```bash
+./bin/gen_crt --calc-ctr \
+  --ctr-primes 23 --ctr-merit 21 --ctr-bits 2 \
+  --ctr-strength 10000 --ctr-evolution --ctr-fixed 8 --ctr-ivs 1000 \
+  --ctr-file crt/crt_s110_m21.txt
+```
+
+Expected: ~587 candidates.
 
 ### Shift 128 (merit 22)
 
@@ -142,10 +224,23 @@ Expected: ~620 candidates.
 ./bin/gen_crt --calc-ctr \
   --ctr-primes 26 --ctr-merit 22 --ctr-bits 0 \
   --ctr-strength 10000 --ctr-evolution --ctr-fixed 10 --ctr-ivs 1000 \
-  --ctr-file crt_s128_m22.txt
+  --ctr-file crt/crt_s128_m22.txt
 ```
 
 Expected: ~610 candidates.
+
+### Shift 133 (merit 30)
+
+Same 26 primes as shift 128, but with ctr-bits=5 to reach shift 133.
+
+```bash
+./bin/gen_crt --calc-ctr \
+  --ctr-primes 26 --ctr-merit 30 --ctr-bits 5 \
+  --ctr-strength 10000 --ctr-evolution --ctr-fixed 10 --ctr-ivs 1000 \
+  --ctr-file crt/crt_s133_m30.txt
+```
+
+Expected: ~871 candidates.
 
 ### Shift 160 (merit 22)
 
@@ -153,7 +248,7 @@ Expected: ~610 candidates.
 ./bin/gen_crt --calc-ctr \
   --ctr-primes 30 --ctr-merit 22 --ctr-bits 5 \
   --ctr-strength 10000 --ctr-evolution --ctr-fixed 10 --ctr-ivs 1000 \
-  --ctr-file crt_s160_m22.txt
+  --ctr-file crt/crt_s160_m22.txt
 ```
 
 ### Shift 192 (merit 22)
@@ -161,8 +256,8 @@ Expected: ~610 candidates.
 ```bash
 ./bin/gen_crt --calc-ctr \
   --ctr-primes 35 --ctr-merit 22 --ctr-bits 2 \
-  --ctr-strength 10000 --ctr-evolution --ctr-fixed 11 --ctr-ivs 1000 \
-  --ctr-file crt_s192_m22.txt
+  --ctr-strength 10000 --crt-evolution --ctr-fixed 11 --ctr-ivs 1000 \
+  --ctr-file crt/crt_s192_m22.txt
 ```
 
 ### Shift 256 (merit 22)
@@ -171,7 +266,7 @@ Expected: ~610 candidates.
 ./bin/gen_crt --calc-ctr \
   --ctr-primes 43 --ctr-merit 22 --ctr-bits 6 \
   --ctr-strength 10000 --ctr-evolution --ctr-fixed 11 --ctr-ivs 1000 \
-  --ctr-file crt_s256_m22.txt
+  --ctr-file crt/crt_s256_m22.txt
 ```
 
 Expected: ~680 candidates.
@@ -182,7 +277,7 @@ Expected: ~680 candidates.
 ./bin/gen_crt --calc-ctr \
   --ctr-primes 60 --ctr-merit 22 --ctr-bits 0 \
   --ctr-strength 10000 --ctr-evolution --ctr-fixed 12 --ctr-ivs 1000 \
-  --ctr-file crt_s384_m22.txt
+  --ctr-file crt/crt_s384_m22.txt
 ```
 
 Expected: ~750 candidates.
@@ -207,13 +302,24 @@ Expected: ~800 candidates.
   --ctr-file crt/crt_s640_m22.txt
 ```
 
+### Shift 720 (merit 21)
+
+```bash
+./bin/gen_crt --calc-ctr \
+  --ctr-primes 98 --ctr-merit 21 --ctr-bits 8 \
+  --ctr-strength 10000 --ctr-evolution --ctr-fixed 13 --ctr-ivs 1000 \
+  --ctr-file crt/crt_s720_m21.txt
+```
+
+Expected: ~889 candidates.
+
 ### Shift 768 (merit 22)
 
 ```bash
 ./bin/gen_crt --calc-ctr \
   --ctr-primes 104 --ctr-merit 22 --ctr-bits 1 \
   --ctr-strength 10000 --ctr-evolution --ctr-fixed 14 --ctr-ivs 1000 \
-  --ctr-file crt_s768_m22.txt
+  --ctr-file crt/crt_s768_m22.txt
 ```
 
 ### Shift 896 (merit 22)
@@ -222,8 +328,19 @@ Expected: ~800 candidates.
 ./bin/gen_crt --calc-ctr \
   --ctr-primes 118 --ctr-merit 22 --ctr-bits 0 \
   --ctr-strength 10000 --ctr-evolution --ctr-fixed 14 --ctr-ivs 1000 \
-  --ctr-file crt_s896_m22.txt
+  --ctr-file crt/crt_s896_m22.txt
 ```
+
+### Shift 1024 (merit 21)
+
+```bash
+./bin/gen_crt --calc-ctr \
+  --ctr-primes 131 --ctr-merit 21 --ctr-bits 5 \
+  --ctr-strength 10000 --ctr-evolution --ctr-fixed 15 --ctr-ivs 1000 \
+  --ctr-file crt/crt_s1024_m21.txt
+```
+
+Expected: ~1027 candidates.
 
 ### Shift 1024 (merit 22)
 
@@ -231,26 +348,35 @@ Expected: ~800 candidates.
 ./bin/gen_crt --calc-ctr \
   --ctr-primes 131 --ctr-merit 22 --ctr-bits 5 \
   --ctr-strength 10000 --ctr-evolution --ctr-fixed 15 --ctr-ivs 1000 \
-  --ctr-file crt_s1024_m22.txt
+  --ctr-file crt/crt_s1024_m22.txt
 ```
 
-## Merit 25 Variants
+## Merit Variants
 
-For higher merit targets (e.g., merit 25), replace `--ctr-merit 22` with
-`--ctr-merit 25`. The gap target increases, which generally produces more
-candidates. Example:
+For different merit targets, replace `--ctr-merit` with the desired value.
+The gap target increases with merit, producing more candidates.  Example
+for shift 128, merit 25:
 
 ```bash
 ./bin/gen_crt --calc-ctr \
   --ctr-primes 26 --ctr-merit 25 --ctr-bits 0 \
   --ctr-strength 10000 --ctr-evolution --ctr-fixed 10 --ctr-ivs 1000 \
-  --ctr-file crt_s128_m25.txt
+  --ctr-file crt/crt_s128_m25.txt
+```
+
+Shift 133, merit 30 (26 primes, ctr-bits=5):
+
+```bash
+./bin/gen_crt --calc-ctr \
+  --ctr-primes 26 --ctr-merit 30 --ctr-bits 5 \
+  --ctr-strength 10000 --ctr-evolution --ctr-fixed 10 --ctr-ivs 1000 \
+  --ctr-file crt/crt_s133_m30.txt
 ```
 
 ## Using CRT Files with the Miner
 
 ```bash
-./bin/gap_miner --shift 128 --crt-file crt_s128_m22.txt \
+./bin/gap_miner --shift 128 --crt-file crt/crt_s128_m22.txt \
   --rpc-url http://127.0.0.1:31397 \
   --rpc-user user --rpc-pass pass \
   --threads 14 --fast-fermat
@@ -272,6 +398,8 @@ ignored and do not need to be specified.
 3. **Scale `--ctr-fixed` with prime count:** 8 for ≤23 primes, 10 for
    24-33, 11 for 34-49, 12 for 50-73, 13 for 74-95, 14 for 96-118,
    15 for 119+. Small primes are almost always optimally placed by greedy.
+   Note: the Phase 3 ILS also respects `--ctr-fixed` — frozen primes are
+   never perturbed during ILS.
 4. **`--ctr-ivs 1000`** for production, 20 for quick tests.
 5. **`--ctr-merit` should be `target_merit - 1`** per original GapMiner
    recommendations. So for mining merit 22 blocks, use `--ctr-merit 21`.

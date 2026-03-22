@@ -836,6 +836,7 @@ gap scanning.  Multiple GPUs are supported via `--cuda 0,1`.
 | `--sample-stride K`   | 8             | Controls gap scanning strategy.  K > 1 enables backward-scan (CPU) or two-phase smart-scan (GPU).  Set to 1 for full-test (all survivors tested). |
 | `--crt-file FILE`     | --            | Load a CRT sieve file (binary `.bin` or text `.txt`).  Text files enable CRT-aligned mining; binary files enable template tiling. |
 | `--fermat-threads N` / `-d N` | 0 (monolithic) | Number of Fermat consumer threads for CRT producer-consumer mode.  Default `0` = monolithic (all threads sieve+fermat independently).  Set to `N` to enable producer-consumer with `threads - N` sieve and `N` fermat threads. |
+| `--heap N`            | 4096          | Maximum number of pending CRT windows in the producer-consumer gaplist heap.  Only relevant when `--fermat-threads N` is active.  Larger values allow the sieve producers to run further ahead of the Fermat consumers; useful if producers are significantly faster than consumers. |
 | `--mr-verify`         | off           | Verify gap boundary primes with a Miller-Rabin base-3 check before submission.  Catches Fermat base-2 pseudoprimes with negligible overhead. |
 | `--no-primality`      | off           | Skip primality testing entirely |
 | `--build-only`        | off           | Fetch template and build one block, then exit |
