@@ -129,6 +129,9 @@ jobs:
         shell: msys2 {0}
         run: dlltool --dllname gpu_fermat.dll -d src/gpu_fermat.def -l src/libgpu_fermat.a
 
+      - name: Setup MSVC (provides cl.exe for nvcc host compiler)
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Build CUDA kernel DLL (nvcc + MSVC)
         shell: pwsh
         run: |
