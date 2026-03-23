@@ -5266,12 +5266,14 @@ int main(int argc, char **argv) {
        used in the monolithic CRT sieve path.  In producer-consumer mode
        the fermat consumer threads call CPU Fermat via backward-scan and
        the GPU is idle.  Use monolithic (no --fermat-threads) for GPU. */
+#if defined(WITH_CUDA) || defined(WITH_OPENCL)
     if (g_gpu_count > 0 && crt_fermat_threads > 0 &&
             g_crt_mode == CRT_MODE_SOLVER)
         log_msg("WARNING: --cuda is ignored in producer-consumer CRT mode "
                 "(--fermat-threads %d).  Remove --fermat-threads to use GPU, "
                 "or remove --cuda to silence this warning.\n",
                 crt_fermat_threads);
+#endif
 
     /* ── OpenCL GPU initialization scaffolding ── */
 #ifdef WITH_OPENCL
