@@ -4892,6 +4892,8 @@ worker_done:
 
 
 int main(int argc, char **argv) {
+    /* Windows: initialise Winsock2 before any network calls (no-op on POSIX) */
+    win_wsa_init();
     if (argc < 2) {
         printf("Usage: %s [options]\n", argv[0]);
         printf("  -o, --host HOST       node hostname or IP  (default: 127.0.0.1)\n");
@@ -5413,8 +5415,6 @@ int main(int argc, char **argv) {
     atexit(print_stats);
     /* free thread-local sieve buffers when the process exits */
     atexit(free_sieve_buffers);
-    /* Windows: initialise Winsock2 (no-op on POSIX) */
-    win_wsa_init();
     if (log_file) {
         log_fp = fopen(log_file, "a");
         if (!log_fp) fprintf(stderr, "Failed to open log file %s\n", log_file);
