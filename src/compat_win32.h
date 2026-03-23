@@ -131,6 +131,19 @@ static inline const char *win_temp_dir(void) {
  * using MSVC as the host compiler we map pthread_mutex_t → CRITICAL_SECTION.
  * MinGW builds include <pthread.h> directly and use winpthreads.
  */
+/* ── GCC atomic builtins shim (MSVC only) ──────────────────────────
+ * gpu_fermat.cu uses __atomic_load_n / __atomic_store_n with relaxed
+ * ordering.  Map these to MSVC interlocked intrinsics on x86-64.
+ */
+#ifdef _MSC_VER
+#include <intrin.h>
+#define __ATOMIC_RELAXED 0
+#define __atomic_load_n(ptr, mo) \
+    ((void)(mo), (int)_InterlockedOr((long volatile *)(ptr), 0))
+#define __atomic_store_n(ptr, val, mo) \
+    ((void)(mo), (void)_InterlockedExchange((long volatile *)(ptr), (long)(val)))
+#endif /* _MSC_VER atomic shim */
+
 #ifdef _MSC_VER
 typedef CRITICAL_SECTION pthread_mutex_t;
 /* CRITICAL_SECTION must be explicitly initialised; zero-fill is not safe
