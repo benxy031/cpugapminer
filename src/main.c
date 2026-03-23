@@ -43,6 +43,7 @@ static int             g_gpu_count = 0;
 #include "gap_scan.h"
 #include "crt_heap.h"
 #include "presieve_utils.h"
+#include "crt_solver.h"
 #include "uint256_utils.h"
 #include "block_utils.h"
 #include "primality_utils.h"
@@ -370,7 +371,7 @@ static int load_crt_binary_file(const char *path) {
      prime1 offset1
      prime2 offset2
      ...                                                                    */
-static int load_crt_text_file(const char *path) {
+static int load_crt_text_file(const char *path, int cmd_shift) {
     FILE *fp = fopen(path, "r");
     if (!fp) { log_msg("CRT: cannot open %s\n", path); return 0; }
 
@@ -453,20 +454,46 @@ static int load_crt_text_file(const char *path) {
     g_crt_mode        = CRT_MODE_SOLVER;
 
     double prim_log2 = (double)mpz_sizeinbase(g_crt_primorial_mpz, 2);
-    log_msg("CRT: loaded %s  (gap-solver mode)\n"
-            "  primes=%d (2..%d)  shift=%d  merit=%.2f\n"
-            "  gap_target=%d  n_candidates=%d  (%.1f%% uncovered)\n"
-            "  primorial ~2^%.0f  ctr-bits=%d\n",
-            path, g_crt_n_primes, (int)g_crt_max_prime,
-            g_crt_shift, g_crt_merit,
-            g_crt_gap_target, g_crt_n_candidates,
-            gap_target > 0 ? 100.0 * (double)n_cand / (double)gap_target : 0,
-            prim_log2, shift - (int)prim_log2);
+    int file_ctr_bits   = shift      - (int)prim_log2;
+    int eff_ctr_bits    = cmd_shift  - (int)prim_log2;
+    if (cmd_shift > 0 && cmd_shift != shift) {
+        if (cmd_shift < shift)
+            log_msg("CRT: warning: mining shift=%d is less than file's designed"
+                    " shift=%d — only %d primorial step(s) will be tried per"
+                    " nonce (intended: %d).  Use a CRT file generated for"
+                    " shift=%d.\n",
+                    cmd_shift, shift,
+                    1 << (eff_ctr_bits < 0 ? 0 : eff_ctr_bits),
+                    1 << file_ctr_bits, cmd_shift);
+        log_msg("CRT: loaded %s  (gap-solver mode)\n"
+                "  primes=%d (2..%d)  shift=%d  merit=%.2f\n"
+                "  gap_target=%d  n_candidates=%d  (%.1f%% uncovered)\n"
+                "  primorial ~2^%.0f  ctr-bits=%d"
+                "  (file designed for shift=%d; mining at shift=%d)\n",
+                path, g_crt_n_primes, (int)g_crt_max_prime,
+                g_crt_shift, g_crt_merit,
+                g_crt_gap_target, g_crt_n_candidates,
+                gap_target > 0 ? 100.0 * (double)n_cand / (double)gap_target : 0,
+                prim_log2,
+                eff_ctr_bits < 0 ? 0 : eff_ctr_bits,
+                shift, cmd_shift);
+    } else {
+        log_msg("CRT: loaded %s  (gap-solver mode)\n"
+                "  primes=%d (2..%d)  shift=%d  merit=%.2f\n"
+                "  gap_target=%d  n_candidates=%d  (%.1f%% uncovered)\n"
+                "  primorial ~2^%.0f  ctr-bits=%d\n",
+                path, g_crt_n_primes, (int)g_crt_max_prime,
+                g_crt_shift, g_crt_merit,
+                g_crt_gap_target, g_crt_n_candidates,
+                gap_target > 0 ? 100.0 * (double)n_cand / (double)gap_target : 0,
+                prim_log2, file_ctr_bits);
+    }
     return 1;
 }
 
-/* Auto-detect CRT file format and load accordingly. */
-static int load_crt_file(const char *path) {
+/* Auto-detect CRT file format and load accordingly.
+   cmd_shift: the shift value from the command line (0 = unknown/not yet parsed). */
+static int load_crt_file(const char *path, int cmd_shift) {
     FILE *fp = fopen(path, "rb");
     if (!fp) { log_msg("CRT: cannot open %s\n", path); return 0; }
     char magic[4] = {0};
@@ -475,7 +502,7 @@ static int load_crt_file(const char *path) {
     if (rd >= 4 && memcmp(magic, "CRT1", 4) == 0)
         return load_crt_binary_file(path);
     else
-        return load_crt_text_file(path);
+        return load_crt_text_file(path, cmd_shift);
 }
 
 /* Tile the CRT template into the sieve bitmap with the correct rotation.
@@ -633,14 +660,17 @@ static void print_stats(void) {
         format_est(est_buf, sizeof(est_buf), est_sec);
     }
 
+    double prime_rate = (elapsed > 0.001) ? (double)stats_primes_found / elapsed : 0.0;
+
     double bm = stats_best_merit;
         log_msg("STATS: elapsed=%.1fs  sieved=%llu (%.0f/s)  tested=%llu (%.0f/s)  "
-            "primes=%llu (%.1f%%)  "
+            "pps=%.0f  primes=%llu (%.1f%%)  "
             "gaps=%llu (%.3f/s)  built=%llu  submitted=%llu  accepted=%llu  "
             "prob=%.2e/pair  est=%s (target=%.4f)  best=%.2f (gap=%llu)",
             elapsed,
             (unsigned long long)stats_sieved,  sieve_rate,
             (unsigned long long)stats_tested,  test_rate,
+            prime_rate,
             (unsigned long long)stats_primes_found,
             (stats_tested > 0) ? 100.0 * (double)stats_primes_found / (double)stats_tested : 0.0,
             (unsigned long long)stats_gaps,    gap_rate,
@@ -670,8 +700,9 @@ static void print_stats(void) {
                 format_est(crt_est_buf, sizeof(crt_est_buf), crt_est_sec);
             }
         }
-        log_msg("  windows=%llu (%.1f/s)  primes/win=%.1f  crt_est=%s (merit>=%.1f)",
-                (unsigned long long)crt_w, win_rate, ppw,
+        double tpw = (crt_w > 0) ? (double)stats_crt_tmpl_hits / (double)crt_w : 0.0;
+        log_msg("  windows=%llu (%.1f/s)  primes/win=%.1f  tmpl/win=%.2f  crt_est=%s (merit>=%.1f)",
+                (unsigned long long)crt_w, win_rate, ppw, tpw,
                 crt_est_buf, g_crt_merit);
         if (crt_fermat_threads > 0)
             log_msg("  gaplist=%lu", (unsigned long)crt_heap_count());
@@ -795,7 +826,35 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
        Mode=SOLVER uses a different mining path entirely; the regular sieve
        just skips the CRT-covered primes and relies on the CRT alignment.  */
     int crt_skip_to = 0;   /* small_primes_cache index to start sieving from */
-    if (g_crt_mode == CRT_MODE_TEMPLATE && g_crt_template && g_crt_primorial > 0) {
+    if (g_crt_mode == CRT_MODE_SOLVER) {
+        /* Per-nonce CRT template: built once after rebase_for_gap_check().
+           Valid for all windows in the nonce (primorial mod p_i = 0 for
+           all CRT primes p_i → tls_base_mod_p[i] unchanged per window).
+           Falls back to presieve/memset if template not yet built.       */
+        const uint8_t *nt = crt_solver_get_thread_tmpl(bit_size, &crt_skip_to);
+        if (nt) {
+            memcpy(bits, nt, bit_size);
+            __sync_fetch_and_add(&stats_crt_tmpl_hits, 1);
+            goto sieve_main;
+        }
+        /* Fallback: presieve or zero (same as original path). */
+        if (g_presieve_tmpl && tls_base_mod_p_ready && tls_base_mod_p
+                   && small_primes_count > 6) {
+            uint64_t bm = (tls_base_mod_p[1] * 170170ULL
+                         + tls_base_mod_p[2] * 306306ULL
+                         + tls_base_mod_p[3] * 145860ULL
+                         + tls_base_mod_p[4] *  46410ULL
+                         + tls_base_mod_p[5] * 157080ULL
+                         + tls_base_mod_p[6] * 450450ULL)
+                         % PRESIEVE_2PERIOD;
+            size_t sb = (size_t)(((bm + L - 1) / 2) % g_presieve_period);
+            tile_presieve(bits, bit_size, sb);
+            crt_skip_to = PRESIEVE_SKIP_TO;
+        } else {
+            memset(bits, 0, bit_size);
+        }
+        goto sieve_main;
+    } else if (g_crt_mode == CRT_MODE_TEMPLATE && g_crt_template && g_crt_primorial > 0) {
         /* Compute which template bit corresponds to sieve position 0.
            Sieve position j represents value (base + L + 2j).
            base+L is always odd (base even, L odd).
@@ -836,6 +895,7 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
     } else {
         memset(bits, 0, bit_size);
     }
+    sieve_main:;
 
     /* Mark composites: for each small prime p, find first offset ≡ 0 (mod p)
        and stride by 2p (odd-only sieve).
@@ -3894,6 +3954,13 @@ static void *worker_fn(void *arg) {
                 int cand_odd = mpz_odd_p(candidate);
                 if (cand_odd) mpz_sub_ui(candidate, candidate, 1);
                 rebase_for_gap_check(candidate);
+                /* Build per-nonce template once: valid for all windows because
+                   primorial mod p_i = 0 for every CRT prime p_i, so
+                   tls_base_mod_p[i] is invariant across primorial steps. */
+                if (g_crt_solver_skip_to > 0 && tls_base_mod_p_ready
+                        && tls_base_mod_p && small_primes_cache)
+                    crt_solver_rebuild_thread_tmpl(
+                        tls_base_mod_p, small_primes_cache, gap_scan_max);
                 crt_filter_init_residues();
                 int crt_first_win = 1;
 
@@ -5076,7 +5143,7 @@ int main(int argc, char **argv) {
 
     /* Load CRT sieve template if requested. */
     if (cli_crt_file) {
-        if (!load_crt_file(cli_crt_file)) {
+        if (!load_crt_file(cli_crt_file, shift)) {
             log_msg("Warning: CRT file load failed, continuing without CRT\n");
         }
     }
@@ -5194,6 +5261,17 @@ int main(int argc, char **argv) {
         return 2;
     }
 #endif
+
+    /* Warn if --cuda is combined with --fermat-threads: the GPU is only
+       used in the monolithic CRT sieve path.  In producer-consumer mode
+       the fermat consumer threads call CPU Fermat via backward-scan and
+       the GPU is idle.  Use monolithic (no --fermat-threads) for GPU. */
+    if (g_gpu_count > 0 && crt_fermat_threads > 0 &&
+            g_crt_mode == CRT_MODE_SOLVER)
+        log_msg("WARNING: --cuda is ignored in producer-consumer CRT mode "
+                "(--fermat-threads %d).  Remove --fermat-threads to use GPU, "
+                "or remove --cuda to silence this warning.\n",
+                crt_fermat_threads);
 
     /* ── OpenCL GPU initialization scaffolding ── */
 #ifdef WITH_OPENCL
@@ -5339,28 +5417,23 @@ int main(int argc, char **argv) {
         log_fp = fopen(log_file, "a");
         if (!log_fp) fprintf(stderr, "Failed to open log file %s\n", log_file);
     }
-    /* ── CRT: cap sieve primes for the tiny gap-check bitmap ──
-       In CRT solver mode the sieve bitmap is only gap_scan_max/2 bits
-       (~1.7 KB at merit 21).  For each sieve prime p the cost is:
-         CPU: one residue update + one bounds-check + one bit-set  (~10 ns)
-         Fermat test per unfiltered survivor                       (~1.5 µs GPU / ~ms CPU)
-       For a prime p the probability of eliminating a survivor is
-         P ≈ (gap_scan / (2p)) × survival_rate.
-       Break-even: p ≈ gap_scan × survival_rate × test_cost / (2 × cpu_cost).
-       With typical numbers this is ~19 × gap_scan, but we cap at 500 000
-       to keep the sieve prime cache and residue array reasonable.      */
-    if (g_crt_mode == CRT_MODE_SOLVER && g_crt_gap_target > 0) {
+    /* ── CRT monolithic mode: cap sieve-primes to the useful limit ──
+       In producer-consumer mode (--fermat-threads > 0) the user tunes
+       --sieve-primes manually watching the gaplist saw-tooth, so we
+       leave it untouched.  In monolithic mode there is no gaplist and
+       primes beyond ~19×gap_scan add cost but no benefit, so cap. */
+    if (g_crt_mode == CRT_MODE_SOLVER && g_crt_gap_target > 0
+            && crt_fermat_threads == 0) {
         uint64_t gap_scan = (uint64_t)g_crt_gap_target * 2;
         if (gap_scan < 10000) gap_scan = 10000;
         uint64_t crt_limit = gap_scan * 19;
         if (crt_limit > 500000) crt_limit = 500000;
         if (cli_sieve_prime_limit > crt_limit) {
-            log_msg("CRT: capping sieve-prime-limit %llu -> %llu "
-                    "(gap_scan=%llu, bitmap=%llu bytes)\n",
+            log_msg("CRT monolithic: capping sieve-prime-limit %llu -> %llu "
+                    "(gap_scan=%llu; use --fermat-threads to tune freely)\n",
                     (unsigned long long)cli_sieve_prime_limit,
                     (unsigned long long)crt_limit,
-                    (unsigned long long)gap_scan,
-                    (unsigned long long)((gap_scan / 2 + 7) / 8));
+                    (unsigned long long)gap_scan);
             cli_sieve_prime_limit = crt_limit;
         }
     }
@@ -5369,6 +5442,18 @@ int main(int argc, char **argv) {
     start_stats_thread(print_stats);
     /* Trigger sieve cache population so we can log its stats. */
     pthread_once(&small_primes_once, populate_small_primes_cache);
+
+    /* Init CRT solver skip_to (primes covered by per-nonce template).
+       The template itself is built per-thread per-nonce after CRT alignment;
+       only the skip index is global and set here.                         */
+    if (g_crt_mode == CRT_MODE_SOLVER && g_crt_primorial_mpz_init) {
+        crt_solver_init(g_crt_max_prime, small_primes_cache, small_primes_count);
+        if (g_crt_solver_skip_to > 0 && small_primes_cache)
+            log_msg("CRT solver: per-nonce template active  "
+                    "skip_to=%d (primes 3..%llu pre-covered)\n",
+                    g_crt_solver_skip_to,
+                    (unsigned long long)small_primes_cache[g_crt_solver_skip_to - 1]);
+    }
 
     /* Build CRT post-sieve filter table (primes beyond sieve limit up to 2M).
        These primes are too large for the tiny CRT bitmap but cheap to check
@@ -5379,10 +5464,20 @@ int main(int argc, char **argv) {
             build_crt_filter_table(filt_limit);
     }
 
-    log_msg("C miner starting (shift=%d sieve=%llu sieve-primes=%lu [up to %llu])\n",
-            shift, (unsigned long long)sieve_size,
-            (unsigned long)small_primes_count,
-            small_primes_count > 0 ? (unsigned long long)small_primes_cache[small_primes_count-1] : 0ULL);
+    {
+        unsigned long long log_sieve_sz;
+        if (g_crt_mode == CRT_MODE_SOLVER && g_crt_gap_target > 0) {
+            int gsm = g_crt_gap_target * 2;
+            if (gsm < 10000) gsm = 10000;
+            log_sieve_sz = (unsigned long long)gsm;
+        } else {
+            log_sieve_sz = (unsigned long long)sieve_size;
+        }
+        log_msg("C miner starting (shift=%d sieve=%llu sieve-primes=%lu [up to %llu])\n",
+                shift, log_sieve_sz,
+                (unsigned long)small_primes_count,
+                small_primes_count > 0 ? (unsigned long long)small_primes_cache[small_primes_count-1] : 0ULL);
+    }
     if (keep_going)
         log_msg("default behaviour: will continue mining after finding a valid block\n");
     else
@@ -5508,6 +5603,11 @@ int main(int argc, char **argv) {
                     int st_odd = mpz_odd_p(cand_st);
                     if (st_odd) mpz_sub_ui(cand_st, cand_st, 1);
                     rebase_for_gap_check(cand_st);
+                    /* Build per-nonce template once (see multi-thread path). */
+                    if (g_crt_solver_skip_to > 0 && tls_base_mod_p_ready
+                            && tls_base_mod_p && small_primes_cache)
+                        crt_solver_rebuild_thread_tmpl(
+                            tls_base_mod_p, small_primes_cache, gap_scan_max);
                     crt_filter_init_residues();
                     int st_first_win = 1;
 

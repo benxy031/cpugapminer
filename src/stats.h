@@ -21,6 +21,7 @@ extern volatile double stats_best_merit;
 extern volatile uint64_t stats_best_gap;
 extern volatile uint64_t stats_gpu_flushes;
 extern volatile uint64_t stats_gpu_batched;
+extern volatile uint64_t stats_crt_tmpl_hits;  /* times per-nonce CRT template was applied */
 
 /* Rolling-window state used by print_stats(). */
 #define RATE_RING_SLOTS 6
