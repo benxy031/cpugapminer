@@ -14,7 +14,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
+/* On MSVC (nvcc DLL build) use CRITICAL_SECTION shim; elsewhere use winpthreads / glibc. */
+#ifdef _MSC_VER
+#  include "compat_win32.h"
+#else
+#  include <pthread.h>
+#endif
 #include <cuda_runtime.h>
 
 #define NL GPU_NLIMBS   /* shorthand for loop bounds */

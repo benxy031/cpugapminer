@@ -125,6 +125,27 @@ static inline const char *win_temp_dir(void) {
     return buf;
 }
 
+/* ── pthread mutex shim (MSVC only — MinGW provides real winpthreads) ──
+ *
+ * gpu_fermat.cu uses pthread_mutex_t internally.  When compiled with nvcc
+ * using MSVC as the host compiler we map pthread_mutex_t → CRITICAL_SECTION.
+ * MinGW builds include <pthread.h> directly and use winpthreads.
+ */
+#ifdef _MSC_VER
+typedef CRITICAL_SECTION pthread_mutex_t;
+/* CRITICAL_SECTION must be explicitly initialised; zero-fill is not safe
+ * for all Windows versions.  cal pthread_mutex_init() before use. */
+#define PTHREAD_MUTEX_INITIALIZER {0}
+static inline int pthread_mutex_init(pthread_mutex_t *m, void *attr)
+    { (void)attr; InitializeCriticalSection(m); return 0; }
+static inline int pthread_mutex_destroy(pthread_mutex_t *m)
+    { DeleteCriticalSection(m); return 0; }
+static inline int pthread_mutex_lock(pthread_mutex_t *m)
+    { EnterCriticalSection(m); return 0; }
+static inline int pthread_mutex_unlock(pthread_mutex_t *m)
+    { LeaveCriticalSection(m); return 0; }
+#endif /* _MSC_VER */
+
 /* Winsock initialisation — call once from main(). */
 static inline void win_wsa_init(void) {
     WSADATA wsa;
