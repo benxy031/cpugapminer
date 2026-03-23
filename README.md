@@ -256,13 +256,18 @@ bin/gap_miner ... --log-file miner.log
 
 ### With CUDA GPU acceleration
 
-Add `--cuda` to offload Fermat testing to the GPU.  This works on **all
-mining paths** — normal sieve, smart-scan, and CRT gap-solver.  In CRT
-mode, a batch accumulator collects candidates from multiple windows and
-flushes them to the GPU in large batches (default 4096) for efficient SM
-utilization.  In non-CRT mode, each sieve window already produces
-thousands of candidates, so they are sent directly to the GPU without
-accumulation.
+Add `--cuda` to offload Fermat testing to the GPU.  Works on the normal
+sieve path and CRT **monolithic** mode.  In non-CRT mode, each sieve
+window already produces thousands of candidates, so they are sent directly
+to the GPU without accumulation.  In CRT monolithic mode, a batch
+accumulator collects candidates from multiple windows and flushes them to
+the GPU in large batches (default 4096) for efficient SM utilization.
+
+> **Note:** `--cuda` is **not** used in CRT producer-consumer mode
+> (`--fermat-threads N`).  The fermat consumer threads run CPU backward-scan
+> (`crt_bkscan_and_submit`) which calls CPU Fermat directly.  Using `--cuda`
+> together with `--fermat-threads` will print a warning and the GPU will be
+> idle.  To use the GPU with CRT, use monolithic mode (omit `--fermat-threads`).
 
 OpenCL scaffolding can be selected with `--opencl [DEV,...]` and
 `--opencl-platform N`; this enables the OpenCL Fermat backend.
@@ -325,7 +330,7 @@ bin/gap_miner \
   --cuda
 ```
 
-CUDA with CRT gap-solver (shift 512):
+CUDA with CRT gap-solver in monolithic mode (shift 512):
 
 ```sh
 bin/gap_miner \
@@ -336,6 +341,9 @@ bin/gap_miner \
   --cuda \
   --crt-file crt/crt_s512_m22.txt
 ```
+
+> Do **not** combine `--cuda` with `--fermat-threads` — the GPU is unused in
+> producer-consumer CRT mode and the miner will warn you.
 
 Tune GPU batch size for larger flushes:
 
@@ -464,14 +472,14 @@ After sieving, each candidate undergoes a probabilistic primality test using
 - `--no-primality` -- skip testing entirely (benchmarking / sieve trust).
 
 When built with `WITH_CUDA=1` and run with `--cuda`, the miner offloads
-Fermat testing to the GPU on **all mining paths**:
+Fermat testing to the GPU on these paths:
 
-- **CRT gap-solver** — A **batch accumulator** collects candidates from
-  multiple CRT windows into a single large buffer (default 4096 candidates,
-  configurable via `--gpu-batch N`) before flushing to the GPU.  This
-  dramatically improves GPU SM utilization — instead of launching a kernel
-  with ~38 candidates per window (wasting 99% of SMs), the GPU receives
-  thousands of candidates per launch.
+- **CRT gap-solver (monolithic)** — A **batch accumulator** collects
+  candidates from multiple CRT windows into a single large buffer (default
+  4096 candidates, configurable via `--gpu-batch N`) before flushing to the
+  GPU.  This dramatically improves GPU SM utilization — instead of launching
+  a kernel with ~38 candidates per window (wasting 99% of SMs), the GPU
+  receives thousands of candidates per launch.
 - **Normal sieve (non-CRT)** — Each sieve window already produces thousands
   of candidates, so they are sent directly to the GPU via `gpu_batch_filter`
   without accumulation.  The host pipeline uses double-buffered async
@@ -484,6 +492,10 @@ Fermat testing to the GPU on **all mining paths**:
   Cooperative Fermat is disabled (`coop.active=0`) so the helper thread
   only sieves the next window and does not waste CPU on redundant Fermat
   work.
+- **CRT producer-consumer (`--fermat-threads N`)** — GPU is **not used**.
+  The Fermat consumer threads run CPU backward-scan (`crt_bkscan_and_submit`)
+  with GMP Fermat directly.  Combining `--cuda` with `--fermat-threads`
+  prints a warning at startup.
 
 Each candidate is exported as a configurable-width number (default 1024-bit
 / 16×64-bit limbs); the CUDA kernel performs Montgomery-form modular
@@ -551,13 +563,19 @@ The CRT mining loop:
    `scan_candidates` path for block assembly and submission.
 
 The normal large windowed sieve is bypassed, so `--sieve-size` and
-`--sample-stride` have no effect in CRT mode.  However, `--sieve-primes`
-**is** used — it controls how many small primes are applied to the gap-check
-sieve (default 900 000 primes, up to ~15.4M).  The prime value limit is
-auto-computed from the count via the PNT upper bound
-($p_n < n(\ln n + \ln \ln n)$ with a 5% margin).  The relevant flags are
-`--shift`, `--threads`, `--fast-fermat`, `--target`, `--crt-file`,
-`--fermat-threads`, and `--sieve-primes`.
+`--sample-stride` have no effect in CRT mode.  `--sieve-primes` **is**
+used — it controls how many small primes are applied to the gap-check sieve.
+
+- **Monolithic mode** (no `--fermat-threads`): `--sieve-primes` is
+  automatically capped to `gap_scan × 19` (≈ 190 000 for shift 64, merit 22)
+  since there is no gaplist to tune and primes beyond this add cost with no
+  benefit.
+- **Producer-consumer mode** (`--fermat-threads N`): `--sieve-primes` is
+  passed through as-is for manual tuning via the gaplist saw-tooth (see
+  below).
+
+The relevant flags are `--shift`, `--threads`, `--fast-fermat`, `--target`,
+`--crt-file`, `--fermat-threads`, and `--sieve-primes`.
 
 #### Producer-consumer mode (gaplist)
 
@@ -590,6 +608,21 @@ This may help at low shifts (< 128) where the sieve takes longer.
 |----------|---------------|
 | High shift (≥ 256), any thread count | Monolithic (default) — sieve is <1ms, every thread should do Fermat work |
 | Low shift (< 128), many threads | Producer-consumer (`--fermat-threads N`) — sieve takes longer, benefits from dedicated threads |
+| Using `--cuda` with CRT | Monolithic only — GPU is idle in producer-consumer mode |
+
+**Tuning `--sieve-primes` in producer-consumer mode** (GapMiner dev recommendation):
+
+The ideal gaplist saw-tooth: creeps up to 2000–3000 then drops to ~100,
+repeating.  Adjust `--sieve-primes` by ±1000 increments, wait 1 minute,
+observe `gaplist` in STATS.
+
+- `gaplist` stays low (< 100): sieve is too slow → reduce `--sieve-primes`
+  or decrease `--fermat-threads`
+- `gaplist` pegs near 4096: sieve is too fast → increase `--sieve-primes`
+  or increase `--fermat-threads`
+
+GapMiner starting point for shift 64: `-t 4 -d 3 -i 13000`
+(4 threads, 3 fermat threads, 13000 sieve-primes).
 
 Two CRT file formats are supported:
 
@@ -906,7 +939,8 @@ STATS: elapsed=30.0s  sieved=5502926848 (183400328/s)  tested=8665707 (288809/s)
 | `est` | Estimated time to find a qualifying gap at current rate.  For backward-scan, pairs/s is extrapolated from the Fermat pass rate (`primes / tested × total_survivors`), not counted directly — since the backward scan only tests ~5% of survivors, the extrapolation estimates how many consecutive prime pairs the full window contains. |
 | `best` | Best verified gap merit seen so far (from the sampling pass and qualifying-gap forward searches) |
 | `gpu_batch` | (CUDA only) Average candidates per GPU flush.  Higher = better GPU utilization.  Absent when not using `--cuda`. |
-| `gaplist` | (CRT producer-consumer only) Number of sieved windows waiting in the priority heap.  Healthy range is 50–500; 0 means consumers are starved, near 4096 means producers are blocked. |
+| `pps` | Primes found per second (actual measured rate = `primes / elapsed`).  Directly comparable to GapMiner's `tests/s` field.  Note: GapMiner's `pps` field is a theoretical CRT-scaled estimate, not the actual measured rate. |
+| `gaplist` | (CRT producer-consumer only) Number of sieved windows waiting in the priority heap.  Ideal: saw-tooth oscillating between ~100 and ~3000.  Persistently 0 = fermat threads too fast / sieve-primes too low.  Persistently near 4096 = sieve too fast, add fermat threads or reduce sieve-primes. |
 
 ### Why `gaps=0` and `submitted=0` are normal early on
 
