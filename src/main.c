@@ -2371,11 +2371,29 @@ static int bn_candidate_is_prime(uint64_t offset) {
        offset, update tls_cand_mpz by +delta instead of rebuilding from base. */
     if (tls_cand_last_valid && offset >= tls_cand_last_offset) {
         uint64_t delta = offset - tls_cand_last_offset;
+        /* delta is within one sieve window (≤ 33 M < 2^32) — safe on all platforms */
         if (delta)
             mpz_add_ui(tls_cand_mpz, tls_cand_mpz, (unsigned long)delta);
     } else {
+        /* Recompute from scratch.
+           On Windows, unsigned long = 32 bits, so mpz_add_ui silently truncates
+           offsets > 4 GiB (reached after ~128 sieve windows at sieve_size=33 M).
+           Use tls_exp_mpz as a scratch register — it is overwritten moments
+           later by the Fermat test anyway. */
+#if ULONG_MAX < UINT64_MAX
+        if (offset >> 32) {
+            mpz_set_ui(tls_exp_mpz, (unsigned long)(offset >> 32));
+            mpz_mul_2exp(tls_exp_mpz, tls_exp_mpz, 32);
+            mpz_add_ui(tls_exp_mpz, tls_exp_mpz, (unsigned long)(offset & 0xFFFFFFFFUL));
+            mpz_add(tls_cand_mpz, tls_base_mpz, tls_exp_mpz);
+        } else {
+            mpz_set(tls_cand_mpz, tls_base_mpz);
+            mpz_add_ui(tls_cand_mpz, tls_cand_mpz, (unsigned long)offset);
+        }
+#else
         mpz_set(tls_cand_mpz, tls_base_mpz);
         mpz_add_ui(tls_cand_mpz, tls_cand_mpz, (unsigned long)offset);
+#endif
     }
     tls_cand_last_offset = offset;
     tls_cand_last_valid  = 1;
@@ -3461,22 +3479,35 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
            Only ~2-4 MR calls per qualifying gap — zero GPU overhead. */
         if (use_mr_verify) {
             ensure_gmp_tls();
-            mpz_set(tls_cand_mpz, tls_base_mpz);
-            mpz_add_ui(tls_cand_mpz, tls_cand_mpz, prev);
+            /* Use tls_exp_mpz as scratch for 64-bit offsets on Windows
+               (unsigned long = 32-bit there; offsets > 4 GiB need two steps). */
+#define SC_SET_CAND_U64(val) do { \
+    uint64_t _v = (val); \
+    if (sizeof(unsigned long) < sizeof(uint64_t) && (_v >> 32)) { \
+        mpz_set_ui(tls_exp_mpz, (unsigned long)(_v >> 32)); \
+        mpz_mul_2exp(tls_exp_mpz, tls_exp_mpz, 32); \
+        mpz_add_ui(tls_exp_mpz, tls_exp_mpz, (unsigned long)(_v & 0xFFFFFFFFUL)); \
+        mpz_add(tls_cand_mpz, tls_base_mpz, tls_exp_mpz); \
+    } else { \
+        mpz_set(tls_cand_mpz, tls_base_mpz); \
+        mpz_add_ui(tls_cand_mpz, tls_cand_mpz, (unsigned long)(_v)); \
+    } \
+} while (0)
+            SC_SET_CAND_U64(prev);
             tls_cand_last_valid = 0;
             if (!mr_verify_cand()) {
                 log_msg("[mr_verify] pseudoprime at gap start nAdd=%llu\n",
                         (unsigned long long)prev);
                 continue;
             }
-            mpz_set(tls_cand_mpz, tls_base_mpz);
-            mpz_add_ui(tls_cand_mpz, tls_cand_mpz, q);
+            SC_SET_CAND_U64(q);
             tls_cand_last_valid = 0;
             if (!mr_verify_cand()) {
                 log_msg("[mr_verify] pseudoprime at gap end nAdd=%llu\n",
                         (unsigned long long)q);
                 continue;
             }
+#undef SC_SET_CAND_U64
         }
 
         __sync_fetch_and_add(&stats_gaps, 1);
