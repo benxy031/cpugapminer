@@ -126,11 +126,8 @@ jobs:
             bc
 
       - name: Create MinGW import library for gpu_fermat.dll
-        shell: pwsh
-        run: |
-          $dlltool = "C:\msys64\mingw64\bin\dlltool.exe"
-          & $dlltool --dllname gpu_fermat.dll -d src/gpu_fermat.def -l src/libgpu_fermat.a
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+        shell: msys2 {0}
+        run: dlltool --dllname gpu_fermat.dll -d src/gpu_fermat.def -l src/libgpu_fermat.a
 
       - name: Build CUDA kernel DLL (nvcc + MSVC)
         shell: pwsh
