@@ -192,9 +192,19 @@ static volatile int debug_force = 0;    /* if nonzero, pretend any header meets 
    the full deterministic Miller‑Rabin.  This is faster but may misclassify a
    tiny number of composites as primes; use with --fast-fermat. */
 static volatile int use_fast_fermat = 0;
+/* if nonzero the miner uses an Euler-Plumb style base-2 test. */
+static volatile int use_fast_euler = 0;
+/* if nonzero, use adaptive sieve-prime limiting on non-CRT windows. */
+static volatile int use_partial_sieve_auto = 0;
+/* if nonzero, adapt CRT producer/consumer split between passes. */
+static volatile int use_crt_auto_split = 0;
 static volatile int use_mr_verify = 0;   /* MR base-3 verify Fermat survivors */
 static volatile int no_primality = 0;   /* skip all probable‑prime filtering */
 static volatile int selftest = 0;        /* run a quick internal test then exit */
+
+#define PARTIAL_SIEVE_MIN_LIMIT     50000ULL
+#define PARTIAL_SIEVE_ADAPT_EVERY   8U
+#define PARTIAL_SIEVE_COOLDOWN_WIN  6U
 
 /* Sampling stride for two-phase gap scanning.  In phase 1 only every Kth
    sieve-survivor is Fermat-tested ("sampled"); candidate gap regions (where
@@ -621,6 +631,7 @@ static void refresh_target_from_ndiff(int target_explicit, double *target,
 }
 
 static void print_stats(void) {
+    static uint64_t auto_split_last_rebalance_ms = 0;
     uint64_t now = now_ms();
     double elapsed = stats_start_ms ? (double)(now - stats_start_ms) / 1000.0 : 0.0;
     double sieve_rate  = (elapsed > 0.001) ? (double)stats_sieved  / elapsed : 0.0;
@@ -662,6 +673,13 @@ static void print_stats(void) {
     }
 
     double prime_rate = (elapsed > 0.001) ? (double)stats_primes_found / elapsed : 0.0;
+    double surv_per_million = (stats_sieved > 0)
+        ? ((double)stats_primes_found * 1000000.0) / (double)stats_sieved : 0.0;
+    double pairs_per_million = (stats_sieved > 0)
+        ? ((double)stats_pairs * 1000000.0) / (double)stats_sieved : 0.0;
+    double false_gap_pct = ((stats_false_gaps + stats_gaps) > 0)
+        ? (100.0 * (double)stats_false_gaps /
+           (double)(stats_false_gaps + stats_gaps)) : 0.0;
 
     double bm = stats_best_merit;
         log_msg("STATS: elapsed=%.1fs  sieved=%llu (%.0f/s)  tested=%llu (%.0f/s)  "
@@ -702,11 +720,47 @@ static void print_stats(void) {
             }
         }
         double tpw = (crt_w > 0) ? (double)stats_crt_tmpl_hits / (double)crt_w : 0.0;
+        uint64_t hp_ok = stats_crt_heap_push_ok;
+        uint64_t hp_rep = stats_crt_heap_push_replace;
+        uint64_t hp_drop = stats_crt_heap_push_drop;
+        uint64_t pop_ok = stats_crt_heap_pop_ok;
+        uint64_t waits = stats_crt_heap_waits;
+        uint64_t stale = stats_crt_stale_drop;
+        double wait_pct = (waits + pop_ok > 0)
+            ? (100.0 * (double)waits / (double)(waits + pop_ok)) : 0.0;
+        double drop_pct = (hp_ok + hp_rep + hp_drop > 0)
+            ? (100.0 * (double)hp_drop / (double)(hp_ok + hp_rep + hp_drop)) : 0.0;
+
+        /* Auto-split decisions are applied at pass boundaries because thread
+           roles are assigned at spawn. If a pass runs for a long time with an
+           empty queue, trigger a controlled pass restart so rebalancing can
+           take effect without waiting for a new block. */
+        if (use_crt_auto_split && g_crt_mode == CRT_MODE_SOLVER &&
+            crt_fermat_threads > 1 && keep_going && !g_abort_pass) {
+            if (elapsed >= 20.0 &&
+                (now - auto_split_last_rebalance_ms) >= 20000 &&
+                crt_heap_count() == 0 && wait_pct >= 45.0 && drop_pct < 1.0 &&
+                (pop_ok + waits) >= 500) {
+                auto_split_last_rebalance_ms = now;
+                log_msg("CRT auto-split: queue underfilled (gaplist=0 wait=%.1f%%)"
+                        " -> restart pass for rebalance\n", wait_pct);
+                g_abort_pass = 1;
+            }
+        }
         log_msg("  windows=%llu (%.1f/s)  primes/win=%.1f  tmpl/win=%.2f  crt_est=%s (merit>=%.1f)",
                 (unsigned long long)crt_w, win_rate, ppw, tpw,
                 crt_est_buf, g_crt_merit);
         if (crt_fermat_threads > 0)
-            log_msg("  gaplist=%lu", (unsigned long)crt_heap_count());
+            log_msg("  gaplist=%lu hwm=%llu push=%llu rep=%llu drop=%llu (%.1f%%) pop=%llu wait%%=%.1f stale=%llu",
+                (unsigned long)crt_heap_count(),
+                (unsigned long long)stats_crt_heap_hwm,
+                (unsigned long long)hp_ok,
+                (unsigned long long)hp_rep,
+                (unsigned long long)hp_drop,
+                drop_pct,
+                (unsigned long long)pop_ok,
+                wait_pct,
+                (unsigned long long)stale);
     }
 
 #ifdef WITH_GPU_FERMAT
@@ -726,6 +780,9 @@ static void print_stats(void) {
         log_msg("  pool=%lu/%lu", (unsigned long)s_acc, (unsigned long)(s_acc + s_rej));
     }
 #endif
+    log_msg("  cpu: surv/Msieved=%.1f  pairs/Msieved=%.1f  false_gaps=%llu (%.2f%%)",
+            surv_per_million, pairs_per_million,
+            (unsigned long long)stats_false_gaps, false_gap_pct);
     log_msg("\n");
 }
 
@@ -743,6 +800,10 @@ static __thread size_t    tls_bits_cap = 0;
 /* Reusable sieve start-position array per thread */
 static __thread uint64_t *tls_sp_start     = NULL;
 static __thread size_t    tls_sp_start_cap = 0;
+/* Adaptive non-CRT partial-sieve state (opt-in via --partial-sieve-auto). */
+static __thread uint64_t  tls_partial_use_limit = 0;
+static __thread uint32_t  tls_partial_windows   = 0;
+static __thread uint32_t  tls_partial_cooldown  = 0;
 
 /* ── Cached base_mod_p array ──
    base_mod_p[i] = (h256 << shift) % small_primes_cache[i], precomputed ONCE
@@ -780,6 +841,9 @@ static void free_sieve_buffers(void) {
     tls_base_mod_p_cap = 0;
     tls_sp_start_cap = 0;
     tls_base_mod_p_ready = 0;
+    tls_partial_use_limit = 0;
+    tls_partial_windows = 0;
+    tls_partial_cooldown = 0;
 #ifdef WITH_GPU_FERMAT
     free(tls_gpu_cands[0]); tls_gpu_cands[0] = NULL;
     free(tls_gpu_cands[1]); tls_gpu_cands[1] = NULL;
@@ -817,6 +881,22 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
     /* For big primes (256+shift bits), the sieve trial-division limit is
        bounded by the user-configured --sieve-primes (or default).         */
     uint64_t use_limit = (uint64_t)cli_sieve_prime_limit;
+    if (use_partial_sieve_auto && g_crt_mode == CRT_MODE_NONE && use_limit > PARTIAL_SIEVE_MIN_LIMIT) {
+        if (tls_partial_use_limit == 0) {
+            uint64_t span = (R > L) ? (R - L) : 0ULL;
+            /* Conservative bootstrap near current static behavior. */
+            if (span <= 2000000ULL)      tls_partial_use_limit = use_limit / 16ULL;
+            else if (span <= 8000000ULL) tls_partial_use_limit = use_limit / 8ULL;
+            else if (span <= 20000000ULL) tls_partial_use_limit = use_limit / 4ULL;
+            else if (span <= 50000000ULL) tls_partial_use_limit = use_limit / 2ULL;
+            else tls_partial_use_limit = use_limit;
+        }
+        if (tls_partial_use_limit < PARTIAL_SIEVE_MIN_LIMIT)
+            tls_partial_use_limit = PARTIAL_SIEVE_MIN_LIMIT;
+        if (tls_partial_use_limit > use_limit)
+            tls_partial_use_limit = use_limit;
+        use_limit = tls_partial_use_limit;
+    }
     pthread_once(&small_primes_once, populate_small_primes_cache);
 
     /* ── CRT fast-init path ──
@@ -1039,6 +1119,38 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
     }
     size_t est_survivors = (seg_size > set_bits) ? seg_size - set_bits : 0;
     est_survivors += 64;  /* small safety margin for rounding */
+
+    /* Adaptive non-CRT partial-sieve controller.
+       Goal: keep survivor density in a broad, stable band by nudging the
+       sieve-prime limit up/down in small steps with cooldown. */
+    if (use_partial_sieve_auto && g_crt_mode == CRT_MODE_NONE
+            && cli_sieve_prime_limit > PARTIAL_SIEVE_MIN_LIMIT && seg_size > 0) {
+        tls_partial_windows++;
+        if (tls_partial_cooldown > 0)
+            tls_partial_cooldown--;
+        if (tls_partial_cooldown == 0
+                && (tls_partial_windows % PARTIAL_SIEVE_ADAPT_EVERY) == 0) {
+            double surv_ratio = (double)est_survivors / (double)seg_size;
+            uint64_t cur = tls_partial_use_limit ? tls_partial_use_limit : use_limit;
+            uint64_t next = cur;
+
+            if (surv_ratio > 0.18) {
+                next = cur + (cur >> 3);   /* +12.5% */
+            } else if (surv_ratio < 0.08) {
+                next = cur - (cur / 10);   /* -10% */
+            }
+
+            if (next < PARTIAL_SIEVE_MIN_LIMIT)
+                next = PARTIAL_SIEVE_MIN_LIMIT;
+            if (next > cli_sieve_prime_limit)
+                next = cli_sieve_prime_limit;
+
+            if (next != cur) {
+                tls_partial_use_limit = next;
+                tls_partial_cooldown = PARTIAL_SIEVE_COOLDOWN_WIN;
+            }
+        }
+    }
 
     /* ensure the tls_pr buffer is large enough */
     if (tls_cap < est_survivors) {
@@ -2192,6 +2304,9 @@ static void set_base_bn(const uint8_t h256[32], int shift) {
     mpz_import(tls_base_mpz, 32, 1, 1, 1, 0, h256);
     mpz_mul_2exp(tls_base_mpz, tls_base_mpz, (unsigned long)shift);
     prime_cache_invalidate_base();
+    tls_partial_use_limit = 0;
+    tls_partial_windows = 0;
+    tls_partial_cooldown = 0;
 
     /* ── Precompute CRT base residue once per pass ── */
     if (g_crt_mode == CRT_MODE_TEMPLATE && g_crt_primorial > 0)
@@ -2337,7 +2452,10 @@ static inline void crt_filter_step_residues(void) {
  *     Computes 2^(n-1) mod n and checks == 1.
  *     Bypasses mpz_probab_prime_p's internal trial-division (which is
  *     redundant — our candidates already survived a million-prime sieve).
- *  B. Full: mpz_probab_prime_p(n, 10) — 10 MR rounds.
+ *  B. --fast-euler: Euler-Plumb style base-2 criterion via GMP mpz_powm.
+ *     Stronger than plain base-2 Fermat while remaining cheaper than
+ *     full Miller-Rabin.
+ *  C. Full: mpz_probab_prime_p(n, 10) — 10 MR rounds.
  */
 /* Single-round Miller-Rabin with base 3 on tls_cand_mpz.
    Call after tls_cand_mpz is set to the candidate.
@@ -2419,7 +2537,33 @@ static int bn_candidate_is_prime(uint64_t offset) {
     tls_cand_last_valid  = 1;
 
     int is_prime;
-    if (use_fast_fermat) {
+    if (use_fast_euler) {
+        unsigned long nmod8 = mpz_fdiv_ui(tls_cand_mpz, 8UL);
+        if ((nmod8 & 1UL) == 0) {
+            is_prime = 0;
+        } else if (mpz_cmp_ui(tls_cand_mpz, 5UL) < 0) {
+            is_prime = (mpz_cmp_ui(tls_cand_mpz, 2UL) == 0 ||
+                        mpz_cmp_ui(tls_cand_mpz, 3UL) == 0);
+        } else {
+            mpz_sub_ui(tls_exp_mpz, tls_cand_mpz, 1);
+            mpz_tdiv_q_2exp(tls_exp_mpz, tls_exp_mpz,
+                            (nmod8 == 1UL) ? 2UL : 1UL);
+            mpz_powm(tls_res_mpz, tls_two_mpz, tls_exp_mpz, tls_cand_mpz);
+
+            if (mpz_cmp_ui(tls_res_mpz, 1UL) == 0) {
+                is_prime = (nmod8 == 1UL || nmod8 == 7UL);
+            } else {
+                mpz_sub_ui(tls_mr_nm1, tls_cand_mpz, 1);
+                if (mpz_cmp(tls_res_mpz, tls_mr_nm1) == 0)
+                    is_prime = (nmod8 == 1UL || nmod8 == 3UL || nmod8 == 5UL);
+                else
+                    is_prime = 0;
+            }
+        }
+        /* MR base-3 verification catches pseudoprimes from fast modes */
+        if (is_prime && use_mr_verify)
+            is_prime = mr_verify_cand();
+    } else if (use_fast_fermat) {
         /* Raw base-2 Fermat test: 2^(n-1) mod n == 1?
            Skips GMP's redundant internal trial-division (~700 primes
            up to 5000) that mpz_probab_prime_p does before MR.
@@ -3479,6 +3623,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
                 }
             }
             if (false_gap) {
+                __sync_fetch_and_add(&stats_false_gaps, 1);
                 log_msg("[gap_verify] FALSE GAP: reported=%llu"
                         "  prime at nAdd+%llu (nAdd=%llu)\n",
                         (unsigned long long)gap,
@@ -3826,6 +3971,7 @@ static void *worker_fn(void *arg) {
 
                 /* Discard stale items from previous template */
                 if (w->generation != crt_heap_gen) {
+                    __sync_fetch_and_add(&stats_crt_stale_drop, 1);
                     crt_work_free(w);
                     continue;
                 }
@@ -4955,12 +5101,16 @@ int main(int argc, char **argv) {
         printf("      --threads N       worker threads        (default: 1)\n");
         printf("      --adder-max M     adder upper bound     (default: 2^shift)\n");
         printf("      --fast-fermat     fast primality (fewer Miller-Rabin rounds)\n");
+        printf("      --fast-euler      fast Euler-Plumb primality (CPU path)\n");
+        printf("      --partial-sieve-auto  adaptive non-CRT sieve-prime limiting (opt-in)\n");
+        printf("      --partial-sieve       alias for --partial-sieve-auto\n");
         printf("      --sample-stride K smart scan: test every Kth survivor (default: 8, 1=off)\n");
         printf("      --mr-rounds N     Miller-Rabin rounds for primality  (default: 2)\n");
         printf("      --mr-verify       MR base-3 verify Fermat/GPU survivors (catches pseudoprimes)\n");
         printf("      --crt-file FILE   load CRT sieve file (binary template or text gap-solver)\n");
         printf("      --fermat-threads N  number of Fermat testing threads for CRT producer-consumer\n");
         printf("                          default: auto = threads-1 for CRT solver with threads>=3\n");
+        printf("      --crt-auto-split  adapt CRT sieve/fermat split between passes (opt-in)\n");
         printf("      --heap N          max pending CRT windows in heap (default: 4096)\n");
         printf("      --keep-going      continue after block found (default on)\n");
         printf("      --stop-after-block  exit after first valid block\n");
@@ -5038,6 +5188,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--no-opreturn")) no_opreturn = 1;
         else if (!strcmp(argv[i],"--force-solution")) debug_force = 1;
         else if (!strcmp(argv[i],"--fast-fermat")) use_fast_fermat = 1;
+        else if (!strcmp(argv[i],"--fast-euler")) use_fast_euler = 1;
+        else if (!strcmp(argv[i],"--partial-sieve-auto") || !strcmp(argv[i],"--partial-sieve")) use_partial_sieve_auto = 1;
+        else if (!strcmp(argv[i],"--crt-auto-split")) use_crt_auto_split = 1;
         else if (!strcmp(argv[i],"--mr-verify")) use_mr_verify = 1;
         else if (!strcmp(argv[i],"--cuda")) {
             use_cuda = 1;
@@ -5108,6 +5261,10 @@ int main(int argc, char **argv) {
     }
     if (use_cuda && use_opencl) {
         fprintf(stderr, "Use either --cuda or --opencl, not both in one run.\n");
+        return 2;
+    }
+    if (use_fast_fermat && use_fast_euler) {
+        fprintf(stderr, "Use either --fast-fermat or --fast-euler, not both.\n");
         return 2;
     }
     /* Build rpc_url from --host / --port if not given explicitly.
@@ -5529,11 +5686,18 @@ int main(int argc, char **argv) {
         log_msg("default behaviour: will continue mining after finding a valid block\n");
     else
         log_msg("miner configured to exit when a valid block is found\n");
-    if (use_fast_fermat)
+    if (use_fast_euler)
+        log_msg("fast Euler-Plumb: GMP mpz_powm base-2 (--fast-euler)%s\n",
+                use_mr_verify ? " + MR base-3 verify (--mr-verify)" : "");
+    else if (use_fast_fermat)
         log_msg("fast Fermat: GMP mpz_powm base-2 (--fast-fermat)%s\n",
                 use_mr_verify ? " + MR base-3 verify (--mr-verify)" : "");
     else
         log_msg("Miller-Rabin rounds: %d (--mr-rounds to change)\n", cli_mr_rounds);
+    if (use_partial_sieve_auto)
+        log_msg("partial sieve auto: enabled (--partial-sieve-auto/--partial-sieve)\n");
+    if (use_crt_auto_split)
+        log_msg("CRT auto split: enabled (--crt-auto-split)\n");
 
 #ifndef WITH_RPC
     /* suppress unused-but-set warnings when built without RPC */
@@ -6063,8 +6227,65 @@ int main(int argc, char **argv) {
             }
         } while (keep_going);
     } else {
+        int auto_fermat_threads = crt_fermat_threads;
+        uint64_t split_prev_push_ok = 0, split_prev_push_rep = 0, split_prev_push_drop = 0;
+        uint64_t split_prev_pop_ok = 0, split_prev_pop_empty = 0, split_prev_waits = 0;
         do {
             g_abort_pass = 0;
+            if (use_crt_auto_split && g_crt_mode == CRT_MODE_SOLVER && auto_fermat_threads > 0) {
+                uint64_t cur_push_ok = stats_crt_heap_push_ok;
+                uint64_t cur_push_rep = stats_crt_heap_push_replace;
+                uint64_t cur_push_drop = stats_crt_heap_push_drop;
+                uint64_t cur_pop_ok = stats_crt_heap_pop_ok;
+                uint64_t cur_pop_empty = stats_crt_heap_pop_empty;
+                uint64_t cur_waits = stats_crt_heap_waits;
+
+                uint64_t d_push_ok = cur_push_ok - split_prev_push_ok;
+                uint64_t d_push_rep = cur_push_rep - split_prev_push_rep;
+                uint64_t d_push_drop = cur_push_drop - split_prev_push_drop;
+                uint64_t d_pop_ok = cur_pop_ok - split_prev_pop_ok;
+                uint64_t d_pop_empty = cur_pop_empty - split_prev_pop_empty;
+                uint64_t d_waits = cur_waits - split_prev_waits;
+                uint64_t d_push_total = d_push_ok + d_push_rep + d_push_drop;
+                uint64_t d_pop_total = d_pop_ok + d_pop_empty;
+
+                if (d_pop_total >= 100) {
+                    double wait_pct = (d_waits + d_pop_ok > 0)
+                        ? (100.0 * (double)d_waits / (double)(d_waits + d_pop_ok)) : 0.0;
+                    double empty_pct = (d_pop_total > 0)
+                        ? (100.0 * (double)d_pop_empty / (double)d_pop_total) : 0.0;
+                    double drop_pct = (d_push_total > 0)
+                        ? (100.0 * (double)d_push_drop / (double)d_push_total) : 0.0;
+                    int next = auto_fermat_threads;
+
+                    /* Consumers idle often / queue empty often -> add sieve capacity. */
+                    if ((wait_pct >= 45.0 || empty_pct >= 30.0) &&
+                        drop_pct < 1.0 && auto_fermat_threads > 1)
+                        next--;
+                    /* Heap drops often -> add Fermat consumer capacity. */
+                    else if (drop_pct > 3.0 && auto_fermat_threads < (num_threads - 1))
+                        next++;
+
+                    if (next != auto_fermat_threads) {
+                        int old_f = auto_fermat_threads;
+                        auto_fermat_threads = next;
+                        log_msg("CRT auto-split: fermat-threads %d -> %d"
+                                " (wait=%.1f%% empty=%.1f%% drop=%.1f%% over last pass)\n",
+                                old_f, auto_fermat_threads, wait_pct, empty_pct, drop_pct);
+                    }
+                }
+
+                split_prev_push_ok = cur_push_ok;
+                split_prev_push_rep = cur_push_rep;
+                split_prev_push_drop = cur_push_drop;
+                split_prev_pop_ok = cur_pop_ok;
+                split_prev_pop_empty = cur_pop_empty;
+                split_prev_waits = cur_waits;
+            }
+
+            if (use_crt_auto_split && g_crt_mode == CRT_MODE_SOLVER && auto_fermat_threads > 0)
+                crt_fermat_threads = auto_fermat_threads;
+
             /* Flush stale heap items from previous pass and bump generation */
             if (crt_fermat_threads > 0) {
                 crt_heap_clear_shutdown();

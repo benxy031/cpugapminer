@@ -3,6 +3,7 @@
 #endif
 
 #include "crt_heap.h"
+#include "stats.h"
 
 #include <pthread.h>
 #include <stdlib.h>
@@ -90,6 +91,9 @@ int crt_heap_push(struct crt_work_item *w) {
         crt_heap[crt_heap_size] = w;
         crt_heap_sift_up(crt_heap_size);
         crt_heap_size++;
+        if (crt_heap_size > stats_crt_heap_hwm)
+            stats_crt_heap_hwm = crt_heap_size;
+        __sync_fetch_and_add(&stats_crt_heap_push_ok, 1);
         pthread_cond_signal(&crt_heap_cv);
         pthread_mutex_unlock(&crt_heap_mtx);
         return 1;
@@ -106,12 +110,14 @@ int crt_heap_push(struct crt_work_item *w) {
         crt_heap[max_idx] = w;
         crt_heap_sift_up(max_idx);
         crt_heap_sift_down(max_idx, crt_heap_size);
+        __sync_fetch_and_add(&stats_crt_heap_push_replace, 1);
         pthread_cond_signal(&crt_heap_cv);
         pthread_mutex_unlock(&crt_heap_mtx);
         return 1;
     }
 
     pthread_mutex_unlock(&crt_heap_mtx);
+    __sync_fetch_and_add(&stats_crt_heap_push_drop, 1);
     crt_work_free(w);
     return 0;
 }
@@ -119,6 +125,7 @@ int crt_heap_push(struct crt_work_item *w) {
 struct crt_work_item *crt_heap_pop(void) {
     pthread_mutex_lock(&crt_heap_mtx);
     while (crt_heap_size == 0 && !crt_heap_shutdown) {
+        __sync_fetch_and_add(&stats_crt_heap_waits, 1);
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_nsec += 100000000L;
@@ -129,6 +136,7 @@ struct crt_work_item *crt_heap_pop(void) {
         pthread_cond_timedwait(&crt_heap_cv, &crt_heap_mtx, &ts);
     }
     if (crt_heap_size == 0 || crt_heap_shutdown) {
+        __sync_fetch_and_add(&stats_crt_heap_pop_empty, 1);
         pthread_mutex_unlock(&crt_heap_mtx);
         return NULL;
     }
@@ -139,6 +147,7 @@ struct crt_work_item *crt_heap_pop(void) {
         crt_heap[0] = crt_heap[crt_heap_size];
         crt_heap_sift_down(0, crt_heap_size);
     }
+    __sync_fetch_and_add(&stats_crt_heap_pop_ok, 1);
     pthread_mutex_unlock(&crt_heap_mtx);
     return best;
 }

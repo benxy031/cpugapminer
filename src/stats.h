@@ -22,6 +22,15 @@ extern volatile uint64_t stats_best_gap;
 extern volatile uint64_t stats_gpu_flushes;
 extern volatile uint64_t stats_gpu_batched;
 extern volatile uint64_t stats_crt_tmpl_hits;  /* times per-nonce CRT template was applied */
+extern volatile uint64_t stats_false_gaps;     /* rejected as false after interior verification */
+extern volatile uint64_t stats_crt_heap_push_ok;
+extern volatile uint64_t stats_crt_heap_push_replace;
+extern volatile uint64_t stats_crt_heap_push_drop;
+extern volatile uint64_t stats_crt_heap_pop_ok;
+extern volatile uint64_t stats_crt_heap_pop_empty;
+extern volatile uint64_t stats_crt_heap_waits;
+extern volatile uint64_t stats_crt_heap_hwm;
+extern volatile uint64_t stats_crt_stale_drop;
 
 /* Rolling-window state used by print_stats(). */
 #define RATE_RING_SLOTS 6

@@ -24,6 +24,15 @@ volatile uint64_t stats_best_gap = 0;
 volatile uint64_t stats_gpu_flushes = 0;
 volatile uint64_t stats_gpu_batched = 0;
 volatile uint64_t stats_crt_tmpl_hits = 0;
+volatile uint64_t stats_false_gaps = 0;
+volatile uint64_t stats_crt_heap_push_ok = 0;
+volatile uint64_t stats_crt_heap_push_replace = 0;
+volatile uint64_t stats_crt_heap_push_drop = 0;
+volatile uint64_t stats_crt_heap_pop_ok = 0;
+volatile uint64_t stats_crt_heap_pop_empty = 0;
+volatile uint64_t stats_crt_heap_waits = 0;
+volatile uint64_t stats_crt_heap_hwm = 0;
+volatile uint64_t stats_crt_stale_drop = 0;
 
 struct rate_ring_slot rate_ring[RATE_RING_SLOTS];
 int rate_ring_idx = 0;
