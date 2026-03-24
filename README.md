@@ -254,6 +254,74 @@ Capture output to a file as well:
 bin/gap_miner ... --log-file miner.log
 ```
 
+## Recent changes (March 2026)
+
+This section summarizes behavior that changed recently and may differ from
+older logs, scripts, or command lines.
+
+### Correctness and platform safety
+
+- 64-bit candidate offset additions now use a safe GMP path on platforms where
+  `unsigned long` is 32-bit (notably Windows).  This avoids truncation in
+  base+offset arithmetic and prevents false-gap style misclassification caused
+  by offset overflow.
+
+### Primality mode flags
+
+- `--fast-euler` is available as a separate explicit mode (CPU path).
+- `--fast-fermat` and `--fast-euler` are mutually exclusive.
+- `--mr-verify` can still be layered on fast modes to re-check boundary
+  candidates with MR base-3.
+
+### Non-CRT adaptive sieve control
+
+- `--partial-sieve-auto` enables adaptive non-CRT sieve-prime limiting.
+- `--partial-sieve` is an alias for `--partial-sieve-auto`.
+
+### CRT producer-consumer telemetry
+
+In CRT producer-consumer mode (`--fermat-threads N`), STATS now include queue
+telemetry:
+
+- `gaplist`: current heap depth (pending windows)
+- `hwm`: heap high-water mark (peak depth since start)
+- `push`: windows accepted into heap
+- `rep`: push-replace events (lower-priority entries evicted)
+- `drop`: pushes dropped due to pressure (with percentage)
+- `pop`: windows consumed by Fermat threads
+- `wait%`: consumer wait ratio
+- `stale`: stale windows dropped at pass transitions
+
+Interpretation rule of thumb:
+
+- `hwm` near heap cap plus non-zero `drop` means the queue is saturated and
+  some work is being discarded.
+- `gaplist` near zero with high `wait%` means consumers are starved and sieve
+  production is too slow for the current split.
+
+### CRT adaptive split
+
+- `--crt-auto-split` enables pass-level adaptation of the
+  sieve/fermat-thread split in CRT solver mode.
+- The controller now uses queue pressure signals (`wait%`, empty-pop pressure,
+  and `drop%`) to move the split conservatively.
+- When persistent queue underfill is detected, the miner can trigger a
+  controlled pass restart so a new split can take effect immediately instead of
+  waiting for a naturally ending pass.
+
+### Stats output update
+
+- The advisory `merit_trend(k=1): paper~... evt~... target_delta=...` segment
+  has been removed from periodic STATS output.
+
+### Benchmark script updates
+
+- `scripts/bench_sieve_matrix.sh` was updated to improve default handling,
+  environment overrides, and TSV extraction (including tested-per-second from
+  current STATS formatting).
+- Use this script for repeatable sieve/throughput matrices; keep generated
+  `logs/` data out of commits unless you explicitly want to version benchmarks.
+
 ### With CUDA GPU acceleration
 
 Add `--cuda` to offload Fermat testing to the GPU.  Works on the normal
