@@ -9,6 +9,7 @@
 #include <stdatomic.h>
 #include <math.h>
 #include <time.h>
+#include <limits.h>
 #include "compat_win32.h"
 #include <openssl/sha.h>
 #include <openssl/bn.h>
@@ -2160,6 +2161,25 @@ static void ensure_gmp_tls(void) {
     }
 }
 
+/* Safe mpz addition for 64-bit offsets on platforms where unsigned long
+   is 32 bits (e.g., Win32 GMP); avoids silent truncation in mpz_add_ui. */
+static inline void mpz_add_u64(mpz_t rop, mpz_srcptr base, uint64_t off) {
+#if ULONG_MAX < UINT64_MAX
+    if (off >> 32) {
+        mpz_set_ui(rop, (unsigned long)(off >> 32));
+        mpz_mul_2exp(rop, rop, 32);
+        mpz_add_ui(rop, rop, (unsigned long)(off & 0xFFFFFFFFUL));
+        mpz_add(rop, rop, base);
+    } else {
+        mpz_set(rop, base);
+        mpz_add_ui(rop, rop, (unsigned long)off);
+    }
+#else
+    mpz_set(rop, base);
+    mpz_add_ui(rop, rop, (unsigned long)off);
+#endif
+}
+
 /* Thread-local TD residues: tls_td_residues[i] = (base << shift) % td_extra_primes[i].         Precomputed once per mining pass in set_base_bn(); used for cheap pre-filtering. */
 static __thread uint32_t tls_td_residues[TD_EXTRA_CNT];
 
@@ -2728,12 +2748,10 @@ static size_t crt_bkscan_and_submit(
             /* MR base-3 boundary verification for CRT backward-scan path */
             if (use_mr_verify) {
                 ensure_gmp_tls();
-                mpz_set(tls_cand_mpz, tls_base_mpz);
-                mpz_add_ui(tls_cand_mpz, tls_cand_mpz, start_off);
+                mpz_add_u64(tls_cand_mpz, tls_base_mpz, start_off);
                 tls_cand_last_valid = 0;
                 if (!mr_verify_cand()) continue;
-                mpz_set(tls_cand_mpz, tls_base_mpz);
-                mpz_add_ui(tls_cand_mpz, tls_cand_mpz, end_off);
+                mpz_add_u64(tls_cand_mpz, tls_base_mpz, end_off);
                 tls_cand_last_valid = 0;
                 if (!mr_verify_cand()) continue;
             }
@@ -2742,8 +2760,7 @@ static size_t crt_bkscan_and_submit(
 
             mpz_t nAdd_prime;
             mpz_init(nAdd_prime);
-            mpz_set(nAdd_prime, nAdd);
-            mpz_add_ui(nAdd_prime, nAdd_prime, start_off);
+            mpz_add_u64(nAdd_prime, nAdd, start_off);
             if (cand_odd)
                 mpz_sub_ui(nAdd_prime, nAdd_prime, 1);
 
@@ -2863,14 +2880,12 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
         if (use_mr_verify) {
             ensure_gmp_tls();
             /* Verify gap start prime: nAdd + primes[i] */
-            mpz_set(tls_cand_mpz, nAdd);
-            mpz_add_ui(tls_cand_mpz, tls_cand_mpz, primes[i]);
+            mpz_add_u64(tls_cand_mpz, nAdd, primes[i]);
             if (cand_odd) mpz_sub_ui(tls_cand_mpz, tls_cand_mpz, 1);
             tls_cand_last_valid = 0;
             if (!mr_verify_cand()) continue;
             /* Verify gap end prime: nAdd + primes[i+1] */
-            mpz_set(tls_cand_mpz, nAdd);
-            mpz_add_ui(tls_cand_mpz, tls_cand_mpz, primes[i + 1]);
+            mpz_add_u64(tls_cand_mpz, nAdd, primes[i + 1]);
             if (cand_odd) mpz_sub_ui(tls_cand_mpz, tls_cand_mpz, 1);
             tls_cand_last_valid = 0;
             if (!mr_verify_cand()) continue;
@@ -2879,8 +2894,7 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
         __sync_fetch_and_add(&stats_gaps, 1);
         mpz_t nAdd_prime;
         mpz_init(nAdd_prime);
-        mpz_set(nAdd_prime, nAdd);
-        mpz_add_ui(nAdd_prime, nAdd_prime, primes[i]);
+        mpz_add_u64(nAdd_prime, nAdd, primes[i]);
         if (cand_odd)
             mpz_sub_ui(nAdd_prime, nAdd_prime, 1);
         char nAdd_str[256];
