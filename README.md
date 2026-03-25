@@ -309,6 +309,44 @@ Interpretation rule of thumb:
   controlled pass restart so a new split can take effect immediately instead of
   waiting for a naturally ending pass.
 
+### 8-at-a-time sieve inner-loop marking
+
+The sieve Phase 1 inner block loop was rewritten to process **8 bit-marks per
+iteration** using precomputed byte-offset/mask tables (Kim Walisch / danaj
+style).  For each sieve prime `p`, the miner precomputes 8 `(offset, mask)`
+pairs once before the loop; the main loop performs 8 `OR` operations and a
+single pointer advance `s += p` — with no per-mark division.  A scalar tail
+handles the remaining `< 8` marks.
+
+Benchmarked on NVIDIA GeForce RTX 3060 at shift 64
+(`--sieve-primes 1500000 --sieve-size 67108864 --cuda --fast-euler`):
+
+| | Before | After | Change |
+|---|---|---|---|
+| Sieve throughput | 562 M/s | 633 M/s | **+12.6%** |
+| Pairs/s (pps) | 737 K | 924 K | **+25.4%** |
+
+CPU-only runs show no measurable gain because Fermat testing dominates the
+pipeline in CPU mode.  The improvement is visible when CUDA offloads Fermat
+and exposes the sieve as the pipeline bottleneck.
+
+### `--fast-euler` recommended with `--cuda`
+
+In GPU (smart-scan) mode the sieve and GPU phases are CPU-free, but the
+edge-probe phase between Phase 1 and Phase 2 calls CPU `bn_candidate_is_prime`
+(up to 6 calls per gap region, left + right boundary).  `--fast-euler` halves
+the cost of those calls by using a base-2 Euler–Plumb exponent `(n-1)/2`
+instead of the full `(n-1)` Fermat exponent.  Without it, pps drops by ~29%
+at typical shift-64 settings.
+
+Recommended command line for RTX 3060, shift 64:
+
+```sh
+./gap_miner -o 127.0.0.1 -p 31397 -u USER --pass PASS \
+  -s 64 --threads 4 --fast-euler \
+  --sieve-size 67108864 --sieve-primes 1500000 --cuda
+```
+
 ### Stats output update
 
 - The advisory `merit_trend(k=1): paper~... evt~... target_delta=...` segment
@@ -905,6 +943,16 @@ gap scanning.  Multiple GPUs are supported via `--cuda 0,1`.
     `memcpy` tiling wraps with zero bit-drift.  Replaces 6 per-prime
     sieve passes with a single `memcpy` + shift, cutting sieve setup
     time for each window.
+
+12. **8-at-a-time sieve marking** -- The Phase 1 bit-setting inner loop
+    (adapted from Kim Walisch's `primesieve` / danaj's `Math::Prime::Util`
+    CROSS_INDEX technique) precomputes 8 `(byte-offset, bitmask)` pairs
+    per sieve prime using `q = p/8` and `r = p%8`.  The main loop fires
+    8 `OR` operations and advances the base pointer by `p` bytes once,
+    with no per-mark division.  A scalar tail cleans up `< 8` remaining
+    marks.  On GPU-bottleneck workloads (CUDA, shift 64) this yields
+    **+12.6% sieve throughput** and **+25.4% pps** (RTX 3060
+    benchmark).
 
 > **Historical note:** an earlier Barrett-reduction path for fast modular
 > exponentiation contained a correctness bug for large moduli and was

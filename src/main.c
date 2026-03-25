@@ -1053,11 +1053,41 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
                         uint64_t skip = (blk_L - m + stride - 1) / stride;
                         m += skip * stride;
                     }
-                    for (; m < blk_R; m += stride) {
-                        uint64_t pos = (m - L) / 2;
-                        bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+                    if (m >= blk_R) { sp_start[i] = m; continue; }
+
+                    /* 8-at-a-time unrolled marking (Kim Walisch / danaj style).
+                     * For prime p with q = p/8 and r = p%8:
+                     *   mark k lands at bit-position (pos + k*p),
+                     *   relative byte offset = k*q + floor((b + k*r)/8),
+                     *   where b = pos%8 (fixed phase).
+                     * After exactly 8 marks the bitmap pointer advances p bytes
+                     * and b is unchanged (since 8p ≡ 0 mod 8).
+                     * Precomputing off[8]/msk[8] reduces the inner loop to
+                     * 8 OR ops + 1 pointer advance — no per-mark division. */
+                    uint64_t pos     = (m - L) >> 1;
+                    uint64_t pos_end = (blk_R - L) >> 1;
+                    uint64_t q = p >> 3;   /* floor(p / 8) */
+                    uint64_t r = p & 7;    /* p mod 8; odd for all primes p > 2 */
+                    uint64_t b = pos & 7;  /* starting bit-within-byte (invariant) */
+                    uint32_t off[8]; uint8_t msk[8];
+                    uint64_t acc = b;
+                    for (int k = 0; k < 8; k++, acc += r) {
+                        off[k] = (uint32_t)((uint64_t)k * q + (acc >> 3));
+                        msk[k] = (uint8_t)(1u << (acc & 7));
                     }
-                    sp_start[i] = m; /* carry into next block */
+                    /* Main loop: advance s by p bytes = 8 bit-positions per iter. */
+                    uint8_t *s = bits + (pos >> 3);
+                    while (pos + 7 * p < pos_end) {
+                        s[off[0]] |= msk[0]; s[off[1]] |= msk[1];
+                        s[off[2]] |= msk[2]; s[off[3]] |= msk[3];
+                        s[off[4]] |= msk[4]; s[off[5]] |= msk[5];
+                        s[off[6]] |= msk[6]; s[off[7]] |= msk[7];
+                        s += p; pos += 8 * p;
+                    }
+                    /* Tail: fewer than 8 marks remain in this block. */
+                    for (; pos < pos_end; pos += p)
+                        bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+                    sp_start[i] = L + pos * 2;  /* carry as m-value into next block */
                 }
             }
             /* sp_start is TLS-owned; no free needed */
