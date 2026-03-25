@@ -67,13 +67,37 @@ static const int PRIMES[] = {
 #define N_PRIMES_AVAIL ((int)(sizeof(PRIMES) / sizeof(PRIMES[0])))
 
 /* ------------------------------------------------------------------ */
+/* Per-position primality weight for the weighted fitness function.    */
+/*                                                                     */
+/* w(d) = ∏(1 - 1/p) for p in WEIGHT_PRIMES where p does NOT divide d */
+/*                                                                     */
+/* Rationale: positions coprime to many small primes are harder to     */
+/* eliminate by subsequent sieving (they don't have "free" small-prime  */
+/* coverage and will linger as Fermat candidates longer on average).   */
+/* Weighting by w(d) gives the optimizer a smoother, continuous        */
+/* landscape — analogous to cross-entropy vs. 0-1 loss — reducing      */
+/* degeneracy from large flat integer plateaus.                        */
+/* ------------------------------------------------------------------ */
+static const int    WEIGHT_PRIMES[]   = {3,5,7,11,13,17,19,23,29,31};
+#define N_WEIGHT_PRIMES 10
+
+static double position_weight(int d) {
+    double w = 1.0;
+    for (int i = 0; i < N_WEIGHT_PRIMES; i++)
+        if (d % WEIGHT_PRIMES[i] != 0)
+            w *= (1.0 - 1.0 / WEIGHT_PRIMES[i]);
+    return w;
+}
+
+/* ------------------------------------------------------------------ */
 /* Solution: a set of offsets and its fitness (n_candidates)           */
 /* ------------------------------------------------------------------ */
 typedef struct {
-    int  n_primes;
-    int  gap_size;
-    int *offsets;       /* offsets[i] for PRIMES[i], 0 <= o < p_i */
-    int  n_candidates;  /* uncovered positions in [1, gap_size]   */
+    int    n_primes;
+    int    gap_size;
+    int   *offsets;       /* offsets[i] for PRIMES[i], 0 <= o < p_i    */
+    int    n_candidates;  /* integer uncovered count (display/file out) */
+    double w_score;       /* weighted fitness used for optimization     */
 } Solution;
 
 /* ---- helpers ---- */
@@ -91,6 +115,7 @@ static Solution sol_alloc(int n_primes, int gap_size) {
     s.gap_size     = gap_size;
     s.offsets      = (int *)malloc((size_t)n_primes * sizeof(int));
     s.n_candidates = INT_MAX;
+    s.w_score      = 1e18;
     if (!s.offsets) { perror("malloc"); exit(1); }
     return s;
 }
@@ -99,6 +124,7 @@ static Solution sol_clone(const Solution *src) {
     Solution c = sol_alloc(src->n_primes, src->gap_size);
     memcpy(c.offsets, src->offsets, (size_t)src->n_primes * sizeof(int));
     c.n_candidates = src->n_candidates;
+    c.w_score      = src->w_score;
     return c;
 }
 
@@ -110,9 +136,10 @@ static void sol_free(Solution *s) {
 /* ------------------------------------------------------------------ */
 /* Evaluate: count uncovered positions in [1, gap_size].              */
 /* Uses caller-owned buffer buf[0..gap_size] (uint8_t).               */
+/* If w_out is non-NULL, also computes weighted fitness score.         */
 /* ------------------------------------------------------------------ */
 static int evaluate(const int *offsets, int n_primes, int gap_size,
-                    uint8_t *buf) {
+                    uint8_t *buf, double *w_out) {
     memset(buf, 0, (size_t)(gap_size + 1));
     for (int i = 0; i < n_primes; i++) {
         int p = PRIMES[i];
@@ -121,9 +148,15 @@ static int evaluate(const int *offsets, int n_primes, int gap_size,
         for (int d = (o ? o : p); d <= gap_size; d += p)
             buf[d] = 1;
     }
-    int cnt = 0;
-    for (int d = 1; d <= gap_size; d++)
-        if (!buf[d]) cnt++;
+    int    cnt = 0;
+    double wt  = 0.0;
+    for (int d = 1; d <= gap_size; d++) {
+        if (!buf[d]) {
+            cnt++;
+            wt += position_weight(d);
+        }
+    }
+    if (w_out) *w_out = wt;
     return cnt;
 }
 
@@ -138,12 +171,13 @@ static void greedy_solve(int *offsets, int n_primes, int gap_size,
 
     for (int i = 0; i < n_primes; i++) {
         int p = PRIMES[i];
-        int best_o = 0, best_new = -1, ties = 0;
+        int best_o = 0, ties = 0;
+        double best_new = -1.0;
 
         for (int o = 0; o < p; o++) {
-            int new_cov = 0;
+            double new_cov = 0.0;
             for (int d = (o ? o : p); d <= gap_size; d += p)
-                if (!buf[d]) new_cov++;
+                if (!buf[d]) new_cov += position_weight(d);
 
             if (new_cov > best_new) {
                 best_new = new_cov;
@@ -177,12 +211,13 @@ static int local_search_one(int *offsets, int n_primes, int gap_size,
             buf[d] = 1;
     }
     /* find best offset for prime at idx */
-    int p = PRIMES[idx];
-    int best_o = offsets[idx], best_new = -1;
+    int    p       = PRIMES[idx];
+    int    best_o  = offsets[idx];
+    double best_new = -1.0;
     for (int o = 0; o < p; o++) {
-        int cnt = 0;
+        double cnt = 0.0;
         for (int d = (o ? o : p); d <= gap_size; d += p)
-            if (!buf[d]) cnt++;
+            if (!buf[d]) cnt += position_weight(d);
         if (cnt > best_new) {
             best_new = cnt;
             best_o   = o;
@@ -217,7 +252,7 @@ static int local_search_pair(int *offsets, int n_primes, int gap_size,
 
     int best_oa = offsets[idx_a];
     int best_ob = offsets[idx_b];
-    int best_uncov = INT_MAX;
+    double best_uncov = 1e18;
 
     for (int oa = 0; oa < pa; oa++) {
         /* overlay prime a onto base coverage */
@@ -226,11 +261,12 @@ static int local_search_pair(int *offsets, int n_primes, int gap_size,
             work_buf[d] = 1;
 
         /* find best offset for prime b given base + a */
-        int local_best_ob = 0, local_best_new = -1;
+        int    local_best_ob  = 0;
+        double local_best_new = -1.0;
         for (int ob = 0; ob < pb; ob++) {
-            int cnt = 0;
+            double cnt = 0.0;
             for (int d = (ob ? ob : pb); d <= gap_size; d += pb)
-                if (!work_buf[d]) cnt++;
+                if (!work_buf[d]) cnt += position_weight(d);
             if (cnt > local_best_new) {
                 local_best_new = cnt;
                 local_best_ob  = ob;
@@ -238,12 +274,12 @@ static int local_search_pair(int *offsets, int n_primes, int gap_size,
         }
 
         /* count total uncovered = positions not hit by base + a + best_b */
-        int uncov = 0;
+        double uncov = 0.0;
         for (int d = 1; d <= gap_size; d++) {
             if (!work_buf[d]) {
                 /* check if prime b covers this position */
                 if (d % pb != local_best_ob)
-                    uncov++;
+                    uncov += position_weight(d);
             }
         }
 
@@ -298,7 +334,7 @@ static int pair_search_sweep(int *offsets, int n_primes, int gap_size,
 
 /* forward declarations (needed by evolve) */
 static int evaluate(const int *offsets, int n_primes, int gap_size,
-                    uint8_t *buf);
+                    uint8_t *buf, double *w_out);
 static void greedy_solve(int *offsets, int n_primes, int gap_size,
                          uint8_t *buf);
 static int local_search_one(int *offsets, int n_primes, int gap_size,
@@ -323,19 +359,23 @@ static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
     uint8_t *buf2  = (uint8_t *)calloc((size_t)(gap_size + 1), 1);
     if (!child || !buf || !buf2) { perror("alloc"); exit(1); }
 
-    int best_ever = INT_MAX;
-    for (int i = 0; i < pop_size; i++)
-        if (pop[i].n_candidates < best_ever)
-            best_ever = pop[i].n_candidates;
+    double best_ever_w   = 1e18;
+    int    best_ever_cnt = INT_MAX;
+    for (int i = 0; i < pop_size; i++) {
+        if (pop[i].w_score < best_ever_w) {
+            best_ever_w   = pop[i].w_score;
+            best_ever_cnt = pop[i].n_candidates;
+        }
+    }
 
     int stale = 0;
 
     for (int gen = 0; gen < max_gens; gen++) {
         /* tournament select two parents */
         int a = rand() % pop_size, b = rand() % pop_size;
-        int p1 = (pop[a].n_candidates <= pop[b].n_candidates) ? a : b;
+        int p1 = (pop[a].w_score <= pop[b].w_score) ? a : b;
         a = rand() % pop_size; b = rand() % pop_size;
-        int p2 = (pop[a].n_candidates <= pop[b].n_candidates) ? a : b;
+        int p2 = (pop[a].w_score <= pop[b].w_score) ? a : b;
 
         /* uniform crossover */
         for (int i = 0; i < n_primes; i++) {
@@ -370,21 +410,24 @@ static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
         }
 
         /* evaluate */
-        int fitness = evaluate(child, n_primes, gap_size, buf);
+        double fitness_w;
+        int fitness = evaluate(child, n_primes, gap_size, buf, &fitness_w);
 
         /* replace worst if child is better */
         int worst = 0;
         for (int i = 1; i < pop_size; i++)
-            if (pop[i].n_candidates > pop[worst].n_candidates)
+            if (pop[i].w_score > pop[worst].w_score)
                 worst = i;
 
-        if (fitness < pop[worst].n_candidates) {
+        if (fitness_w < pop[worst].w_score) {
             memcpy(pop[worst].offsets, child, (size_t)n_primes * sizeof(int));
             pop[worst].n_candidates = fitness;
+            pop[worst].w_score      = fitness_w;
         }
 
-        if (fitness < best_ever) {
-            best_ever = fitness;
+        if (fitness_w < best_ever_w) {
+            best_ever_w   = fitness_w;
+            best_ever_cnt = fitness;
             stale = 0;
         } else {
             stale++;
@@ -393,7 +436,7 @@ static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
         /* progress */
         if ((gen + 1) % 10000 == 0 || gen == max_gens - 1) {
             fprintf(stderr, "\r  evolution: gen %d/%d  best=%d  stale=%d     ",
-                    gen + 1, max_gens, best_ever, stale);
+                    gen + 1, max_gens, best_ever_cnt, stale);
             fflush(stderr);
         }
 
@@ -571,6 +614,7 @@ int main(int argc, char **argv) {
     Solution global_best;
     global_best.offsets      = NULL;
     global_best.n_candidates = INT_MAX;
+    global_best.w_score      = 1e18;
     global_best.n_primes     = 0;
     global_best.gap_size     = 0;
 
@@ -602,17 +646,19 @@ int main(int argc, char **argv) {
                             ^ (unsigned)rand();
             srand(seed);
             greedy_solve(tmp, np, gs, buf);
-            int nc = evaluate(tmp, np, gs, buf);
+            double w_nc;
+            int nc = evaluate(tmp, np, gs, buf, &w_nc);
 
             /* insert into population if better than worst */
             int worst = 0;
             for (int i = 1; i < pop_size; i++)
-                if (pop[i].n_candidates > pop[worst].n_candidates)
+                if (pop[i].w_score > pop[worst].w_score)
                     worst = i;
 
-            if (nc < pop[worst].n_candidates) {
+            if (w_nc < pop[worst].w_score) {
                 memcpy(pop[worst].offsets, tmp, (size_t)np * sizeof(int));
                 pop[worst].n_candidates = nc;
+                pop[worst].w_score      = w_nc;
             }
 
             if ((r + 1) % 5 == 0 || r == ctr_strength - 1) {
@@ -659,7 +705,7 @@ int main(int argc, char **argv) {
             /* find current best */
             int bi = 0;
             for (int i = 1; i < pop_size; i++)
-                if (pop[i].n_candidates < pop[bi].n_candidates)
+                if (pop[i].w_score < pop[bi].w_score)
                     bi = i;
 
             /* initial full sweep + pair sweep on best */
@@ -668,9 +714,11 @@ int main(int argc, char **argv) {
             pair_search_sweep(pop[bi].offsets, np, gs,
                               ctr_fixed < np ? ctr_fixed : np,
                               ils_buf, ils_buf2);
-            pop[bi].n_candidates = evaluate(pop[bi].offsets, np, gs, ils_buf);
+            pop[bi].n_candidates = evaluate(pop[bi].offsets, np, gs, ils_buf,
+                                            &pop[bi].w_score);
 
-            int ils_best = pop[bi].n_candidates;
+            double ils_best_w   = pop[bi].w_score;
+            int    ils_best_cnt = pop[bi].n_candidates;
             int ils_fixed = ctr_fixed < np ? ctr_fixed : np;
             int nfree = np - ils_fixed;
 
@@ -697,13 +745,16 @@ int main(int argc, char **argv) {
                 local_search_sweep(ils_work, np, gs, ils_fixed, ils_buf);
                 pair_search_sweep(ils_work, np, gs, ils_fixed,
                                   ils_buf, ils_buf2);
-                int nc = evaluate(ils_work, np, gs, ils_buf);
+                double w_nc;
+                int nc = evaluate(ils_work, np, gs, ils_buf, &w_nc);
 
-                if (nc < ils_best) {
+                if (w_nc < ils_best_w) {
                     memcpy(pop[bi].offsets, ils_work,
                            (size_t)np * sizeof(int));
                     pop[bi].n_candidates = nc;
-                    ils_best = nc;
+                    pop[bi].w_score      = w_nc;
+                    ils_best_w   = w_nc;
+                    ils_best_cnt = nc;
                     ils_stale = 0;
                 } else {
                     ils_stale++;
@@ -712,7 +763,7 @@ int main(int argc, char **argv) {
                 if ((r + 1) % 50 == 0 || r == ils_rounds - 1) {
                     fprintf(stderr,
                         "\r  ILS: %d/%d rounds  best=%d  stale=%d     ",
-                        r + 1, ils_rounds, ils_best, ils_stale);
+                        r + 1, ils_rounds, ils_best_cnt, ils_stale);
                     fflush(stderr);
                 }
 
@@ -728,10 +779,10 @@ int main(int argc, char **argv) {
         /* ---- find best in population ---- */
         int best_idx = 0;
         for (int i = 1; i < pop_size; i++)
-            if (pop[i].n_candidates < pop[best_idx].n_candidates)
+            if (pop[i].w_score < pop[best_idx].w_score)
                 best_idx = i;
 
-        if (pop[best_idx].n_candidates < global_best.n_candidates) {
+        if (pop[best_idx].w_score < global_best.w_score) {
             if (global_best.offsets) sol_free(&global_best);
             global_best = sol_clone(&pop[best_idx]);
         }
@@ -751,6 +802,11 @@ int main(int argc, char **argv) {
     fprintf(stderr, "  uncovered ratio: %.2f%%\n",
             100.0 * (double)global_best.n_candidates
                    / (double)global_best.gap_size);
+    fprintf(stderr, "  weighted score:  %.3f  (mean w/cand: %.4f)\n",
+            global_best.w_score,
+            global_best.n_candidates > 0
+                ? global_best.w_score / (double)global_best.n_candidates
+                : 0.0);
     fprintf(stderr, "========================================\n");
 
     /* print offsets */
