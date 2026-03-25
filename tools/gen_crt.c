@@ -82,9 +82,15 @@ static const int    WEIGHT_PRIMES[]   = {3,5,7,11,13,17,19,23,29,31};
 #define N_WEIGHT_PRIMES 10
 
 static double position_weight(int d) {
+    /* Positions coprime to small primes are harder to eliminate by
+     * subsequent sieving (no small factor to anchor a residue test)
+     * → higher weight = more valuable to cover via CRT.
+     * Positions that ARE divisible by a small prime p have at least
+     * one sieve event covering them with probability 1 for that p,
+     * so their net coverage value is discounted by (1 - 1/p). */
     double w = 1.0;
     for (int i = 0; i < N_WEIGHT_PRIMES; i++)
-        if (d % WEIGHT_PRIMES[i] != 0)
+        if (d % WEIGHT_PRIMES[i] == 0)   /* divisible → discount */
             w *= (1.0 - 1.0 / WEIGHT_PRIMES[i]);
     return w;
 }
@@ -171,12 +177,12 @@ static void greedy_solve(int *offsets, int n_primes, int gap_size,
 
     for (int i = 0; i < n_primes; i++) {
         int p = PRIMES[i];
-        int best_o = 0, ties = 0;
+        int best_o = 1, ties = 0;  /* never use offset 0: n ≡ 0 (mod p) → n composite */
         double best_new = -1.0;
 
-        for (int o = 0; o < p; o++) {
+        for (int o = 1; o < p; o++) {  /* start at 1, skip 0 */
             double new_cov = 0.0;
-            for (int d = (o ? o : p); d <= gap_size; d += p)
+            for (int d = o; d <= gap_size; d += p)
                 if (!buf[d]) new_cov += position_weight(d);
 
             if (new_cov > best_new) {
@@ -190,7 +196,7 @@ static void greedy_solve(int *offsets, int n_primes, int gap_size,
         }
 
         offsets[i] = best_o;
-        for (int d = (best_o ? best_o : p); d <= gap_size; d += p)
+        for (int d = best_o; d <= gap_size; d += p)
             buf[d] = 1;
     }
 }
@@ -210,13 +216,13 @@ static int local_search_one(int *offsets, int n_primes, int gap_size,
         for (int d = (o ? o : p); d <= gap_size; d += p)
             buf[d] = 1;
     }
-    /* find best offset for prime at idx */
+    /* find best offset for prime at idx; skip offset 0 (n ≡ 0 mod p → composite) */
     int    p       = PRIMES[idx];
-    int    best_o  = offsets[idx];
+    int    best_o  = (offsets[idx] > 0) ? offsets[idx] : 1;
     double best_new = -1.0;
-    for (int o = 0; o < p; o++) {
+    for (int o = 1; o < p; o++) {  /* start at 1, skip 0 */
         double cnt = 0.0;
-        for (int d = (o ? o : p); d <= gap_size; d += p)
+        for (int d = o; d <= gap_size; d += p)
             if (!buf[d]) cnt += position_weight(d);
         if (cnt > best_new) {
             best_new = cnt;
@@ -250,22 +256,23 @@ static int local_search_pair(int *offsets, int n_primes, int gap_size,
             base_buf[d] = 1;
     }
 
-    int best_oa = offsets[idx_a];
-    int best_ob = offsets[idx_b];
+    /* start both at 1 — offset 0 means n ≡ 0 (mod p) → n composite */
+    int best_oa = (offsets[idx_a] > 0) ? offsets[idx_a] : 1;
+    int best_ob = (offsets[idx_b] > 0) ? offsets[idx_b] : 1;
     double best_uncov = 1e18;
 
-    for (int oa = 0; oa < pa; oa++) {
+    for (int oa = 1; oa < pa; oa++) {  /* skip offset 0 */
         /* overlay prime a onto base coverage */
         memcpy(work_buf, base_buf, (size_t)(gap_size + 1));
-        for (int d = (oa ? oa : pa); d <= gap_size; d += pa)
+        for (int d = oa; d <= gap_size; d += pa)
             work_buf[d] = 1;
 
         /* find best offset for prime b given base + a */
-        int    local_best_ob  = 0;
+        int    local_best_ob  = 1;
         double local_best_new = -1.0;
-        for (int ob = 0; ob < pb; ob++) {
+        for (int ob = 1; ob < pb; ob++) {  /* skip offset 0 */
             double cnt = 0.0;
-            for (int d = (ob ? ob : pb); d <= gap_size; d += pb)
+            for (int d = ob; d <= gap_size; d += pb)
                 if (!work_buf[d]) cnt += position_weight(d);
             if (cnt > local_best_new) {
                 local_best_new = cnt;
