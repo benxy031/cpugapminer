@@ -275,8 +275,20 @@ older logs, scripts, or command lines.
 
 ### Non-CRT adaptive sieve control
 
-- `--partial-sieve-auto` enables adaptive non-CRT sieve-prime limiting.
+- `--partial-sieve-auto` automatically adjusts how many small primes are used
+  by the non-CRT sieve.  It changes sieve depth.
 - `--partial-sieve` is an alias for `--partial-sieve-auto`.
+- `--adaptive-presieve` keeps the sieve depth the same, but skips a window
+  after presieving if that window is still too dense compared with recent
+  windows.  It changes window selection, not sieve depth.
+
+When `--partial-sieve-auto` is active, STATS now include
+`partial_auto=on windows=... activations=... adjusts=...`, and the miner logs
+each time the auto limit changes.
+
+In short: `--partial-sieve-auto` decides how much sieving to do, while
+`--adaptive-presieve` decides whether a presieved window is worth spending
+more time on.
 
 ### CRT producer-consumer telemetry
 
@@ -539,6 +551,14 @@ multiples of the first 6 odd primes (3–17) via a single byte-level tile
 copy, then the remaining sieve primes are applied on top.  The sieve
 reuses a thread-local buffer for primes and their logarithms to avoid
 repeated allocation overhead.
+
+The optional `--adaptive-presieve` mode adds a cheap window-level gate on top
+of that sieve.  After presieving, it measures how many candidates are still
+alive in the window.  If a window is unusually dense compared with recent
+windows, the miner skips the expensive primality and gap-scanning work for
+that window.  This is useful when you want to spend CPU/GPU time on the
+windows that are more likely to produce large gaps instead of fully testing
+every presieved segment.
 
 Qualifying candidates are passed to `scan_candidates()`, which:
 
@@ -983,6 +1003,8 @@ gap scanning.  Multiple GPUs are supported via `--cuda 0,1`.
 | `--fast-fermat`       | off           | Fast single-base Fermat primality test |
 | `--mr-rounds N`       | 2             | Miller-Rabin rounds for `mpz_probab_prime_p` (default path, not `--fast-fermat`).  Old default was 10; 2 rounds gives false-positive rate < 2^-128 for sieve-filtered candidates. |
 | `--sample-stride K`   | 8             | Controls gap scanning strategy.  K > 1 enables backward-scan (CPU) or two-phase smart-scan (GPU).  Set to 1 for full-test (all survivors tested). |
+| `-e` / `--extra-verbose` | off       | Write detailed `--partial-sieve-auto` adjustments to the log file only. |
+| `--adaptive-presieve` | off           | Skips dense non-CRT windows after presieve when the survivor density is worse than the recent per-thread baseline.  Helps focus work on sparser, more promising windows. |
 | `--crt-file FILE`     | --            | Load a CRT sieve file (binary `.bin` or text `.txt`).  Text files enable CRT-aligned mining; binary files enable template tiling. |
 | `--fermat-threads N` / `-d N` | 0 (monolithic) | Number of Fermat consumer threads for CRT producer-consumer mode.  Default `0` = monolithic (all threads sieve+fermat independently).  Set to `N` to enable producer-consumer with `threads - N` sieve and `N` fermat threads. |
 | `--heap N`            | 4096          | Maximum number of pending CRT windows in the producer-consumer gaplist heap.  Only relevant when `--fermat-threads N` is active.  Larger values allow the sieve producers to run further ahead of the Fermat consumers; useful if producers are significantly faster than consumers. |

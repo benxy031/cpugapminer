@@ -20,6 +20,8 @@
 /* Forward declarations for helpers defined later */
 static void     set_base_bn(const uint8_t h256[32], int shift);
 static int      bn_candidate_is_prime(uint64_t offset);
+static int      adaptive_presieve_should_skip_window(uint64_t L, uint64_t R,
+                                                      size_t survivor_count);
 #ifdef WITH_RPC
 static int      build_mining_pass(const char *url, const char *user, const char *pass, int shift);
 static int      assemble_mining_block(uint64_t nadd_val, uint64_t expect_seq, char out_hex[16384]);
@@ -196,15 +198,23 @@ static volatile int use_fast_fermat = 0;
 static volatile int use_fast_euler = 0;
 /* if nonzero, use adaptive sieve-prime limiting on non-CRT windows. */
 static volatile int use_partial_sieve_auto = 0;
+/* if nonzero, skip dense non-CRT windows after presieve based on survivor density. */
+static volatile int use_adaptive_presieve = 0;
+/* if nonzero, write extra partial-sieve-auto details to the log file. */
+static volatile int use_extra_verbose = 0;
 /* if nonzero, adapt CRT producer/consumer split between passes. */
 static volatile int use_crt_auto_split = 0;
 static volatile int use_mr_verify = 0;   /* MR base-3 verify Fermat survivors */
 static volatile int no_primality = 0;   /* skip all probable‑prime filtering */
 static volatile int selftest = 0;        /* run a quick internal test then exit */
 
-#define PARTIAL_SIEVE_MIN_LIMIT     50000ULL
-#define PARTIAL_SIEVE_ADAPT_EVERY   8U
-#define PARTIAL_SIEVE_COOLDOWN_WIN  6U
+#define PARTIAL_SIEVE_MIN_LIMIT     4000000ULL
+#define PARTIAL_SIEVE_ADAPT_EVERY   16U
+#define PARTIAL_SIEVE_COOLDOWN_WIN  12U
+
+/* Adaptive presieve skip thresholds (non-CRT only). */
+#define ADAPTIVE_PRESIEVE_MIN_SURVIVORS 2048ULL
+#define ADAPTIVE_PRESIEVE_COOLDOWN_WIN  4U
 
 /* Sampling stride for two-phase gap scanning.  In phase 1 only every Kth
    sieve-survivor is Fermat-tested ("sampled"); candidate gap regions (where
@@ -783,6 +793,17 @@ static void print_stats(void) {
     log_msg("  cpu: surv/Msieved=%.1f  pairs/Msieved=%.1f  false_gaps=%llu (%.2f%%)",
             surv_per_million, pairs_per_million,
             (unsigned long long)stats_false_gaps, false_gap_pct);
+    if (use_partial_sieve_auto)
+        log_msg("  partial_auto=on windows=%llu activations=%llu adjusts=%llu limit=%llu avg=%llu",
+                (unsigned long long)stats_partial_sieve_auto_windows,
+                (unsigned long long)stats_partial_sieve_auto_activations,
+                (unsigned long long)stats_partial_sieve_auto_adjusts,
+                (unsigned long long)stats_partial_sieve_auto_limit_last,
+                (unsigned long long)((stats_partial_sieve_auto_limit_samples > 0)
+                    ? (stats_partial_sieve_auto_limit_sum / stats_partial_sieve_auto_limit_samples)
+                    : 0ULL));
+    if (use_adaptive_presieve)
+        log_msg("  adaptive_skips=%llu", (unsigned long long)stats_adaptive_presieve_skipped);
     log_msg("\n");
 }
 
@@ -804,6 +825,10 @@ static __thread size_t    tls_sp_start_cap = 0;
 static __thread uint64_t  tls_partial_use_limit = 0;
 static __thread uint32_t  tls_partial_windows   = 0;
 static __thread uint32_t  tls_partial_cooldown  = 0;
+/* Adaptive presieve window filter (opt-in via --adaptive-presieve). */
+static __thread double    tls_adapt_presieve_ema = 0.0;
+static __thread uint32_t  tls_adapt_presieve_windows = 0;
+static __thread uint32_t  tls_adapt_presieve_cooldown = 0;
 
 /* ── Cached base_mod_p array ──
    base_mod_p[i] = (h256 << shift) % small_primes_cache[i], precomputed ONCE
@@ -844,6 +869,9 @@ static void free_sieve_buffers(void) {
     tls_partial_use_limit = 0;
     tls_partial_windows = 0;
     tls_partial_cooldown = 0;
+    tls_adapt_presieve_ema = 0.0;
+    tls_adapt_presieve_windows = 0;
+    tls_adapt_presieve_cooldown = 0;
 #ifdef WITH_GPU_FERMAT
     free(tls_gpu_cands[0]); tls_gpu_cands[0] = NULL;
     free(tls_gpu_cands[1]); tls_gpu_cands[1] = NULL;
@@ -890,11 +918,16 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
             else if (span <= 20000000ULL) tls_partial_use_limit = use_limit / 4ULL;
             else if (span <= 50000000ULL) tls_partial_use_limit = use_limit / 2ULL;
             else tls_partial_use_limit = use_limit;
+            __sync_fetch_and_add(&stats_partial_sieve_auto_activations, 1);
         }
         if (tls_partial_use_limit < PARTIAL_SIEVE_MIN_LIMIT)
             tls_partial_use_limit = PARTIAL_SIEVE_MIN_LIMIT;
         if (tls_partial_use_limit > use_limit)
             tls_partial_use_limit = use_limit;
+        stats_partial_sieve_auto_limit_last = tls_partial_use_limit;
+        __sync_fetch_and_add(&stats_partial_sieve_auto_limit_sum, tls_partial_use_limit);
+        __sync_fetch_and_add(&stats_partial_sieve_auto_limit_samples, 1);
+        __sync_fetch_and_add(&stats_partial_sieve_auto_windows, 1);
         use_limit = tls_partial_use_limit;
     }
     pthread_once(&small_primes_once, populate_small_primes_cache);
@@ -1165,9 +1198,9 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
             uint64_t next = cur;
 
             if (surv_ratio > 0.18) {
-                next = cur + (cur >> 3);   /* +12.5% */
+                next = cur + (cur >> 5);   /* +3.125% */
             } else if (surv_ratio < 0.08) {
-                next = cur - (cur / 10);   /* -10% */
+                next = cur - (cur >> 6);   /* -1.5625% */
             }
 
             if (next < PARTIAL_SIEVE_MIN_LIMIT)
@@ -1178,6 +1211,13 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
             if (next != cur) {
                 tls_partial_use_limit = next;
                 tls_partial_cooldown = PARTIAL_SIEVE_COOLDOWN_WIN;
+                __sync_fetch_and_add(&stats_partial_sieve_auto_adjusts, 1);
+                if (use_extra_verbose)
+                    log_file_only("partial sieve auto: limit %llu -> %llu (survivors=%.3f%%, windows=%u)\n",
+                                  (unsigned long long)cur,
+                                  (unsigned long long)next,
+                                  100.0 * surv_ratio,
+                                  (unsigned)tls_partial_windows);
             }
         }
     }
@@ -1237,6 +1277,93 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
     }
     *out_count = out_cnt;
     return tls_pr;
+}
+
+/* Adaptive presieve gate: skip windows whose post-sieve survivor density is
+   significantly worse than the recent per-thread baseline.  This is an
+   opt-in heuristic for users who want to spend time only on sparse windows
+   instead of testing every presieved interval. */
+static int adaptive_presieve_should_skip_window(uint64_t L, uint64_t R,
+                                                size_t survivor_count) {
+    if (!use_adaptive_presieve || g_crt_mode != CRT_MODE_NONE || R <= L)
+        return 0;
+
+    uint64_t span = R - L;
+    size_t seg_size = (size_t)(span / 2ULL + 1ULL);
+    if (seg_size == 0 || survivor_count == 0) {
+        if (use_extra_verbose)
+            log_file_only("adaptive presieve: eval window L=%llu R=%llu survivors=%zu seg=%zu ratio=0.000 ema=%.3f threshold=0.020 skip=0 reason=%s cooldown=%u windows=%u\n",
+                          (unsigned long long)L,
+                          (unsigned long long)R,
+                          survivor_count,
+                          seg_size,
+                          tls_adapt_presieve_ema,
+                          (survivor_count == 0) ? "no-survivors" : "empty-seg",
+                          (unsigned)tls_adapt_presieve_cooldown,
+                          (unsigned)tls_adapt_presieve_windows);
+        return 0;
+    }
+
+    double ratio = (double)survivor_count / (double)seg_size;
+    if (tls_adapt_presieve_windows == 0)
+        tls_adapt_presieve_ema = ratio;
+    else
+        tls_adapt_presieve_ema = tls_adapt_presieve_ema * 0.875 + ratio * 0.125;
+    tls_adapt_presieve_windows++;
+
+    if (tls_adapt_presieve_cooldown > 0) {
+        tls_adapt_presieve_cooldown--;
+        if (use_extra_verbose)
+            log_file_only("adaptive presieve: eval window L=%llu R=%llu survivors=%zu seg=%zu ratio=%.3f ema=%.3f threshold=%.3f skip=0 reason=cooldown cooldown=%u windows=%u\n",
+                          (unsigned long long)L,
+                          (unsigned long long)R,
+                          survivor_count,
+                          seg_size,
+                          ratio,
+                          tls_adapt_presieve_ema,
+                          tls_adapt_presieve_ema * 1.30 < 0.020 ? 0.020 : tls_adapt_presieve_ema * 1.30,
+                          (unsigned)tls_adapt_presieve_cooldown,
+                          (unsigned)tls_adapt_presieve_windows);
+        return 0;
+    }
+
+    /* Skip only when the current window is clearly denser than recent ones
+       and still large enough to matter.  The ratio threshold is relative to
+       the running average, with a small absolute floor to avoid over-skipping
+       when the average is tiny. */
+    double threshold = tls_adapt_presieve_ema * 1.30;
+    if (threshold < 0.020)
+        threshold = 0.020;
+    int should_skip = (survivor_count >= ADAPTIVE_PRESIEVE_MIN_SURVIVORS && ratio > threshold);
+    const char *reason = should_skip ? "dense" : "below-threshold";
+    if (tls_adapt_presieve_cooldown > 0) {
+        reason = "cooldown";
+        should_skip = 0;
+    }
+
+    if (use_extra_verbose)
+        log_file_only("adaptive presieve: eval window L=%llu R=%llu survivors=%zu seg=%zu ratio=%.3f ema=%.3f threshold=%.3f skip=%d reason=%s cooldown=%u windows=%u\n",
+                      (unsigned long long)L,
+                      (unsigned long long)R,
+                      survivor_count,
+                      seg_size,
+                      ratio,
+                      tls_adapt_presieve_ema,
+                      threshold,
+                      should_skip ? 1 : 0,
+                      reason,
+                      (unsigned)tls_adapt_presieve_cooldown,
+                      (unsigned)tls_adapt_presieve_windows);
+
+    if (tls_adapt_presieve_cooldown > 0)
+        tls_adapt_presieve_cooldown--;
+
+    if (should_skip) {
+        tls_adapt_presieve_cooldown = ADAPTIVE_PRESIEVE_COOLDOWN_WIN;
+        __sync_fetch_and_add(&stats_adaptive_presieve_skipped, 1);
+        return 1;
+    }
+    return 0;
 }
 
 #ifdef WITH_RPC
@@ -4602,6 +4729,20 @@ static void *worker_fn(void *arg) {
             size_t pf = 0;
             size_t worker_tested = 0;
 
+            if (adaptive_presieve_should_skip_window(psc.bufs[cur_slot].L,
+                                                     psc.bufs[cur_slot].R,
+                                                     cnt)) {
+                psc.coop.pr = NULL;
+                psc.coop.cnt = 0;
+                psc.coop.next_idx = 0;
+                psc.coop.active = 0;
+                psc.coop.more_work = 0;
+                psc.coop.helper_done = 1;
+                __sync_synchronize();
+                pthread_mutex_unlock(&psc.mu);
+                continue;
+            }
+
             /* Decide up-front whether to use two-phase smart scanning.
                Pre-allocate phase-1 buffers BEFORE unlocking the mutex so
                the fallback path can still set up coop normally.             */
@@ -5175,6 +5316,8 @@ int main(int argc, char **argv) {
         printf("      --fast-euler      fast Euler-Plumb primality (CPU path)\n");
         printf("      --partial-sieve-auto  adaptive non-CRT sieve-prime limiting (opt-in)\n");
         printf("      --partial-sieve       alias for --partial-sieve-auto\n");
+        printf("      --adaptive-presieve   skip dense non-CRT windows after presieve\n");
+        printf("  -e, --extra-verbose  write partial-sieve-auto details to log file\n");
         printf("      --sample-stride K smart scan: test every Kth survivor (default: 8, 1=off)\n");
         printf("      --mr-rounds N     Miller-Rabin rounds for primality  (default: 2)\n");
         printf("      --mr-verify       MR base-3 verify Fermat/GPU survivors (catches pseudoprimes)\n");
@@ -5261,6 +5404,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--fast-fermat")) use_fast_fermat = 1;
         else if (!strcmp(argv[i],"--fast-euler")) use_fast_euler = 1;
         else if (!strcmp(argv[i],"--partial-sieve-auto") || !strcmp(argv[i],"--partial-sieve")) use_partial_sieve_auto = 1;
+        else if (!strcmp(argv[i],"--adaptive-presieve")) use_adaptive_presieve = 1;
+        else if (!strcmp(argv[i],"-e") || !strcmp(argv[i],"--extra-verbose")) use_extra_verbose = 1;
         else if (!strcmp(argv[i],"--crt-auto-split")) use_crt_auto_split = 1;
         else if (!strcmp(argv[i],"--mr-verify")) use_mr_verify = 1;
         else if (!strcmp(argv[i],"--cuda")) {
@@ -5772,7 +5917,14 @@ int main(int argc, char **argv) {
     else
         log_msg("Miller-Rabin rounds: %d (--mr-rounds to change)\n", cli_mr_rounds);
     if (use_partial_sieve_auto)
-        log_msg("partial sieve auto: enabled (--partial-sieve-auto/--partial-sieve)\n");
+        log_msg("partial sieve auto: enabled (--partial-sieve-auto/--partial-sieve), adapt every %u windows, min limit %llu, cooldown %u windows\n",
+                (unsigned)PARTIAL_SIEVE_ADAPT_EVERY,
+                (unsigned long long)PARTIAL_SIEVE_MIN_LIMIT,
+                (unsigned)PARTIAL_SIEVE_COOLDOWN_WIN);
+    if (use_extra_verbose)
+        log_file_only("partial sieve auto: extra verbose enabled (-e/--extra-verbose)\n");
+    if (use_adaptive_presieve)
+        log_msg("adaptive presieve: enabled (--adaptive-presieve)\n");
     if (use_crt_auto_split)
         log_msg("CRT auto split: enabled (--crt-auto-split)\n");
 
@@ -6026,6 +6178,10 @@ int main(int argc, char **argv) {
                 /* primality – compact pr[] in-place using big-prime BN test */
                 size_t pf = 0;
                 size_t orig_cnt_st = cnt;
+
+                if (adaptive_presieve_should_skip_window(L, R, cnt))
+                    continue;
+
                 int smart_K_st = cli_sample_stride;
                 int use_smart_st = (smart_K_st > 1 && !no_primality
                                     && cnt > (size_t)(smart_K_st * 4));
