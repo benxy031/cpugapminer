@@ -183,3 +183,24 @@ void crt_heap_clear_shutdown(void) {
 void crt_heap_next_generation(void) {
     __sync_fetch_and_add(&crt_heap_gen, 1);
 }
+
+/* Advisory: when the heap is full, return the surv_cnt of the worst leaf
+   (highest surv_cnt = most expensive to Fermat-test = candidate for eviction).
+   Returns 0 if the heap has room or is empty.
+   Callers use this to skip crt_work_alloc() when the item would be dropped
+   anyway, avoiding malloc + mpz + memcpy overhead for no-op windows.
+   Takes the heap mutex so the answer is definitive (not just a hint). */
+size_t crt_heap_worst_surv_advisory(void) {
+    pthread_mutex_lock(&crt_heap_mtx);
+    if (!crt_heap || crt_heap_size < crt_heap_cap || crt_heap_size == 0) {
+        pthread_mutex_unlock(&crt_heap_mtx);
+        return 0;   /* heap has room — caller should try the push */
+    }
+    size_t first_leaf = crt_heap_size / 2;
+    size_t max_sc = crt_heap[first_leaf]->surv_cnt;
+    for (size_t i = first_leaf + 1; i < crt_heap_size; i++)
+        if (crt_heap[i]->surv_cnt > max_sc)
+            max_sc = crt_heap[i]->surv_cnt;
+    pthread_mutex_unlock(&crt_heap_mtx);
+    return max_sc;
+}

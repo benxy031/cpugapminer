@@ -3226,9 +3226,23 @@ static void gpu_accum_buf_free(struct gpu_accum_buf *b) {
     free(b->results); b->results = NULL;
 }
 
-/* Assign each accumulator a distinct GPU slot so two threads sharing
-   the same gpu_fermat_ctx never collide.  With 2 GPU slots, accum 0
-   uses slot 0 and accum 1 uses slot 1. */
+/* Per-slot ownership mutex.  gpu_fermat_submit() marks a slot as busy
+   (pending != 0) and only clears it when the CALLER later calls
+   gpu_fermat_collect() — even if the GPU finishes in ~5 ms.  With 6
+   CPU threads and only 2 GPU slots (3 threads per slot), threads B and C
+   arrive at flush time while thread A still owns the slot and get rc=-1
+   from gpu_fermat_submit, silently discarding their entire batches.
+   This wastes 4/6 of GPU work (observed as tmpl/win ≈ 3 instead of 1).
+
+   Fix: each slot has an ownership mutex held from submit until collect.
+   Threads that lost the race simply WAIT rather than discard, so all
+   sieved work eventually reaches the GPU.  The critical section around
+   collect (≈5 ms GPU complete + result copy) is short relative to the
+   ~860 ms fill cycle, so stall overhead is minimal. */
+static pthread_mutex_t g_gpu_slot_owned[2] = {
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER
+};
+
 static volatile int g_accum_slot_counter = 0;
 
 static struct gpu_accum *gpu_accum_create(gpu_fermat_ctx *ctx, int threshold) {
@@ -3342,13 +3356,15 @@ static int gpu_accum_add(struct gpu_accum *a,
     return (int)(b->total >= (size_t)a->threshold);
 }
 
-/* Collect results from the in-flight GPU batch, process gap scanning. */
+/* Collect results from the in-flight GPU batch, process gap scanning.
+   Releases g_gpu_slot_owned[slot] after collecting so the next thread
+   waiting for the slot can proceed. */
 static void gpu_accum_collect(struct gpu_accum *a) {
     if (!a || a->inflight < 0) return;
     int buf_idx = a->inflight;  /* buffer that was submitted */
     int slot = a->slot_base;    /* GPU slot it was submitted to */
     struct gpu_accum_buf *b = &a->buf[buf_idx];
-    if (b->total == 0) { a->inflight = -1; return; }
+    if (b->total == 0) { a->inflight = -1; pthread_mutex_unlock(&g_gpu_slot_owned[slot]); return; }
 
     /* Wait for GPU results */
     int np = gpu_fermat_collect(a->ctx, slot, b->results, b->total);
@@ -3377,42 +3393,48 @@ static void gpu_accum_collect(struct gpu_accum *a) {
     b->total = 0;
     b->win_count = 0;
     a->inflight = -1;
+    /* Release slot ownership — next waiting thread can now submit */
+    pthread_mutex_unlock(&g_gpu_slot_owned[slot]);
 }
 
 /* Flush: submit the active buffer to GPU asynchronously, swap to other buffer.
-   If a previous batch is still in-flight, collect it first.
-   After this call, the caller can immediately continue adding to the new
-   active buffer while the GPU works on the submitted batch.              */
+   If a previous batch is still in-flight, collect it first (which releases
+   the slot ownership mutex), then re-acquire ownership before submitting.
+   Threads that share a slot WAIT here rather than discarding work. */
 static void gpu_accum_flush(struct gpu_accum *a) {
     if (!a || !a->ctx) return;
     struct gpu_accum_buf *b = &a->buf[a->fill];
     if (b->total == 0) return;
 
-    /* If previous batch in-flight, collect it first */
+    /* If previous batch in-flight, collect it first.
+       collect() releases g_gpu_slot_owned[slot] at the end. */
     if (a->inflight >= 0)
         gpu_accum_collect(a);
 
-    /* Submit current fill buffer to GPU asynchronously.
-       Use this accumulator's fixed slot to avoid collisions when
-       multiple threads share the same gpu_fermat_ctx.  Each accum
-       gets a dedicated slot (0 or 1) assigned at creation time. */
+    /* Acquire slot ownership — blocks if another thread currently owns it.
+       Once we hold the mutex the slot is free (pending==0) because the
+       previous owner called gpu_fermat_collect which cleared pending. */
+    int slot = a->slot_base;
+    pthread_mutex_lock(&g_gpu_slot_owned[slot]);
+
     __sync_fetch_and_add(&stats_gpu_flushes, 1);
     __sync_fetch_and_add(&stats_gpu_batched, b->total);
-    int slot = a->slot_base;
     int rc = gpu_fermat_submit(a->ctx, slot, b->limbs, b->total);
     if (rc < 0) {
-        /* Slot busy (should not happen with dedicated slots) — discard batch */
+        /* Genuine GPU error (not a contention issue) — discard batch */
+        pthread_mutex_unlock(&g_gpu_slot_owned[slot]);
         gpu_accum_buf_reset(b);
         return;
     }
 
-    /* Mark the buffer index as in-flight */
+    /* Mark the buffer index as in-flight.
+       g_gpu_slot_owned[slot] is HELD until gpu_accum_collect() releases it. */
     a->inflight = a->fill;
 
-    /* Swap fill to the other buffer — CPU continues sieving here.
-       Note: with dedicated slots there is no async overlap between
-       two buffers of the same accum, but the GPU still overlaps
-       with the OTHER thread's accum. */
+    /* Swap fill to the other buffer — CPU continues sieving here while
+       GPU processes the submitted batch.  The slot mutex remains held,
+       so other threads wanting the same slot will wait in their next
+       flush call until we call collect (which unlocks). */
     a->fill = 1 - a->fill;
 }
 #endif /* WITH_GPU_FERMAT — accumulator */
@@ -4273,6 +4295,18 @@ static void *worker_fn(void *arg) {
 
                     /* ── Producer-consumer: push to heap ── */
                     if (crt_fermat_threads > 0) {
+                        /* Pre-check: if heap is full and this window has
+                           more survivors than the worst leaf it would be
+                           dropped by crt_heap_push() — skip the expensive
+                           alloc/mpz/memcpy and yield to fermat threads. */
+                        size_t heap_worst = crt_heap_worst_surv_advisory();
+                        if (heap_worst > 0 && surv_cnt >= heap_worst) {
+                            __sync_fetch_and_add(&stats_crt_heap_push_drop, 1);
+                            struct timespec bt = {0, 200000L}; /* 200 µs */
+                            nanosleep(&bt, NULL);
+                            mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
+                            continue;
+                        }
                         struct crt_work_item *w = crt_work_alloc();
                         if (w) {
                             mpz_set(w->base, tls_base_mpz);
@@ -4289,7 +4323,14 @@ static void *worker_fn(void *arg) {
                             w->cand_odd   = cand_odd;
                             w->logbase    = logbase_nonce;
                             w->generation = crt_heap_gen;
-                            crt_heap_push(w); /* may discard if worse */
+                            if (!crt_heap_push(w)) {
+                                /* Heap full and item was worse than worst leaf.
+                                   Back off briefly to let fermat threads drain
+                                   the queue — avoids spinning and burning CPU
+                                   on work that will keep getting dropped. */
+                                struct timespec bt = {0, 200000L}; /* 200 µs */
+                                nanosleep(&bt, NULL);
+                            }
                         }
                         mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
                         continue;
@@ -5651,20 +5692,26 @@ int main(int argc, char **argv) {
         log_fp = fopen(log_file, "a");
         if (!log_fp) fprintf(stderr, "Failed to open log file %s\n", log_file);
     }
-    /* ── CRT monolithic mode: cap sieve-primes to the useful limit ──
-       In producer-consumer mode (--fermat-threads > 0) the user tunes
-       --sieve-primes manually watching the gaplist saw-tooth, so we
-       leave it untouched.  In monolithic mode there is no gaplist and
-       primes beyond ~19×gap_scan add cost but no benefit, so cap. */
-    if (g_crt_mode == CRT_MODE_SOLVER && g_crt_gap_target > 0
-            && crt_fermat_threads == 0) {
+    /* ── CRT sieve-primes cap (monolithic and producer-consumer) ──
+       Primes beyond ~19×gap_scan add sieve cost but zero Fermat benefit:
+       extra primes knock out more candidates, but those candidates would
+       already fail Fermat anyway (the window's surv_cnt only matters at
+       the margin).  Cap applies to both modes; the formula is identical.
+       In P-C mode the user can still override downward via --sieve-primes
+       to tune the sieve/fermat balance, but the cap prevents accidental
+       over-sieving when a high --sieve-primes value was left over from
+       single-thread use. */
+    if (g_crt_mode == CRT_MODE_SOLVER && g_crt_gap_target > 0) {
         uint64_t gap_scan = (uint64_t)g_crt_gap_target * 2;
         if (gap_scan < 10000) gap_scan = 10000;
         uint64_t crt_limit = gap_scan * 19;
         if (crt_limit > 500000) crt_limit = 500000;
         if (cli_sieve_prime_limit > crt_limit) {
-            log_msg("CRT monolithic: capping sieve-prime-limit %llu -> %llu "
-                    "(gap_scan=%llu; use --fermat-threads to tune freely)\n",
+            const char *mlabel = (crt_fermat_threads == 0)
+                                 ? "monolithic" : "producer-consumer";
+            log_msg("CRT %s: capping sieve-prime-limit %llu -> %llu "
+                    "(gap_scan=%llu)\n",
+                    mlabel,
                     (unsigned long long)cli_sieve_prime_limit,
                     (unsigned long long)crt_limit,
                     (unsigned long long)gap_scan);

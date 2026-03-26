@@ -41,4 +41,9 @@ void crt_heap_signal_shutdown(void);
 void crt_heap_clear_shutdown(void);
 void crt_heap_next_generation(void);
 
+/* Advisory: if heap is full, return surv_cnt of worst leaf; else 0.
+   Use as a pre-check before crt_work_alloc() to avoid wasted allocation
+   when the new window would be immediately dropped. */
+size_t crt_heap_worst_surv_advisory(void);
+
 #endif /* CRT_HEAP_H */
