@@ -19,6 +19,12 @@ extern uint64_t stats_start_ms;
 extern volatile double g_mining_target;
 extern volatile double stats_best_merit;
 extern volatile uint64_t stats_best_gap;
+extern volatile uint64_t stats_last_gap;
+extern volatile uint64_t stats_last_qual_gap;
+extern volatile uint64_t stats_crt_consumer_windows;
+extern volatile uint64_t stats_crt_consumer_last_gap;
+extern volatile uint64_t stats_crt_consumer_last_qual_gap;
+extern volatile uint64_t stats_crt_consumer_best_gap;
 extern volatile uint64_t stats_gpu_flushes;
 extern volatile uint64_t stats_gpu_batched;
 extern volatile uint64_t stats_crt_tmpl_hits;  /* times per-nonce CRT template was applied */

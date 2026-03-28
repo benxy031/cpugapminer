@@ -81,6 +81,10 @@ static const int PRIMES[] = {
 static const int    WEIGHT_PRIMES[]   = {3,5,7,11,13,17,19,23,29,31};
 #define N_WEIGHT_PRIMES 10
 
+/* Penalize adjacent uncovered positions so the optimizer prefers
+ * candidates that are not clustered into weak dense runs. */
+#define CLUSTER_PENALTY_WEIGHT 0.45
+
 static double position_weight(int d) {
     /* Positions coprime to small primes are harder to eliminate by
      * subsequent sieving (no small factor to anchor a residue test)
@@ -156,13 +160,26 @@ static int evaluate(const int *offsets, int n_primes, int gap_size,
     }
     int    cnt = 0;
     double wt  = 0.0;
+    double cluster_penalty = 0.0;
+    int prev_uncovered = 0;
+    int run_len = 0;
     for (int d = 1; d <= gap_size; d++) {
         if (!buf[d]) {
             cnt++;
             wt += position_weight(d);
+            if (prev_uncovered) {
+                run_len++;
+                cluster_penalty += 1.0 + 0.25 * (double)(run_len - 1);
+            } else {
+                run_len = 1;
+            }
+            prev_uncovered = 1;
+        } else {
+            prev_uncovered = 0;
+            run_len = 0;
         }
     }
-    if (w_out) *w_out = wt;
+    if (w_out) *w_out = wt + CLUSTER_PENALTY_WEIGHT * cluster_penalty;
     return cnt;
 }
 
@@ -173,9 +190,23 @@ static int evaluate(const int *offsets, int n_primes, int gap_size,
 /* ------------------------------------------------------------------ */
 static void greedy_solve(int *offsets, int n_primes, int gap_size,
                          uint8_t *buf) {
+    int *order = (int *)malloc((size_t)n_primes * sizeof(int));
+    if (!order) { perror("malloc"); exit(1); }
+
     memset(buf, 0, (size_t)(gap_size + 1));
 
-    for (int i = 0; i < n_primes; i++) {
+    for (int i = 0; i < n_primes; i++)
+        order[i] = i;
+
+    for (int i = n_primes - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        int tmp = order[i];
+        order[i] = order[j];
+        order[j] = tmp;
+    }
+
+    for (int k = 0; k < n_primes; k++) {
+        int i = order[k];
         int p = PRIMES[i];
         int best_o = 1, ties = 0;  /* never use offset 0: n ≡ 0 (mod p) → n composite */
         double best_new = -1.0;
@@ -199,6 +230,75 @@ static void greedy_solve(int *offsets, int n_primes, int gap_size,
         for (int d = best_o; d <= gap_size; d += p)
             buf[d] = 1;
     }
+
+    free(order);
+}
+
+/* Randomly perturb a few non-fixed offsets to escape greedy plateaus. */
+static void kick_offsets(int *offsets, int n_primes, int fixed, int kicks) {
+    if (fixed >= n_primes || kicks <= 0) return;
+
+    int nfree = n_primes - fixed;
+    if (kicks > nfree) kicks = nfree;
+
+    for (int k = 0; k < kicks; k++) {
+        int idx = fixed + rand() % nfree;
+        int p = PRIMES[idx];
+        int next = rand() % p;
+        if (next == 0) next = 1;
+        if (next == offsets[idx])
+            next = (next % (p - 1)) + 1;
+        offsets[idx] = next;
+    }
+}
+
+/* Score how much a prime contributes uniquely at its current offset. */
+static double prime_unique_score(const int *offsets, int n_primes, int gap_size,
+                                 int idx, uint8_t *buf) {
+    memset(buf, 0, (size_t)(gap_size + 1));
+    for (int i = 0; i < n_primes; i++) {
+        if (i == idx) continue;
+        int p = PRIMES[i];
+        int o = offsets[i] % p;
+        for (int d = (o ? o : p); d <= gap_size; d += p)
+            buf[d] = 1;
+    }
+
+    int p = PRIMES[idx];
+    int o = offsets[idx] % p;
+    double score = 0.0;
+    for (int d = (o ? o : p); d <= gap_size; d += p)
+        if (!buf[d]) score += position_weight(d);
+    return score;
+}
+
+/* Pick the weakest non-fixed prime by unique coverage. */
+static int weakest_nonfixed_prime(const int *offsets, int n_primes, int gap_size,
+                                  int fixed, uint8_t *buf) {
+    int best_idx = -1;
+    double best_score = 1e18;
+    for (int i = fixed; i < n_primes; i++) {
+        double score = prime_unique_score(offsets, n_primes, gap_size, i, buf);
+        if (score < best_score) {
+            best_score = score;
+            best_idx = i;
+        }
+    }
+    return best_idx;
+}
+
+/* Strong escape jump: randomize the weakest non-fixed prime. */
+static int kick_weakest_prime(int *offsets, int n_primes, int gap_size,
+                              int fixed, uint8_t *buf) {
+    int idx = weakest_nonfixed_prime(offsets, n_primes, gap_size, fixed, buf);
+    if (idx < 0) return -1;
+    int p = PRIMES[idx];
+    int next = rand() % p;
+    if (next == 0) next = 1;
+    if (next == offsets[idx])
+        next = (next % (p - 1)) + 1;
+    offsets[idx] = next;
+    return idx;
 }
 
 /* ------------------------------------------------------------------ */
@@ -416,6 +516,20 @@ static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
             }
         }
 
+        /* Controlled escape: jump one weakest prime, then repair locally. */
+        if (fixed < n_primes && (stale > 2000 || (rand() % 12) == 0)) {
+            int weak_idx = kick_weakest_prime(child, n_primes, gap_size,
+                                             fixed, buf2);
+            if (weak_idx >= 0) {
+                local_search_one(child, n_primes, gap_size, weak_idx, buf);
+                if (rand() % 2 == 0 && weak_idx + 1 < n_primes)
+                    local_search_pair(child, n_primes, gap_size,
+                                      weak_idx,
+                                      weak_idx + 1,
+                                      buf, buf2);
+            }
+        }
+
         /* evaluate */
         double fitness_w;
         int fitness = evaluate(child, n_primes, gap_size, buf, &fitness_w);
@@ -625,6 +739,9 @@ int main(int argc, char **argv) {
     global_best.n_primes     = 0;
     global_best.gap_size     = 0;
 
+    int greedy_best_cnt = INT_MAX;
+    int phase_best_cnt  = INT_MAX;
+
     for (int np = lo_np; np <= hi_np; np++) {
         double pb = primorial_log2(np);
         int    sh = (int)ceil(pb) + ctr_bits;
@@ -653,6 +770,11 @@ int main(int argc, char **argv) {
                             ^ (unsigned)rand();
             srand(seed);
             greedy_solve(tmp, np, gs, buf);
+            if (ctr_fixed < np) {
+                int kicks = 1 + rand() % 3;
+                kick_offsets(tmp, np, ctr_fixed, kicks);
+                local_search_sweep(tmp, np, gs, ctr_fixed, buf);
+            }
             double w_nc;
             int nc = evaluate(tmp, np, gs, buf, &w_nc);
 
@@ -668,19 +790,74 @@ int main(int argc, char **argv) {
                 pop[worst].w_score      = w_nc;
             }
 
+            if (nc < greedy_best_cnt)
+                greedy_best_cnt = nc;
+
             if ((r + 1) % 5 == 0 || r == ctr_strength - 1) {
-                int best_nc = INT_MAX;
-                for (int i = 0; i < pop_size; i++)
-                    if (pop[i].n_candidates < best_nc)
-                        best_nc = pop[i].n_candidates;
                 fprintf(stderr,
                     "\r  greedy: %d/%d restarts  best=%d candidates     ",
-                    r + 1, ctr_strength, best_nc);
+                    r + 1, ctr_strength, greedy_best_cnt);
                 fflush(stderr);
             }
         }
         free(tmp);
         fprintf(stderr, "\n");
+
+        /* Keep a small elite bank of the best greedy solutions. */
+        int elite_keep = pop_size < 8 ? pop_size : 8;
+        Solution *elite_bank = (Solution *)calloc((size_t)elite_keep,
+                                                  sizeof(Solution));
+        bool *picked = (bool *)calloc((size_t)pop_size, sizeof(bool));
+        uint8_t *seed_buf = NULL;
+        if (!elite_bank || !picked) { perror("calloc"); exit(1); }
+
+        for (int i = 0; i < elite_keep; i++)
+            elite_bank[i].offsets = NULL;
+
+        for (int e = 0; e < elite_keep; e++) {
+            int best_idx = -1;
+            for (int i = 0; i < pop_size; i++) {
+                if (picked[i]) continue;
+                if (best_idx < 0 || pop[i].w_score < pop[best_idx].w_score)
+                    best_idx = i;
+            }
+            picked[best_idx] = true;
+            elite_bank[e] = sol_clone(&pop[best_idx]);
+        }
+
+        if (ctr_evolution && pop_size > 1) {
+            seed_buf = (uint8_t *)calloc((size_t)(gs + 1), 1);
+            if (!seed_buf) { perror("calloc"); exit(1); }
+
+            /* Rebuild the population around the elite bank. */
+            for (int i = 0; i < pop_size; i++) {
+                int src = i % elite_keep;
+                memcpy(pop[i].offsets, elite_bank[src].offsets,
+                       (size_t)np * sizeof(int));
+
+                if (i >= elite_keep) {
+                    int weak_idx = kick_weakest_prime(pop[i].offsets, np, gs,
+                                                      ctr_fixed, seed_buf);
+                    if (weak_idx >= 0) {
+                        local_search_one(pop[i].offsets, np, gs, weak_idx,
+                                         seed_buf);
+                        if ((i & 1) == 0 && weak_idx + 1 < np)
+                            local_search_pair(pop[i].offsets, np, gs,
+                                              weak_idx, weak_idx + 1,
+                                              seed_buf, buf);
+                    }
+                }
+
+                pop[i].n_candidates = evaluate(pop[i].offsets, np, gs,
+                                               seed_buf, &pop[i].w_score);
+            }
+        }
+
+        for (int i = 0; i < elite_keep; i++)
+            sol_free(&elite_bank[i]);
+        free(elite_bank);
+        free(picked);
+        free(seed_buf);
 
         /* ---- Phase 2: evolution ---- */
         if (ctr_evolution && pop_size > 1) {
@@ -700,7 +877,7 @@ int main(int argc, char **argv) {
 
         /* ---- Phase 3: Iterated Local Search (ILS) ---- */
         /* Take the best solution, apply full sweeps + pair sweeps,     */
-        /* then repeatedly perturb 3-5 offsets and re-sweep.            */
+        /* then repeatedly perturb 1-2 offsets and re-sweep.            */
         {
             uint8_t *ils_buf  = (uint8_t *)calloc((size_t)(gs + 1), 1);
             uint8_t *ils_buf2 = (uint8_t *)calloc((size_t)(gs + 1), 1);
@@ -740,12 +917,15 @@ int main(int argc, char **argv) {
                 memcpy(ils_work, pop[bi].offsets,
                        (size_t)np * sizeof(int));
 
-                /* perturb 3-5 random non-fixed offsets */
-                int nkick = 3 + rand() % 3;
-                if (nkick > nfree) nkick = nfree;
-                for (int k = 0; k < nkick; k++) {
-                    int idx = ils_fixed + rand() % nfree;
-                    ils_work[idx] = rand() % PRIMES[idx];
+                /* one controlled escape on the weakest non-fixed prime */
+                int weak_idx = kick_weakest_prime(ils_work, np, gs,
+                                                 ils_fixed, ils_buf2);
+                if (weak_idx >= 0) {
+                    local_search_one(ils_work, np, gs, weak_idx, ils_buf);
+                    if (weak_idx + 1 < np)
+                        local_search_pair(ils_work, np, gs,
+                                          weak_idx, weak_idx + 1,
+                                          ils_buf, ils_buf2);
                 }
 
                 /* re-sweep: single then pair */
@@ -789,6 +969,8 @@ int main(int argc, char **argv) {
             if (pop[i].w_score < pop[best_idx].w_score)
                 best_idx = i;
 
+        phase_best_cnt = pop[best_idx].n_candidates;
+
         if (pop[best_idx].w_score < global_best.w_score) {
             if (global_best.offsets) sol_free(&global_best);
             global_best = sol_clone(&pop[best_idx]);
@@ -804,6 +986,8 @@ int main(int argc, char **argv) {
     int    sh = (int)ceil(pb) + ctr_bits;
 
     fprintf(stderr, "\n========================================\n");
+    fprintf(stderr, "  greedy:    %d candidates\n", greedy_best_cnt);
+    fprintf(stderr, "  evolution: %d candidates\n", phase_best_cnt);
     fprintf(stderr, "  best:  %d candidates  (%d primes, shift=%d)\n",
             global_best.n_candidates, global_best.n_primes, sh);
     fprintf(stderr, "  uncovered ratio: %.2f%%\n",

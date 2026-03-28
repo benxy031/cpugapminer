@@ -118,6 +118,24 @@ static uint64_t now_ms(void) {
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+/* Mertens-style estimate for the fraction of integers that survive
+   sieving by all primes up to `limit`.  This is a cheap live proxy for
+   the conditional-density effect. */
+static double estimate_sieve_keep_fraction(uint64_t limit) {
+    if (limit < 3)
+        return 1.0;
+    double log_limit = log((double)limit);
+    if (log_limit <= 0.0)
+        return 1.0;
+    /* exp(-gamma) ~= 0.5614594835668851 */
+    double keep = 0.5614594835668851 / log_limit;
+    if (keep < 1e-12)
+        keep = 1e-12;
+    if (keep > 1.0)
+        keep = 1.0;
+    return keep;
+}
+
 /* shared current-work state so any thread can detect a new block */
 static char     g_prevhash[65]  = {0};
 static pthread_mutex_t g_work_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -214,7 +232,7 @@ static volatile int selftest = 0;        /* run a quick internal test then exit 
 
 /* Adaptive presieve skip thresholds (non-CRT only). */
 #define ADAPTIVE_PRESIEVE_MIN_SURVIVORS 2048ULL
-#define ADAPTIVE_PRESIEVE_COOLDOWN_WIN  4U
+#define ADAPTIVE_PRESIEVE_COOLDOWN_WIN  2U
 
 /* Sampling stride for two-phase gap scanning.  In phase 1 only every Kth
    sieve-survivor is Fermat-tested ("sampled"); candidate gap regions (where
@@ -691,11 +709,22 @@ static void print_stats(void) {
         ? (100.0 * (double)stats_false_gaps /
            (double)(stats_false_gaps + stats_gaps)) : 0.0;
 
+    uint64_t sieve_limit_for_model = cli_sieve_prime_limit;
+    if (use_partial_sieve_auto && g_crt_mode == CRT_MODE_NONE &&
+        stats_partial_sieve_auto_limit_samples > 0) {
+        sieve_limit_for_model = stats_partial_sieve_auto_limit_sum /
+                               stats_partial_sieve_auto_limit_samples;
+        if (sieve_limit_for_model == 0)
+            sieve_limit_for_model = cli_sieve_prime_limit;
+    }
+    double sieve_keep = estimate_sieve_keep_fraction(sieve_limit_for_model);
+    double sieve_boost = (sieve_keep > 0.0) ? (1.0 / sieve_keep) : 0.0;
+
     double bm = stats_best_merit;
         log_msg("STATS: elapsed=%.1fs  sieved=%llu (%.0f/s)  tested=%llu (%.0f/s)  "
             "pps=%.0f  primes=%llu (%.1f%%)  "
             "gaps=%llu (%.3f/s)  built=%llu  submitted=%llu  accepted=%llu  "
-            "prob=%.2e/pair  est=%s (target=%.4f)  best=%.2f (gap=%llu)",
+            "prob=%.2e/pair  est=%s (target=%.4f)  best=%.2f (gap=%llu)  last_gap=%llu  last_qual_gap=%llu",
             elapsed,
             (unsigned long long)stats_sieved,  sieve_rate,
             (unsigned long long)stats_tested,  test_rate,
@@ -707,7 +736,9 @@ static void print_stats(void) {
             (unsigned long long)stats_submits,
             (unsigned long long)stats_success,
             prob_pair, est_buf, target_m,
-            bm, (unsigned long long)stats_best_gap);
+            bm, (unsigned long long)stats_best_gap,
+            (unsigned long long)stats_last_gap,
+            (unsigned long long)stats_last_qual_gap);
 
     /* ── CRT-specific stats ── */
     if (g_crt_mode == CRT_MODE_SOLVER) {
@@ -760,7 +791,12 @@ static void print_stats(void) {
         log_msg("  windows=%llu (%.1f/s)  primes/win=%.1f  tmpl/win=%.2f  crt_est=%s (merit>=%.1f)",
                 (unsigned long long)crt_w, win_rate, ppw, tpw,
                 crt_est_buf, g_crt_merit);
-        if (crt_fermat_threads > 0)
+        if (crt_fermat_threads > 0) {
+            log_msg("  consumer_windows=%llu best_gap=%llu last_gap=%llu last_qual_gap=%llu",
+                (unsigned long long)stats_crt_consumer_windows,
+                (unsigned long long)stats_crt_consumer_best_gap,
+                (unsigned long long)stats_crt_consumer_last_gap,
+                (unsigned long long)stats_crt_consumer_last_qual_gap);
             log_msg("  gaplist=%lu hwm=%llu push=%llu rep=%llu drop=%llu (%.1f%%) pop=%llu wait%%=%.1f stale=%llu",
                 (unsigned long)crt_heap_count(),
                 (unsigned long long)stats_crt_heap_hwm,
@@ -771,6 +807,7 @@ static void print_stats(void) {
                 (unsigned long long)pop_ok,
                 wait_pct,
                 (unsigned long long)stale);
+        }
     }
 
 #ifdef WITH_GPU_FERMAT
@@ -804,6 +841,10 @@ static void print_stats(void) {
                     : 0ULL));
     if (use_adaptive_presieve)
         log_msg("  adaptive_skips=%llu", (unsigned long long)stats_adaptive_presieve_skipped);
+    if (g_crt_mode == CRT_MODE_NONE)
+        log_msg("  sieve_model: keep~%.3e boost~%.1fx (limit=%llu)",
+                sieve_keep, sieve_boost,
+                (unsigned long long)sieve_limit_for_model);
     log_msg("\n");
 }
 
@@ -1292,7 +1333,7 @@ static int adaptive_presieve_should_skip_window(uint64_t L, uint64_t R,
     size_t seg_size = (size_t)(span / 2ULL + 1ULL);
     if (seg_size == 0 || survivor_count == 0) {
         if (use_extra_verbose)
-            log_file_only("adaptive presieve: eval window L=%llu R=%llu survivors=%zu seg=%zu ratio=0.000 ema=%.3f threshold=0.020 skip=0 reason=%s cooldown=%u windows=%u\n",
+            log_file_only("adaptive presieve: eval window L=%llu R=%llu survivors=%zu seg=%zu ratio=0.000 ema=%.3f threshold=0.067 skip=0 reason=%s cooldown=%u windows=%u\n",
                           (unsigned long long)L,
                           (unsigned long long)R,
                           survivor_count,
@@ -1321,7 +1362,7 @@ static int adaptive_presieve_should_skip_window(uint64_t L, uint64_t R,
                           seg_size,
                           ratio,
                           tls_adapt_presieve_ema,
-                          tls_adapt_presieve_ema * 1.30 < 0.020 ? 0.020 : tls_adapt_presieve_ema * 1.30,
+                          tls_adapt_presieve_ema * 1.01 < 0.067 ? 0.067 : tls_adapt_presieve_ema * 1.01,
                           (unsigned)tls_adapt_presieve_cooldown,
                           (unsigned)tls_adapt_presieve_windows);
         return 0;
@@ -1331,9 +1372,9 @@ static int adaptive_presieve_should_skip_window(uint64_t L, uint64_t R,
        and still large enough to matter.  The ratio threshold is relative to
        the running average, with a small absolute floor to avoid over-skipping
        when the average is tiny. */
-    double threshold = tls_adapt_presieve_ema * 1.30;
-    if (threshold < 0.020)
-        threshold = 0.020;
+    double threshold = tls_adapt_presieve_ema * 1.01;
+    if (threshold < 0.067)
+        threshold = 0.067;
     int should_skip = (survivor_count >= ADAPTIVE_PRESIEVE_MIN_SURVIVORS && ratio > threshold);
     const char *reason = should_skip ? "dense" : "below-threshold";
     if (tls_adapt_presieve_cooldown > 0) {
@@ -1342,14 +1383,14 @@ static int adaptive_presieve_should_skip_window(uint64_t L, uint64_t R,
     }
 
     if (use_extra_verbose)
-        log_file_only("adaptive presieve: eval window L=%llu R=%llu survivors=%zu seg=%zu ratio=%.3f ema=%.3f threshold=%.3f skip=%d reason=%s cooldown=%u windows=%u\n",
+        log_file_only("adaptive presieve: eval window L=%llu R=%llu survivors=%zu seg=%zu ratio=%.2f%% ema=%.2f%% threshold=%.2f%% skip=%d reason=%s cooldown=%u windows=%u\n",
                       (unsigned long long)L,
                       (unsigned long long)R,
                       survivor_count,
                       seg_size,
-                      ratio,
-                      tls_adapt_presieve_ema,
-                      threshold,
+                      ratio * 100.0,
+                      tls_adapt_presieve_ema * 100.0,
+                      threshold * 100.0,
                       should_skip ? 1 : 0,
                       reason,
                       (unsigned)tls_adapt_presieve_cooldown,
@@ -3039,6 +3080,14 @@ static size_t crt_bkscan_and_submit(
             stats_best_gap   = bk.best_gap;
         }
 
+        if (bk.best_gap > stats_crt_consumer_best_gap)
+            stats_crt_consumer_best_gap = bk.best_gap;
+
+        if (bk.best_gap > 0) {
+            stats_crt_consumer_last_gap = bk.best_gap;
+            stats_last_gap = bk.best_gap;
+        }
+
         /* Submit qualifying gaps */
         for (size_t qi = 0; qi < bk.qual_cnt; qi++) {
             uint64_t start_off = bk.qual_pairs[qi][0];
@@ -3171,6 +3220,7 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
     for (size_t i = 0; i + 1 < prime_cnt; i++) {
         uint64_t gap = primes[i + 1] - primes[i];
         double merit = (double)gap / logbase;
+        stats_last_gap = gap;
         if (merit > stats_best_merit) {
             stats_best_merit = merit;
             stats_best_gap   = gap;
@@ -3192,6 +3242,7 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
             if (!mr_verify_cand()) continue;
         }
 
+        stats_last_qual_gap = gap;
         __sync_fetch_and_add(&stats_gaps, 1);
         mpz_t nAdd_prime;
         mpz_init(nAdd_prime);
@@ -3773,6 +3824,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
         uint64_t q     = pr[i + 1];   /* nAdd of gap end prime   */
         uint64_t gap   = q - prev;
         double merit   = (double)gap / logbase;
+        stats_last_gap = gap;
         /* Track best merit seen (lock-free: small races are harmless).
            Updated for ALL pairs so the stats display shows progress.
            Note: smart-scan false gaps may inflate this — cosmetic only. */
@@ -3848,6 +3900,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
 #undef SC_SET_CAND_U64
         }
 
+        stats_last_qual_gap = gap;
         __sync_fetch_and_add(&stats_gaps, 1);
         /* nAdd = relative offset = prev (prime = base + nAdd). */
         uint64_t nadd_sc = prev;
@@ -4154,6 +4207,8 @@ static void *worker_fn(void *arg) {
                     crt_work_free(w);
                     continue;
                 }
+
+                __sync_fetch_and_add(&stats_crt_consumer_windows, 1);
 
                 /* Set thread-local base for Fermat testing */
                 mpz_set(tls_base_mpz, w->base);
@@ -5032,6 +5087,8 @@ static void *worker_fn(void *arg) {
                         if (last_sample_prime) {
                             uint64_t gap_s = pr[j] - last_sample_prime;
                             double merit_s = (double)gap_s / logbase;
+                            stats_crt_consumer_last_gap = gap_s;
+                            stats_last_gap = gap_s;
                             if (merit_s > stats_best_merit) {
                                 stats_best_merit = merit_s;
                                 stats_best_gap   = gap_s;
@@ -5074,6 +5131,10 @@ static void *worker_fn(void *arg) {
                     for (size_t qi = 0; qi < res_w.qual_cnt; qi++) {
                         uint64_t pair[2] = { res_w.qual_pairs[qi][0],
                                              res_w.qual_pairs[qi][1] };
+                        stats_crt_consumer_last_gap = pair[1] - pair[0];
+                        stats_crt_consumer_last_qual_gap = pair[1] - pair[0];
+                        stats_last_qual_gap = pair[1] - pair[0];
+                        stats_last_gap = pair[1] - pair[0];
                         if (scan_candidates(pair, 2,
                                 target_local, logbase,
                                 shift_local, header_local,
@@ -5609,7 +5670,7 @@ int main(int argc, char **argv) {
 #else
                     ""
 #endif
-                    );
+                );
             cli_sieve_prime_count = new_count;
             /* Recompute the value limit from the new count. */
             double n = (double)cli_sieve_prime_count;
