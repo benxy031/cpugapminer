@@ -85,12 +85,12 @@ static void log_file_only(const char *fmt, ...) {
 #include <pthread.h>
 #ifndef _WIN32
 #include <sys/time.h>
+#endif
 
 /* rpc timing/retry globals */
 static uint64_t last_submit_ms = 0;
 static int rpc_rate_ms = 0;
 static int rpc_default_retries = 3;
-#endif
 
 // helper returning current time in milliseconds since epoch
 static uint64_t now_ms(void) {
