@@ -37,7 +37,6 @@ volatile uint64_t stats_partial_sieve_auto_adjusts = 0;
 volatile uint64_t stats_partial_sieve_auto_limit_last = 0;
 volatile uint64_t stats_partial_sieve_auto_limit_sum = 0;
 volatile uint64_t stats_partial_sieve_auto_limit_samples = 0;
-volatile uint64_t stats_adaptive_presieve_skipped = 0;
 volatile uint64_t stats_crt_heap_push_ok = 0;
 volatile uint64_t stats_crt_heap_push_replace = 0;
 volatile uint64_t stats_crt_heap_push_drop = 0;

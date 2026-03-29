@@ -35,7 +35,6 @@ extern volatile uint64_t stats_partial_sieve_auto_adjusts;    /* auto limit chan
 extern volatile uint64_t stats_partial_sieve_auto_limit_last;  /* last effective sieve-prime limit */
 extern volatile uint64_t stats_partial_sieve_auto_limit_sum;   /* sum of effective sieve-prime limits */
 extern volatile uint64_t stats_partial_sieve_auto_limit_samples;/* sampled windows for effective limit */
-extern volatile uint64_t stats_adaptive_presieve_skipped; /* windows skipped by adaptive presieve */
 extern volatile uint64_t stats_crt_heap_push_ok;
 extern volatile uint64_t stats_crt_heap_push_replace;
 extern volatile uint64_t stats_crt_heap_push_drop;

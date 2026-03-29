@@ -20,11 +20,15 @@
 /* Forward declarations for helpers defined later */
 static void     set_base_bn(const uint8_t h256[32], int shift);
 static int      bn_candidate_is_prime(uint64_t offset);
-static int      adaptive_presieve_should_skip_window(uint64_t L, uint64_t R,
-                                                      size_t survivor_count);
 #ifdef WITH_RPC
 static int      build_mining_pass(const char *url, const char *user, const char *pass, int shift);
 static int      assemble_mining_block(uint64_t nadd_val, uint64_t expect_seq, char out_hex[16384]);
+static void     submit_gap_block_common(const char *blockhex, double merit,
+                                        const char *rpc_url,
+                                        const char *rpc_user,
+                                        const char *rpc_pass,
+                                        const char *rpc_sign_key,
+                                        const char *queue_note);
 extern int      rpc_getwork_data(const char *url, const char *user, const char *pass, char data_out[161], uint64_t *ndiff_out);
 #endif
 #ifdef WITH_RPC
@@ -81,29 +85,6 @@ static void log_file_only(const char *fmt, ...) {
 #include <pthread.h>
 #ifndef _WIN32
 #include <sys/time.h>
-#endif
-
-#ifdef WITH_RPC
-// submit queue and RPC globals
-#define SUBMIT_QUEUE_MAX 32
-
-struct submit_job {
-    char url[256];
-    char user[128];
-    char pass[128];
-    char method[64];
-    char hex[16384];   /* block hex, hopefully large enough for most submissions */
-    char signature[128]; /* optional signature string */
-    int retries;
-};
-
-static pthread_mutex_t sq_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t sq_cond = PTHREAD_COND_INITIALIZER;
-static pthread_cond_t sq_empty_cond = PTHREAD_COND_INITIALIZER; /* fired when queue drains to 0 */
-static struct submit_job submit_queue[SUBMIT_QUEUE_MAX];
-static int sq_head = 0, sq_tail = 0, sq_count = 0;
-static int sq_running = 0;
-static pthread_t sq_thread;
 
 /* rpc timing/retry globals */
 static uint64_t last_submit_ms = 0;
@@ -216,8 +197,6 @@ static volatile int use_fast_fermat = 0;
 static volatile int use_fast_euler = 0;
 /* if nonzero, use adaptive sieve-prime limiting on non-CRT windows. */
 static volatile int use_partial_sieve_auto = 0;
-/* if nonzero, skip dense non-CRT windows after presieve based on survivor density. */
-static volatile int use_adaptive_presieve = 0;
 /* if nonzero, write extra partial-sieve-auto details to the log file. */
 static volatile int use_extra_verbose = 0;
 /* if nonzero, adapt CRT producer/consumer split between passes. */
@@ -839,8 +818,6 @@ static void print_stats(void) {
                 (unsigned long long)((stats_partial_sieve_auto_limit_samples > 0)
                     ? (stats_partial_sieve_auto_limit_sum / stats_partial_sieve_auto_limit_samples)
                     : 0ULL));
-    if (use_adaptive_presieve)
-        log_msg("  adaptive_skips=%llu", (unsigned long long)stats_adaptive_presieve_skipped);
     if (g_crt_mode == CRT_MODE_NONE)
         log_msg("  sieve_model: keep~%.3e boost~%.1fx (limit=%llu)",
                 sieve_keep, sieve_boost,
@@ -1320,93 +1297,6 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
     return tls_pr;
 }
 
-/* Adaptive presieve gate: skip windows whose post-sieve survivor density is
-   significantly worse than the recent per-thread baseline.  This is an
-   opt-in heuristic for users who want to spend time only on sparse windows
-   instead of testing every presieved interval. */
-static int adaptive_presieve_should_skip_window(uint64_t L, uint64_t R,
-                                                size_t survivor_count) {
-    if (!use_adaptive_presieve || g_crt_mode != CRT_MODE_NONE || R <= L)
-        return 0;
-
-    uint64_t span = R - L;
-    size_t seg_size = (size_t)(span / 2ULL + 1ULL);
-    if (seg_size == 0 || survivor_count == 0) {
-        if (use_extra_verbose)
-            log_file_only("adaptive presieve: eval window L=%llu R=%llu survivors=%zu seg=%zu ratio=0.000 ema=%.3f threshold=0.067 skip=0 reason=%s cooldown=%u windows=%u\n",
-                          (unsigned long long)L,
-                          (unsigned long long)R,
-                          survivor_count,
-                          seg_size,
-                          tls_adapt_presieve_ema,
-                          (survivor_count == 0) ? "no-survivors" : "empty-seg",
-                          (unsigned)tls_adapt_presieve_cooldown,
-                          (unsigned)tls_adapt_presieve_windows);
-        return 0;
-    }
-
-    double ratio = (double)survivor_count / (double)seg_size;
-    if (tls_adapt_presieve_windows == 0)
-        tls_adapt_presieve_ema = ratio;
-    else
-        tls_adapt_presieve_ema = tls_adapt_presieve_ema * 0.875 + ratio * 0.125;
-    tls_adapt_presieve_windows++;
-
-    if (tls_adapt_presieve_cooldown > 0) {
-        tls_adapt_presieve_cooldown--;
-        if (use_extra_verbose)
-            log_file_only("adaptive presieve: eval window L=%llu R=%llu survivors=%zu seg=%zu ratio=%.3f ema=%.3f threshold=%.3f skip=0 reason=cooldown cooldown=%u windows=%u\n",
-                          (unsigned long long)L,
-                          (unsigned long long)R,
-                          survivor_count,
-                          seg_size,
-                          ratio,
-                          tls_adapt_presieve_ema,
-                          tls_adapt_presieve_ema * 1.01 < 0.067 ? 0.067 : tls_adapt_presieve_ema * 1.01,
-                          (unsigned)tls_adapt_presieve_cooldown,
-                          (unsigned)tls_adapt_presieve_windows);
-        return 0;
-    }
-
-    /* Skip only when the current window is clearly denser than recent ones
-       and still large enough to matter.  The ratio threshold is relative to
-       the running average, with a small absolute floor to avoid over-skipping
-       when the average is tiny. */
-    double threshold = tls_adapt_presieve_ema * 1.01;
-    if (threshold < 0.067)
-        threshold = 0.067;
-    int should_skip = (survivor_count >= ADAPTIVE_PRESIEVE_MIN_SURVIVORS && ratio > threshold);
-    const char *reason = should_skip ? "dense" : "below-threshold";
-    if (tls_adapt_presieve_cooldown > 0) {
-        reason = "cooldown";
-        should_skip = 0;
-    }
-
-    if (use_extra_verbose)
-        log_file_only("adaptive presieve: eval window L=%llu R=%llu survivors=%zu seg=%zu ratio=%.2f%% ema=%.2f%% threshold=%.2f%% skip=%d reason=%s cooldown=%u windows=%u\n",
-                      (unsigned long long)L,
-                      (unsigned long long)R,
-                      survivor_count,
-                      seg_size,
-                      ratio * 100.0,
-                      tls_adapt_presieve_ema * 100.0,
-                      threshold * 100.0,
-                      should_skip ? 1 : 0,
-                      reason,
-                      (unsigned)tls_adapt_presieve_cooldown,
-                      (unsigned)tls_adapt_presieve_windows);
-
-    if (tls_adapt_presieve_cooldown > 0)
-        tls_adapt_presieve_cooldown--;
-
-    if (should_skip) {
-        tls_adapt_presieve_cooldown = ADAPTIVE_PRESIEVE_COOLDOWN_WIN;
-        __sync_fetch_and_add(&stats_adaptive_presieve_skipped, 1);
-        return 1;
-    }
-    return 0;
-}
-
 #ifdef WITH_RPC
 // rpc_submit/rpc_call are provided by the C++ wrapper in `src/rpc_cwrap.cpp`
 #ifdef __cplusplus
@@ -1420,6 +1310,26 @@ char *rpc_getblocktemplate(const char *url, const char *user, const char *pass);
 #endif
 #endif
 #ifdef WITH_RPC
+struct submit_job {
+    char url[256];
+    char user[128];
+    char pass[128];
+    char method[32];
+    char hex[16384];
+    int retries;
+};
+
+#define SUBMIT_QUEUE_MAX 16
+static struct submit_job submit_queue[SUBMIT_QUEUE_MAX];
+static size_t sq_head = 0;
+static size_t sq_tail = 0;
+static size_t sq_count = 0;
+static pthread_mutex_t sq_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t sq_cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t sq_empty_cond = PTHREAD_COND_INITIALIZER;
+static pthread_t sq_thread;
+static int sq_running = 0;
+
 static void enqueue_job(const struct submit_job *job) {
     pthread_mutex_lock(&sq_lock);
     if (sq_count >= SUBMIT_QUEUE_MAX) {
@@ -2309,9 +2219,71 @@ static int verify_pow_hex(const char *blockhex) {
     return valid;
 }
 
-/* Build a mining pass from stratum work data.
-   Same logic as build_mining_pass() but reads from the caller-provided
-   data_hex/ndiff (obtained from the stratum client) instead of HTTP getwork. */
+/* Build a mining pass from stratum work data. */
+
+static void submit_gap_block_common(const char *blockhex, double merit,
+                                    const char *rpc_url,
+                                    const char *rpc_user,
+                                    const char *rpc_pass,
+                                    const char *rpc_sign_key,
+                                    const char *queue_note)
+{
+#ifdef WITH_RPC
+    if (g_stratum) {
+        if (!verify_pow_hex(blockhex)) {
+            log_msg(">>> SKIPPING invalid PoW (stale pass)\n");
+        } else if (stratum_dedup(blockhex)) {
+            log_msg(">>> SKIPPING duplicate share\n");
+        } else if (stratum_submit(g_stratum, blockhex)) {
+            double net_m = ndiff_to_merit(g_pass.net_ndiff);
+            log_msg(">>> SUBMITTED via stratum%s  merit=%.6f  (net=%.6f)\n",
+                    (merit >= net_m && net_m > 0) ? " (block)" : "",
+                    merit, net_m);
+        } else {
+            log_msg(">>> stratum submit FAILED\n");
+        }
+        print_stats();
+        return;
+    }
+
+    if (!rpc_url || g_abort_pass)
+        return;
+
+    if (rpc_sign_key) {
+        char sig[65];
+        hmac_sha256_hex(rpc_sign_key, blockhex, sig);
+        log_msg("    signature: %s\n", sig);
+    }
+
+    if (!verify_pow_hex(blockhex)) {
+        log_msg(">>> SKIPPING: local PoW verification FAILED\n");
+        return;
+    }
+
+    struct submit_job _job;
+    memset(&_job, 0, sizeof(_job));
+    strncpy(_job.url, rpc_url, sizeof(_job.url) - 1);
+    strncpy(_job.user, rpc_user ? rpc_user : "", sizeof(_job.user) - 1);
+    strncpy(_job.pass, rpc_pass ? rpc_pass : "", sizeof(_job.pass) - 1);
+    strncpy(_job.method, "getwork", sizeof(_job.method) - 1);
+    memcpy(_job.hex, blockhex, sizeof(_job.hex));
+    _job.retries = rpc_default_retries;
+    enqueue_job(&_job);
+    log_msg(">>> QUEUED for async submit%s\n",
+            queue_note ? queue_note : "");
+    print_stats();
+#else
+    (void)blockhex;
+    (void)merit;
+    (void)rpc_url;
+    (void)rpc_user;
+    (void)rpc_pass;
+    (void)rpc_sign_key;
+    (void)queue_note;
+#endif
+}
+/* Same logic as build_mining_pass() but reads from the caller-provided
+    data_hex/ndiff (obtained from the stratum client) instead of HTTP getwork. */
 static int build_mining_pass_stratum(const char *data_hex, uint64_t ndiff, int shift) {
     /* decode 80-byte header from hex */
     uint8_t hdr80[80];
@@ -2427,20 +2399,52 @@ static __thread int    tls_gmp_inited = 0;  /* 0 until first init       */
 static __thread uint64_t tls_cand_last_offset = 0;
 static __thread int      tls_cand_last_valid  = 0;
 
-/* Per-thread primality memoization cache (direct-mapped).
+/* Per-thread primality memoization cache (two-way set-associative).
     Caches bn_candidate_is_prime(offset) results for the current base.
     Reset cheaply via epoch bump in set_base_bn(). */
 #define PRIME_CACHE_BITS 13
-#define PRIME_CACHE_SIZE (1u << PRIME_CACHE_BITS)
-#define PRIME_CACHE_MASK (PRIME_CACHE_SIZE - 1u)
-static __thread uint64_t tls_prime_cache_key[PRIME_CACHE_SIZE];
-static __thread uint8_t  tls_prime_cache_val[PRIME_CACHE_SIZE];
-static __thread uint32_t tls_prime_cache_gen[PRIME_CACHE_SIZE];
+#define PRIME_CACHE_SETS (1u << PRIME_CACHE_BITS)
+#define PRIME_CACHE_MASK (PRIME_CACHE_SETS - 1u)
+#define PRIME_CACHE_WAYS 2
+static __thread uint64_t tls_prime_cache_key[PRIME_CACHE_WAYS][PRIME_CACHE_SETS];
+static __thread uint8_t  tls_prime_cache_val[PRIME_CACHE_WAYS][PRIME_CACHE_SETS];
+static __thread uint32_t tls_prime_cache_gen[PRIME_CACHE_WAYS][PRIME_CACHE_SETS];
+static __thread uint8_t  tls_prime_cache_victim[PRIME_CACHE_SETS];
 static __thread uint32_t tls_prime_cache_epoch = 1;
 
 static inline uint32_t prime_cache_slot(uint64_t offset) {
      uint64_t h = offset * 11400714819323198485ull;
      return (uint32_t)((h >> (64 - PRIME_CACHE_BITS)) & PRIME_CACHE_MASK);
+}
+
+static inline int prime_cache_lookup(uint64_t offset, int *value_out) {
+    uint32_t slot = prime_cache_slot(offset);
+    for (int way = 0; way < PRIME_CACHE_WAYS; way++) {
+        if (tls_prime_cache_gen[way][slot] == tls_prime_cache_epoch &&
+            tls_prime_cache_key[way][slot] == offset) {
+            *value_out = (int)tls_prime_cache_val[way][slot];
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static inline void prime_cache_store(uint64_t offset, int is_prime) {
+    uint32_t slot = prime_cache_slot(offset);
+    int way = -1;
+    for (int i = 0; i < PRIME_CACHE_WAYS; i++) {
+        if (tls_prime_cache_gen[i][slot] != tls_prime_cache_epoch) {
+            way = i;
+            break;
+        }
+    }
+    if (way < 0) {
+        way = tls_prime_cache_victim[slot] & (PRIME_CACHE_WAYS - 1);
+        tls_prime_cache_victim[slot] = (uint8_t)((way + 1) & (PRIME_CACHE_WAYS - 1));
+    }
+    tls_prime_cache_key[way][slot] = offset;
+    tls_prime_cache_val[way][slot] = (uint8_t)is_prime;
+    tls_prime_cache_gen[way][slot] = tls_prime_cache_epoch;
 }
 
 /* Must be called whenever tls_base_mpz changes.
@@ -2451,6 +2455,7 @@ static inline void prime_cache_invalidate_base(void) {
     tls_prime_cache_epoch++;
     if (tls_prime_cache_epoch == 0) {
         memset(tls_prime_cache_gen, 0, sizeof(tls_prime_cache_gen));
+        memset(tls_prime_cache_victim, 0, sizeof(tls_prime_cache_victim));
         tls_prime_cache_epoch = 1;
     }
 }
@@ -2681,10 +2686,9 @@ static int mr_verify_cand(void) {
 static int bn_candidate_is_prime(uint64_t offset) {
     /* Fast memoization hit: same offset for current base. */
     {
-        uint32_t slot = prime_cache_slot(offset);
-        if (tls_prime_cache_gen[slot] == tls_prime_cache_epoch &&
-            tls_prime_cache_key[slot] == offset)
-            return (int)tls_prime_cache_val[slot];
+        int cached_val;
+        if (prime_cache_lookup(offset, &cached_val))
+            return cached_val;
     }
 
     /* --- Trial-division pre-filter (disabled when TD_EXTRA_CNT=0) --- */
@@ -2693,10 +2697,7 @@ static int bn_candidate_is_prime(uint64_t offset) {
         uint32_t rem = (uint32_t)(((uint64_t)tls_td_residues[i]
                                    + (uint64_t)(offset % p)) % p);
         if (rem == 0) {
-            uint32_t slot = prime_cache_slot(offset);
-            tls_prime_cache_key[slot] = offset;
-            tls_prime_cache_val[slot] = 0;
-            tls_prime_cache_gen[slot] = tls_prime_cache_epoch;
+            prime_cache_store(offset, 0);
             return 0;
         }
     }
@@ -2779,12 +2780,7 @@ static int bn_candidate_is_prime(uint64_t offset) {
         is_prime = (mpz_probab_prime_p(tls_cand_mpz, cli_mr_rounds) > 0);
     }
 
-    {
-        uint32_t slot = prime_cache_slot(offset);
-        tls_prime_cache_key[slot] = offset;
-        tls_prime_cache_val[slot] = (uint8_t)is_prime;
-        tls_prime_cache_gen[slot] = tls_prime_cache_epoch;
-    }
+    prime_cache_store(offset, is_prime);
     return is_prime;
 }
 
@@ -2795,6 +2791,20 @@ static int bn_candidate_is_prime(uint64_t offset) {
    offsets.  Sends (base + offset[i]) for each i to the GPU for Fermat
    testing, then compacts the survivors in-place.
    Returns the new count (number of probable primes).  */
+static int gpu_batch_submit_chunk(gpu_fermat_ctx *ctx, int preferred_slot,
+                                  const uint64_t *cands, size_t count,
+                                  int *actual_slot) {
+    int slots[2] = { preferred_slot & 1, 1 - (preferred_slot & 1) };
+    for (int i = 0; i < 2; i++) {
+        int slot = slots[i];
+        if (gpu_fermat_submit(ctx, slot, cands, count) == 0) {
+            if (actual_slot) *actual_slot = slot;
+            return 0;
+        }
+    }
+    return -1;
+}
+
 static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
     if (g_gpu_count == 0 || cnt == 0) return 0;
 
@@ -2907,7 +2917,8 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
         uint64_t *cur_cands = tls_gpu_cands[build_buf];
         int this_slot = submit_slot;
 
-        if (gpu_fermat_submit(ctx, this_slot, cur_cands, cur_size) < 0) {
+        if (gpu_batch_submit_chunk(ctx, this_slot, cur_cands, cur_size,
+                                   &this_slot) < 0) {
             for (size_t j = 0; j < cur_size; j++)
                 if (bn_candidate_is_prime(offsets[cur_start + j]))
                     offsets[pf++] = offsets[cur_start + j];
@@ -3094,6 +3105,7 @@ static size_t crt_bkscan_and_submit(
             uint64_t end_off   = bk.qual_pairs[qi][1];
             uint64_t gap = end_off - start_off;
             double merit = (double)gap / logbase;
+            char submit_msg[160];
 
             /* MR base-3 boundary verification for CRT backward-scan path */
             if (use_mr_verify) {
@@ -3129,56 +3141,19 @@ static size_t crt_bkscan_and_submit(
             if (rpc_url && !g_abort_pass) {
                 char blockhex[16384];
                 memset(blockhex, 0, sizeof(blockhex));
-                if (assemble_mining_block_mpz(nonce, nAdd_prime, 0,
-                                             blockhex)) {
+                if (assemble_mining_block_mpz(nonce, nAdd_prime, 0, blockhex)) {
                     __sync_fetch_and_add(&stats_blocks, 1);
                     log_file_only("Built blockhex: %s\n", blockhex);
                     if (header_meets_target_hex(blockhex)) {
-                        log_msg(">>> SUBMITTING  merit=%.6f"
-                                "  gap=%llu  nShift=%d  nonce=%u\n",
-                                merit, (unsigned long long)gap,
-                                shift_v, (unsigned)nonce);
+                        snprintf(submit_msg, sizeof(submit_msg),
+                                 ">>> SUBMITTING  merit=%.6f  gap=%llu  nShift=%d  nonce=%u",
+                                 merit, (unsigned long long)gap,
+                                 shift_v, (unsigned)nonce);
+                        log_msg("%s\n", submit_msg);
                         __sync_fetch_and_add(&stats_submits, 1);
-                        if (g_stratum) {
-                            if (!verify_pow_hex(blockhex))
-                                log_msg(">>> SKIPPING invalid"
-                                        " PoW (stale pass)\n");
-                            else if (stratum_dedup(blockhex))
-                                log_msg(">>> SKIPPING duplicate"
-                                        " share\n");
-                            else if (stratum_submit(g_stratum,
-                                    blockhex)) {
-                                double net_m = ndiff_to_merit(
-                                    g_pass.net_ndiff);
-                                log_msg(">>> SUBMITTED via stratum%s"
-                                        "  merit=%.6f  (net=%.6f)\n",
-                                        (merit >= net_m && net_m > 0)
-                                            ? " (block)" : "",
-                                        merit, net_m);
-                            } else {
-                                log_msg(">>> stratum submit FAILED\n");
-                            }
-                            print_stats();
-                        } else {
-                            struct submit_job _job;
-                            memset(&_job, 0, sizeof(_job));
-                            strncpy(_job.url, rpc_url,
-                                    sizeof(_job.url)-1);
-                            strncpy(_job.user,
-                                    rpc_user ? rpc_user : "",
-                                    sizeof(_job.user)-1);
-                            strncpy(_job.pass,
-                                    rpc_pass ? rpc_pass : "",
-                                    sizeof(_job.pass)-1);
-                            strncpy(_job.method, "getwork",
-                                    sizeof(_job.method)-1);
-                            memcpy(_job.hex, blockhex,
-                                   sizeof(_job.hex));
-                            _job.retries = rpc_default_retries;
-                            enqueue_job(&_job);
-                            log_msg(">>> QUEUED for async submit\n");
-                            print_stats();
-                        }
+                        submit_gap_block_common(blockhex, merit,
+                                                rpc_url, rpc_user, rpc_pass,
+                                                NULL, "");
                     }
                 } else {
                     log_msg("Failed to assemble block\n");
@@ -3250,6 +3225,7 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
         if (cand_odd)
             mpz_sub_ui(nAdd_prime, nAdd_prime, 1);
         char nAdd_str[256];
+        char submit_msg[160];
         gmp_snprintf(nAdd_str, sizeof(nAdd_str), "%Zd", nAdd_prime);
         log_msg("\n>>> GAP FOUND\n"
                 "    gap     = %llu\n"
@@ -3268,45 +3244,15 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
                 __sync_fetch_and_add(&stats_blocks, 1);
                 log_file_only("Built blockhex: %s\n", blockhex);
                 if (header_meets_target_hex(blockhex)) {
-                    log_msg(">>> SUBMITTING  merit=%.6f  gap=%llu"
-                            "  nShift=%d  nonce=%u\n",
-                            merit, (unsigned long long)gap,
-                            shift_v, (unsigned)nonce);
+                    snprintf(submit_msg, sizeof(submit_msg),
+                             ">>> SUBMITTING  merit=%.6f  gap=%llu  nShift=%d  nonce=%u",
+                             merit, (unsigned long long)gap,
+                             shift_v, (unsigned)nonce);
+                    log_msg("%s\n", submit_msg);
                     __sync_fetch_and_add(&stats_submits, 1);
-                    if (g_stratum) {
-                        if (!verify_pow_hex(blockhex)) {
-                            log_msg(">>> SKIPPING invalid PoW (stale pass)\n");
-                        } else if (stratum_dedup(blockhex)) {
-                            log_msg(">>> SKIPPING duplicate share\n");
-                        } else if (stratum_submit(g_stratum, blockhex)) {
-                            double net_m = ndiff_to_merit(g_pass.net_ndiff);
-                            log_msg(">>> SUBMITTED via stratum%s  merit=%.6f  (net=%.6f)\n",
-                                    (merit >= net_m && net_m > 0) ? " (block)" : "", merit, net_m);
-                        } else {
-                            log_msg(">>> stratum submit FAILED\n");
-                        }
-                        print_stats();
-                    } else {
-                        /* Local PoW verification before sending to node */
-                        if (!verify_pow_hex(blockhex)) {
-                            log_msg(">>> SKIPPING: local PoW verification FAILED\n");
-                        } else {
-                        struct submit_job _job;
-                        memset(&_job, 0, sizeof(_job));
-                        strncpy(_job.url, rpc_url, sizeof(_job.url)-1);
-                        strncpy(_job.user, rpc_user ? rpc_user : "",
-                                sizeof(_job.user)-1);
-                        strncpy(_job.pass, rpc_pass ? rpc_pass : "",
-                                sizeof(_job.pass)-1);
-                        strncpy(_job.method, "getwork",
-                                sizeof(_job.method)-1);
-                        memcpy(_job.hex, blockhex, sizeof(_job.hex));
-                        _job.retries = rpc_default_retries;
-                        enqueue_job(&_job);
-                        log_msg(">>> QUEUED for async submit\n");
-                        print_stats();
-                        }
-                    }
+                    submit_gap_block_common(blockhex, merit,
+                                            rpc_url, rpc_user, rpc_pass,
+                                            NULL, "");
                 }
             } else {
                 log_msg("Failed to assemble block\n");
@@ -3367,9 +3313,10 @@ struct gpu_accum {
     struct gpu_accum_buf buf[2];     /* ping-pong buffers                */
     int       fill;                  /* 0 or 1: which buf we're adding to */
     int       inflight;              /* 0 or 1 or -1: buf with GPU work   */
+    int       inflight_slot;         /* slot used by the in-flight batch  */
     int       threshold;             /* flush when total >= this          */
     gpu_fermat_ctx *ctx;             /* assigned GPU context              */
-    int       slot_base;             /* 0 or 1: fixed GPU slot for this accum */
+    int       slot_base;             /* preferred GPU slot for this accum */
     int       stride;                /* limbs per candidate (= active_limbs) */
 };
 
@@ -3423,6 +3370,16 @@ static pthread_mutex_t g_gpu_slot_owned[2] = {
 
 static volatile int g_accum_slot_counter = 0;
 
+static int gpu_accum_acquire_slot(int preferred_slot) {
+    int alternate_slot = 1 - preferred_slot;
+    if (pthread_mutex_trylock(&g_gpu_slot_owned[preferred_slot]) == 0)
+        return preferred_slot;
+    if (pthread_mutex_trylock(&g_gpu_slot_owned[alternate_slot]) == 0)
+        return alternate_slot;
+    pthread_mutex_lock(&g_gpu_slot_owned[preferred_slot]);
+    return preferred_slot;
+}
+
 static struct gpu_accum *gpu_accum_create(gpu_fermat_ctx *ctx, int threshold) {
     struct gpu_accum *a = (struct gpu_accum *)calloc(1, sizeof(*a));
     if (!a) return NULL;
@@ -3432,6 +3389,7 @@ static struct gpu_accum *gpu_accum_create(gpu_fermat_ctx *ctx, int threshold) {
     a->stride = gpu_fermat_get_limbs(ctx);
     a->fill = 0;
     a->inflight = -1;
+    a->inflight_slot = -1;
     size_t cap = (size_t)a->threshold + 1024;
     if (gpu_accum_buf_init(&a->buf[0], cap, a->stride) < 0 ||
         gpu_accum_buf_init(&a->buf[1], cap, a->stride) < 0) {
@@ -3540,9 +3498,15 @@ static int gpu_accum_add(struct gpu_accum *a,
 static void gpu_accum_collect(struct gpu_accum *a) {
     if (!a || a->inflight < 0) return;
     int buf_idx = a->inflight;  /* buffer that was submitted */
-    int slot = a->slot_base;    /* GPU slot it was submitted to */
+    int slot = a->inflight_slot; /* GPU slot it was submitted to */
     struct gpu_accum_buf *b = &a->buf[buf_idx];
-    if (b->total == 0) { a->inflight = -1; pthread_mutex_unlock(&g_gpu_slot_owned[slot]); return; }
+    if (b->total == 0) {
+        a->inflight = -1;
+        a->inflight_slot = -1;
+        if (slot >= 0)
+            pthread_mutex_unlock(&g_gpu_slot_owned[slot]);
+        return;
+    }
 
     /* Wait for GPU results */
     int np = gpu_fermat_collect(a->ctx, slot, b->results, b->total);
@@ -3571,6 +3535,7 @@ static void gpu_accum_collect(struct gpu_accum *a) {
     b->total = 0;
     b->win_count = 0;
     a->inflight = -1;
+    a->inflight_slot = -1;
     /* Release slot ownership — next waiting thread can now submit */
     pthread_mutex_unlock(&g_gpu_slot_owned[slot]);
 }
@@ -3589,11 +3554,7 @@ static void gpu_accum_flush(struct gpu_accum *a) {
     if (a->inflight >= 0)
         gpu_accum_collect(a);
 
-    /* Acquire slot ownership — blocks if another thread currently owns it.
-       Once we hold the mutex the slot is free (pending==0) because the
-       previous owner called gpu_fermat_collect which cleared pending. */
-    int slot = a->slot_base;
-    pthread_mutex_lock(&g_gpu_slot_owned[slot]);
+    int slot = gpu_accum_acquire_slot(a->slot_base);
 
     __sync_fetch_and_add(&stats_gpu_flushes, 1);
     __sync_fetch_and_add(&stats_gpu_batched, b->total);
@@ -3608,6 +3569,7 @@ static void gpu_accum_flush(struct gpu_accum *a) {
     /* Mark the buffer index as in-flight.
        g_gpu_slot_owned[slot] is HELD until gpu_accum_collect() releases it. */
     a->inflight = a->fill;
+     a->inflight_slot = slot;
 
     /* Swap fill to the other buffer — CPU continues sieving here while
        GPU processes the submitted batch.  The slot mutex remains held,
@@ -3926,44 +3888,11 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
                                 merit, (unsigned long long)gap,
                                 shift_sc, (unsigned long long)nadd_sc);
                         __sync_fetch_and_add(&stats_submits, 1);
-                        if (g_stratum) {
-                            /* Submit via stratum (non-blocking) */
-                            if (!verify_pow_hex(blockhex)) {
-                                log_msg(">>> SKIPPING invalid PoW (stale pass)\n");
-                            } else if (stratum_dedup(blockhex)) {
-                                log_msg(">>> SKIPPING duplicate share\n");
-                            } else if (stratum_submit(g_stratum, blockhex)) {
-                                double net_m = ndiff_to_merit(g_pass.net_ndiff);
-                                log_msg(">>> SUBMITTED via stratum%s  merit=%.6f  (net=%.6f)\n",
-                                        (merit >= net_m && net_m > 0) ? " (block)" : "", merit, net_m);
-                            } else {
-                                log_msg(">>> stratum submit FAILED\n");
-                            }
-                            print_stats();
-                        } else {
-                            /* Submit via HTTP RPC (async queue) */
-                            if (rpc_sign_key_local) {
-                                char sig[65];
-                                hmac_sha256_hex(rpc_sign_key_local, blockhex, sig);
-                                log_msg("    signature: %s\n", sig);
-                            }
-                            /* Local PoW verification before sending to node */
-                            if (!verify_pow_hex(blockhex)) {
-                                log_msg(">>> SKIPPING: local PoW verification FAILED\n");
-                                continue;
-                            }
-                            struct submit_job _job;
-                            memset(&_job, 0, sizeof(_job));
-                            strncpy(_job.url,    rpc_url_local,                     sizeof(_job.url)-1);
-                            strncpy(_job.user,   rpc_user_local  ? rpc_user_local  : "", sizeof(_job.user)-1);
-                            strncpy(_job.pass,   rpc_pass_local  ? rpc_pass_local  : "", sizeof(_job.pass)-1);
-                            strncpy(_job.method, "getwork",                         sizeof(_job.method)-1);
-                            memcpy(_job.hex, blockhex, sizeof(_job.hex));
-                            _job.retries = rpc_default_retries;
-                            enqueue_job(&_job);
-                            log_msg(">>> QUEUED for async submit (mining continues)\n");
-                            print_stats();
-                        }
+                        submit_gap_block_common(blockhex, merit,
+                                                rpc_url_local, rpc_user_local,
+                                                rpc_pass_local,
+                                                rpc_sign_key_local,
+                                                " (mining continues)");
                         if (!keep_going) return 1;
                         else log_msg("continuing mining after success\n");
                     }
@@ -4784,20 +4713,6 @@ static void *worker_fn(void *arg) {
             size_t pf = 0;
             size_t worker_tested = 0;
 
-            if (adaptive_presieve_should_skip_window(psc.bufs[cur_slot].L,
-                                                     psc.bufs[cur_slot].R,
-                                                     cnt)) {
-                psc.coop.pr = NULL;
-                psc.coop.cnt = 0;
-                psc.coop.next_idx = 0;
-                psc.coop.active = 0;
-                psc.coop.more_work = 0;
-                psc.coop.helper_done = 1;
-                __sync_synchronize();
-                pthread_mutex_unlock(&psc.mu);
-                continue;
-            }
-
             /* Decide up-front whether to use two-phase smart scanning.
                Pre-allocate phase-1 buffers BEFORE unlocking the mutex so
                the fallback path can still set up coop normally.             */
@@ -5465,7 +5380,6 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--fast-fermat")) use_fast_fermat = 1;
         else if (!strcmp(argv[i],"--fast-euler")) use_fast_euler = 1;
         else if (!strcmp(argv[i],"--partial-sieve-auto") || !strcmp(argv[i],"--partial-sieve")) use_partial_sieve_auto = 1;
-        else if (!strcmp(argv[i],"--adaptive-presieve")) use_adaptive_presieve = 1;
         else if (!strcmp(argv[i],"-e") || !strcmp(argv[i],"--extra-verbose")) use_extra_verbose = 1;
         else if (!strcmp(argv[i],"--crt-auto-split")) use_crt_auto_split = 1;
         else if (!strcmp(argv[i],"--mr-verify")) use_mr_verify = 1;
@@ -5984,8 +5898,6 @@ int main(int argc, char **argv) {
                 (unsigned)PARTIAL_SIEVE_COOLDOWN_WIN);
     if (use_extra_verbose)
         log_file_only("partial sieve auto: extra verbose enabled (-e/--extra-verbose)\n");
-    if (use_adaptive_presieve)
-        log_msg("adaptive presieve: enabled (--adaptive-presieve)\n");
     if (use_crt_auto_split)
         log_msg("CRT auto split: enabled (--crt-auto-split)\n");
 
@@ -6239,9 +6151,6 @@ int main(int argc, char **argv) {
                 /* primality – compact pr[] in-place using big-prime BN test */
                 size_t pf = 0;
                 size_t orig_cnt_st = cnt;
-
-                if (adaptive_presieve_should_skip_window(L, R, cnt))
-                    continue;
 
                 int smart_K_st = cli_sample_stride;
                 int use_smart_st = (smart_K_st > 1 && !no_primality

@@ -18,7 +18,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 BIN="${BIN:-./bin/gap_miner}"
-MINER_ARGS="${MINER_ARGS:--o 127.0.0.1 -p 31397 -u benxy031 --pass xx --shift 64 --threads 3 --fast-fermat --cuda --sample-stride 5 --partial-sieve-auto --adaptive-presieve}"
+MINER_ARGS="${MINER_ARGS:--o 127.0.0.1 -p 31397 -u benxy031 --pass xx --shift 64 --threads 3 --fast-fermat --sample-stride 5 --partial-sieve-auto --adaptive-presieve --cuda}"
 DURATION_SEC="${DURATION_SEC:-100}"
 TARGET="${TARGET:-20.5607}"
 CASES="${CASES:-A,B,C,D,E,F,G,H}"
@@ -38,8 +38,8 @@ mkdir -p "$OUT_DIR"
 # 8-case matrix around baseline.
 CASE_NAMES=(A B C D E F G H)
 # CASE_SIEVE_SIZE=(33554432 33554432 33554432 67108864 67108864 67108864 134217728 134217728)
-CASE_SIEVE_SIZE=(33554432 67108864 33554432 67108864 33554432 67108864 33554432 67108864)
-CASE_SIEVE_PRIMES=(1800000 1000000 2000000 2000000 2200000 2200000 2800000 2800000)
+CASE_SIEVE_SIZE=(33554432 33554432 33554432 33554432 33554432 33554432 33554432 33554432)
+CASE_SIEVE_PRIMES=(1500000 2000000 2500000 3000000 3500000 4000000 4500000 5000000)
 
 want_case() {
   local c="$1"
