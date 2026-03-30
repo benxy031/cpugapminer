@@ -50,6 +50,7 @@ static int             g_gpu_count = 0;
 #include "gap_scan.h"
 #include "crt_heap.h"
 #include "presieve_utils.h"
+#include "wheel_sieve.h"
 #include "crt_solver.h"
 #include "uint256_utils.h"
 #include "block_utils.h"
@@ -197,6 +198,8 @@ static volatile int use_fast_fermat = 0;
 static volatile int use_fast_euler = 0;
 /* if nonzero, use adaptive sieve-prime limiting on non-CRT windows. */
 static volatile int use_partial_sieve_auto = 0;
+/* if nonzero, use the selectable wheel presieve backend. */
+static volatile int use_wheel_sieve = 0;
 /* if nonzero, write extra partial-sieve-auto details to the log file. */
 static volatile int use_extra_verbose = 0;
 /* if nonzero, adapt CRT producer/consumer split between passes. */
@@ -1009,6 +1012,12 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
                 crt_skip_to = (int)(idx + 1);
             }
         }
+    } else if (use_wheel_sieve && g_crt_mode == CRT_MODE_NONE
+               && wheel_sieve_enabled() && h256) {
+        uint64_t base_mod_w = uint256_mod_small(h256, shift, wheel_sieve_size());
+        size_t sb = wheel_sieve_start_bit(base_mod_w, L);
+        wheel_sieve_tile(bits, bit_size, sb);
+        crt_skip_to = (int)wheel_sieve_skip_to();
     } else if (g_presieve_tmpl && tls_base_mod_p_ready && tls_base_mod_p
                && small_primes_count > 6) {
         /* Pre-sieve template: mark composites of {3,5,7,11,13,17}.
@@ -5293,6 +5302,7 @@ int main(int argc, char **argv) {
         printf("      --partial-sieve-auto  adaptive non-CRT sieve-prime limiting (opt-in)\n");
         printf("      --partial-sieve       alias for --partial-sieve-auto\n");
         printf("      --adaptive-presieve   skip dense non-CRT windows after presieve\n");
+        printf("      --wheel-sieve N      use wheel presieve backend (0 disables; 30, 210, 2310, 30030, 510510, or 9699690)\n");
         printf("  -e, --extra-verbose  write partial-sieve-auto details to log file\n");
         printf("      --sample-stride K smart scan: test every Kth survivor (default: 8, 1=off)\n");
         printf("      --mr-rounds N     Miller-Rabin rounds for primality  (default: 2)\n");
@@ -5327,6 +5337,7 @@ int main(int argc, char **argv) {
     double target = 20.0;
     int target_explicit = 0;  /* set to 1 if user passes --target */
     int cli_sieve_explicit = 0; /* set to 1 if user passes --sieve-primes */
+    unsigned int cli_wheel_sieve = 0;
     const char *rpc_url = NULL, *rpc_user = NULL, *rpc_pass = NULL, *rpc_method = "getwork";
     const char *stratum_arg = NULL; /* "host:port" for stratum pool connection */
     const char *rpc_sign_key = NULL;
@@ -5380,6 +5391,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--fast-fermat")) use_fast_fermat = 1;
         else if (!strcmp(argv[i],"--fast-euler")) use_fast_euler = 1;
         else if (!strcmp(argv[i],"--partial-sieve-auto") || !strcmp(argv[i],"--partial-sieve")) use_partial_sieve_auto = 1;
+        else if (!strcmp(argv[i],"--wheel-sieve") && i+1<argc) {
+            cli_wheel_sieve = (unsigned int)strtoul(argv[++i], NULL, 10);
+            use_wheel_sieve = 1;
+        }
         else if (!strcmp(argv[i],"-e") || !strcmp(argv[i],"--extra-verbose")) use_extra_verbose = 1;
         else if (!strcmp(argv[i],"--crt-auto-split")) use_crt_auto_split = 1;
         else if (!strcmp(argv[i],"--mr-verify")) use_mr_verify = 1;
@@ -5535,6 +5550,19 @@ int main(int argc, char **argv) {
 
     /* Build generic pre-sieve template (primes 3..17). */
     presieve_template_init();
+    if (use_wheel_sieve) {
+        if (wheel_sieve_configure(cli_wheel_sieve) != 0) {
+                log_msg("invalid --wheel-sieve value %u (use 30, 210, 2310, 30030, 510510, or 9699690)\n",
+                    cli_wheel_sieve);
+            return 2;
+        }
+        if (wheel_sieve_enabled()) {
+            log_msg("wheel sieve: enabled (W=%u, skip_to=%zu)\n",
+                    wheel_sieve_size(), wheel_sieve_skip_to());
+        } else {
+            log_msg("wheel sieve: disabled\n");
+        }
+    }
 
     /* Load CRT sieve template if requested. */
     if (cli_crt_file) {

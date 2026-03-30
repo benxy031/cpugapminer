@@ -18,7 +18,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 BIN="${BIN:-./bin/gap_miner}"
-MINER_ARGS="${MINER_ARGS:--o 127.0.0.1 -p 31397 -u benxy031 --pass xx --shift 64 --threads 3 --fast-fermat --sample-stride 5 --partial-sieve-auto --adaptive-presieve --cuda}"
+MINER_ARGS="${MINER_ARGS:--o 127.0.0.1 -p 31397 -u benxy031 --pass xx --shift 128 --threads 6 --fast-fermat --cuda --crt crt/crt_s160_m22_tight.txt}"
 DURATION_SEC="${DURATION_SEC:-100}"
 TARGET="${TARGET:-20.5607}"
 CASES="${CASES:-A,B,C,D,E,F,G,H}"
@@ -39,7 +39,7 @@ mkdir -p "$OUT_DIR"
 CASE_NAMES=(A B C D E F G H)
 # CASE_SIEVE_SIZE=(33554432 33554432 33554432 67108864 67108864 67108864 134217728 134217728)
 CASE_SIEVE_SIZE=(33554432 33554432 33554432 33554432 33554432 33554432 33554432 33554432)
-CASE_SIEVE_PRIMES=(1500000 2000000 2500000 3000000 3500000 4000000 4500000 5000000)
+CASE_SIEVE_PRIMES=(150000 200000 250000 300000 350000 400000 450000 500000)
 
 want_case() {
   local c="$1"

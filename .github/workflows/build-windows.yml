@@ -47,6 +47,9 @@ jobs:
       - name: Build (CPU-only, WITH_RPC)
         run: make -f Makefile.mingw clean && make -f Makefile.mingw WITH_RPC=1
 
+      - name: Wheel sieve smoke test
+        run: bin/gap_miner.exe --wheel-sieve 210 --selftest
+
       - name: Build gen_crt
         run: make -f Makefile.mingw gen_crt
 
@@ -153,6 +156,10 @@ jobs:
       - name: Build gap_miner (WITH_RPC + CUDA DLL mode)
         shell: msys2 {0}
         run: make -f Makefile.mingw clean && make -f Makefile.mingw WITH_RPC=1 WITH_CUDA=1 CUDA_DLL=1 GPU_BITS=1024
+
+      - name: Wheel sieve smoke test
+        shell: msys2 {0}
+        run: bin/gap_miner.exe --wheel-sieve 210 --selftest
 
       - name: Build gen_crt
         shell: msys2 {0}

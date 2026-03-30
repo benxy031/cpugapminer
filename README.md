@@ -285,6 +285,42 @@ each time the auto limit changes.
 
 In short: `--partial-sieve-auto` decides how much sieving to do.
 
+### Non-CRT wheel presieve backend
+
+- `--wheel-sieve N` enables an alternate wheel presieve backend for the
+  non-CRT sieve.
+- Supported wheel sizes are `30`, `210`, `2310`, `30030`, `510510`, and `9699690`.
+- This changes only the presieve initialization; CRT solver modes keep their
+  existing CRT-specific sieve paths.
+
+How to use it:
+
+1. Build the miner as usual on Linux or Windows.
+2. Run the binary with `--wheel-sieve 30`, `--wheel-sieve 210`,
+  `--wheel-sieve 2310`, `--wheel-sieve 30030`, `--wheel-sieve 510510`, or
+  `--wheel-sieve 9699690`.
+3. Keep your normal mining flags (`--shift`, `--sieve-size`, `--target`,
+   `--cuda`, `--rpc-url`, etc.) unchanged.
+
+Examples:
+
+- Linux non-CRT run with the 210 wheel:
+  `./bin/gap_miner --shift 20 --sieve-size 33554432 --wheel-sieve 210 ...`
+- Stronger wheel presieve with the 510510 cycle:
+  `./bin/gap_miner --shift 20 --sieve-size 33554432 --wheel-sieve 510510 ...`
+- Even stronger wheel presieve with the 9699690 cycle:
+  `./bin/gap_miner --shift 20 --sieve-size 33554432 --wheel-sieve 9699690 ...`
+- Windows build from GitHub Actions:
+  the Windows workflow now compiles the wheel module and runs a smoke test
+  with `--wheel-sieve 210 --selftest`.
+
+Notes:
+
+- `--wheel-sieve` is a presieve backend choice, not a change to the CRT
+  solver or the Fermat stage.
+- If you do not pass `--wheel-sieve`, the miner uses the existing generic
+  pre-sieve path.
+
 ### CRT producer-consumer telemetry
 
 In CRT producer-consumer mode (`--fermat-threads N`), STATS now include queue
