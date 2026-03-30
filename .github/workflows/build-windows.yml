@@ -48,7 +48,7 @@ jobs:
         run: make -f Makefile.mingw clean && make -f Makefile.mingw WITH_RPC=1
 
       - name: Wheel sieve smoke test
-        run: bin/gap_miner.exe --wheel-sieve 210 --selftest
+        run: ./bin/gap_miner.exe --wheel-sieve 210 --selftest
 
       - name: Build gen_crt
         run: make -f Makefile.mingw gen_crt
@@ -159,7 +159,7 @@ jobs:
 
       - name: Wheel sieve smoke test
         shell: msys2 {0}
-        run: bin/gap_miner.exe --wheel-sieve 210 --selftest
+        run: ./bin/gap_miner.exe --wheel-sieve 210 --selftest
 
       - name: Build gen_crt
         shell: msys2 {0}
