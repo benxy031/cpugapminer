@@ -157,6 +157,10 @@ jobs:
         shell: msys2 {0}
         run: make -f Makefile.mingw clean && make -f Makefile.mingw WITH_RPC=1 WITH_CUDA=1 CUDA_DLL=1 GPU_BITS=1024
 
+      - name: Stage CUDA DLL for smoke test
+        shell: msys2 {0}
+        run: cp src/gpu_fermat.dll bin/
+
       - name: Wheel sieve smoke test
         shell: msys2 {0}
         run: ./bin/gap_miner.exe --wheel-sieve 210 --selftest
