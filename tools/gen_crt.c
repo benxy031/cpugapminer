@@ -110,6 +110,19 @@ typedef struct {
     double w_score;       /* weighted fitness used for optimization     */
 } Solution;
 
+static bool solution_better(const Solution *a, const Solution *b) {
+    if (a->n_candidates != b->n_candidates)
+        return a->n_candidates < b->n_candidates;
+    return a->w_score < b->w_score;
+}
+
+static bool solution_better_metrics(int a_cnt, double a_w,
+                                    int b_cnt, double b_w) {
+    if (a_cnt != b_cnt)
+        return a_cnt < b_cnt;
+    return a_w < b_w;
+}
+
 /* ---- helpers ---- */
 
 static double primorial_log2(int n) {
@@ -466,12 +479,13 @@ static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
     uint8_t *buf2  = (uint8_t *)calloc((size_t)(gap_size + 1), 1);
     if (!child || !buf || !buf2) { perror("alloc"); exit(1); }
 
-    double best_ever_w   = 1e18;
     int    best_ever_cnt = INT_MAX;
+    double best_ever_w   = 1e18;
     for (int i = 0; i < pop_size; i++) {
-        if (pop[i].w_score < best_ever_w) {
-            best_ever_w   = pop[i].w_score;
+        if (solution_better_metrics(pop[i].n_candidates, pop[i].w_score,
+                                    best_ever_cnt, best_ever_w)) {
             best_ever_cnt = pop[i].n_candidates;
+            best_ever_w   = pop[i].w_score;
         }
     }
 
@@ -480,9 +494,9 @@ static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
     for (int gen = 0; gen < max_gens; gen++) {
         /* tournament select two parents */
         int a = rand() % pop_size, b = rand() % pop_size;
-        int p1 = (pop[a].w_score <= pop[b].w_score) ? a : b;
+        int p1 = solution_better(&pop[a], &pop[b]) ? a : b;
         a = rand() % pop_size; b = rand() % pop_size;
-        int p2 = (pop[a].w_score <= pop[b].w_score) ? a : b;
+        int p2 = solution_better(&pop[a], &pop[b]) ? a : b;
 
         /* uniform crossover */
         for (int i = 0; i < n_primes; i++) {
@@ -500,8 +514,9 @@ static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
                 child[i] = rand() % PRIMES[i];
         }
 
-        /* local-search refinement (10% of generations) */
-        if (rand() % 10 == 0 && fixed < n_primes) {
+        /* local-search refinement is intentionally sparse; greedy already
+         * does most of the useful work. */
+        if (rand() % 25 == 0 && fixed < n_primes) {
             int nfree = n_primes - fixed;
             if (nfree >= 2 && rand() % 2 == 0) {
                 /* pair search: jointly optimise two random primes */
@@ -517,7 +532,7 @@ static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
         }
 
         /* Controlled escape: jump one weakest prime, then repair locally. */
-        if (fixed < n_primes && (stale > 2000 || (rand() % 12) == 0)) {
+        if (fixed < n_primes && (stale > 8000 || (rand() % 24) == 0)) {
             int weak_idx = kick_weakest_prime(child, n_primes, gap_size,
                                              fixed, buf2);
             if (weak_idx >= 0) {
@@ -536,19 +551,25 @@ static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
 
         /* replace worst if child is better */
         int worst = 0;
-        for (int i = 1; i < pop_size; i++)
-            if (pop[i].w_score > pop[worst].w_score)
+        for (int i = 1; i < pop_size; i++) {
+            if (pop[i].n_candidates > pop[worst].n_candidates ||
+                (pop[i].n_candidates == pop[worst].n_candidates &&
+                 pop[i].w_score > pop[worst].w_score))
                 worst = i;
+        }
 
-        if (fitness_w < pop[worst].w_score) {
+        if (solution_better_metrics(fitness, fitness_w,
+                                    pop[worst].n_candidates,
+                                    pop[worst].w_score)) {
             memcpy(pop[worst].offsets, child, (size_t)n_primes * sizeof(int));
             pop[worst].n_candidates = fitness;
             pop[worst].w_score      = fitness_w;
         }
 
-        if (fitness_w < best_ever_w) {
-            best_ever_w   = fitness_w;
+        if (solution_better_metrics(fitness, fitness_w,
+                                    best_ever_cnt, best_ever_w)) {
             best_ever_cnt = fitness;
+            best_ever_w   = fitness_w;
             stale = 0;
         } else {
             stale++;
@@ -562,7 +583,7 @@ static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
         }
 
         /* early stop if no improvement for a long time */
-        if (stale > max_gens / 4 && stale > 50000) break;
+        if (stale > max_gens / 10 && stale > 8000) break;
     }
 
     fprintf(stderr, "\n");
@@ -781,10 +802,14 @@ int main(int argc, char **argv) {
             /* insert into population if better than worst */
             int worst = 0;
             for (int i = 1; i < pop_size; i++)
-                if (pop[i].w_score > pop[worst].w_score)
+                if (pop[i].n_candidates > pop[worst].n_candidates ||
+                    (pop[i].n_candidates == pop[worst].n_candidates &&
+                     pop[i].w_score > pop[worst].w_score))
                     worst = i;
 
-            if (w_nc < pop[worst].w_score) {
+            if (solution_better_metrics(nc, w_nc,
+                                        pop[worst].n_candidates,
+                                        pop[worst].w_score)) {
                 memcpy(pop[worst].offsets, tmp, (size_t)np * sizeof(int));
                 pop[worst].n_candidates = nc;
                 pop[worst].w_score      = w_nc;
@@ -818,7 +843,7 @@ int main(int argc, char **argv) {
             int best_idx = -1;
             for (int i = 0; i < pop_size; i++) {
                 if (picked[i]) continue;
-                if (best_idx < 0 || pop[i].w_score < pop[best_idx].w_score)
+                if (best_idx < 0 || solution_better(&pop[i], &pop[best_idx]))
                     best_idx = i;
             }
             picked[best_idx] = true;
@@ -867,10 +892,11 @@ int main(int argc, char **argv) {
             int adj_fixed = ctr_fixed;
             if (adj_fixed > np) adj_fixed = np;
 
-            /* adaptive generation count */
-            int gens = np * pop_size * 5000;
-            if (gens < 100000)  gens = 100000;
-            if (gens > 2000000) gens = 2000000;
+            /* adaptive generation count: keep evolution as a light
+             * refinement pass, not a second full search. */
+            int gens = np * pop_size * 1200;
+            if (gens < 30000)  gens = 30000;
+            if (gens > 400000) gens = 400000;
 
             evolve(pop, pop_size, np, gs, adj_fixed, gens);
         }
@@ -889,17 +915,26 @@ int main(int argc, char **argv) {
             /* find current best */
             int bi = 0;
             for (int i = 1; i < pop_size; i++)
-                if (pop[i].w_score < pop[bi].w_score)
+                if (solution_better(&pop[i], &pop[bi]))
                     bi = i;
 
-            /* initial full sweep + pair sweep on best */
-            local_search_sweep(pop[bi].offsets, np, gs,
+            /* initial full sweep + pair sweep on a copy so ILS cannot
+             * make the best solution worse before it has earned the update. */
+            memcpy(ils_work, pop[bi].offsets, (size_t)np * sizeof(int));
+            local_search_sweep(ils_work, np, gs,
                                ctr_fixed < np ? ctr_fixed : np, ils_buf);
-            pair_search_sweep(pop[bi].offsets, np, gs,
+            pair_search_sweep(ils_work, np, gs,
                               ctr_fixed < np ? ctr_fixed : np,
                               ils_buf, ils_buf2);
-            pop[bi].n_candidates = evaluate(pop[bi].offsets, np, gs, ils_buf,
-                                            &pop[bi].w_score);
+            double ils_init_w;
+            int ils_init_cnt = evaluate(ils_work, np, gs, ils_buf, &ils_init_w);
+            if (solution_better_metrics(ils_init_cnt, ils_init_w,
+                                        pop[bi].n_candidates,
+                                        pop[bi].w_score)) {
+                memcpy(pop[bi].offsets, ils_work, (size_t)np * sizeof(int));
+                pop[bi].n_candidates = ils_init_cnt;
+                pop[bi].w_score      = ils_init_w;
+            }
 
             double ils_best_w   = pop[bi].w_score;
             int    ils_best_cnt = pop[bi].n_candidates;
@@ -907,9 +942,9 @@ int main(int argc, char **argv) {
             int nfree = np - ils_fixed;
 
             /* ILS rounds: perturb + re-sweep */
-            int ils_rounds = nfree * nfree * 20;
-            if (ils_rounds < 500)    ils_rounds = 500;
-            if (ils_rounds > 100000) ils_rounds = 100000;
+            int ils_rounds = nfree * nfree * 5;
+            if (ils_rounds < 200)    ils_rounds = 200;
+            if (ils_rounds > 25000)   ils_rounds = 25000;
             int ils_stale = 0;
 
             for (int r = 0; r < ils_rounds; r++) {
@@ -935,7 +970,7 @@ int main(int argc, char **argv) {
                 double w_nc;
                 int nc = evaluate(ils_work, np, gs, ils_buf, &w_nc);
 
-                if (w_nc < ils_best_w) {
+                                  if (solution_better_metrics(nc, w_nc, ils_best_cnt, ils_best_w)) {
                     memcpy(pop[bi].offsets, ils_work,
                            (size_t)np * sizeof(int));
                     pop[bi].n_candidates = nc;
@@ -954,7 +989,7 @@ int main(int argc, char **argv) {
                     fflush(stderr);
                 }
 
-                if (ils_stale > ils_rounds / 3 && ils_stale > 200) break;
+                if (ils_stale > ils_rounds / 5 && ils_stale > 80) break;
             }
             fprintf(stderr, "\n");
 
@@ -966,12 +1001,12 @@ int main(int argc, char **argv) {
         /* ---- find best in population ---- */
         int best_idx = 0;
         for (int i = 1; i < pop_size; i++)
-            if (pop[i].w_score < pop[best_idx].w_score)
+            if (solution_better(&pop[i], &pop[best_idx]))
                 best_idx = i;
 
         phase_best_cnt = pop[best_idx].n_candidates;
 
-        if (pop[best_idx].w_score < global_best.w_score) {
+        if (!global_best.offsets || solution_better(&pop[best_idx], &global_best)) {
             if (global_best.offsets) sol_free(&global_best);
             global_best = sol_clone(&pop[best_idx]);
         }
