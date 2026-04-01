@@ -551,6 +551,65 @@ bin/gap_miner \
   --cuda
 ```
 
+## Recent changes (April 2026)
+
+### Async GPU Fermat pipeline (CUDA)
+
+The CUDA Fermat path was rearchitected to eliminate `cudaStreamSynchronize`
+as a ~47% CPU hotspot and to prevent candidates from being silently discarded
+when the GPU was busy.
+
+- **Async collector thread** — a dedicated `gpu_fermat_collector()` thread
+  polls completed GPU slots via `cudaEventQuery` in a tight spin loop and
+  signals results via a per-slot `pthread_cond_t`.  GPU completion is fully
+  decoupled from the mining worker threads; workers never stall waiting for
+  the GPU to finish.
+- **Blocking submit** — `gpu_fermat_submit()` now blocks on
+  `pthread_cond_wait()` when all GPU slots are busy instead of returning `-1`
+  and silently dropping candidates.  Under peak GPU load, workers queue
+  normally; no primality work is lost.
+- **Broadcast wakeup** — the collector uses `pthread_cond_broadcast()` (not
+  `pthread_cond_signal()`) to wake all waiters when a slot is freed.  Using
+  `signal` caused a latent deadlock: a "collect waiter" could steal the wakeup
+  intended for a "submit waiter", leaving the submit path permanently stuck.
+- **GMP CPU fallbacks removed** — `bn_candidate_is_prime()` was called as a
+  CPU fallback on every returned candidate inside `gpu_batch_filter()`.
+  Removing this path dropped GMP CPU usage from **73.59% → 3.29%** of total
+  CPU time, restoring GPU-based throughput to its intended level.
+
+Before this fix the miner appeared to run but accepted very few (or zero)
+blocks because the GPU results were re-tested serially on the CPU, defeating
+the entire purpose of GPU offload.
+
+Recommended command for RTX 3060, shift=160:
+
+```sh
+./bin/gap_miner -o 127.0.0.1 -p 31397 -u USER --pass PASS \
+  -s 160 --threads 4 --fast-fermat \
+  --sieve-size 33554432 --sieve-primes 1800000 \
+  --sample-stride 5 --cuda
+```
+
+Typical output: ~353 M sieved/s, ~311k pps, est ~10m (merit target ~20.5).
+
+### `--sample-stride` tuning with `--cuda`
+
+The `--sample-stride K` parameter controls the two-phase GPU smart-scan for
+the non-CRT path.  Choosing K well keeps the CPU sieve and GPU Fermat pipeline
+overlapped:
+
+- **Phase 1** tests every K-th sieve survivor (~cnt/K candidates) in a small
+  fast GPU batch (~1–2 ms return time).
+- **Phase 2** retests all survivors that fall inside the gap regions identified
+  by Phase 1.
+
+At **shift=160** with ~140k survivors per window, **K=5 is optimal**: Phase-1
+batches of ~22k complete in ~1–2 ms, allowing the CPU to sieve the next window
+while the GPU processes the current one.  The default K=8 produces smaller
+Phase-1 batches with less gap-region coverage; K=1 disables smart-scan and
+sends a single ~110k-candidate batch that stalls the sieve for ~8–10 ms per
+window, degrading throughput.
+
 ## How it works
 
 ### Header hash and the adder
@@ -631,18 +690,16 @@ Fermat testing to the GPU on these paths:
   receives thousands of candidates per launch.
 - **Normal sieve (non-CRT)** — Each sieve window already produces thousands
   of candidates, so they are sent directly to the GPU via `gpu_batch_filter`
-  without accumulation.  The host pipeline uses double-buffered async
-  submit/collect with build-ahead chunk preparation and thread-local staging
-  buffer reuse to reduce allocator overhead and improve stream overlap.
-  The direct batch path now tries the alternate CUDA slot before falling back
-  to CPU, which reduces contention when multiple workers share a GPU.
+  without accumulation.  A dedicated `gpu_fermat_collector()` thread polls
+  completed GPU slots via `cudaEventQuery` and signals results via per-slot
+  `pthread_cond_t`; worker threads submit to available slots and block only
+  when all slots are busy, ensuring no candidates are discarded under load.
   The GPU path uses two-phase smart-scan (Phase 1 sampling + Phase 2
-  verification).  The CPU path uses a backward-scan
-  algorithm that jumps ahead by the target gap and scans backward for
-  primes, achieving ~8× fewer Fermat tests than full-test.
-  Cooperative Fermat is disabled (`coop.active=0`) so the helper thread
-  only sieves the next window and does not waste CPU on redundant Fermat
-  work.
+  verification).  The CPU path uses a backward-scan algorithm that jumps
+  ahead by the target gap and scans backward for primes, achieving ~8× fewer
+  Fermat tests than full-test.  Cooperative Fermat is disabled
+  (`coop.active=0`) so the helper thread only sieves the next window and does
+  not waste CPU on redundant Fermat work.
 - **CRT producer-consumer (`--fermat-threads N`)** — GPU is **not used**.
   The Fermat consumer threads run CPU backward-scan (`crt_bkscan_and_submit`)
   with GMP Fermat directly.  Combining `--cuda` with `--fermat-threads`
@@ -899,14 +956,20 @@ achieving full SM utilization.
 
 #### Non-CRT (normal sieve + smart-scan)
 
-| Mode | Threads | Fermat tests/s | Est | Relative |
-|------|---------|---------------|-----|----------|
-| GPU (non-CRT) | 2 | 350 K/s | 5.1h | **2.8×** vs CRT GPU |
+| Mode | Shift | Threads | sieve/s | pps | Est | Notes |
+|------|-------|---------|---------|-----|-----|-------|
+| GPU (non-CRT), before async fix | 512 | 2 | — | 350 K/s | 5.1h | `cudaStreamSynchronize` hotspot |
+| GPU (non-CRT), async collector | 512 | 2 | — | 350 K/s | 5.1h | **2.8×** vs CRT GPU |
+| GPU (non-CRT), async collector | 160 | 4 | ~353 M/s | ~311 K/s | ~10m | RTX 3060, `--sieve-primes 1800000 --sample-stride 5` |
 
 At shift 512, the non-CRT path with GPU is **dramatically faster** than CRT:
 each 33M sieve window produces thousands of candidates, fully saturating the
 GPU without needing an accumulator.  The CRT path is limited by its tiny
 per-window candidate count (~38), even with batching across windows.
+
+At shift 160 with `--sieve-primes 1800000 --sample-stride 5`, the async
+collector keeps the CPU sieve and GPU Phase-1 batches overlapped, achieving
+~311k pps with a ~10m estimated time-to-block at merit target ~20.5.
 
 The `gpu_batch=N` stat in the output shows the average candidates per GPU
 flush (CRT mode only).  Larger values indicate better GPU utilization.
@@ -978,8 +1041,13 @@ gap scanning.  Multiple GPUs are supported via `--cuda 0,1`.
     large GPU buffer (default 4096, `--gpu-batch N`), transforming tiny
     per-window batches into GPU-filling workloads — 2.6× speedup on an
     RTX 3060 at shift 512.  Non-CRT paths (full-test and smart-scan)
-    send entire sieve windows directly to the GPU.  Cooperative Fermat
-    is disabled when GPU is active so the helper thread only sieves.
+    send entire sieve windows directly to the GPU.  A dedicated
+    `gpu_fermat_collector()` thread polls completed slots via
+    `cudaEventQuery` and signals per-slot `pthread_cond_t`; workers block
+    only when all slots are full, so no candidates are ever dropped.
+    CPU GMP fallbacks inside `gpu_batch_filter()` were removed, cutting
+    GMP CPU overhead from 73.59% → 3.29%.  Cooperative Fermat is disabled
+    when GPU is active so the helper thread only sieves.
     Multiple GPUs supported via `--cuda 0,1` with round-robin dispatch.
 
 11. **Presieve template** -- A 249 KB precomputed bitmap marks all
