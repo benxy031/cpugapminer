@@ -20,6 +20,7 @@
 #else
 #  include <pthread.h>
 #endif
+#include <unistd.h>
 #include <cuda_runtime.h>
 
 #define NL GPU_NLIMBS   /* shorthand for loop bounds */
@@ -359,6 +360,17 @@ struct gpu_fermat_ctx {
     /* Per-slot mutexes avoid cross-slot contention while preserving safety. */
     pthread_mutex_t slot_mu[2];
     int       slot_mu_inited[2];
+
+    /* Per-slot completion events and a collector thread to query them */
+    cudaEvent_t event[2];
+    int         event_inited[2];
+    int         ready[2];            /* set by collector when results ready */
+    pthread_cond_t slot_cv[2];
+    int         slot_cv_inited[2];
+
+    /* Background collector thread */
+    pthread_t  collector_thread;
+    int        collector_running;
 };
 
 static __host__ __forceinline__ cudaError_t ensure_device(int device_id)
@@ -369,6 +381,9 @@ static __host__ __forceinline__ cudaError_t ensure_device(int device_id)
     if (cur == device_id) return cudaSuccess;
     return cudaSetDevice(device_id);
 }
+
+/* Forward declaration for background collector thread */
+static void *gpu_fermat_collector(void *arg);
 
 gpu_fermat_ctx *gpu_fermat_init(int device_id, size_t max_batch)
 {
@@ -448,6 +463,32 @@ gpu_fermat_ctx *gpu_fermat_init(int device_id, size_t max_batch)
         }
 
         ctx->pending[s] = 0;
+        ctx->ready[s] = 0;
+        ctx->event_inited[s] = 0;
+        ctx->slot_cv_inited[s] = 0;
+
+        /* Create completion event (disable timing to reduce overhead) */
+        err = cudaEventCreateWithFlags(&ctx->event[s], cudaEventDisableTiming);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "gpu_fermat: cudaEventCreate[%d]: %s\n",
+                    s, cudaGetErrorString(err));
+            goto fail;
+        }
+        ctx->event_inited[s] = 1;
+
+        if (pthread_cond_init(&ctx->slot_cv[s], NULL) != 0) {
+            fprintf(stderr, "gpu_fermat: pthread_cond_init[%d] failed\n", s);
+            goto fail;
+        }
+        ctx->slot_cv_inited[s] = 1;
+    }
+
+    /* Start background collector thread that queries per-slot events */
+    ctx->collector_running = 1;
+    if (pthread_create(&ctx->collector_thread, NULL, gpu_fermat_collector, ctx) != 0) {
+        fprintf(stderr, "gpu_fermat: pthread_create collector failed\n");
+        ctx->collector_running = 0;
+        goto fail;
     }
 
     return ctx;
@@ -469,10 +510,11 @@ int gpu_fermat_submit(gpu_fermat_ctx *ctx, int slot,
     if (count > ctx->max_batch) count = ctx->max_batch;
 
     pthread_mutex_lock(&ctx->slot_mu[slot]);
-    if (ctx->pending[slot] != 0) {
-        pthread_mutex_unlock(&ctx->slot_mu[slot]);
-        return -1; /* slot busy: caller must collect first */
-    }
+    /* Block until the slot is free — the collector broadcasts slot_cv
+       when collect() drains a slot, so this wait is bounded by GPU
+       kernel latency (~5-15 ms).  Never skips candidates. */
+    while (ctx->pending[slot] != 0)
+        pthread_cond_wait(&ctx->slot_cv[slot], &ctx->slot_mu[slot]);
 
     cudaError_t err = ensure_device(ctx->device_id);
     if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->slot_mu[slot]); return -1; }
@@ -505,7 +547,11 @@ int gpu_fermat_submit(gpu_fermat_ctx *ctx, int slot,
                           count, cudaMemcpyDeviceToHost,
                           ctx->stream[slot]);
     if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->slot_mu[slot]); return -1; }
+    /* Record an event when the D→H copy completes; collector will query it. */
+    err = cudaEventRecord(ctx->event[slot], ctx->stream[slot]);
+    if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->slot_mu[slot]); return -1; }
 
+    ctx->ready[slot] = 0;
     ctx->pending[slot] = count;
     pthread_mutex_unlock(&ctx->slot_mu[slot]);
     return 0;
@@ -526,12 +572,11 @@ int gpu_fermat_collect(gpu_fermat_ctx *ctx, int slot,
     size_t n = ctx->pending[slot];
     if (count < n) n = count;
 
-    cudaError_t err = ensure_device(ctx->device_id);
-    if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->slot_mu[slot]); return -1; }
-
-    /* Wait for all operations on this stream */
-    err = cudaStreamSynchronize(ctx->stream[slot]);
-    if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->slot_mu[slot]); return -1; }
+    /* Wait for the background collector to mark this slot ready. The
+       collector will pthread_cond_signal() when the CUDA event completes. */
+    while (!ctx->ready[slot]) {
+        pthread_cond_wait(&ctx->slot_cv[slot], &ctx->slot_mu[slot]);
+    }
 
     /* Results are already in pinned host buffer — copy to user */
     memcpy(results, ctx->h_results[slot], n);
@@ -541,6 +586,9 @@ int gpu_fermat_collect(gpu_fermat_ctx *ctx, int slot,
         primes += results[i];
 
     ctx->pending[slot] = 0;
+    ctx->ready[slot] = 0;
+    /* Wake any thread blocked in gpu_fermat_submit waiting for this slot. */
+    pthread_cond_broadcast(&ctx->slot_cv[slot]);
     pthread_mutex_unlock(&ctx->slot_mu[slot]);
     return primes;
 }
@@ -579,9 +627,58 @@ int gpu_fermat_get_limbs(gpu_fermat_ctx *ctx)
     return (al >= 1 && al <= NL) ? al : NL;
 }
 
+/* Background collector thread: polls per-slot CUDA events with cudaEventQuery
+   and signals waiting collectors via pthread condition variables. */
+static void *gpu_fermat_collector(void *arg)
+{
+    gpu_fermat_ctx *ctx = (gpu_fermat_ctx *)arg;
+    if (!ctx) return NULL;
+
+    /* Ensure the thread is bound to the same CUDA device used for ops. */
+    if (ensure_device(ctx->device_id) != cudaSuccess) return NULL;
+
+    while (__atomic_load_n(&ctx->collector_running, __ATOMIC_RELAXED)) {
+        for (int s = 0; s < 2; s++) {
+            int need_check = 0;
+            pthread_mutex_lock(&ctx->slot_mu[s]);
+            if (ctx->pending[s] != 0 && !ctx->ready[s])
+                need_check = 1;
+            pthread_mutex_unlock(&ctx->slot_mu[s]);
+
+            if (!need_check) continue;
+
+            cudaError_t q = cudaEventQuery(ctx->event[s]);
+            if (q == cudaSuccess) {
+                pthread_mutex_lock(&ctx->slot_mu[s]);
+                ctx->ready[s] = 1;
+                /* broadcast: both submit() waiters (pending==0) and
+                   collect() waiters (ready==1) share this condvar;
+                   signal() would wake only one and could starve the other. */
+                pthread_cond_broadcast(&ctx->slot_cv[s]);
+                pthread_mutex_unlock(&ctx->slot_mu[s]);
+            } else if (q != cudaErrorNotReady) {
+                /* On unexpected errors, broadcast to avoid hangs. */
+                pthread_mutex_lock(&ctx->slot_mu[s]);
+                ctx->ready[s] = 1;
+                pthread_cond_broadcast(&ctx->slot_cv[s]);
+                pthread_mutex_unlock(&ctx->slot_mu[s]);
+            }
+        }
+        usleep(1000); /* sleep 1ms between polls */
+    }
+    return NULL;
+}
+
 void gpu_fermat_destroy(gpu_fermat_ctx *ctx)
 {
     if (!ctx) return;
+
+    /* Stop background collector thread first to avoid races on slot state */
+    if (__atomic_load_n(&ctx->collector_running, __ATOMIC_RELAXED)) {
+        __atomic_store_n(&ctx->collector_running, 0, __ATOMIC_RELAXED);
+        pthread_join(ctx->collector_thread, NULL);
+    }
+
     for (int s = 0; s < 2; s++) {
         if (ctx->slot_mu_inited[s]) pthread_mutex_lock(&ctx->slot_mu[s]);
     }
@@ -598,6 +695,8 @@ void gpu_fermat_destroy(gpu_fermat_ctx *ctx)
     for (int s = 0; s < 2; s++) {
         if (ctx->slot_mu_inited[s]) {
             pthread_mutex_unlock(&ctx->slot_mu[s]);
+            if (ctx->slot_cv_inited[s]) pthread_cond_destroy(&ctx->slot_cv[s]);
+            if (ctx->event_inited[s]) cudaEventDestroy(ctx->event[s]);
             pthread_mutex_destroy(&ctx->slot_mu[s]);
         }
     }

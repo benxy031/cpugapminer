@@ -2844,12 +2844,8 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
                     (unsigned long)nexp, gpu_al, (unsigned long)(nexp * 64));
             warned = 1;
         }
-        /* CPU fallback */
-        size_t pf = 0;
-        for (size_t j = 0; j < cnt; j++)
-            if (bn_candidate_is_prime(offsets[j]))
-                offsets[pf++] = offsets[j];
-        return pf;
+        /* GPU cannot handle these candidates — skip them. */
+        return 0;
     }
 
     /* Allocate flat candidate buffer: cnt × gpu_al limbs */
@@ -2928,9 +2924,7 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
 
         if (gpu_batch_submit_chunk(ctx, this_slot, cur_cands, cur_size,
                                    &this_slot) < 0) {
-            for (size_t j = 0; j < cur_size; j++)
-                if (bn_candidate_is_prime(offsets[cur_start + j]))
-                    offsets[pf++] = offsets[cur_start + j];
+            /* Submit failed — skip chunk (treat as composite). */
         } else {
             /* Non-CRT direct GPU path: count each successful submit chunk. */
             __sync_fetch_and_add(&stats_gpu_flushes, 1);
@@ -2961,14 +2955,11 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
 
             if (prev_valid) {
                 int np = gpu_fermat_collect(ctx, prev_slot, tls_gpu_res, prev_size);
-                if (np < 0) {
-                    for (size_t j = 0; j < prev_size; j++)
-                        if (bn_candidate_is_prime(offsets[prev_start + j]))
-                            offsets[pf++] = offsets[prev_start + j];
-                } else {
+                if (np >= 0) {
                     for (size_t j = 0; j < prev_size; j++)
                         if (tls_gpu_res[j]) offsets[pf++] = offsets[prev_start + j];
                 }
+                /* Collect failed — skip prev chunk (treat as composite). */
             }
 
             prev_valid = 1;
@@ -2985,42 +2976,30 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
         }
 
         /* Submit failed for current: collect any previous pending chunk and
-           continue with CPU fallback for remaining chunks. */
+           skip remaining chunks (treat as composite). */
         if (prev_valid) {
             int np = gpu_fermat_collect(ctx, prev_slot, tls_gpu_res, prev_size);
-            if (np < 0) {
-                for (size_t j = 0; j < prev_size; j++)
-                    if (bn_candidate_is_prime(offsets[prev_start + j]))
-                        offsets[pf++] = offsets[prev_start + j];
-            } else {
+            if (np >= 0) {
                 for (size_t j = 0; j < prev_size; j++)
                     if (tls_gpu_res[j]) offsets[pf++] = offsets[prev_start + j];
             }
+            /* Collect failed — skip prev chunk (treat as composite). */
             prev_valid = 0;
         }
 
-        while (next_i < cnt) {
-            size_t left = cnt - next_i;
-            size_t n = (left > batch) ? batch : left;
-            for (size_t j = 0; j < n; j++)
-                if (bn_candidate_is_prime(offsets[next_i + j]))
-                    offsets[pf++] = offsets[next_i + j];
-            next_i += n;
-        }
+        /* Skip remaining chunks (treat as composite). */
+        next_i = cnt;
         cur_valid = 0;
     }
 
     /* Collect final chunk */
     if (prev_valid) {
         int np = gpu_fermat_collect(ctx, prev_slot, tls_gpu_res, prev_size);
-        if (np < 0) {
-            for (size_t j = 0; j < prev_size; j++)
-                if (bn_candidate_is_prime(offsets[prev_start + j]))
-                    offsets[pf++] = offsets[prev_start + j];
-        } else {
+        if (np >= 0) {
             for (size_t j = 0; j < prev_size; j++)
                 if (tls_gpu_res[j]) offsets[pf++] = offsets[prev_start + j];
         }
+        /* Collect failed — skip chunk (treat as composite). */
     }
 
     if (pf > 0)
@@ -4839,45 +4818,12 @@ static void *worker_fn(void *arg) {
                             n_gap_regions++;
                         }
                     }
-                    /* Edge probing (GPU path uses CPU probes — cheap vs GPU launch) */
+                    /* Keep all gap regions alive — GPU handles full verification. */
                     if (n_gap_regions > 0) {
                         gpu_reg_alive = (int *)malloc(n_gap_regions * sizeof(int));
                         if (gpu_reg_alive) {
-                            size_t eprobes = 0;
-                            for (size_t r = 0; r < n_gap_regions; r++) {
+                            for (size_t r = 0; r < n_gap_regions; r++)
                                 gpu_reg_alive[r] = 1;
-                                uint64_t rlo = gap_reg_lo[r], rhi = gap_reg_hi[r];
-                                size_t lo_idx, hi_idx;
-                                { size_t l = 0, h = cnt;
-                                  while (l < h) { size_t m = l+(h-l)/2;
-                                    if (pr[m] <= rlo) l=m+1; else h=m; }
-                                  lo_idx = l; }
-                                { size_t l = 0, h = cnt;
-                                  while (l < h) { size_t m = l+(h-l)/2;
-                                    if (pr[m] < rhi) l=m+1; else h=m; }
-                                  hi_idx = l; }
-                                size_t rcnt = hi_idx > lo_idx ? hi_idx - lo_idx : 0;
-                                if (rcnt < (size_t)(EDGE_PROBE_N * 3)) continue;
-                                uint64_t lp = 0, rp = 0;
-                                size_t np = 0;
-                                for (size_t j = lo_idx; j < hi_idx && np < EDGE_PROBE_N; j++) {
-                                    if (j % (size_t)smart_K == 0) continue;
-                                    np++;
-                                    if (bn_candidate_is_prime(pr[j])) { lp = pr[j]; break; }
-                                }
-                                eprobes += np; np = 0;
-                                for (size_t j = hi_idx; j > lo_idx && np < EDGE_PROBE_N; ) {
-                                    j--;
-                                    if (j % (size_t)smart_K == 0) continue;
-                                    np++;
-                                    if (bn_candidate_is_prime(pr[j])) { rp = pr[j]; break; }
-                                }
-                                eprobes += np;
-                                if (lp && rp && rp - lp < needed_gap)
-                                    gpu_reg_alive[r] = 0;
-                            }
-                            if (eprobes > 0)
-                                __sync_fetch_and_add(&stats_tested, (uint64_t)eprobes);
                         }
                     }
                     /* Collect verification candidates from surviving regions */
