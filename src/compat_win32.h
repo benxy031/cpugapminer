@@ -145,9 +145,14 @@ static inline const char *win_temp_dir(void) {
 #endif /* _MSC_VER atomic shim */
 
 #ifdef _MSC_VER
+
+/* ── usleep ── */
+static inline void usleep(unsigned int us) { Sleep((DWORD)((us + 999) / 1000)); }
+
+/* ── pthread_mutex_t → CRITICAL_SECTION ── */
 typedef CRITICAL_SECTION pthread_mutex_t;
 /* CRITICAL_SECTION must be explicitly initialised; zero-fill is not safe
- * for all Windows versions.  cal pthread_mutex_init() before use. */
+ * for all Windows versions.  Call pthread_mutex_init() before use. */
 #define PTHREAD_MUTEX_INITIALIZER {0}
 static inline int pthread_mutex_init(pthread_mutex_t *m, void *attr)
     { (void)attr; InitializeCriticalSection(m); return 0; }
@@ -157,6 +162,50 @@ static inline int pthread_mutex_lock(pthread_mutex_t *m)
     { EnterCriticalSection(m); return 0; }
 static inline int pthread_mutex_unlock(pthread_mutex_t *m)
     { LeaveCriticalSection(m); return 0; }
+
+/* ── pthread_cond_t → CONDITION_VARIABLE (Vista+) ── */
+typedef CONDITION_VARIABLE pthread_cond_t;
+#define PTHREAD_COND_INITIALIZER CONDITION_VARIABLE_INIT
+static inline int pthread_cond_init(pthread_cond_t *c, void *attr)
+    { (void)attr; InitializeConditionVariable(c); return 0; }
+static inline int pthread_cond_destroy(pthread_cond_t *c)
+    { (void)c; return 0; }
+static inline int pthread_cond_wait(pthread_cond_t *c, pthread_mutex_t *m)
+    { SleepConditionVariableCS(c, m, INFINITE); return 0; }
+static inline int pthread_cond_broadcast(pthread_cond_t *c)
+    { WakeAllConditionVariable(c); return 0; }
+static inline int pthread_cond_signal(pthread_cond_t *c)
+    { WakeConditionVariable(c); return 0; }
+
+/* ── pthread_t → HANDLE + CreateThread trampoline ── */
+typedef HANDLE pthread_t;
+typedef struct { void *(*fn)(void *); void *arg; } _compat_pthread_tramp_t;
+static DWORD WINAPI _compat_pthread_trampoline(LPVOID p) {
+    _compat_pthread_tramp_t *t = (_compat_pthread_tramp_t *)p;
+    void *(*fn)(void *) = t->fn;
+    void *arg = t->arg;
+    HeapFree(GetProcessHeap(), 0, t);
+    fn(arg);
+    return 0;
+}
+static inline int pthread_create(pthread_t *tid, void *attr,
+                                  void *(*fn)(void *), void *arg) {
+    (void)attr;
+    _compat_pthread_tramp_t *t =
+        (_compat_pthread_tramp_t *)HeapAlloc(GetProcessHeap(), 0, sizeof(*t));
+    if (!t) return -1;
+    t->fn = fn; t->arg = arg;
+    *tid = CreateThread(NULL, 0, _compat_pthread_trampoline, t, 0, NULL);
+    if (!*tid) { HeapFree(GetProcessHeap(), 0, t); return -1; }
+    return 0;
+}
+static inline int pthread_join(pthread_t tid, void **retval) {
+    (void)retval;
+    WaitForSingleObject(tid, INFINITE);
+    CloseHandle(tid);
+    return 0;
+}
+
 #endif /* _MSC_VER */
 
 /* Winsock initialisation — call once from main(). */
