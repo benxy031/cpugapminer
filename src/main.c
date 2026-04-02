@@ -5252,18 +5252,15 @@ static void *worker_fn(void *arg) {
             }
             break; /* exit outer loop — main loop will respawn with new h256 */
         } else if (rpc_url_local) {
-            /* RPC (non-stratum): adder range exhausted.  Advance nonce so
-               we don't re-mine the same search space.                      */
-            if (rpc_thread_local) {
-                advance_nonce();
-                g_abort_pass = 1;
-            } else {
-                while (keep_going && !g_abort_pass) {
-                    struct timespec ts = {0, 100000000L};
-                    nanosleep(&ts, NULL);
-                }
-            }
-            break;
+            /* RPC (non-stratum): adder range exhausted.
+               Loop back and re-mine the same nonce/header — the 5-second
+               getbestblockhash poll in the window loop will catch new blocks
+               and set g_abort_pass.  Advancing the nonce here caused an
+               excessive getwork-call storm at small shifts (e.g. shift=25
+               where the entire 2^25 adder range is exhausted in <1 s).
+               Qualifying-gap probability per pair (~1e-9) makes duplicate
+               re-submission of the same gap negligibly rare.               */
+            /* fall through — outer while loop re-mines naturally */
         }
 #endif
         /* Pass complete without abort: loop back and mine the same slice */
