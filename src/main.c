@@ -10,6 +10,9 @@
 #include <math.h>
 #include <time.h>
 #include <limits.h>
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 #include "compat_win32.h"
 #include <openssl/sha.h>
 #include <openssl/bn.h>
@@ -572,7 +575,9 @@ static void presieve_template_init(void) {
 
 /* Tile the pre-sieve template into the sieve bitmap at the given bit
    offset.  Uses byte-at-a-time copy with bit-shifting when the start
-   is not byte-aligned; ~6× faster than per-bit iteration. */
+   is not byte-aligned; ~6× faster than per-bit iteration.
+   AVX2 path: process 32 output bytes per step when no period wrap falls
+   within the 34-byte source window; scalar fallback at wrap edges.      */
 static void tile_presieve(uint8_t *sieve, size_t sieve_bytes,
                           size_t start_bit) {
     size_t period_bytes = g_presieve_bytes;
@@ -592,8 +597,64 @@ static void tile_presieve(uint8_t *sieve, size_t sieve_bytes,
             src_byte  = 0;
         }
     } else {
-        /* Bit-shifted: two loads + shift-merge per output byte */
-        unsigned inv = 8 - shift;
+        /* Bit-shifted: out[i] = (src[s+i] >> shift) | (src[s+i+1] << inv)
+           AVX2: use _mm256_cvtepu8_epi16 to zero-extend 16 source bytes into
+           16 epi16 lanes, compose lo|(hi<<8), shift right by `shift` bits,
+           mask to 8 bits, pack to bytes.  Two passes per step → 32 bytes.
+           Fires only when [src_byte .. src_byte+33] is within the period.  */
+        unsigned inv = 8u - shift;
+#ifdef __AVX2__
+        const __m256i byte_mask = _mm256_set1_epi16(0x00FF);
+        for (size_t i = 0; i < sieve_bytes; ) {
+            size_t avail = period_bytes - src_byte;
+
+            if (avail >= 34 && sieve_bytes - i >= 32) {
+                /* ── AVX2 fast path: 32 output bytes from 33 source bytes ── */
+                /* First 16 output bytes: src[s..s+16] */
+                __m256i lo_a = _mm256_cvtepu8_epi16(
+                    _mm_loadu_si128((const __m128i *)(g_presieve_tmpl + src_byte)));
+                __m256i hi_a = _mm256_cvtepu8_epi16(
+                    _mm_loadu_si128((const __m128i *)(g_presieve_tmpl + src_byte + 1)));
+                /* lane[k] in [0..0x1FE]: (lo>>shift)|(hi<<inv) — mask to byte. */
+                __m256i out_a = _mm256_and_si256(
+                    _mm256_srli_epi16(
+                        _mm256_or_si256(lo_a, _mm256_slli_epi16(hi_a, 8)), shift),
+                    byte_mask);
+                /* Pack 16 epi16 lanes → 16 bytes.  packus_epi16(a, zero):
+                   lower 128-bit lane of result = pack(a[0..7], zeros[0..7])
+                   upper 128-bit lane of result = pack(a[8..15], zeros[8..15])
+                   permute4x64 ctrl=0xD8 → [chunk0,chunk2,chunk1,chunk3]
+                   → lower 128 bits = the 16 useful bytes.                  */
+                __m256i pk_a = _mm256_packus_epi16(out_a, _mm256_setzero_si256());
+                _mm_storeu_si128((__m128i *)(sieve + i),
+                    _mm256_castsi256_si128(_mm256_permute4x64_epi64(pk_a, 0xD8)));
+
+                /* Second 16 output bytes: src[s+16..s+32] */
+                __m256i lo_b = _mm256_cvtepu8_epi16(
+                    _mm_loadu_si128((const __m128i *)(g_presieve_tmpl + src_byte + 16)));
+                __m256i hi_b = _mm256_cvtepu8_epi16(
+                    _mm_loadu_si128((const __m128i *)(g_presieve_tmpl + src_byte + 17)));
+                __m256i out_b = _mm256_and_si256(
+                    _mm256_srli_epi16(
+                        _mm256_or_si256(lo_b, _mm256_slli_epi16(hi_b, 8)), shift),
+                    byte_mask);
+                __m256i pk_b  = _mm256_packus_epi16(out_b, _mm256_setzero_si256());
+                _mm_storeu_si128((__m128i *)(sieve + i + 16),
+                    _mm256_castsi256_si128(_mm256_permute4x64_epi64(pk_b, 0xD8)));
+
+                i        += 32;
+                src_byte += 32;
+                if (src_byte >= period_bytes) src_byte -= period_bytes;
+            } else {
+                /* Scalar: period wrap or < 32 bytes remaining */
+                size_t nx = src_byte + 1;
+                if (nx >= period_bytes) nx = 0;
+                sieve[i++] = (uint8_t)((g_presieve_tmpl[src_byte] >> shift)
+                             | (g_presieve_tmpl[nx] << inv));
+                src_byte = nx;
+            }
+        }
+#else
         for (size_t i = 0; i < sieve_bytes; i++) {
             uint8_t lo = g_presieve_tmpl[src_byte];
             size_t  nx = src_byte + 1;
@@ -602,6 +663,7 @@ static void tile_presieve(uint8_t *sieve, size_t sieve_bytes,
             sieve[i] = (uint8_t)((lo >> shift) | (hi << inv));
             src_byte = nx;
         }
+#endif
     }
 }
 
@@ -5506,6 +5568,14 @@ int main(int argc, char **argv) {
 
     /* Build generic pre-sieve template (primes 3..17). */
     presieve_template_init();
+    log_msg("presieve: %u-byte template built%s\n",
+            (unsigned)g_presieve_bytes,
+#ifdef __AVX2__
+            " (AVX2 tiling)"
+#else
+            ""
+#endif
+            );
     if (use_wheel_sieve) {
         if (wheel_sieve_configure(cli_wheel_sieve) != 0) {
                 log_msg("invalid --wheel-sieve value %u (use 30, 210, 2310, 30030, 510510, or 9699690)\n",

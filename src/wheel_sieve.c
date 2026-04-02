@@ -2,6 +2,9 @@
 
 #include <stdlib.h>
 #include <string.h>
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 
 static unsigned int g_wheel_size = 0;
 static uint8_t *g_wheel_tmpl = NULL;
@@ -117,7 +120,54 @@ void wheel_sieve_tile(uint8_t *sieve, size_t sieve_bytes, size_t start_bit) {
             src_byte = 0;
         }
     } else {
+        /* Bit-shifted: out[i] = (src[s+i] >> shift) | (src[s+i+1] << inv)
+           AVX2: same strategy as tile_presieve — two 16-byte passes per step
+           to produce 32 output bytes.  Scalar fallback at period wrap edges. */
         unsigned inv = 8U - shift;
+#ifdef __AVX2__
+        const __m256i byte_mask = _mm256_set1_epi16(0x00FF);
+        for (size_t i = 0; i < sieve_bytes; ) {
+            size_t avail = period_bytes - src_byte;
+
+            if (avail >= 34 && sieve_bytes - i >= 32) {
+                /* ── AVX2 fast path: 32 output bytes from 33 source bytes ── */
+                __m256i lo_a = _mm256_cvtepu8_epi16(
+                    _mm_loadu_si128((const __m128i *)(g_wheel_tmpl + src_byte)));
+                __m256i hi_a = _mm256_cvtepu8_epi16(
+                    _mm_loadu_si128((const __m128i *)(g_wheel_tmpl + src_byte + 1)));
+                __m256i out_a = _mm256_and_si256(
+                    _mm256_srli_epi16(
+                        _mm256_or_si256(lo_a, _mm256_slli_epi16(hi_a, 8)), shift),
+                    byte_mask);
+                __m256i pk_a = _mm256_packus_epi16(out_a, _mm256_setzero_si256());
+                _mm_storeu_si128((__m128i *)(sieve + i),
+                    _mm256_castsi256_si128(_mm256_permute4x64_epi64(pk_a, 0xD8)));
+
+                __m256i lo_b = _mm256_cvtepu8_epi16(
+                    _mm_loadu_si128((const __m128i *)(g_wheel_tmpl + src_byte + 16)));
+                __m256i hi_b = _mm256_cvtepu8_epi16(
+                    _mm_loadu_si128((const __m128i *)(g_wheel_tmpl + src_byte + 17)));
+                __m256i out_b = _mm256_and_si256(
+                    _mm256_srli_epi16(
+                        _mm256_or_si256(lo_b, _mm256_slli_epi16(hi_b, 8)), shift),
+                    byte_mask);
+                __m256i pk_b  = _mm256_packus_epi16(out_b, _mm256_setzero_si256());
+                _mm_storeu_si128((__m128i *)(sieve + i + 16),
+                    _mm256_castsi256_si128(_mm256_permute4x64_epi64(pk_b, 0xD8)));
+
+                i        += 32;
+                src_byte += 32;
+                if (src_byte >= period_bytes) src_byte -= period_bytes;
+            } else {
+                /* Scalar: period wrap or < 32 bytes remaining */
+                size_t nx = src_byte + 1;
+                if (nx >= period_bytes) nx = 0;
+                sieve[i++] = (uint8_t)((g_wheel_tmpl[src_byte] >> shift)
+                             | (g_wheel_tmpl[nx] << inv));
+                src_byte = nx;
+            }
+        }
+#else
         for (size_t i = 0; i < sieve_bytes; i++) {
             uint8_t lo = g_wheel_tmpl[src_byte];
             size_t nx = src_byte + 1;
@@ -126,5 +176,6 @@ void wheel_sieve_tile(uint8_t *sieve, size_t sieve_bytes, size_t start_bit) {
             sieve[i] = (uint8_t)((lo >> shift) | (hi << inv));
             src_byte = nx;
         }
+#endif
     }
 }
