@@ -19,8 +19,8 @@
 #  include "compat_win32.h"
 #else
 #  include <pthread.h>
+#  include <unistd.h>
 #endif
-#include <unistd.h>
 #include <cuda_runtime.h>
 
 #define NL GPU_NLIMBS   /* shorthand for loop bounds */
