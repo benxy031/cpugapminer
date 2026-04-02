@@ -673,6 +673,22 @@ static int cmp_u64(const void *a, const void *b) {
     return (va > vb) - (va < vb);
 }
 
+/* Merge two consecutive sorted halves of buf[0..total-1] in-place.
+   buf[0..split-1] and buf[split..total-1] are each individually sorted
+   ascending.  O(n) time, O(n) extra space; falls back to qsort on OOM. */
+static void merge_sorted_u64(uint64_t *buf, size_t split, size_t total) {
+    if (split == 0 || split >= total) return;
+    uint64_t *tmp = (uint64_t *)malloc(total * sizeof(uint64_t));
+    if (!tmp) { qsort(buf, total, sizeof(uint64_t), cmp_u64); return; }
+    size_t ai = 0, bi = split, mi = 0;
+    while (ai < split && bi < total)
+        tmp[mi++] = (buf[ai] <= buf[bi]) ? buf[ai++] : buf[bi++];
+    while (ai < split) tmp[mi++] = buf[ai++];
+    while (bi < total) tmp[mi++] = buf[bi++];
+    memcpy(buf, tmp, total * sizeof(uint64_t));
+    free(tmp);
+}
+
 static void format_est(char *buf, size_t sz, double est_sec) {
     if (est_sec < 10.0)
         snprintf(buf, sz, "%.1fs", est_sec);
@@ -4347,13 +4363,8 @@ static void *worker_fn(void *arg) {
                 int cand_odd = mpz_odd_p(candidate);
                 if (cand_odd) mpz_sub_ui(candidate, candidate, 1);
                 rebase_for_gap_check(candidate);
-                /* Build per-nonce template once: valid for all windows because
-                   primorial mod p_i = 0 for every CRT prime p_i, so
-                   tls_base_mod_p[i] is invariant across primorial steps. */
-                if (g_crt_solver_skip_to > 0 && tls_base_mod_p_ready
-                        && tls_base_mod_p && small_primes_cache)
-                    crt_solver_rebuild_thread_tmpl(
-                        tls_base_mod_p, small_primes_cache, gap_scan_max);
+                /* Static template (built once at startup from fixed CRT offsets)
+                   is returned by crt_solver_get_thread_tmpl() in sieve_range(). */
                 crt_filter_init_residues();
                 int crt_first_win = 1;
 
@@ -4933,7 +4944,7 @@ static void *worker_fn(void *arg) {
                             pr[pf++] = verify[i];
                     }
                     __sync_fetch_and_add(&stats_tested, (uint64_t)v_cnt);
-                    if (pf > 1) qsort(pr, pf, sizeof(uint64_t), cmp_u64);
+                    if (pf > sp_cnt) merge_sorted_u64(pr, sp_cnt, pf);
                     cnt = pf;
 
                     /* Scan verified gap regions */
@@ -5185,13 +5196,16 @@ static void *worker_fn(void *arg) {
             /* Smart-scan path handles gap scanning internally (region-based).
                Only run scan_candidates for full-test and no_primality. */
             if (!use_smart && cnt >= 2) {
-                /* Prepend carry prime from previous window for cross-window gap detection */
+                /* Cross-window gap: check the carry→pr[0] pair first without
+                   shifting the array (avoids an O(cnt) memmove every window). */
                 if (carry_last_prime && carry_last_prime < pr[0]) {
-                    /* Shift pr[] right by 1 to insert carry at front.
-                       pr[] lives in presieve_buf which has capacity >= cnt. */
-                    memmove(pr + 1, pr, cnt * sizeof(uint64_t));
-                    pr[0] = carry_last_prime;
-                    cnt++;
+                    uint64_t xw[2] = { carry_last_prime, pr[0] };
+                    if (scan_candidates(xw, 2, target_local, logbase,
+                                        shift_local,
+                                        header_local,
+                                        rpc_url_local, rpc_user_local, rpc_pass_local,
+                                        rpc_method_local, rpc_sign_key_local))
+                        goto worker_done;
                 }
                 if (scan_candidates(pr, cnt, target_local, logbase,
                                     shift_local,
@@ -5901,13 +5915,45 @@ int main(int argc, char **argv) {
     /* Trigger sieve cache population so we can log its stats. */
     pthread_once(&small_primes_once, populate_small_primes_cache);
 
-    /* Init CRT solver skip_to (primes covered by per-nonce template).
-       The template itself is built per-thread per-nonce after CRT alignment;
-       only the skip index is global and set here.                         */
+    /* Init CRT solver: compute skip_to, then build the global static template.
+       The template depends only on the fixed CRT offsets (not the block hash),
+       so it is built ONCE here and reused for every nonce/thread.           */
     if (g_crt_mode == CRT_MODE_SOLVER && g_crt_primorial_mpz_init) {
         crt_solver_init(g_crt_max_prime, small_primes_cache, small_primes_count);
+        if (g_crt_solver_skip_to > 0 && g_crt_offsets && g_crt_prime_list
+                && g_crt_gap_target > 0) {
+            int gsm = g_crt_gap_target * 2;
+            if (gsm < 10000) gsm = 10000;
+            /* adj = nAdd0(base=0) mod 2.
+               base = h256<<shift is always even, so candidate = base+nAdd0-adj
+               where adj=1 when base+nAdd0 is odd (i.e. nAdd0 is odd).
+               Composite positions in the forward sieve are t ≡ (offset_i+adj)
+               rather than t ≡ offset_i. */
+            int adj = 0;
+            {
+                __uint128_t n0 = 0, M0 = 1;
+                for (int ci = 0; ci < g_crt_n_primes; ci++) {
+                    uint64_t p = (uint64_t)g_crt_prime_list[ci];
+                    uint64_t o = (uint64_t)g_crt_offsets[ci];
+                    if (o == 0) continue;
+                    uint64_t tr = p - (o % p); /* nAdd0 ≡ -o (mod p), base=0 */
+                    uint64_t cr = (uint64_t)(n0 % (__uint128_t)p);
+                    uint64_t df = (tr + p - cr) % p;
+                    uint64_t mp = (uint64_t)(M0 % (__uint128_t)p);
+                    uint64_t iv = mod_inv_u64(mp, p);
+                    uint64_t k  = (df * iv) % p;
+                    n0 += (__uint128_t)k * M0;
+                    M0 *= (__uint128_t)p;
+                }
+                adj = (int)(n0 & 1);
+            }
+            crt_solver_build_static_tmpl(g_crt_offsets, g_crt_prime_list,
+                                         g_crt_n_primes, gsm, adj);
+            log_msg("CRT solver: nAdd0_parity=%d (candidate odd-adj=%d)\n",
+                    adj, adj);
+        }
         if (g_crt_solver_skip_to > 0 && small_primes_cache)
-            log_msg("CRT solver: per-nonce template active  "
+            log_msg("CRT solver: static template built  "
                     "skip_to=%d (primes 3..%llu pre-covered)\n",
                     g_crt_solver_skip_to,
                     (unsigned long long)small_primes_cache[g_crt_solver_skip_to - 1]);
@@ -6073,11 +6119,8 @@ int main(int argc, char **argv) {
                     int st_odd = mpz_odd_p(cand_st);
                     if (st_odd) mpz_sub_ui(cand_st, cand_st, 1);
                     rebase_for_gap_check(cand_st);
-                    /* Build per-nonce template once (see multi-thread path). */
-                    if (g_crt_solver_skip_to > 0 && tls_base_mod_p_ready
-                            && tls_base_mod_p && small_primes_cache)
-                        crt_solver_rebuild_thread_tmpl(
-                            tls_base_mod_p, small_primes_cache, gap_scan_max);
+                    /* Static template (built once at startup from fixed CRT offsets)
+                       is returned by crt_solver_get_thread_tmpl() in sieve_range(). */
                     crt_filter_init_residues();
                     int st_first_win = 1;
 
@@ -6370,7 +6413,7 @@ int main(int argc, char **argv) {
                         }
                     }
                     __sync_fetch_and_add(&stats_tested, (uint64_t)v_cnt);
-                    if (pf > 1) qsort(pr, pf, sizeof(uint64_t), cmp_u64);
+                    if (pf > sp) merge_sorted_u64(pr, sp, pf);
                     cnt = pf;
                     __sync_fetch_and_add(&stats_primes_found, (uint64_t)pf);
 

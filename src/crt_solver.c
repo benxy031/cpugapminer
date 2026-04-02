@@ -19,82 +19,87 @@ void crt_solver_init(uint64_t       crt_max_prime,
     }
 }
 
-/* ── Per-thread (TLS) template ── */
-static __thread uint8_t *tls_nonce_tmpl       = NULL;
-static __thread size_t   tls_nonce_tmpl_bytes = 0;
-static __thread int      tls_nonce_tmpl_valid = 0;
+/* ── Global static template (built once at startup from fixed offsets) ── */
+static uint8_t *g_static_tmpl       = NULL;
+static size_t   g_static_tmpl_bytes = 0;
+static int      g_static_tmpl_valid = 0;
 
-void crt_solver_rebuild_thread_tmpl(const uint64_t *base_mod_p,
-                                    const uint64_t *prime_cache,
-                                    int             gap_scan_max)
+void crt_solver_build_static_tmpl(const int *offsets,
+                                  const int *primes,
+                                  int        n_primes,
+                                  int        gap_scan_max,
+                                  int        adj)
 {
-    /* sieve_range() odd-only bitmap layout:
-     *   L = 1 (odd), R = gap_scan_max+1 (odd, since gap_scan_max is even)
-     *   seg_size = (R - L)/2 + 1 = gap_scan_max/2 + 1
-     * Position k in the bitmap represents odd value t = 1 + 2k.
-     *
-     * After CRT alignment + rebase_for_gap_check(candidate):
-     *   candidate mod p_i  =  base_mod_p[i]
-     * Position t is composite for prime p_i iff:
-     *   (candidate + t) mod p_i == 0  →  t ≡ (p_i - base_mod_p[i]) mod p_i
-     *
-     * Invariant: primorial mod p_i = 0 for every CRT prime p_i, so
-     * base_mod_p[i] is unchanged across all windows in one nonce.
-     * Build once per nonce; reuse for all windows.                       */
-
-    if (!base_mod_p || !prime_cache || g_crt_solver_skip_to <= 0) {
-        tls_nonce_tmpl_valid = 0;
-        return;
-    }
+    g_static_tmpl_valid = 0;
+    if (!offsets || !primes || n_primes <= 0 || gap_scan_max <= 0) return;
 
     size_t seg_size = (size_t)gap_scan_max / 2 + 1;
     size_t bytes    = (seg_size + 7) / 8;
 
-    if (tls_nonce_tmpl_bytes < bytes) {
-        free(tls_nonce_tmpl);
-        tls_nonce_tmpl = (uint8_t *)malloc(bytes);
-        if (!tls_nonce_tmpl) {
-            tls_nonce_tmpl_bytes = 0;
-            tls_nonce_tmpl_valid = 0;
-            return;
-        }
-        tls_nonce_tmpl_bytes = bytes;
+    if (g_static_tmpl_bytes < bytes) {
+        free(g_static_tmpl);
+        g_static_tmpl = (uint8_t *)malloc(bytes);
+        if (!g_static_tmpl) { g_static_tmpl_bytes = 0; return; }
+        g_static_tmpl_bytes = bytes;
     }
 
-    /* Start: all positions are prime candidates (0 = not composite). */
-    memset(tls_nonce_tmpl, 0, bytes);
+    memset(g_static_tmpl, 0, bytes);
 
-    for (int i = 0; i < g_crt_solver_skip_to; i++) {
-        uint64_t p = prime_cache[i];
-        if (p == 2) continue; /* odd-only sieve; even positions excluded */
+    /* Mark composites: after CRT alignment with odd-adjustment adj,
+       candidate ≡ -(offset_i + adj) (mod p_i), so (candidate + t) ≡ 0
+       when t ≡ (offset_i + adj) (mod p_i).
+       Only primes with original offset != 0 are in the primorial.
+       Skip p=2: sieve is odd-only, base is always even. */
+    for (int i = 0; i < n_primes; i++) {
+        uint64_t p = (uint64_t)primes[i];
+        if (p == 2) continue;
+        if (offsets[i] == 0) continue; /* zero-offset: excluded from primorial */
 
-        /* Forbidden residue: first odd t >= 1 where (candidate+t) % p == 0. */
-        uint64_t r = (base_mod_p[i] == 0) ? 0 : (p - base_mod_p[i]);
-        /* r is in [0, p-1].  r==0 means t=p is the first composite (p is odd). */
-        uint64_t t = (r == 0) ? p : r;
-        /* Ensure t is odd: if even, add p (p is odd → flips parity). */
-        if ((t & 1) == 0) t += p;
+        uint64_t o = ((uint64_t)offsets[i] + (uint64_t)adj) % p;
+        /* o == 0 means first hit at t = p (not excluded — offset_i != 0) */
+        uint64_t t = (o == 0) ? p : o;
+        if ((t & 1) == 0) t += p; /* ensure t is odd */
 
-        /* Mark all odd composite positions in [1, gap_scan_max]. */
         for (; t <= (uint64_t)gap_scan_max; t += 2 * p) {
-            size_t pos = (size_t)(t - 1) / 2; /* odd-only bitmap index */
+            size_t pos = (size_t)(t - 1) / 2;
             if (pos < seg_size)
-                tls_nonce_tmpl[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+                g_static_tmpl[pos >> 3] |= (uint8_t)(1u << (pos & 7));
         }
     }
 
-    /* Set tail bits beyond seg_size as composite (excluded region). */
+    /* Mark tail bits beyond seg_size as composite (excluded region). */
     for (size_t b = seg_size; b < bytes * 8; b++)
-        tls_nonce_tmpl[b >> 3] |= (uint8_t)(1u << (b & 7));
+        g_static_tmpl[b >> 3] |= (uint8_t)(1u << (b & 7));
 
-    tls_nonce_tmpl_valid = 1;
+    g_static_tmpl_valid = 1;
+
+    /* Reduce skip_to to stop before the first zero-offset prime (other than p=2).
+       Zero-offset primes are excluded from the primorial, so candidate mod p is
+       hash-dependent — the sieve loop must handle them per-window. */
+    {
+        int eff_skip = g_crt_solver_skip_to;
+        for (int i = 0; i < n_primes && i < eff_skip; i++) {
+            if (primes[i] == 2) continue;
+            if (offsets[i] == 0) { eff_skip = i; break; }
+        }
+        g_crt_solver_skip_to = eff_skip;
+    }
 }
+
+/* No-op: template is now built once at startup, not per-nonce. */
+void crt_solver_rebuild_thread_tmpl(const uint64_t *base_mod_p,
+                                    const uint64_t *prime_cache,
+                                    int             gap_scan_max)
+{
+    (void)base_mod_p; (void)prime_cache; (void)gap_scan_max;
+}
+
 
 const uint8_t *crt_solver_get_thread_tmpl(size_t bit_size, int *out_skip_to)
 {
-    if (!tls_nonce_tmpl_valid || !tls_nonce_tmpl
-            || bit_size > tls_nonce_tmpl_bytes)
+    if (!g_static_tmpl_valid || !g_static_tmpl
+            || bit_size > g_static_tmpl_bytes)
         return NULL;
     *out_skip_to = g_crt_solver_skip_to;
-    return tls_nonce_tmpl;
+    return g_static_tmpl;
 }

@@ -61,19 +61,43 @@ void crt_solver_init(uint64_t       crt_max_prime,
  * positions are left as 0 (candidate).  sieve_range() then memcpy's this
  * bitmap and continues from prime_cache[g_crt_solver_skip_to] onward.
  *
- *   base_mod_p  — tls_base_mod_p[] (candidate mod each small prime)
- *   prime_cache — small_primes_cache[]
- *   gap_scan_max — window size used by sieve_range (= g_crt_gap_target*2)
+ * The template depends only on the CRT offsets, not on the block hash.
+ * It is built ONCE at startup by crt_solver_build_static_tmpl() and
+ * reused for every nonce.  crt_solver_rebuild_thread_tmpl() is a no-op.
  */
+
+/*
+ * crt_solver_build_static_tmpl — call once at startup after loading the
+ * CRT file (after crt_solver_init).  Builds a read-only shared bitmap from
+ * the fixed per-prime offsets.  Thread-safe once built (read-only after).
+ *
+ *   offsets     — g_crt_offsets[]   (offset[i] for prime i)
+ *   primes      — g_crt_prime_list[] (prime values)
+ *   n_primes    — g_crt_n_primes
+ *   gap_scan_max — g_crt_gap_target * 2 (clamped to >= 10000)
+ */
+/*
+ * adj — odd-adjustment: 0 if base+nAdd0 is always even, 1 if always odd.
+ * base = h256<<shift is always even, so adj = nAdd0(base=0) mod 2.
+ * Compute in main.c via crt_nAdd0_parity() and pass here.
+ * When adj=1 (base+nAdd0 odd), candidate = base+nAdd0-1, so composite
+ * positions shift: t ≡ (offset_i + adj) mod p_i.
+ */
+void crt_solver_build_static_tmpl(const int *offsets,
+                                  const int *primes,
+                                  int        n_primes,
+                                  int        gap_scan_max,
+                                  int        adj);
+
+/* No-op kept for call-site compatibility. */
 void crt_solver_rebuild_thread_tmpl(const uint64_t *base_mod_p,
                                     const uint64_t *prime_cache,
                                     int             gap_scan_max);
 
 /*
  * crt_solver_get_thread_tmpl — called by sieve_range().
- * Returns the per-thread template if it was built and covers bit_size bytes,
- * and sets *out_skip_to = g_crt_solver_skip_to.  Returns NULL otherwise
- * (caller should fall back to presieve/memset path).
+ * Returns the global static template if it covers bit_size bytes,
+ * and sets *out_skip_to = g_crt_solver_skip_to.  Returns NULL otherwise.
  */
 const uint8_t *crt_solver_get_thread_tmpl(size_t bit_size, int *out_skip_to);
 
