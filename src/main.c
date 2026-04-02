@@ -44,6 +44,8 @@ static int             g_gpu_batch_size = 0;  /* --gpu-batch; 0 = use default (4
 #define GPU_MAX_BATCH (1 << 21)   /* 2M candidates per batch */
 static gpu_fermat_ctx *g_gpu_ctx[GPU_MAX_DEVS];
 static int             g_gpu_count = 0;
+static int             g_gpu_device_ids[GPU_MAX_DEVS]; /* parallel to g_gpu_ctx */
+static int             g_gpu_active_limbs_global = 0;  /* set after GPU init  */
 #endif
 #include "stats.h"
 #include "sieve_cache.h"
@@ -1126,6 +1128,18 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
                      * 8 OR ops + 1 pointer advance — no per-mark division. */
                     uint64_t pos     = (m - L) >> 1;
                     uint64_t pos_end = (blk_R - L) >> 1;
+                    /* Fast path: if fewer than 8 occurrences of p fit in
+                       the remaining block, the 8-at-a-time main loop below
+                       can never fire.  Skip the 8-pair precompute (8 muls +
+                       8 shifts) and mark positions one-at-a-time directly.
+                       Triggers for p > block/8; in CRT gap windows
+                       (~5390 positions) this covers ~93% of Phase-1 primes. */
+                    if (pos + 7 * p >= pos_end) {
+                        for (; pos < pos_end; pos += p)
+                            bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+                        sp_start[i] = L + pos * 2;
+                        continue;
+                    }
                     uint64_t q = p >> 3;   /* floor(p / 8) */
                     uint64_t r = p & 7;    /* p mod 8; odd for all primes p > 2 */
                     uint64_t b = pos & 7;  /* starting bit-within-byte (invariant) */
@@ -3306,6 +3320,7 @@ struct gpu_accum {
     gpu_fermat_ctx *ctx;             /* assigned GPU context              */
     int       slot_base;             /* preferred GPU slot for this accum */
     int       stride;                /* limbs per candidate (= active_limbs) */
+    int       owns_ctx;              /* 1 → destroy ctx in gpu_accum_destroy */
 };
 
 static __thread struct gpu_accum *tls_gpu_accum;
@@ -3339,34 +3354,12 @@ static void gpu_accum_buf_free(struct gpu_accum_buf *b) {
     free(b->results); b->results = NULL;
 }
 
-/* Per-slot ownership mutex.  gpu_fermat_submit() marks a slot as busy
-   (pending != 0) and only clears it when the CALLER later calls
-   gpu_fermat_collect() — even if the GPU finishes in ~5 ms.  With 6
-   CPU threads and only 2 GPU slots (3 threads per slot), threads B and C
-   arrive at flush time while thread A still owns the slot and get rc=-1
-   from gpu_fermat_submit, silently discarding their entire batches.
-   This wastes 4/6 of GPU work (observed as tmpl/win ≈ 3 instead of 1).
-
-   Fix: each slot has an ownership mutex held from submit until collect.
-   Threads that lost the race simply WAIT rather than discard, so all
-   sieved work eventually reaches the GPU.  The critical section around
-   collect (≈5 ms GPU complete + result copy) is short relative to the
-   ~860 ms fill cycle, so stall overhead is minimal. */
-static pthread_mutex_t g_gpu_slot_owned[2] = {
-    PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER
-};
-
+/* Round-robin slot counter: each thread accumulator gets its OWN gpu_fermat_ctx
+   (see lazy-init below), so slot_base only picks which of the 2 private slots
+   (0 or 1) to start on — purely cosmetic within that thread's private context.
+   No two accumulators ever share a slot, so gpu_fermat_submit() never blocks
+   waiting for another thread's batch to be collected. */
 static volatile int g_accum_slot_counter = 0;
-
-static int gpu_accum_acquire_slot(int preferred_slot) {
-    int alternate_slot = 1 - preferred_slot;
-    if (pthread_mutex_trylock(&g_gpu_slot_owned[preferred_slot]) == 0)
-        return preferred_slot;
-    if (pthread_mutex_trylock(&g_gpu_slot_owned[alternate_slot]) == 0)
-        return alternate_slot;
-    pthread_mutex_lock(&g_gpu_slot_owned[preferred_slot]);
-    return preferred_slot;
-}
 
 static struct gpu_accum *gpu_accum_create(gpu_fermat_ctx *ctx, int threshold) {
     struct gpu_accum *a = (struct gpu_accum *)calloc(1, sizeof(*a));
@@ -3406,7 +3399,10 @@ static void gpu_accum_destroy(struct gpu_accum *a) {
     gpu_accum_reset(a);
     gpu_accum_buf_free(&a->buf[0]);
     gpu_accum_buf_free(&a->buf[1]);
+    gpu_fermat_ctx *ctx = a->ctx;
+    int owns_ctx = a->owns_ctx;
     free(a);
+    if (owns_ctx && ctx) gpu_fermat_destroy(ctx);
 }
 
 /* Add a window's survivors to the active fill buffer.
@@ -3480,9 +3476,9 @@ static int gpu_accum_add(struct gpu_accum *a,
     return (int)(b->total >= (size_t)a->threshold);
 }
 
-/* Collect results from the in-flight GPU batch, process gap scanning.
-   Releases g_gpu_slot_owned[slot] after collecting so the next thread
-   waiting for the slot can proceed. */
+/* Collect results from the in-flight GPU batch and process gap scanning.
+   gpu_fermat_collect() blocks until the collector thread signals completion
+   (~0.3 ms); no external slot mutex is held between calls. */
 static void gpu_accum_collect(struct gpu_accum *a) {
     if (!a || a->inflight < 0) return;
     int buf_idx = a->inflight;  /* buffer that was submitted */
@@ -3491,8 +3487,6 @@ static void gpu_accum_collect(struct gpu_accum *a) {
     if (b->total == 0) {
         a->inflight = -1;
         a->inflight_slot = -1;
-        if (slot >= 0)
-            pthread_mutex_unlock(&g_gpu_slot_owned[slot]);
         return;
     }
 
@@ -3524,45 +3518,40 @@ static void gpu_accum_collect(struct gpu_accum *a) {
     b->win_count = 0;
     a->inflight = -1;
     a->inflight_slot = -1;
-    /* Release slot ownership — next waiting thread can now submit */
-    pthread_mutex_unlock(&g_gpu_slot_owned[slot]);
 }
 
-/* Flush: submit the active buffer to GPU asynchronously, swap to other buffer.
-   If a previous batch is still in-flight, collect it first (which releases
-   the slot ownership mutex), then re-acquire ownership before submitting.
-   Threads that share a slot WAIT here rather than discarding work. */
+/* Flush: submit the active buffer to the GPU and swap to the ping-pong buffer.
+   If a previous batch is still in-flight, collect it first (~0.3 ms GPU wait).
+   gpu_fermat_submit() blocks internally if the chosen slot is busy, so no
+   external mutex is needed — wait time is bounded by GPU kernel latency
+   (~0.3 ms per 4096-candidate batch) not by the ~80 ms fill cycle. */
 static void gpu_accum_flush(struct gpu_accum *a) {
     if (!a || !a->ctx) return;
     struct gpu_accum_buf *b = &a->buf[a->fill];
     if (b->total == 0) return;
 
-    /* If previous batch in-flight, collect it first.
-       collect() releases g_gpu_slot_owned[slot] at the end. */
+    /* Collect any previous in-flight batch before reusing the buffer. */
     if (a->inflight >= 0)
         gpu_accum_collect(a);
 
-    int slot = gpu_accum_acquire_slot(a->slot_base);
+    /* Use the slot assigned to this accumulator.  Threads with colliding
+       slot assignments will queue inside gpu_fermat_submit for at most
+       ~0.3 ms (one GPU batch) — negligible vs the ~80 ms fill cycle. */
+    int slot = a->slot_base % 2;
 
     __sync_fetch_and_add(&stats_gpu_flushes, 1);
     __sync_fetch_and_add(&stats_gpu_batched, b->total);
     int rc = gpu_fermat_submit(a->ctx, slot, b->limbs, b->total);
     if (rc < 0) {
-        /* Genuine GPU error (not a contention issue) — discard batch */
-        pthread_mutex_unlock(&g_gpu_slot_owned[slot]);
+        /* Genuine GPU error — discard batch */
         gpu_accum_buf_reset(b);
         return;
     }
 
-    /* Mark the buffer index as in-flight.
-       g_gpu_slot_owned[slot] is HELD until gpu_accum_collect() releases it. */
     a->inflight = a->fill;
-     a->inflight_slot = slot;
-
-    /* Swap fill to the other buffer — CPU continues sieving here while
-       GPU processes the submitted batch.  The slot mutex remains held,
-       so other threads wanting the same slot will wait in their next
-       flush call until we call collect (which unlocks). */
+    a->inflight_slot = slot;
+    /* Swap: CPU continues sieving into the other buffer while the GPU
+       processes the submitted batch asynchronously. */
     a->fill = 1 - a->fill;
 }
 #endif /* WITH_GPU_FERMAT — accumulator */
@@ -4441,18 +4430,39 @@ static void *worker_fn(void *arg) {
                         /* GPU path: accumulate survivors for batch Fermat.
                            GPU handles its own gap scanning internally. */
                         size_t pf = 0;
-                        /* Lazy-init thread-local GPU accumulator */
+                        /* Lazy-init thread-local GPU accumulator.
+                           Each thread creates its own gpu_fermat_ctx so it
+                           gets private GPU slots — no two threads ever block
+                           each other in gpu_fermat_submit().  With a shared
+                           ctx (2 slots, 3 threads/slot) the non-owning threads
+                           are permanently stuck in cond_wait, never sieving. */
                         if (!tls_gpu_accum) {
                             static volatile int accum_rr = 0;
                             int gi = __sync_fetch_and_add(&accum_rr, 1)
                                      % g_gpu_count;
-                            tls_gpu_accum = gpu_accum_create(
-                                g_gpu_ctx[gi], g_gpu_batch_size);
+                            int batch_size = g_gpu_batch_size > 0
+                                             ? g_gpu_batch_size
+                                             : GPU_ACCUM_DEFAULT;
+                            size_t batch_cap = (size_t)batch_size + 4096;
+                            gpu_fermat_ctx *per_ctx =
+                                gpu_fermat_init(g_gpu_device_ids[gi], batch_cap);
+                            if (per_ctx && g_gpu_active_limbs_global > 0)
+                                gpu_fermat_set_limbs(per_ctx,
+                                                    g_gpu_active_limbs_global);
+                            tls_gpu_accum = gpu_accum_create(per_ctx, batch_size);
+                            if (tls_gpu_accum)
+                                tls_gpu_accum->owns_ctx = 1;
+                            else if (per_ctx)
+                                gpu_fermat_destroy(per_ctx);
                         }
                         if (tls_gpu_accum) {
                             ensure_gmp_tls();
+                            /* Only zero and export the limbs the GPU will
+                               actually read (active_limbs ≤ GPU_NLIMBS). */
+                            int gpu_al_crt = tls_gpu_accum->stride;
                             uint64_t bl[GPU_NLIMBS];
-                            memset(bl, 0, sizeof(bl));
+                            memset(bl, 0,
+                                   (size_t)gpu_al_crt * sizeof(uint64_t));
                             size_t nexp = 0;
                             mpz_export(bl, &nexp, -1, 8, 0, 0,
                                        tls_base_mpz);
@@ -5602,6 +5612,7 @@ int main(int argc, char **argv) {
                 log_msg("CUDA: using %s (device %d) for Fermat testing\n",
                         gpu_fermat_device_name(g_gpu_ctx[g_gpu_count]),
                         cuda_devices[gi]);
+                g_gpu_device_ids[g_gpu_count] = cuda_devices[gi];
                 g_gpu_count++;
             }
         }
@@ -5619,6 +5630,7 @@ int main(int argc, char **argv) {
             int active_limbs   = (candidate_bits + 63) / 64;
             for (int gi = 0; gi < g_gpu_count; gi++)
                 gpu_fermat_set_limbs(g_gpu_ctx[gi], active_limbs);
+            g_gpu_active_limbs_global = active_limbs;
             log_msg("CUDA: active_limbs=%d (%d-bit candidates, compiled NL=%d)\n",
                     active_limbs < GPU_NLIMBS ? active_limbs : GPU_NLIMBS,
                     candidate_bits, GPU_NLIMBS);
@@ -5665,6 +5677,7 @@ int main(int argc, char **argv) {
                 log_msg("OpenCL: using %s (platform %d, device %d) for Fermat testing\n",
                         gpu_fermat_device_name(g_gpu_ctx[g_gpu_count]),
                         opencl_platform, opencl_devices[gi]);
+                g_gpu_device_ids[g_gpu_count] = opencl_devices[gi];
                 g_gpu_count++;
             }
         }
@@ -6033,18 +6046,33 @@ int main(int argc, char **argv) {
 #ifdef WITH_GPU_FERMAT
                         if (g_gpu_count > 0) {
                             size_t pf = 0;
-                            /* Lazy-init thread-local GPU accumulator */
+                            /* Lazy-init thread-local GPU accumulator (same
+                               per-thread ctx approach as the monolithic path). */
                             if (!tls_gpu_accum) {
                                 static volatile int st_accum_rr = 0;
                                 int gi = __sync_fetch_and_add(&st_accum_rr, 1)
                                          % g_gpu_count;
-                                tls_gpu_accum = gpu_accum_create(
-                                    g_gpu_ctx[gi], g_gpu_batch_size);
+                                int batch_size = g_gpu_batch_size > 0
+                                                 ? g_gpu_batch_size
+                                                 : GPU_ACCUM_DEFAULT;
+                                size_t batch_cap = (size_t)batch_size + 4096;
+                                gpu_fermat_ctx *per_ctx =
+                                    gpu_fermat_init(g_gpu_device_ids[gi], batch_cap);
+                                if (per_ctx && g_gpu_active_limbs_global > 0)
+                                    gpu_fermat_set_limbs(per_ctx,
+                                                        g_gpu_active_limbs_global);
+                                tls_gpu_accum = gpu_accum_create(per_ctx, batch_size);
+                                if (tls_gpu_accum)
+                                    tls_gpu_accum->owns_ctx = 1;
+                                else if (per_ctx)
+                                    gpu_fermat_destroy(per_ctx);
                             }
                             if (tls_gpu_accum) {
                                 ensure_gmp_tls();
+                                int gpu_al_st = tls_gpu_accum->stride;
                                 uint64_t bl[GPU_NLIMBS];
-                                memset(bl, 0, sizeof(bl));
+                                memset(bl, 0,
+                                       (size_t)gpu_al_st * sizeof(uint64_t));
                                 size_t nexp = 0;
                                 mpz_export(bl, &nexp, -1, 8, 0, 0,
                                            tls_base_mpz);
