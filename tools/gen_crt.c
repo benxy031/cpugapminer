@@ -38,6 +38,35 @@
 #include <stdbool.h>
 #include <getopt.h>
 #include <limits.h>
+#include <pthread.h>
+
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+static int get_cpu_count(void) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (int)si.dwNumberOfProcessors;
+}
+/* nanosleep shim: MinGW winpthreads provides it, but guard for MSVC */
+#  if defined(_MSC_VER)
+#    include <time.h>
+static int nanosleep(const struct timespec *req, struct timespec *rem) {
+    (void)rem;
+    DWORD ms = (DWORD)(req->tv_sec * 1000 + req->tv_nsec / 1000000);
+    Sleep(ms ? ms : 1);
+    return 0;
+}
+#  endif
+#else
+#  include <unistd.h>
+static int get_cpu_count(void) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return (n > 1) ? (int)n : 1;
+}
+#endif
 
 /* ------------------------------------------------------------------ */
 /* First 200 primes (covers up to prime 1223, log2 primorial ~ 1588)  */
@@ -202,7 +231,7 @@ static int evaluate(const int *offsets, int n_primes, int gap_size,
 /* Ties are broken randomly (reservoir sampling) for diversity.        */
 /* ------------------------------------------------------------------ */
 static void greedy_solve(int *offsets, int n_primes, int gap_size,
-                         uint8_t *buf) {
+                         uint8_t *buf, unsigned *rng) {
     int *order = (int *)malloc((size_t)n_primes * sizeof(int));
     if (!order) { perror("malloc"); exit(1); }
 
@@ -212,7 +241,7 @@ static void greedy_solve(int *offsets, int n_primes, int gap_size,
         order[i] = i;
 
     for (int i = n_primes - 1; i > 0; i--) {
-        int j = rand() % (i + 1);
+        int j = (int)(rand_r(rng) % (unsigned)(i + 1));
         int tmp = order[i];
         order[i] = order[j];
         order[j] = tmp;
@@ -235,7 +264,7 @@ static void greedy_solve(int *offsets, int n_primes, int gap_size,
                 ties     = 1;
             } else if (new_cov == best_new) {
                 ties++;
-                if (rand() % ties == 0) best_o = o;
+                if ((int)(rand_r(rng) % (unsigned)ties) == 0) best_o = o;
             }
         }
 
@@ -248,16 +277,17 @@ static void greedy_solve(int *offsets, int n_primes, int gap_size,
 }
 
 /* Randomly perturb a few non-fixed offsets to escape greedy plateaus. */
-static void kick_offsets(int *offsets, int n_primes, int fixed, int kicks) {
+static void kick_offsets(int *offsets, int n_primes, int fixed, int kicks,
+                         unsigned *rng) {
     if (fixed >= n_primes || kicks <= 0) return;
 
     int nfree = n_primes - fixed;
     if (kicks > nfree) kicks = nfree;
 
     for (int k = 0; k < kicks; k++) {
-        int idx = fixed + rand() % nfree;
+        int idx = fixed + (int)(rand_r(rng) % (unsigned)nfree);
         int p = PRIMES[idx];
-        int next = rand() % p;
+        int next = (int)(rand_r(rng) % (unsigned)p);
         if (next == 0) next = 1;
         if (next == offsets[idx])
             next = (next % (p - 1)) + 1;
@@ -302,11 +332,11 @@ static int weakest_nonfixed_prime(const int *offsets, int n_primes, int gap_size
 
 /* Strong escape jump: randomize the weakest non-fixed prime. */
 static int kick_weakest_prime(int *offsets, int n_primes, int gap_size,
-                              int fixed, uint8_t *buf) {
+                              int fixed, uint8_t *buf, unsigned *rng) {
     int idx = weakest_nonfixed_prime(offsets, n_primes, gap_size, fixed, buf);
     if (idx < 0) return -1;
     int p = PRIMES[idx];
-    int next = rand() % p;
+    int next = (int)(rand_r(rng) % (unsigned)p);
     if (next == 0) next = 1;
     if (next == offsets[idx])
         next = (next % (p - 1)) + 1;
@@ -456,7 +486,7 @@ static int pair_search_sweep(int *offsets, int n_primes, int gap_size,
 static int evaluate(const int *offsets, int n_primes, int gap_size,
                     uint8_t *buf, double *w_out);
 static void greedy_solve(int *offsets, int n_primes, int gap_size,
-                         uint8_t *buf);
+                         uint8_t *buf, unsigned *rng);
 static int local_search_one(int *offsets, int n_primes, int gap_size,
                             int idx, uint8_t *buf);
 static int local_search_pair(int *offsets, int n_primes, int gap_size,
@@ -466,6 +496,8 @@ static int local_search_sweep(int *offsets, int n_primes, int gap_size,
                               int fixed, uint8_t *buf);
 static int pair_search_sweep(int *offsets, int n_primes, int gap_size,
                              int fixed, uint8_t *buf, uint8_t *buf2);
+static int kick_weakest_prime(int *offsets, int n_primes, int gap_size,
+                              int fixed, uint8_t *buf, unsigned *rng);
 
 /* ------------------------------------------------------------------ */
 /* Evolutionary algorithm                                              */
@@ -473,7 +505,7 @@ static int pair_search_sweep(int *offsets, int n_primes, int gap_size,
 /* random mutation + local-search refinement.                          */
 /* ------------------------------------------------------------------ */
 static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
-                   int fixed, int max_gens) {
+                   int fixed, int max_gens, unsigned *rng) {
     int     *child = (int *)malloc((size_t)n_primes * sizeof(int));
     uint8_t *buf   = (uint8_t *)calloc((size_t)(gap_size + 1), 1);
     uint8_t *buf2  = (uint8_t *)calloc((size_t)(gap_size + 1), 1);
@@ -493,9 +525,11 @@ static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
 
     for (int gen = 0; gen < max_gens; gen++) {
         /* tournament select two parents */
-        int a = rand() % pop_size, b = rand() % pop_size;
+        int a = (int)(rand_r(rng) % (unsigned)pop_size);
+        int b = (int)(rand_r(rng) % (unsigned)pop_size);
         int p1 = solution_better(&pop[a], &pop[b]) ? a : b;
-        a = rand() % pop_size; b = rand() % pop_size;
+        a = (int)(rand_r(rng) % (unsigned)pop_size);
+        b = (int)(rand_r(rng) % (unsigned)pop_size);
         int p2 = solution_better(&pop[a], &pop[b]) ? a : b;
 
         /* uniform crossover */
@@ -503,41 +537,41 @@ static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
             if (i < fixed)
                 child[i] = pop[p1].offsets[i];
             else
-                child[i] = (rand() & 1) ? pop[p1].offsets[i]
-                                         : pop[p2].offsets[i];
+                child[i] = (rand_r(rng) & 1) ? pop[p1].offsets[i]
+                                              : pop[p2].offsets[i];
         }
 
         /* random mutation: adaptive rate — ramp up when stale */
         int mut_thresh = (stale > 10000) ? n_primes / 2 : 2;
         for (int i = fixed; i < n_primes; i++) {
-            if (rand() % n_primes < mut_thresh)
-                child[i] = rand() % PRIMES[i];
+            if ((int)(rand_r(rng) % (unsigned)n_primes) < mut_thresh)
+                child[i] = (int)(rand_r(rng) % (unsigned)PRIMES[i]);
         }
 
         /* local-search refinement is intentionally sparse; greedy already
          * does most of the useful work. */
-        if (rand() % 25 == 0 && fixed < n_primes) {
+        if ((int)(rand_r(rng) % 25) == 0 && fixed < n_primes) {
             int nfree = n_primes - fixed;
-            if (nfree >= 2 && rand() % 2 == 0) {
+            if (nfree >= 2 && (rand_r(rng) & 1)) {
                 /* pair search: jointly optimise two random primes */
-                int ia = fixed + rand() % nfree;
-                int ib = fixed + rand() % nfree;
-                while (ib == ia) ib = fixed + rand() % nfree;
+                int ia = fixed + (int)(rand_r(rng) % (unsigned)nfree);
+                int ib = fixed + (int)(rand_r(rng) % (unsigned)nfree);
+                while (ib == ia) ib = fixed + (int)(rand_r(rng) % (unsigned)nfree);
                 local_search_pair(child, n_primes, gap_size,
                                   ia, ib, buf, buf2);
             } else {
-                int idx = fixed + rand() % nfree;
+                int idx = fixed + (int)(rand_r(rng) % (unsigned)(n_primes - fixed));
                 local_search_one(child, n_primes, gap_size, idx, buf);
             }
         }
 
         /* Controlled escape: jump one weakest prime, then repair locally. */
-        if (fixed < n_primes && (stale > 8000 || (rand() % 24) == 0)) {
+        if (fixed < n_primes && (stale > 8000 || (int)(rand_r(rng) % 24) == 0)) {
             int weak_idx = kick_weakest_prime(child, n_primes, gap_size,
-                                             fixed, buf2);
+                                             fixed, buf2, rng);
             if (weak_idx >= 0) {
                 local_search_one(child, n_primes, gap_size, weak_idx, buf);
-                if (rand() % 2 == 0 && weak_idx + 1 < n_primes)
+                if ((rand_r(rng) & 1) && weak_idx + 1 < n_primes)
                     local_search_pair(child, n_primes, gap_size,
                                       weak_idx,
                                       weak_idx + 1,
@@ -593,6 +627,147 @@ static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
 }
 
 /* ------------------------------------------------------------------ */
+/* Greedy worker thread                                                */
+/* Runs `restarts` independent greedy+local-search trials, keeps the  */
+/* best `keep_n` solutions in `results[]`.                            */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    int          n_primes;
+    int          gap_size;
+    int          ctr_fixed;
+    int          restarts;
+    unsigned     seed;
+    Solution    *results;   /* pre-allocated array of keep_n solutions */
+    int          keep_n;
+    int          best_cnt;  /* best n_candidates seen by this thread   */
+    /* shared progress counter (atomic via __sync) */
+    volatile int *done_restarts;
+} GreedyWorkerArgs;
+
+static void *greedy_worker(void *arg) {
+    GreedyWorkerArgs *a = (GreedyWorkerArgs *)arg;
+    int np  = a->n_primes;
+    int gs  = a->gap_size;
+    unsigned rng = a->seed;
+
+    uint8_t *buf = (uint8_t *)calloc((size_t)(gs + 1), 1);
+    int     *tmp = (int     *)malloc((size_t)np * sizeof(int));
+    if (!buf || !tmp) { perror("malloc"); exit(1); }
+
+    int best_cnt = INT_MAX;
+
+    for (int r = 0; r < a->restarts; r++) {
+        greedy_solve(tmp, np, gs, buf, &rng);
+        if (a->ctr_fixed < np) {
+            int kicks = 1 + (int)(rand_r(&rng) % 3);
+            kick_offsets(tmp, np, a->ctr_fixed, kicks, &rng);
+            local_search_sweep(tmp, np, gs, a->ctr_fixed, buf);
+        }
+        double w_nc;
+        int nc = evaluate(tmp, np, gs, buf, &w_nc);
+        if (nc < best_cnt) best_cnt = nc;
+
+        /* insert into local result pool if better than worst */
+        int worst = 0;
+        for (int i = 1; i < a->keep_n; i++) {
+            if (a->results[i].n_candidates > a->results[worst].n_candidates ||
+                (a->results[i].n_candidates == a->results[worst].n_candidates &&
+                 a->results[i].w_score > a->results[worst].w_score))
+                worst = i;
+        }
+        if (solution_better_metrics(nc, w_nc,
+                                    a->results[worst].n_candidates,
+                                    a->results[worst].w_score)) {
+            memcpy(a->results[worst].offsets, tmp, (size_t)np * sizeof(int));
+            a->results[worst].n_candidates = nc;
+            a->results[worst].w_score      = w_nc;
+        }
+
+        __sync_fetch_and_add(a->done_restarts, 1);
+    }
+
+    a->best_cnt = best_cnt;
+    free(buf);
+    free(tmp);
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* ILS worker thread                                                   */
+/* Runs independent ILS rounds starting from a fixed seed solution.   */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    int       n_primes;
+    int       gap_size;
+    int       ils_fixed;
+    int       rounds;
+    unsigned  seed;
+    int      *start_offsets;   /* read-only: initial solution to start from */
+    Solution  result;          /* best solution found by this thread */
+} ILSWorkerArgs;
+
+static void *ils_worker(void *arg) {
+    ILSWorkerArgs *a = (ILSWorkerArgs *)arg;
+    int np = a->n_primes;
+    int gs = a->gap_size;
+    unsigned rng = a->seed;
+
+    uint8_t *buf  = (uint8_t *)calloc((size_t)(gs + 1), 1);
+    uint8_t *buf2 = (uint8_t *)calloc((size_t)(gs + 1), 1);
+    int     *work = (int     *)malloc((size_t)np * sizeof(int));
+    if (!buf || !buf2 || !work) { perror("malloc"); exit(1); }
+
+    /* start from a copy of the seed solution, already local-search refined */
+    memcpy(work, a->start_offsets, (size_t)np * sizeof(int));
+    local_search_sweep(work, np, gs, a->ils_fixed, buf);
+    pair_search_sweep (work, np, gs, a->ils_fixed, buf, buf2);
+    double best_w;
+    int best_cnt = evaluate(work, np, gs, buf, &best_w);
+
+    int *best_offsets = (int *)malloc((size_t)np * sizeof(int));
+    if (!best_offsets) { perror("malloc"); exit(1); }
+    memcpy(best_offsets, work, (size_t)np * sizeof(int));
+
+    int stale = 0;
+    for (int r = 0; r < a->rounds; r++) {
+        memcpy(work, best_offsets, (size_t)np * sizeof(int));
+
+        int weak_idx = kick_weakest_prime(work, np, gs, a->ils_fixed, buf2, &rng);
+        if (weak_idx >= 0) {
+            local_search_one(work, np, gs, weak_idx, buf);
+            if (weak_idx + 1 < np)
+                local_search_pair(work, np, gs, weak_idx, weak_idx + 1,
+                                  buf, buf2);
+        }
+        local_search_sweep(work, np, gs, a->ils_fixed, buf);
+        pair_search_sweep (work, np, gs, a->ils_fixed, buf, buf2);
+
+        double w_nc;
+        int nc = evaluate(work, np, gs, buf, &w_nc);
+        if (solution_better_metrics(nc, w_nc, best_cnt, best_w)) {
+            memcpy(best_offsets, work, (size_t)np * sizeof(int));
+            best_cnt = nc;
+            best_w   = w_nc;
+            stale    = 0;
+        } else {
+            stale++;
+        }
+        if (stale > a->rounds / 5 && stale > 80) break;
+    }
+
+    a->result.offsets      = best_offsets;
+    a->result.n_candidates = best_cnt;
+    a->result.w_score      = best_w;
+    a->result.n_primes     = np;
+    a->result.gap_size     = gs;
+
+    free(work);
+    free(buf2);
+    free(buf);
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
 /* Write CRT text file                                                 */
 /* ------------------------------------------------------------------ */
 static void write_crt_file(const char *path, const Solution *sol,
@@ -634,6 +809,7 @@ static void usage(const char *prog) {
         "  --ctr-ivs    I        Population size for evolution (default: 10)\n"
         "  --ctr-range  R        Percent deviation from n_primes (default: 0)\n"
         "  --ctr-file   FILE     Output CRT file path (required)\n"
+        "  --threads    N        Parallel threads for greedy+ILS (default: CPU count)\n"
         "  --help                Show this help\n"
         "\n"
         "Gap size = ceil(merit * (256 + shift) * ln2)\n"
@@ -663,6 +839,7 @@ int main(int argc, char **argv) {
     int    ctr_ivs      = 10;
     int    ctr_range    = 0;
     char  *ctr_file     = NULL;
+    int    n_threads    = 0;   /* 0 = auto-detect */
 
     static struct option long_opts[] = {
         {"calc-ctr",       no_argument,       NULL, 'C'},
@@ -675,12 +852,13 @@ int main(int argc, char **argv) {
         {"ctr-ivs",        required_argument, NULL, 'i'},
         {"ctr-range",      required_argument, NULL, 'r'},
         {"ctr-file",       required_argument, NULL, 'o'},
+        {"threads",        required_argument, NULL, 'T'},
         {"help",           no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "Cp:m:b:s:ef:i:r:o:h",
+    while ((opt = getopt_long(argc, argv, "Cp:m:b:s:ef:i:r:o:T:h",
                               long_opts, NULL)) != -1) {
         switch (opt) {
         case 'C': /* --calc-ctr: accepted for compat, always active */ break;
@@ -693,6 +871,7 @@ int main(int argc, char **argv) {
         case 'i': ctr_ivs      = atoi(optarg); break;
         case 'r': ctr_range    = atoi(optarg); break;
         case 'o': ctr_file     = optarg;        break;
+        case 'T': n_threads    = atoi(optarg); break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 1;
         }
@@ -716,6 +895,12 @@ int main(int argc, char **argv) {
     if (ctr_ivs < 2) ctr_ivs = 2;
     if (ctr_strength < 1) ctr_strength = 1;
 
+    /* resolve thread count */
+    if (n_threads <= 0)
+        n_threads = get_cpu_count();
+    if (n_threads > ctr_strength) n_threads = ctr_strength;
+    if (n_threads < 1) n_threads = 1;
+
     /* ---- derived parameters ---- */
     double prim_bits = primorial_log2(ctr_primes);
     int    shift     = (int)ceil(prim_bits) + ctr_bits;
@@ -730,6 +915,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "  merit       : %.2f\n", ctr_merit);
     fprintf(stderr, "  gap target  : %d\n", gap_size);
     fprintf(stderr, "  strength    : %d  (greedy restarts)\n", ctr_strength);
+    fprintf(stderr, "  threads     : %d\n", n_threads);
     if (ctr_evolution)
         fprintf(stderr, "  evolution   : ivs=%d  fixed=%d\n",
                 ctr_ivs, ctr_fixed);
@@ -784,49 +970,93 @@ int main(int argc, char **argv) {
         for (int i = 0; i < pop_size; i++)
             pop[i] = sol_alloc(np, gs);
 
-        /* ---- Phase 1: greedy restarts, keep best pop_size ---- */
-        int *tmp = (int *)malloc((size_t)np * sizeof(int));
-        for (int r = 0; r < ctr_strength; r++) {
-            unsigned seed = (unsigned)time(NULL) ^ ((unsigned)r * 2654435761u)
-                            ^ (unsigned)rand();
-            srand(seed);
-            greedy_solve(tmp, np, gs, buf);
-            if (ctr_fixed < np) {
-                int kicks = 1 + rand() % 3;
-                kick_offsets(tmp, np, ctr_fixed, kicks);
-                local_search_sweep(tmp, np, gs, ctr_fixed, buf);
-            }
-            double w_nc;
-            int nc = evaluate(tmp, np, gs, buf, &w_nc);
+        /* ---- Phase 1: greedy restarts, parallel ---- */
+        /* Distribute restarts across threads; each thread keeps its own
+           pool of pop_size best solutions, merged into pop[] at the end. */
+        int actual_threads = n_threads;
+        if (actual_threads > ctr_strength) actual_threads = ctr_strength;
 
-            /* insert into population if better than worst */
-            int worst = 0;
-            for (int i = 1; i < pop_size; i++)
-                if (pop[i].n_candidates > pop[worst].n_candidates ||
-                    (pop[i].n_candidates == pop[worst].n_candidates &&
-                     pop[i].w_score > pop[worst].w_score))
-                    worst = i;
+        pthread_t        *tids  = (pthread_t        *)malloc((size_t)actual_threads * sizeof(pthread_t));
+        GreedyWorkerArgs *wargs = (GreedyWorkerArgs *)malloc((size_t)actual_threads * sizeof(GreedyWorkerArgs));
+        /* Each thread keeps up to pop_size results; merged below. */
+        Solution **thread_results = (Solution **)malloc((size_t)actual_threads * sizeof(Solution *));
+        if (!tids || !wargs || !thread_results) { perror("malloc"); exit(1); }
 
-            if (solution_better_metrics(nc, w_nc,
-                                        pop[worst].n_candidates,
-                                        pop[worst].w_score)) {
-                memcpy(pop[worst].offsets, tmp, (size_t)np * sizeof(int));
-                pop[worst].n_candidates = nc;
-                pop[worst].w_score      = w_nc;
-            }
+        volatile int done_restarts = 0;
+        unsigned base_seed = (unsigned)time(NULL) ^ 0xDEADBEEFu;
 
-            if (nc < greedy_best_cnt)
-                greedy_best_cnt = nc;
+        for (int t = 0; t < actual_threads; t++) {
+            int r_start = (ctr_strength *  t     ) / actual_threads;
+            int r_end   = (ctr_strength * (t + 1)) / actual_threads;
+            wargs[t].n_primes       = np;
+            wargs[t].gap_size       = gs;
+            wargs[t].ctr_fixed      = ctr_fixed;
+            wargs[t].restarts       = r_end - r_start;
+            wargs[t].seed           = base_seed ^ ((unsigned)t * 2654435761u);
+            wargs[t].keep_n         = pop_size;
+            wargs[t].best_cnt       = INT_MAX;
+            wargs[t].done_restarts  = &done_restarts;
+            thread_results[t] = (Solution *)calloc((size_t)pop_size, sizeof(Solution));
+            if (!thread_results[t]) { perror("calloc"); exit(1); }
+            for (int i = 0; i < pop_size; i++)
+                thread_results[t][i] = sol_alloc(np, gs);
+            wargs[t].results = thread_results[t];
+            pthread_create(&tids[t], NULL, greedy_worker, &wargs[t]);
+        }
 
-            if ((r + 1) % 5 == 0 || r == ctr_strength - 1) {
+        /* progress display while threads work */
+        int last_shown = -1;
+        for (;;) {
+            int done = done_restarts;
+            if (done != last_shown) {
+                /* find best across thread result pools so far (racy but cosmetic) */
+                int display_best = INT_MAX;
+                for (int t = 0; t < actual_threads; t++)
+                    if (wargs[t].best_cnt < display_best)
+                        display_best = wargs[t].best_cnt;
                 fprintf(stderr,
                     "\r  greedy: %d/%d restarts  best=%d candidates     ",
-                    r + 1, ctr_strength, greedy_best_cnt);
+                    done, ctr_strength,
+                    display_best < INT_MAX ? display_best : 0);
                 fflush(stderr);
+                last_shown = done;
             }
+            if (done >= ctr_strength) break;
+            struct timespec ts = {0, 20000000}; /* 20 ms */
+            nanosleep(&ts, NULL);
         }
-        free(tmp);
+        for (int t = 0; t < actual_threads; t++)
+            pthread_join(tids[t], NULL);
         fprintf(stderr, "\n");
+
+        /* merge all thread pools into pop[] */
+        for (int t = 0; t < actual_threads; t++) {
+            if (wargs[t].best_cnt < greedy_best_cnt)
+                greedy_best_cnt = wargs[t].best_cnt;
+            for (int i = 0; i < pop_size; i++) {
+                Solution *src = &thread_results[t][i];
+                if (src->n_candidates == INT_MAX) continue;
+                int worst = 0;
+                for (int j = 1; j < pop_size; j++)
+                    if (pop[j].n_candidates > pop[worst].n_candidates ||
+                        (pop[j].n_candidates == pop[worst].n_candidates &&
+                         pop[j].w_score > pop[worst].w_score))
+                        worst = j;
+                if (solution_better_metrics(src->n_candidates, src->w_score,
+                                            pop[worst].n_candidates,
+                                            pop[worst].w_score)) {
+                    memcpy(pop[worst].offsets, src->offsets,
+                           (size_t)np * sizeof(int));
+                    pop[worst].n_candidates = src->n_candidates;
+                    pop[worst].w_score      = src->w_score;
+                }
+            }
+            for (int i = 0; i < pop_size; i++) sol_free(&thread_results[t][i]);
+            free(thread_results[t]);
+        }
+        free(thread_results);
+        free(wargs);
+        free(tids);
 
         /* Keep a small elite bank of the best greedy solutions. */
         int elite_keep = pop_size < 8 ? pop_size : 8;
@@ -861,8 +1091,9 @@ int main(int argc, char **argv) {
                        (size_t)np * sizeof(int));
 
                 if (i >= elite_keep) {
+                    unsigned pop_rng = (unsigned)time(NULL) ^ ((unsigned)i * 1234567u);
                     int weak_idx = kick_weakest_prime(pop[i].offsets, np, gs,
-                                                      ctr_fixed, seed_buf);
+                                                      ctr_fixed, seed_buf, &pop_rng);
                     if (weak_idx >= 0) {
                         local_search_one(pop[i].offsets, np, gs, weak_idx,
                                          seed_buf);
@@ -886,8 +1117,7 @@ int main(int argc, char **argv) {
 
         /* ---- Phase 2: evolution ---- */
         if (ctr_evolution && pop_size > 1) {
-            /* re-seed so evolution is not deterministic */
-            srand((unsigned)time(NULL) ^ 0xBEEFCAFE);
+            unsigned evo_rng = (unsigned)time(NULL) ^ 0xBEEFCAFEu;
 
             int adj_fixed = ctr_fixed;
             if (adj_fixed > np) adj_fixed = np;
@@ -898,104 +1128,74 @@ int main(int argc, char **argv) {
             if (gens < 30000)  gens = 30000;
             if (gens > 400000) gens = 400000;
 
-            evolve(pop, pop_size, np, gs, adj_fixed, gens);
+            evolve(pop, pop_size, np, gs, adj_fixed, gens, &evo_rng);
         }
 
-        /* ---- Phase 3: Iterated Local Search (ILS) ---- */
-        /* Take the best solution, apply full sweeps + pair sweeps,     */
-        /* then repeatedly perturb 1-2 offsets and re-sweep.            */
+        /* ---- Phase 3: Iterated Local Search (ILS), parallel ---- */
+        /* Run n_threads independent ILS chains, each starting from the
+           current best solution (after an initial local-search polish).
+           Chains are fully independent — no synchronisation needed.    */
         {
-            uint8_t *ils_buf  = (uint8_t *)calloc((size_t)(gs + 1), 1);
-            uint8_t *ils_buf2 = (uint8_t *)calloc((size_t)(gs + 1), 1);
-            int     *ils_work = (int *)malloc((size_t)np * sizeof(int));
-            if (!ils_buf || !ils_buf2 || !ils_work) {
-                perror("alloc"); exit(1);
-            }
-
             /* find current best */
             int bi = 0;
             for (int i = 1; i < pop_size; i++)
                 if (solution_better(&pop[i], &pop[bi]))
                     bi = i;
 
-            /* initial full sweep + pair sweep on a copy so ILS cannot
-             * make the best solution worse before it has earned the update. */
-            memcpy(ils_work, pop[bi].offsets, (size_t)np * sizeof(int));
-            local_search_sweep(ils_work, np, gs,
-                               ctr_fixed < np ? ctr_fixed : np, ils_buf);
-            pair_search_sweep(ils_work, np, gs,
-                              ctr_fixed < np ? ctr_fixed : np,
-                              ils_buf, ils_buf2);
-            double ils_init_w;
-            int ils_init_cnt = evaluate(ils_work, np, gs, ils_buf, &ils_init_w);
-            if (solution_better_metrics(ils_init_cnt, ils_init_w,
-                                        pop[bi].n_candidates,
-                                        pop[bi].w_score)) {
-                memcpy(pop[bi].offsets, ils_work, (size_t)np * sizeof(int));
-                pop[bi].n_candidates = ils_init_cnt;
-                pop[bi].w_score      = ils_init_w;
-            }
-
-            double ils_best_w   = pop[bi].w_score;
-            int    ils_best_cnt = pop[bi].n_candidates;
             int ils_fixed = ctr_fixed < np ? ctr_fixed : np;
-            int nfree = np - ils_fixed;
-
-            /* ILS rounds: perturb + re-sweep */
+            int nfree     = np - ils_fixed;
             int ils_rounds = nfree * nfree * 5;
-            if (ils_rounds < 200)    ils_rounds = 200;
-            if (ils_rounds > 25000)   ils_rounds = 25000;
-            int ils_stale = 0;
+            if (ils_rounds < 200)   ils_rounds = 200;
+            if (ils_rounds > 25000) ils_rounds = 25000;
 
-            for (int r = 0; r < ils_rounds; r++) {
-                /* copy best solution */
-                memcpy(ils_work, pop[bi].offsets,
-                       (size_t)np * sizeof(int));
+            /* rounds per thread (each explores a separate random walk) */
+            int rounds_per_thread = (ils_rounds + actual_threads - 1)
+                                    / actual_threads;
 
-                /* one controlled escape on the weakest non-fixed prime */
-                int weak_idx = kick_weakest_prime(ils_work, np, gs,
-                                                 ils_fixed, ils_buf2);
-                if (weak_idx >= 0) {
-                    local_search_one(ils_work, np, gs, weak_idx, ils_buf);
-                    if (weak_idx + 1 < np)
-                        local_search_pair(ils_work, np, gs,
-                                          weak_idx, weak_idx + 1,
-                                          ils_buf, ils_buf2);
-                }
+            pthread_t     *ils_tids  = (pthread_t    *)malloc((size_t)actual_threads * sizeof(pthread_t));
+            ILSWorkerArgs *ils_wargs = (ILSWorkerArgs*)malloc((size_t)actual_threads * sizeof(ILSWorkerArgs));
+            if (!ils_tids || !ils_wargs) { perror("malloc"); exit(1); }
 
-                /* re-sweep: single then pair */
-                local_search_sweep(ils_work, np, gs, ils_fixed, ils_buf);
-                pair_search_sweep(ils_work, np, gs, ils_fixed,
-                                  ils_buf, ils_buf2);
-                double w_nc;
-                int nc = evaluate(ils_work, np, gs, ils_buf, &w_nc);
-
-                                  if (solution_better_metrics(nc, w_nc, ils_best_cnt, ils_best_w)) {
-                    memcpy(pop[bi].offsets, ils_work,
-                           (size_t)np * sizeof(int));
-                    pop[bi].n_candidates = nc;
-                    pop[bi].w_score      = w_nc;
-                    ils_best_w   = w_nc;
-                    ils_best_cnt = nc;
-                    ils_stale = 0;
-                } else {
-                    ils_stale++;
-                }
-
-                if ((r + 1) % 50 == 0 || r == ils_rounds - 1) {
-                    fprintf(stderr,
-                        "\r  ILS: %d/%d rounds  best=%d  stale=%d     ",
-                        r + 1, ils_rounds, ils_best_cnt, ils_stale);
-                    fflush(stderr);
-                }
-
-                if (ils_stale > ils_rounds / 5 && ils_stale > 80) break;
+            unsigned ils_base_seed = (unsigned)time(NULL) ^ 0xC0FFEE00u;
+            for (int t = 0; t < actual_threads; t++) {
+                ils_wargs[t].n_primes      = np;
+                ils_wargs[t].gap_size      = gs;
+                ils_wargs[t].ils_fixed     = ils_fixed;
+                ils_wargs[t].rounds        = rounds_per_thread;
+                ils_wargs[t].seed          = ils_base_seed ^ ((unsigned)t * 1234567891u);
+                ils_wargs[t].start_offsets = pop[bi].offsets;
+                ils_wargs[t].result.offsets = NULL;
+                pthread_create(&ils_tids[t], NULL, ils_worker, &ils_wargs[t]);
             }
-            fprintf(stderr, "\n");
 
-            free(ils_work);
-            free(ils_buf2);
-            free(ils_buf);
+            /* progress: just wait (ILS is fast) */
+            fprintf(stderr, "  ILS: %d chains x %d rounds ...",
+                    actual_threads, rounds_per_thread);
+            fflush(stderr);
+
+            for (int t = 0; t < actual_threads; t++)
+                pthread_join(ils_tids[t], NULL);
+
+            /* pick best result across all ILS chains */
+            int ils_best_cnt = pop[bi].n_candidates;
+            for (int t = 0; t < actual_threads; t++) {
+                ILSWorkerArgs *w = &ils_wargs[t];
+                if (w->result.offsets &&
+                    solution_better_metrics(w->result.n_candidates,
+                                            w->result.w_score,
+                                            ils_best_cnt, pop[bi].w_score)) {
+                    memcpy(pop[bi].offsets, w->result.offsets,
+                           (size_t)np * sizeof(int));
+                    pop[bi].n_candidates = w->result.n_candidates;
+                    pop[bi].w_score      = w->result.w_score;
+                    ils_best_cnt         = w->result.n_candidates;
+                }
+                free(w->result.offsets);
+            }
+            fprintf(stderr, "  best=%d\n", ils_best_cnt);
+
+            free(ils_wargs);
+            free(ils_tids);
         }
 
         /* ---- find best in population ---- */
