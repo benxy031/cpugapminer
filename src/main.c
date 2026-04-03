@@ -235,6 +235,13 @@ static int cli_sample_stride = DEFAULT_SAMPLE_STRIDE;
    10 rounds cost ~5× more but added negligible confidence.                  */
 static int cli_mr_rounds = 2;
 
+/* Scan-stride merit (non-CRT only).  When > 0, the backward-scan jump stride
+   (needed_gap) is computed from this value instead of --target / network merit.
+   This lets you set a high stride (e.g. 38 for record hunting) while still
+   submitting every gap that meets the network difficulty.
+   0 = use target_local (default: stride == submit threshold). */
+static double g_scan_merit = 0.0;
+
 /* Number of edge-probe candidates per side when eliminating false-positive
    regions in the two-phase smart scan.  Higher values catch more false
    positives but cost more Fermat tests up-front.                            */
@@ -2761,13 +2768,10 @@ static inline void crt_filter_step_residues(void) {
  *     full Miller-Rabin.
  *  C. Full: mpz_probab_prime_p(n, 10) — 10 MR rounds.
  */
-/* Single-round Miller-Rabin with base 3 on tls_cand_mpz.
-   Call after tls_cand_mpz is set to the candidate.
-   Returns 1 if probably prime, 0 if definitely composite. */
-static int mr_verify_cand(void) {
-    mpz_sub_ui(tls_mr_nm1, tls_cand_mpz, 1);
-    unsigned long s = mpz_scan1(tls_mr_nm1, 0);
-    mpz_tdiv_q_2exp(tls_mr_d, tls_mr_nm1, s);
+/* Single-round Miller-Rabin with base 3.
+   Requires tls_mr_nm1 = n-1, tls_mr_d = (n-1)/2^s, s = v_2(n-1)
+   already set by the caller.  Returns 1 if probably prime. */
+static int mr_verify_cand_s(unsigned long s) {
     mpz_set_ui(tls_mr_x, 3);
     mpz_powm(tls_mr_x, tls_mr_x, tls_mr_d, tls_cand_mpz);
     if (mpz_cmp_ui(tls_mr_x, 1) == 0 ||
@@ -2782,6 +2786,16 @@ static int mr_verify_cand(void) {
             return 0;
     }
     return 0;
+}
+
+/* Single-round Miller-Rabin with base 3 on tls_cand_mpz.
+   Call after tls_cand_mpz is set to the candidate.
+   Returns 1 if probably prime, 0 if definitely composite. */
+static int mr_verify_cand(void) {
+    mpz_sub_ui(tls_mr_nm1, tls_cand_mpz, 1);
+    unsigned long s = mpz_scan1(tls_mr_nm1, 0);
+    mpz_tdiv_q_2exp(tls_mr_d, tls_mr_nm1, s);
+    return mr_verify_cand_s(s);
 }
 
 static int bn_candidate_is_prime(uint64_t offset) {
@@ -2838,31 +2852,43 @@ static int bn_candidate_is_prime(uint64_t offset) {
 
     int is_prime;
     if (use_fast_euler) {
-        unsigned long nmod8 = mpz_fdiv_ui(tls_cand_mpz, 8UL);
-        if ((nmod8 & 1UL) == 0) {
-            is_prime = 0;
-        } else if (mpz_cmp_ui(tls_cand_mpz, 5UL) < 0) {
-            is_prime = (mpz_cmp_ui(tls_cand_mpz, 2UL) == 0 ||
-                        mpz_cmp_ui(tls_cand_mpz, 3UL) == 0);
-        } else {
-            mpz_sub_ui(tls_exp_mpz, tls_cand_mpz, 1);
-            mpz_tdiv_q_2exp(tls_exp_mpz, tls_exp_mpz,
-                            (nmod8 == 1UL) ? 2UL : 1UL);
-            mpz_powm(tls_res_mpz, tls_two_mpz, tls_exp_mpz, tls_cand_mpz);
+        /* Strong base-2 Miller-Rabin (single round).
+           Write n-1 = 2^s * d with d odd.  Compute x = 2^d mod n, then
+           square up to s-1 more times.  Any prime satisfies at least one
+           of: x==1, x==n-1, or some x_i==n-1 during the squaring chain.
 
-            if (mpz_cmp_ui(tls_res_mpz, 1UL) == 0) {
-                is_prime = (nmod8 == 1UL || nmod8 == 7UL);
-            } else {
-                mpz_sub_ui(tls_mr_nm1, tls_cand_mpz, 1);
-                if (mpz_cmp(tls_res_mpz, tls_mr_nm1) == 0)
-                    is_prime = (nmod8 == 1UL || nmod8 == 3UL || nmod8 == 5UL);
-                else
-                    is_prime = 0;
+           Advantages over the old nmod8-dispatched Euler criterion:
+             - No n mod 8 needed — single uniform path for all odd n.
+             - Exponent d = (n-1)/2^s is always ≤ (n-1)/2, often shorter
+               (e.g. n≡5 mod 8 → s=2, d=(n-1)/4 vs Euler's (n-1)/2).
+             - Checks every squaring level, catching composites the Euler
+               test misses (e.g. n≡5 mod 8 where only 2^(2d) was checked).
+             - tls_mr_nm1 and tls_mr_d are left set, so the optional
+               base-3 MR pass below can skip recomputing them.          */
+        mpz_sub_ui(tls_mr_nm1, tls_cand_mpz, 1);       /* nm1 = n-1    */
+        unsigned long s = mpz_scan1(tls_mr_nm1, 0);    /* s = v_2(nm1) */
+        mpz_tdiv_q_2exp(tls_mr_d, tls_mr_nm1, s);      /* d = nm1>>s   */
+        mpz_powm(tls_res_mpz, tls_two_mpz, tls_mr_d, tls_cand_mpz);
+        if (mpz_cmp_ui(tls_res_mpz, 1) == 0 ||
+            mpz_cmp(tls_res_mpz, tls_mr_nm1) == 0) {
+            is_prime = 1;
+        } else {
+            is_prime = 0;
+            for (unsigned long i = 1; i < s; i++) {
+                mpz_mul(tls_res_mpz, tls_res_mpz, tls_res_mpz);
+                mpz_mod(tls_res_mpz, tls_res_mpz, tls_cand_mpz);
+                if (mpz_cmp(tls_res_mpz, tls_mr_nm1) == 0) {
+                    is_prime = 1;
+                    break;
+                }
+                if (mpz_cmp_ui(tls_res_mpz, 1) == 0)
+                    break;  /* composite: 1 appeared before n-1 */
             }
         }
-        /* MR base-3 verification catches pseudoprimes from fast modes */
+        /* Optional base-3 MR pass.  tls_mr_nm1 and tls_mr_d are already
+           set above, so mr_verify_cand_s() skips recomputing them.     */
         if (is_prime && use_mr_verify)
-            is_prime = mr_verify_cand();
+            is_prime = mr_verify_cand_s(s);
     } else if (use_fast_fermat) {
         /* Raw base-2 Fermat test: 2^(n-1) mod n == 1?
            Skips GMP's redundant internal trial-division (~700 primes
@@ -4127,6 +4153,11 @@ static void *worker_fn(void *arg) {
     int64_t  adder_max_local        = wa->adder_max;
     uint64_t sieve_size_local       = wa->sieve_size;
     double   target_local           = wa->target;
+    /* scan_target controls the backward-scan jump stride (needed_gap).
+       When --scan-merit is set it can be larger than target_local so the
+       scan skips dense prime clusters more aggressively while still submitting
+       every gap >= target_local (network merit).  Defaults to target_local. */
+    double   scan_target            = (g_scan_merit > 0.0) ? g_scan_merit : target_local;
     int64_t  adder_base_offset_local = wa->adder_base_offset;
     int      rpc_thread_local       = wa->rpc_thread;
     const char *header_local = NULL, *rpc_url_local = NULL, *rpc_user_local = NULL;
@@ -4798,7 +4829,7 @@ static void *worker_fn(void *arg) {
             uint64_t *p1_cands = NULL, *p1_wbuf = NULL;
 
             if (use_smart) {
-                needed_gap = (size_t)(target_local * logbase);
+                needed_gap = (size_t)(scan_target * logbase);
                 if (needed_gap < 2) needed_gap = 2;
 #ifdef WITH_GPU_FERMAT
                 /* GPU smart-scan still needs sampled candidates */
@@ -4876,26 +4907,38 @@ static void *worker_fn(void *arg) {
                     uint64_t *sampled_primes = p1_cands; /* reuse buffer */
                     size_t sp_cnt = sp;
 
-                    /* --- Gap analysis: identify candidate regions ---------- */
+                    /* --- Gap analysis: identify candidate regions ----------
+                       Use target_local×logbase (not scan_target) as the
+                       region-detection threshold for the GPU path.  The GPU
+                       tests all non-sampled interior candidates regardless of
+                       --scan-merit, so the stride optimisation gives no benefit
+                       here.  Using the network-merit threshold ensures every
+                       qualifying gap in [target_local×lb, ∞) is fully verified
+                       by phase 2, which avoids false gaps that would occur when
+                       an interior prime falls on a sampled index inside the
+                       (now-larger) stride window.                            */
                     size_t n_gap_regions = 0;
                     size_t gap_reg_cap = sp_cnt + 2;
+                    /* Region threshold: always network merit, not scan_merit */
+                    size_t gpu_rth = (size_t)(target_local * logbase);
+                    if (gpu_rth < 2) gpu_rth = 2;
                     uint64_t *gap_reg_lo = (uint64_t *)malloc(gap_reg_cap * sizeof(uint64_t));
                     uint64_t *gap_reg_hi = (uint64_t *)malloc(gap_reg_cap * sizeof(uint64_t));
                     int *gpu_reg_alive = NULL;
                     if (sp_cnt >= 1 && gap_reg_lo && gap_reg_hi) {
-                        if (cnt > 0 && sampled_primes[0] - pr[0] >= needed_gap) {
+                        if (cnt > 0 && sampled_primes[0] - pr[0] >= gpu_rth) {
                             gap_reg_lo[n_gap_regions] = 0;
                             gap_reg_hi[n_gap_regions] = sampled_primes[0];
                             n_gap_regions++;
                         }
                         for (size_t i = 0; i + 1 < sp_cnt; i++) {
-                            if (sampled_primes[i+1] - sampled_primes[i] >= needed_gap) {
+                            if (sampled_primes[i+1] - sampled_primes[i] >= gpu_rth) {
                                 gap_reg_lo[n_gap_regions] = sampled_primes[i];
                                 gap_reg_hi[n_gap_regions] = sampled_primes[i+1];
                                 n_gap_regions++;
                             }
                         }
-                        if (cnt > 0 && pr[cnt-1] - sampled_primes[sp_cnt-1] >= needed_gap) {
+                        if (cnt > 0 && pr[cnt-1] - sampled_primes[sp_cnt-1] >= gpu_rth) {
                             gap_reg_lo[n_gap_regions] = sampled_primes[sp_cnt-1];
                             gap_reg_hi[n_gap_regions] = UINT64_MAX;
                             n_gap_regions++;
@@ -5324,6 +5367,11 @@ int main(int argc, char **argv) {
         printf("      --sieve-primes N  number of sieve primes (GapMiner-compatible)\n");
         printf("                        N primes -> largest ~ N*ln(N); default = 900000\n");
         printf("      --target T        minimum merit         (default: 20.0)\n");
+        printf("      --scan-merit M    backward-scan stride merit (non-CRT only).\n");
+        printf("                        When set, the scan jumps M*ln(p) ahead for efficiency\n");
+        printf("                        but still submits all gaps >= --target (or network merit).\n");
+        printf("                        Example: --target 20.4 --scan-merit 38 hunts records\n");
+        printf("                        while still submitting pool shares.\n");
         printf("      --threads N       worker threads        (default: 1)\n");
         printf("      --adder-max M     adder upper bound     (default: 2^shift)\n");
         printf("      --fast-fermat     fast primality (fewer Miller-Rabin rounds)\n");
@@ -5403,6 +5451,7 @@ int main(int argc, char **argv) {
             /* Limit is computed from count after arg parsing (PNT upper bound). */
         }
         else if (!strcmp(argv[i],"--target") && i+1<argc) { target = atof(argv[++i]); target_explicit = 1; }
+        else if (!strcmp(argv[i],"--scan-merit") && i+1<argc) { g_scan_merit = atof(argv[++i]); }
         else if ((!strcmp(argv[i],"-o") || !strcmp(argv[i],"--host")) && i+1<argc) rpc_host = argv[++i];
         else if ((!strcmp(argv[i],"-p") || !strcmp(argv[i],"--port")) && i+1<argc) rpc_port = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--stratum") && i+1<argc) stratum_arg = argv[++i];

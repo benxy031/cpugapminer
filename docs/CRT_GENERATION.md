@@ -403,10 +403,19 @@ ignored and do not need to be specified.
 4. **`--ctr-ivs 1000`** for production, 20 for quick tests.
 5. **`--ctr-merit` should be `target_merit - 1`** per original GapMiner
    recommendations. So for mining merit 22 blocks, use `--ctr-merit 21`.
+   At higher shifts (≥384), `target_merit - 2` is viable and often better:
+   the gap range is larger, so a slightly looser coverage still captures
+   most qualifying gaps while keeping `n_candidates` lower.
 6. **`--ctr-range 10`** explores ±10% prime counts around your target,
    which may find a slightly better solution at a different prime count.
 7. **Lower `n_candidates` is better.** The file with the fewest candidates
    gives the miner the most positions it can skip.
+8. **CRT becomes increasingly efficient relative to windowed sieve at higher
+   shifts.** In CRT mode, total Fermat tests per hash ≈ `n_candidates × 2^ctr_bits`,
+   which stays roughly constant regardless of shift. In windowed sieve mode,
+   tests per hash scale as `2^shift / ln(base)` — exponential in shift. Above
+   shift ~128 the windowed sieve is simply impractical; CRT is the only
+   viable mode for shift 256 and beyond.
 
 ## Computing log2(primorial) with Python
 
