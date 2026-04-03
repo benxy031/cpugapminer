@@ -45,6 +45,11 @@
 #    define WIN32_LEAN_AND_MEAN
 #  endif
 #  include <windows.h>
+/* rand_r is POSIX-only; provide a simple LCG shim for Windows */
+static int rand_r(unsigned *seed) {
+    *seed = *seed * 1103515245u + 12345u;
+    return (int)((*seed >> 16) & 0x7fff);
+}
 static int get_cpu_count(void) {
     SYSTEM_INFO si;
     GetSystemInfo(&si);
