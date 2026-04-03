@@ -62,7 +62,7 @@ def achievable_merit(gap, shift):
     return gap / lnp(shift)
 
 
-def analyze_shift(records, shift, min_merit=20.0, max_merit=40.0):
+def analyze_shift(records, shift, min_merit=20.0, max_merit=45.0):
     """
     For a given shift, find all gaps where the current record merit is lower
     than what Gapcoin can achieve (i.e., the record is beatable).
@@ -109,7 +109,7 @@ def recommended_ctr_merit(beatable, top_n=50):
     return max(20, math.floor(ach) - 1)
 
 
-def print_shift_report(records, shift, top_n, show_all, min_merit=20.0, max_merit=40.0):
+def print_shift_report(records, shift, top_n, show_all, min_merit=20.0, max_merit=45.0):
     lp = lnp(shift)
     beatable = analyze_shift(records, shift, min_merit, max_merit)
 
@@ -168,8 +168,8 @@ def main():
         help="Show all beatable records, not just top N."
     )
     parser.add_argument(
-        "--max-merit", type=float, default=40.0, metavar="M",
-        help="Upper bound on achievable merit to consider (default: 40). "
+        "--max-merit", type=float, default=45.0, metavar="M",
+        help="Upper bound on achievable merit to consider (default: 45). "
              "Gaps above this are outside the practical CRT window."
     )
     parser.add_argument(
