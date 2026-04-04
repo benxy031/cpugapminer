@@ -241,6 +241,8 @@ static int cli_mr_rounds = 2;
    submitting every gap that meets the network difficulty.
    0 = use target_local (default: stride == submit threshold). */
 static double g_scan_merit = 0.0;
+/* One-time warning guard for CPU smart-scan stride clamping. */
+static volatile int g_warn_scan_merit_cpu_clamped = 0;
 
 /* Number of edge-probe candidates per side when eliminating false-positive
    regions in the two-phase smart scan.  Higher values catch more false
@@ -842,19 +844,43 @@ static void print_stats(void) {
             ? (100.0 * (double)hp_drop / (double)(hp_ok + hp_rep + hp_drop)) : 0.0;
 
         /* Auto-split decisions are applied at pass boundaries because thread
-           roles are assigned at spawn. If a pass runs for a long time with an
-           empty queue, trigger a controlled pass restart so rebalancing can
-           take effect without waiting for a new block. */
+           roles are assigned at spawn. For long-running passes, trigger a
+           controlled restart when queue telemetry clearly indicates the split
+           is wrong so rebalancing is not delayed until the next block. */
         if (use_crt_auto_split && g_crt_mode == CRT_MODE_SOLVER &&
-            crt_fermat_threads > 1 && keep_going && !g_abort_pass) {
+            crt_fermat_threads > 0 && keep_going && !g_abort_pass) {
             if (elapsed >= 20.0 &&
-                (now - auto_split_last_rebalance_ms) >= 20000 &&
-                crt_heap_count() == 0 && wait_pct >= 45.0 && drop_pct < 1.0 &&
-                (pop_ok + waits) >= 500) {
-                auto_split_last_rebalance_ms = now;
-                log_msg("CRT auto-split: queue underfilled (gaplist=0 wait=%.1f%%)"
-                        " -> restart pass for rebalance\n", wait_pct);
-                g_abort_pass = 1;
+                (now - auto_split_last_rebalance_ms) >= 20000) {
+                size_t q_now = crt_heap_count();
+                uint64_t push_total = hp_ok + hp_rep + hp_drop;
+
+                int underfilled = (crt_fermat_threads > 1 &&
+                                   q_now == 0 && wait_pct >= 45.0 &&
+                                   drop_pct < 1.0 && (pop_ok + waits) >= 500);
+
+                int overloaded = (push_total >= 500 &&
+                                  q_now >= (crt_heap_cap * 3) / 4 &&
+                                  drop_pct >= 3.0 && wait_pct <= 25.0);
+
+                if (underfilled || overloaded) {
+                    auto_split_last_rebalance_ms = now;
+                    if (underfilled) {
+                        log_msg("CRT auto-split: queue underfilled "
+                                "(gaplist=%lu wait=%.1f%% drop=%.1f%%)"
+                                " -> restart pass for rebalance\n",
+                                (unsigned long)q_now, wait_pct, drop_pct);
+                    } else {
+                        log_msg("CRT auto-split: queue overloaded "
+                                "(gaplist=%lu drop=%.1f%% wait=%.1f%%)"
+                                " -> restart pass for rebalance\n",
+                                (unsigned long)q_now, drop_pct, wait_pct);
+                    }
+                    /* Wake any fermat consumers blocked in crt_heap_pop()
+                       so thread joins complete and the next pass can apply
+                       the adjusted split immediately. */
+                    crt_heap_signal_shutdown();
+                    g_abort_pass = 1;
+                }
             }
         }
         log_msg("  windows=%llu (%.1f/s)  primes/win=%.1f  tmpl/win=%.2f  crt_est=%s (merit>=%.1f)",
@@ -3126,14 +3152,10 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
 }
 #endif /* WITH_GPU_FERMAT */
 
-/* ── CRT backward-scan + gap submission ──
-   Performs a sampling pass for best-merit tracking, then a full backward-
-   scan on sieve survivors.  Qualifying gaps are assembled into blocks and
-   submitted via RPC/stratum.  Shared by consumer, monolithic, and single-
-   thread CRT paths to avoid duplicating ~150 lines of gap submission code.
-
-   Returns the number of Fermat tests performed (for stats accounting). */
-#define CRT_BKSCAN_SAMPLE 50
+/* ── CRT gap scan + submission ──
+   CRT windows are intentionally small; backward-scan can miss qualifying
+   gaps when needed_gap is comparable to window span.  Use a full linear
+   scan over sieve survivors so every consecutive-prime pair is checked. */
 static size_t crt_bkscan_and_submit(
         uint64_t *surv, size_t surv_cnt,
         double logbase, double target, int shift_v,
@@ -3141,146 +3163,126 @@ static size_t crt_bkscan_and_submit(
         const char *rpc_url, const char *rpc_user,
         const char *rpc_pass)
 {
-    size_t needed = (size_t)(target * logbase);
-    if (needed < 2) needed = 2;
-
     size_t total_tested = 0;
     size_t primes_found = 0;
 
-    /* ── Sampling pass for best-merit feedback ──
-       Fully test first CRT_BKSCAN_SAMPLE survivors so the user sees
-       best= climbing gradually.  The last prime found seeds backward scan. */
-    size_t sample_end = surv_cnt < CRT_BKSCAN_SAMPLE
-                      ? surv_cnt : CRT_BKSCAN_SAMPLE;
-    size_t first_idx = surv_cnt; /* sentinel */
-    uint64_t last_sample_prime = 0;
-    for (size_t j = 0; j < sample_end; j++) {
-        total_tested++;
-        if (bn_candidate_is_prime(surv[j])) {
-            if (last_sample_prime) {
-                uint64_t g = surv[j] - last_sample_prime;
-                double m = (double)g / logbase;
-                if (m > stats_best_merit) {
-                    stats_best_merit = m;
-                    stats_best_gap   = g;
-                }
-            }
-            last_sample_prime = surv[j];
-            first_idx = j;
-            primes_found++;
-        }
-    }
-    /* If no prime in sample, scan forward */
-    if (first_idx == surv_cnt) {
-        for (size_t j = sample_end; j < surv_cnt; j++) {
-            total_tested++;
-            if (bn_candidate_is_prime(surv[j])) {
-                first_idx = j;
-                primes_found++;
-                break;
-            }
-        }
-    }
+    uint64_t qual_pairs[64][2];
+    size_t   qual_cnt = 0;
+
+    uint64_t last_prime = 0;
+    int      have_last = 0;
+    uint64_t best_gap_local = 0;
+    double   best_merit_loc = 0.0;
+    uint64_t last_gap_local = 0;
 
     __sync_fetch_and_add(&stats_crt_windows, 1);
 
-    if (first_idx < surv_cnt) {
-        struct bkscan_result bk;
-        backward_scan_segment(surv, first_idx, surv_cnt,
-                              needed, logbase, target,
-                              bn_candidate_is_prime, &bk);
-        total_tested  += bk.tested;
-        primes_found  += bk.primes_found;
+    /* Full linear scan: evaluate every survivor and every consecutive prime
+       pair in this window. */
+    for (size_t j = 0; j < surv_cnt; j++) {
+        total_tested++;
+        if (!bn_candidate_is_prime(surv[j])) continue;
+        primes_found++;
 
-        if (bk.best_merit > stats_best_merit) {
-            stats_best_merit = bk.best_merit;
-            stats_best_gap   = bk.best_gap;
-        }
-
-        if (bk.best_gap > stats_crt_consumer_best_gap)
-            stats_crt_consumer_best_gap = bk.best_gap;
-
-        if (bk.best_gap > 0) {
-            stats_crt_consumer_last_gap = bk.best_gap;
-            stats_last_gap = bk.best_gap;
-        }
-
-        /* Submit qualifying gaps */
-        for (size_t qi = 0; qi < bk.qual_cnt; qi++) {
-            uint64_t start_off = bk.qual_pairs[qi][0];
-            uint64_t end_off   = bk.qual_pairs[qi][1];
-            uint64_t gap = end_off - start_off;
+        if (have_last) {
+            uint64_t gap = surv[j] - last_prime;
             double merit = (double)gap / logbase;
-            char submit_msg[160];
+            last_gap_local = gap;
 
-            /* MR base-3 boundary verification for CRT backward-scan path */
-            if (use_mr_verify) {
-                ensure_gmp_tls();
-                mpz_add_u64(tls_cand_mpz, tls_base_mpz, start_off);
-                tls_cand_last_valid = 0;
-                if (!mr_verify_cand()) continue;
-                mpz_add_u64(tls_cand_mpz, tls_base_mpz, end_off);
-                tls_cand_last_valid = 0;
-                if (!mr_verify_cand()) continue;
+            if (merit > best_merit_loc) {
+                best_merit_loc = merit;
+                best_gap_local = gap;
             }
-
-            __sync_fetch_and_add(&stats_gaps, 1);
-
-            mpz_t nAdd_prime;
-            mpz_init(nAdd_prime);
-            mpz_add_u64(nAdd_prime, nAdd, start_off);
-            if (cand_odd)
-                mpz_sub_ui(nAdd_prime, nAdd_prime, 1);
-
-            char nAdd_str[256];
-            gmp_snprintf(nAdd_str, sizeof(nAdd_str), "%Zd", nAdd_prime);
-            log_msg("\n>>> GAP FOUND\n"
-                    "    gap     = %llu\n"
-                    "    merit   = %.6f  (need >= %.2f)\n"
-                    "    nShift  = %d\n"
-                    "    nonce   = %u\n"
-                    "    nAdd    = %s\n",
-                    (unsigned long long)gap,
-                    merit, target, shift_v,
-                    (unsigned)nonce, nAdd_str);
-#ifdef WITH_RPC
-            if (rpc_url && !g_abort_pass) {
-                char blockhex[16384];
-                memset(blockhex, 0, sizeof(blockhex));
-                if (assemble_mining_block_mpz(nonce, nAdd_prime, 0, blockhex)) {
-                    __sync_fetch_and_add(&stats_blocks, 1);
-                    log_file_only("Built blockhex: %s\n", blockhex);
-                    if (header_meets_target_hex(blockhex)) {
-                        snprintf(submit_msg, sizeof(submit_msg),
-                                 ">>> SUBMITTING  merit=%.6f  gap=%llu  nShift=%d  nonce=%u",
-                                 merit, (unsigned long long)gap,
-                                 shift_v, (unsigned)nonce);
-                        log_msg("%s\n", submit_msg);
-                        __sync_fetch_and_add(&stats_submits, 1);
-                        submit_gap_block_common(blockhex, merit,
-                                                rpc_url, rpc_user, rpc_pass,
-                                                NULL, "");
-                    }
-                } else {
-                    log_msg("Failed to assemble block\n");
-                }
+            if (merit >= target && qual_cnt < 64) {
+                qual_pairs[qual_cnt][0] = last_prime;
+                qual_pairs[qual_cnt][1] = surv[j];
+                qual_cnt++;
             }
-#endif
-            mpz_clear(nAdd_prime);
         }
+        last_prime = surv[j];
+        have_last = 1;
+    }
+
+    if (best_merit_loc > stats_best_merit) {
+        stats_best_merit = best_merit_loc;
+        stats_best_gap = best_gap_local;
+    }
+    if (best_gap_local > stats_crt_consumer_best_gap)
+        stats_crt_consumer_best_gap = best_gap_local;
+    if (last_gap_local > 0) {
+        stats_crt_consumer_last_gap = last_gap_local;
+        stats_last_gap = last_gap_local;
+    }
+
+    /* Submit qualifying gaps found in this window. */
+    for (size_t qi = 0; qi < qual_cnt; qi++) {
+        uint64_t start_off = qual_pairs[qi][0];
+        uint64_t end_off   = qual_pairs[qi][1];
+        uint64_t gap = end_off - start_off;
+        double merit = (double)gap / logbase;
+        char submit_msg[160];
+
+        /* MR base-3 boundary verification for CRT path */
+        if (use_mr_verify) {
+            ensure_gmp_tls();
+            mpz_add_u64(tls_cand_mpz, tls_base_mpz, start_off);
+            tls_cand_last_valid = 0;
+            if (!mr_verify_cand()) continue;
+            mpz_add_u64(tls_cand_mpz, tls_base_mpz, end_off);
+            tls_cand_last_valid = 0;
+            if (!mr_verify_cand()) continue;
+        }
+
+        __sync_fetch_and_add(&stats_gaps, 1);
+        stats_last_qual_gap = gap;
+
+        mpz_t nAdd_prime;
+        mpz_init(nAdd_prime);
+        mpz_add_u64(nAdd_prime, nAdd, start_off);
+        if (cand_odd)
+            mpz_sub_ui(nAdd_prime, nAdd_prime, 1);
+
+        char nAdd_str[256];
+        gmp_snprintf(nAdd_str, sizeof(nAdd_str), "%Zd", nAdd_prime);
+        log_msg("\n>>> GAP FOUND\n"
+                "    gap     = %llu\n"
+                "    merit   = %.6f  (need >= %.2f)\n"
+                "    nShift  = %d\n"
+                "    nonce   = %u\n"
+                "    nAdd    = %s\n",
+                (unsigned long long)gap,
+                merit, target, shift_v,
+                (unsigned)nonce, nAdd_str);
+#ifdef WITH_RPC
+        if (rpc_url && !g_abort_pass) {
+            char blockhex[16384];
+            memset(blockhex, 0, sizeof(blockhex));
+            if (assemble_mining_block_mpz(nonce, nAdd_prime, 0, blockhex)) {
+                __sync_fetch_and_add(&stats_blocks, 1);
+                log_file_only("Built blockhex: %s\n", blockhex);
+                if (header_meets_target_hex(blockhex)) {
+                    snprintf(submit_msg, sizeof(submit_msg),
+                             ">>> SUBMITTING  merit=%.6f  gap=%llu  nShift=%d  nonce=%u",
+                             merit, (unsigned long long)gap,
+                             shift_v, (unsigned)nonce);
+                    log_msg("%s\n", submit_msg);
+                    __sync_fetch_and_add(&stats_submits, 1);
+                    submit_gap_block_common(blockhex, merit,
+                                            rpc_url, rpc_user, rpc_pass,
+                                            NULL, "");
+                }
+            } else {
+                log_msg("Failed to assemble block\n");
+            }
+        }
+#endif
+        mpz_clear(nAdd_prime);
     }
 
     __sync_fetch_and_add(&stats_tested, (uint64_t)total_tested);
     __sync_fetch_and_add(&stats_primes_found, (uint64_t)primes_found);
-
-    /* Estimate total pairs for accurate est calculation */
-    { double prime_rate = total_tested > 0
-          ? (double)primes_found / (double)total_tested : 0.0;
-      size_t est_primes = (size_t)((double)surv_cnt * prime_rate);
-      if (est_primes > 1)
-          __sync_fetch_and_add(&stats_pairs,
-                               (uint64_t)(est_primes - 1));
-    }
+    if (primes_found > 1)
+        __sync_fetch_and_add(&stats_pairs, (uint64_t)(primes_found - 1));
 
     return total_tested;
 }
@@ -4158,6 +4160,23 @@ static void *worker_fn(void *arg) {
        scan skips dense prime clusters more aggressively while still submitting
        every gap >= target_local (network merit).  Defaults to target_local. */
     double   scan_target            = (g_scan_merit > 0.0) ? g_scan_merit : target_local;
+    /* CPU backward-scan cannot safely guarantee all network-threshold gaps
+       when stride target is raised above submit target.  Clamp on CPU-only
+       runs so share correctness matches estimated target. */
+    if (scan_target > target_local) {
+        int clamp_for_cpu = 1;
+#ifdef WITH_GPU_FERMAT
+        clamp_for_cpu = (g_gpu_count == 0);
+#endif
+        if (clamp_for_cpu) {
+            scan_target = target_local;
+            if (__sync_bool_compare_and_swap(&g_warn_scan_merit_cpu_clamped, 0, 1)) {
+                log_msg("scan-merit %.2f > target %.2f on CPU smart-scan; "
+                        "clamping stride to target for share correctness\n",
+                        g_scan_merit, target_local);
+            }
+        }
+    }
     int64_t  adder_base_offset_local = wa->adder_base_offset;
     int      rpc_thread_local       = wa->rpc_thread;
     const char *header_local = NULL, *rpc_url_local = NULL, *rpc_user_local = NULL;
@@ -4831,9 +4850,17 @@ static void *worker_fn(void *arg) {
             if (use_smart) {
                 needed_gap = (size_t)(scan_target * logbase);
                 if (needed_gap < 2) needed_gap = 2;
+
+                /* Degenerate windows (needed_gap >= local span) make
+                   backward-scan ineffective. Fall back to full test path. */
+                if (cnt >= 2) {
+                    uint64_t span = pr[cnt - 1] - pr[0];
+                    if (needed_gap >= (size_t)span)
+                        use_smart = 0;
+                }
 #ifdef WITH_GPU_FERMAT
                 /* GPU smart-scan still needs sampled candidates */
-                if (g_gpu_count > 0) {
+                if (use_smart && g_gpu_count > 0) {
                     p1_cnt  = (cnt + (size_t)smart_K - 1) / (size_t)smart_K;
                     p1_wcap = p1_cnt / 4 + 64;
                     p1_cands = (uint64_t *)malloc(p1_cnt * sizeof(uint64_t));
@@ -5065,16 +5092,24 @@ static void *worker_fn(void *arg) {
                 size_t primes_found_bk = 0;
                 size_t worker_bk_tests = 0;  /* tests for stats_tested flush */
 
-                /* --- Sampling pass for best-merit tracking ---------------
-                   The backward-scan algorithm skips dense prime clusters,
-                   so it never produces verified small gaps for progress
-                   display.  To give the user gradual best-merit feedback,
-                   fully test the first BKSCAN_SAMPLE survivors and track
-                   verified consecutive-prime gaps among them.
-                   Cost: ~200 extra Fermat tests per window (~3% overhead).
-                   The last prime found becomes the backward-scan start. */
-                #define BKSCAN_SAMPLE 200
-                size_t sample_end = cnt < BKSCAN_SAMPLE ? cnt : BKSCAN_SAMPLE;
+                     /* --- Adaptive sampling pass for best-merit tracking -------
+                         Backward-scan skips dense clusters, so without sampling the
+                         UI best-merit can look stale.  Use an adaptive sample size:
+                            - scales with window size,
+                            - has a floor for stability,
+                            - caps overhead on large windows,
+                            - nudges up for larger scan-merit strides. */
+                     size_t bkscan_sample = cnt / 32;           /* ~3.1% of window */
+                     size_t stride_floor  = (size_t)smart_K * 8;
+                     if (bkscan_sample < stride_floor) bkscan_sample = stride_floor;
+                     if (bkscan_sample < 64) bkscan_sample = 64;
+                     {
+                          size_t merit_floor = needed_gap / 96;
+                          if (merit_floor > bkscan_sample)
+                                bkscan_sample = merit_floor;
+                     }
+                     if (bkscan_sample > 320) bkscan_sample = 320;
+                     size_t sample_end = cnt < bkscan_sample ? cnt : bkscan_sample;
                 size_t first_idx = cnt;  /* sentinel: not found */
                 uint64_t last_sample_prime = 0;
                 for (size_t j = 0; j < sample_end; j++) {
@@ -5088,6 +5123,24 @@ static void *worker_fn(void *arg) {
                             if (merit_s > stats_best_merit) {
                                 stats_best_merit = merit_s;
                                 stats_best_gap   = gap_s;
+                            }
+
+                            /* Do not drop qualifying pairs that appear in
+                               the sampled prefix before backward scan starts. */
+                            if (merit_s >= target_local) {
+                                uint64_t pair_s[2] = {
+                                    last_sample_prime,
+                                    pr[j]
+                                };
+                                stats_crt_consumer_last_qual_gap = gap_s;
+                                stats_last_qual_gap = gap_s;
+                                if (scan_candidates(pair_s, 2,
+                                        target_local, logbase,
+                                        shift_local, header_local,
+                                        rpc_url_local, rpc_user_local,
+                                        rpc_pass_local, rpc_method_local,
+                                        rpc_sign_key_local))
+                                    goto worker_done;
                             }
                         }
                         last_sample_prime = pr[j];
@@ -6592,6 +6645,21 @@ int main(int argc, char **argv) {
         } while (keep_going);
     } else {
         int auto_fermat_threads = crt_fermat_threads;
+        if (use_crt_auto_split && g_crt_mode == CRT_MODE_SOLVER &&
+            auto_fermat_threads == 0 && !crt_fermat_explicit &&
+            num_threads > 1) {
+            /* Auto-split needs a producer-consumer baseline. When user did
+               not pin --fermat-threads, bootstrap from monolithic mode with
+               a conservative initial consumer count. */
+            auto_fermat_threads = (num_threads >= 6) ? 2 : 1;
+            if (auto_fermat_threads >= num_threads)
+                auto_fermat_threads = num_threads - 1;
+            if (auto_fermat_threads < 1)
+                auto_fermat_threads = 1;
+            log_msg("CRT auto-split: bootstrap fermat-threads=%d"
+                    " (use --fermat-threads to set initial split)\n",
+                    auto_fermat_threads);
+        }
         uint64_t split_prev_push_ok = 0, split_prev_push_rep = 0, split_prev_push_drop = 0;
         uint64_t split_prev_pop_ok = 0, split_prev_pop_empty = 0, split_prev_waits = 0;
         do {
