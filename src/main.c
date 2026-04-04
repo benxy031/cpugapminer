@@ -756,6 +756,15 @@ static void tile_presieve(uint8_t *sieve, size_t sieve_bytes,
 
 /* ── Multi-table pre-sieve: init + tile ── */
 
+/* Explicitly include the SSE2 header so __m128i is available regardless of
+   how <immintrin.h> was processed (GCC 13+ made SSE2 types conditional on
+   __SSE2__ being set at include time; the pragma + explicit include covers
+   toolchains where the cascade from <immintrin.h> silently fails).         */
+#ifdef __SSE2__
+#  pragma GCC target("sse2")
+#  include <emmintrin.h>
+#endif
+
 /* Modular inverse of a mod m (extended Euclidean, small values only). */
 static uint32_t mod_inv32(uint32_t a, uint32_t m) {
     int64_t t = 0, nt = 1, r = (int64_t)m, nr = (int64_t)(a % m);
