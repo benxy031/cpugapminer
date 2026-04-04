@@ -771,6 +771,14 @@ static void print_stats(void) {
         format_est(est_buf, sizeof(est_buf), est_sec);
     }
 
+    /* Observed average gap interval (elapsed / gaps found). Shows actual
+       performance vs the theoretical est= so the user can compare directly. */
+    char avg_gap_buf[64] = "n/a";
+    if (stats_gaps > 0 && elapsed > 0.001) {
+        double avg_gap_sec = elapsed / (double)stats_gaps;
+        format_est(avg_gap_buf, sizeof(avg_gap_buf), avg_gap_sec);
+    }
+
     double prime_rate = (elapsed > 0.001) ? (double)stats_primes_found / elapsed : 0.0;
     double surv_per_million = (stats_sieved > 0)
         ? ((double)stats_primes_found * 1000000.0) / (double)stats_sieved : 0.0;
@@ -795,7 +803,7 @@ static void print_stats(void) {
         log_msg("STATS: elapsed=%.1fs  sieved=%llu (%.0f/s)  tested=%llu (%.0f/s)  "
             "pps=%.0f  primes=%llu (%.1f%%)  "
             "gaps=%llu (%.3f/s)  built=%llu  submitted=%llu  accepted=%llu  "
-            "prob=%.2e/pair  est=%s (target=%.4f)  best=%.2f (gap=%llu)  last_gap=%llu  last_qual_gap=%llu",
+            "prob=%.2e/pair  est=%s  avg_gap=%s (target=%.4f)  best=%.2f (gap=%llu)  last_gap=%llu  last_qual_gap=%llu",
             elapsed,
             (unsigned long long)stats_sieved,  sieve_rate,
             (unsigned long long)stats_tested,  test_rate,
@@ -806,7 +814,7 @@ static void print_stats(void) {
             (unsigned long long)stats_blocks,
             (unsigned long long)stats_submits,
             (unsigned long long)stats_success,
-            prob_pair, est_buf, target_m,
+            prob_pair, est_buf, avg_gap_buf, target_m,
             bm, (unsigned long long)stats_best_gap,
             (unsigned long long)stats_last_gap,
             (unsigned long long)stats_last_qual_gap);
