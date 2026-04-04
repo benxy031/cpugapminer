@@ -5842,6 +5842,7 @@ int main(int argc, char **argv) {
     /* ── OpenCL GPU initialization scaffolding ── */
 #ifdef WITH_OPENCL
     if (use_opencl) {
+        int opencl_start_idx = g_gpu_count;
         if (opencl_platform_set) {
             char pbuf[32];
             snprintf(pbuf, sizeof(pbuf), "%d", opencl_platform);
@@ -5867,6 +5868,18 @@ int main(int argc, char **argv) {
         if (g_gpu_count == 0) {
             fprintf(stderr, "No OpenCL devices initialized. Falling back to CPU.\n");
             use_opencl = 0;
+        } else {
+            /* Match CUDA behavior: narrow arithmetic width to candidate size.
+               candidates = h256(256 bits) << shift -> (256 + shift) bits.
+               active_limbs = ceil((256 + shift) / 64). */
+            int candidate_bits = 256 + shift;
+            int active_limbs   = (candidate_bits + 63) / 64;
+            for (int gi = opencl_start_idx; gi < g_gpu_count; gi++)
+                gpu_fermat_set_limbs(g_gpu_ctx[gi], active_limbs);
+            g_gpu_active_limbs_global = active_limbs;
+            log_msg("OpenCL: active_limbs=%d (%d-bit candidates, compiled NL=%d)\n",
+                    active_limbs < GPU_NLIMBS ? active_limbs : GPU_NLIMBS,
+                    candidate_bits, GPU_NLIMBS);
         }
     }
 #else

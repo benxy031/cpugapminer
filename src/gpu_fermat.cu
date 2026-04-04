@@ -19,7 +19,6 @@
 #  include "compat_win32.h"
 #else
 #  include <pthread.h>
-#  include <unistd.h>
 #endif
 #include <cuda_runtime.h>
 
@@ -164,8 +163,9 @@ void montmul_t(uint64_t *      __restrict__ r,
                const uint64_t * __restrict__ n,
                uint64_t ninv)
 {
-    uint64_t t[AL + 2];
-    for (int i = 0; i < AL + 2; i++) t[i] = 0;
+    uint64_t tbuf[2 * AL + 4];
+    for (int i = 0; i < 2 * AL + 4; i++) tbuf[i] = 0;
+    uint64_t *t = tbuf;
 
     for (int i = 0; i < AL; i++) {
         uint64_t c = 0;
@@ -183,8 +183,8 @@ void montmul_t(uint64_t *      __restrict__ r,
         t[AL] += c;
         t[AL + 1] += (t[AL] < old);
 
-        for (int j = 0; j < AL + 1; j++)
-            t[j] = t[j + 1];
+        /* Logical left-shift by one limb without AL+1 copies. */
+        t++;
         t[AL + 1] = 0;
     }
 
@@ -203,34 +203,26 @@ void montmul_t(uint64_t *      __restrict__ r,
 template<int AL>
 __global__ void fermat_kernel_t(const uint64_t * __restrict__ cands,
                                 uint8_t        * __restrict__ results,
-                                uint32_t count,
-                                uint32_t stride)
+                                uint32_t count)
 {
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
 
     uint64_t n[AL];
-    const uint64_t *src = &cands[(size_t)idx * stride];
+    const uint64_t *src = &cands[(size_t)idx * (size_t)AL];
     for (int i = 0; i < AL; i++) n[i] = src[i];
 
     if ((n[0] & 1) == 0) { results[idx] = 0; return; }
 
     uint64_t ninv = compute_ninv(n[0]);
 
-    uint64_t one_m[AL];
-    compute_rmodn_t<AL>(one_m, n);
-
     uint64_t base_m[AL];
-    for (int i = 0; i < AL; i++) base_m[i] = one_m[i];
+    compute_rmodn_t<AL>(base_m, n);
     moddbl_t<AL>(base_m, n);
 
-    uint64_t e[AL];
-    for (int i = 0; i < AL; i++) e[i] = n[i];
-    e[0] -= 1;
-
     int top = AL - 1;
-    while (top > 0 && e[top] == 0) top--;
-    int msb = 63 - __clzll(e[top]);
+    while (top > 0 && n[top] == 0) top--;
+    int msb = 63 - __clzll(n[top]);
 
     uint64_t res[AL];
     for (int i = 0; i < AL; i++) res[i] = base_m[i];
@@ -239,15 +231,15 @@ __global__ void fermat_kernel_t(const uint64_t * __restrict__ cands,
         int start = (limb == top) ? msb - 1 : 63;
         for (int bit = start; bit >= 0; bit--) {
             montmul_t<AL>(res, res, res, n, ninv);
-            if ((e[limb] >> bit) & 1)
+            /* Exponent is n-1, so only bit 0 differs from n (odd n). */
+            if (((n[limb] >> bit) & 1) && (limb != 0 || bit != 0))
                 montmul_t<AL>(res, res, base_m, n, ninv);
         }
     }
 
-    uint64_t one[AL];
-    for (int i = 0; i < AL; i++) one[i] = 0;
-    one[0] = 1;
-    montmul_t<AL>(res, res, one, n, ninv);
+    for (int i = 0; i < AL; i++) base_m[i] = 0;
+    base_m[0] = 1;
+    montmul_t<AL>(res, res, base_m, n, ninv);
 
     int ok = (res[0] == 1);
     for (int i = 1; i < AL; i++)
@@ -276,15 +268,41 @@ int fermat_block_size_for_al(int al)
     return 128;
 }
 
+template<int AL>
+static __host__ __forceinline__
+int fermat_block_size_for_kernel()
+{
+    static int cached = 0;
+    if (cached > 0) return cached;
+
+    int min_grid = 0;
+    int block = 0;
+    cudaError_t err = cudaOccupancyMaxPotentialBlockSize(
+        &min_grid, &block, fermat_kernel_t<AL>, 0, 0);
+
+    if (err == cudaSuccess && block > 0) {
+        /* Keep launch shape warp-aligned and conservative for heavy kernels. */
+        block = (block / 32) * 32;
+        if (block < 64)  block = 64;
+        if (block > 256) block = 256;
+        cached = block;
+    } else {
+        cached = fermat_block_size_for_al(AL);
+    }
+
+    return cached;
+}
+
 static cudaError_t launch_fermat(int al, cudaStream_t stream,
                                  const uint64_t *d_cands, uint8_t *d_results,
-                                 uint32_t count, uint32_t stride)
+                                 uint32_t count)
 {
-    int block = fermat_block_size_for_al(al);
-    int grid  = (int)((count + block - 1) / block);
-
 #define FERMAT_DISPATCH(W) \
-    fermat_kernel_t<W><<<grid, block, 0, stream>>>(d_cands, d_results, count, stride); \
+    do { \
+        int block = fermat_block_size_for_kernel<W>(); \
+        int grid  = (int)((count + (uint32_t)block - 1u) / (uint32_t)block); \
+        fermat_kernel_t<W><<<grid, block, 0, stream>>>(d_cands, d_results, count); \
+    } while (0); \
     return cudaPeekAtLastError()
 
 #if NL >= 5
@@ -361,16 +379,11 @@ struct gpu_fermat_ctx {
     pthread_mutex_t slot_mu[2];
     int       slot_mu_inited[2];
 
-    /* Per-slot completion events and a collector thread to query them */
+    /* Per-slot completion events and condition vars for slot reuse */
     cudaEvent_t event[2];
     int         event_inited[2];
-    int         ready[2];            /* set by collector when results ready */
     pthread_cond_t slot_cv[2];
     int         slot_cv_inited[2];
-
-    /* Background collector thread */
-    pthread_t  collector_thread;
-    int        collector_running;
 };
 
 static __host__ __forceinline__ cudaError_t ensure_device(int device_id)
@@ -381,9 +394,6 @@ static __host__ __forceinline__ cudaError_t ensure_device(int device_id)
     if (cur == device_id) return cudaSuccess;
     return cudaSetDevice(device_id);
 }
-
-/* Forward declaration for background collector thread */
-static void *gpu_fermat_collector(void *arg);
 
 gpu_fermat_ctx *gpu_fermat_init(int device_id, size_t max_batch)
 {
@@ -463,7 +473,6 @@ gpu_fermat_ctx *gpu_fermat_init(int device_id, size_t max_batch)
         }
 
         ctx->pending[s] = 0;
-        ctx->ready[s] = 0;
         ctx->event_inited[s] = 0;
         ctx->slot_cv_inited[s] = 0;
 
@@ -481,14 +490,6 @@ gpu_fermat_ctx *gpu_fermat_init(int device_id, size_t max_batch)
             goto fail;
         }
         ctx->slot_cv_inited[s] = 1;
-    }
-
-    /* Start background collector thread that queries per-slot events */
-    ctx->collector_running = 1;
-    if (pthread_create(&ctx->collector_thread, NULL, gpu_fermat_collector, ctx) != 0) {
-        fprintf(stderr, "gpu_fermat: pthread_create collector failed\n");
-        ctx->collector_running = 0;
-        goto fail;
     }
 
     return ctx;
@@ -510,8 +511,8 @@ int gpu_fermat_submit(gpu_fermat_ctx *ctx, int slot,
     if (count > ctx->max_batch) count = ctx->max_batch;
 
     pthread_mutex_lock(&ctx->slot_mu[slot]);
-    /* Block until the slot is free — the collector broadcasts slot_cv
-       when collect() drains a slot, so this wait is bounded by GPU
+        /* Block until the slot is free — collect() broadcasts slot_cv
+             when it drains a slot, so this wait is bounded by GPU
        kernel latency (~5-15 ms).  Never skips candidates. */
     while (ctx->pending[slot] != 0)
         pthread_cond_wait(&ctx->slot_cv[slot], &ctx->slot_mu[slot]);
@@ -539,7 +540,7 @@ int gpu_fermat_submit(gpu_fermat_ctx *ctx, int slot,
     /* Launch kernel — dispatch to narrowest matching specialization */
     err = launch_fermat(active_limbs, ctx->stream[slot],
                         ctx->d_cands[slot], ctx->d_results[slot],
-                        (uint32_t)count, (uint32_t)stride);
+                        (uint32_t)count);
     if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->slot_mu[slot]); return -1; }
 
     /* Async D→H on stream[slot] */
@@ -547,11 +548,10 @@ int gpu_fermat_submit(gpu_fermat_ctx *ctx, int slot,
                           count, cudaMemcpyDeviceToHost,
                           ctx->stream[slot]);
     if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->slot_mu[slot]); return -1; }
-    /* Record an event when the D→H copy completes; collector will query it. */
+    /* Record an event when the D→H copy completes. */
     err = cudaEventRecord(ctx->event[slot], ctx->stream[slot]);
     if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->slot_mu[slot]); return -1; }
 
-    ctx->ready[slot] = 0;
     ctx->pending[slot] = count;
     pthread_mutex_unlock(&ctx->slot_mu[slot]);
     return 0;
@@ -572,10 +572,15 @@ int gpu_fermat_collect(gpu_fermat_ctx *ctx, int slot,
     size_t n = ctx->pending[slot];
     if (count < n) n = count;
 
-    /* Wait for the background collector to mark this slot ready. The
-       collector will pthread_cond_signal() when the CUDA event completes. */
-    while (!ctx->ready[slot]) {
-        pthread_cond_wait(&ctx->slot_cv[slot], &ctx->slot_mu[slot]);
+    cudaError_t err = ensure_device(ctx->device_id);
+    if (err != cudaSuccess) {
+        pthread_mutex_unlock(&ctx->slot_mu[slot]);
+        return -1;
+    }
+    err = cudaEventSynchronize(ctx->event[slot]);
+    if (err != cudaSuccess) {
+        pthread_mutex_unlock(&ctx->slot_mu[slot]);
+        return -1;
     }
 
     /* Results are already in pinned host buffer — copy to user */
@@ -586,7 +591,6 @@ int gpu_fermat_collect(gpu_fermat_ctx *ctx, int slot,
         primes += results[i];
 
     ctx->pending[slot] = 0;
-    ctx->ready[slot] = 0;
     /* Wake any thread blocked in gpu_fermat_submit waiting for this slot. */
     pthread_cond_broadcast(&ctx->slot_cv[slot]);
     pthread_mutex_unlock(&ctx->slot_mu[slot]);
@@ -627,57 +631,9 @@ int gpu_fermat_get_limbs(gpu_fermat_ctx *ctx)
     return (al >= 1 && al <= NL) ? al : NL;
 }
 
-/* Background collector thread: polls per-slot CUDA events with cudaEventQuery
-   and signals waiting collectors via pthread condition variables. */
-static void *gpu_fermat_collector(void *arg)
-{
-    gpu_fermat_ctx *ctx = (gpu_fermat_ctx *)arg;
-    if (!ctx) return NULL;
-
-    /* Ensure the thread is bound to the same CUDA device used for ops. */
-    if (ensure_device(ctx->device_id) != cudaSuccess) return NULL;
-
-    while (__atomic_load_n(&ctx->collector_running, __ATOMIC_RELAXED)) {
-        for (int s = 0; s < 2; s++) {
-            int need_check = 0;
-            pthread_mutex_lock(&ctx->slot_mu[s]);
-            if (ctx->pending[s] != 0 && !ctx->ready[s])
-                need_check = 1;
-            pthread_mutex_unlock(&ctx->slot_mu[s]);
-
-            if (!need_check) continue;
-
-            cudaError_t q = cudaEventQuery(ctx->event[s]);
-            if (q == cudaSuccess) {
-                pthread_mutex_lock(&ctx->slot_mu[s]);
-                ctx->ready[s] = 1;
-                /* broadcast: both submit() waiters (pending==0) and
-                   collect() waiters (ready==1) share this condvar;
-                   signal() would wake only one and could starve the other. */
-                pthread_cond_broadcast(&ctx->slot_cv[s]);
-                pthread_mutex_unlock(&ctx->slot_mu[s]);
-            } else if (q != cudaErrorNotReady) {
-                /* On unexpected errors, broadcast to avoid hangs. */
-                pthread_mutex_lock(&ctx->slot_mu[s]);
-                ctx->ready[s] = 1;
-                pthread_cond_broadcast(&ctx->slot_cv[s]);
-                pthread_mutex_unlock(&ctx->slot_mu[s]);
-            }
-        }
-        usleep(1000); /* sleep 1ms between polls */
-    }
-    return NULL;
-}
-
 void gpu_fermat_destroy(gpu_fermat_ctx *ctx)
 {
     if (!ctx) return;
-
-    /* Stop background collector thread first to avoid races on slot state */
-    if (__atomic_load_n(&ctx->collector_running, __ATOMIC_RELAXED)) {
-        __atomic_store_n(&ctx->collector_running, 0, __ATOMIC_RELAXED);
-        pthread_join(ctx->collector_thread, NULL);
-    }
 
     for (int s = 0; s < 2; s++) {
         if (ctx->slot_mu_inited[s]) pthread_mutex_lock(&ctx->slot_mu[s]);

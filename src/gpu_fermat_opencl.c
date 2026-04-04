@@ -51,11 +51,15 @@ struct gpu_fermat_ctx {
     cl_mem d_cands[2];
     cl_mem d_results[2];
     uint8_t *h_results[2];
+    cl_event done_event[2];
+    int done_event_valid[2];
     size_t pending[2];
 
     char dev_name[256];
     pthread_mutex_t slot_mu[2];
     int slot_mu_inited[2];
+    pthread_cond_t slot_cv[2];
+    int slot_cv_inited[2];
 };
 
 static const char *g_kernel_src =
@@ -144,8 +148,9 @@ static const char *g_kernel_src =
 "    const __private ulong *a, const __private ulong *b, \\\n"
 "    const __private ulong *n, ulong ninv) \\\n"
 "{ \\\n"
-"    ulong t[(AV) + 2]; \\\n"
-"    for (int i = 0; i < (int)(AV) + 2; i++) t[i] = 0; \\\n"
+"    ulong tbuf[2 * (AV) + 4]; \\\n"
+"    for (int i = 0; i < (int)(2 * (AV) + 4); i++) tbuf[i] = 0; \\\n"
+"    __private ulong *t = tbuf; \\\n"
 "    for (int i = 0; i < (AV); i++) { \\\n"
 "        ulong c = 0; \\\n"
 "        for (int j = 0; j < (AV); j++) { \\\n"
@@ -170,8 +175,7 @@ static const char *g_kernel_src =
 "        old = t[(AV)]; \\\n"
 "        t[(AV)] += c; \\\n"
 "        t[(AV) + 1] += (t[(AV)] < old); \\\n"
-"        for (int j = 0; j < (int)(AV) + 1; j++) \\\n"
-"            t[j] = t[j + 1]; \\\n"
+"        t++; \\\n"
 "        t[(AV) + 1] = 0; \\\n"
 "    } \\\n"
 "    if (t[(AV)] || gte_##S(t, n)) \\\n"
@@ -301,22 +305,31 @@ static __inline int kernel_index_for_al(int al)
     return KIDX_ALNL;
 }
 
-static __inline size_t local_size_for_al(int al)
+static __inline size_t local_size_for_al(int al, size_t preferred_mul)
 {
-    if (al <= 6) return 256;
-    if (al <= 10) return 192;
-    return 128;
+    size_t wave = preferred_mul ? preferred_mul : 32;
+    if (al <= 10) return wave * 2;
+    return wave;
 }
 
 static void destroy_partial(gpu_fermat_ctx *ctx)
 {
     if (!ctx) return;
     for (int s = 0; s < 2; s++) {
+        if (ctx->done_event_valid[s] && ctx->done_event[s]) {
+            clReleaseEvent(ctx->done_event[s]);
+            ctx->done_event[s] = NULL;
+            ctx->done_event_valid[s] = 0;
+        }
         if (ctx->d_cands[s]) clReleaseMemObject(ctx->d_cands[s]);
         if (ctx->d_results[s]) clReleaseMemObject(ctx->d_results[s]);
         if (ctx->queue[s]) clReleaseCommandQueue(ctx->queue[s]);
         free(ctx->h_results[s]);
         if (ctx->slot_mu_inited[s]) {
+            if (ctx->slot_cv_inited[s]) {
+                pthread_cond_destroy(&ctx->slot_cv[s]);
+                ctx->slot_cv_inited[s] = 0;
+            }
             pthread_mutex_destroy(&ctx->slot_mu[s]);
             ctx->slot_mu_inited[s] = 0;
         }
@@ -344,6 +357,12 @@ gpu_fermat_ctx *gpu_fermat_init(int device_id, size_t max_batch)
             return NULL;
         }
         ctx->slot_mu_inited[s] = 1;
+        if (pthread_cond_init(&ctx->slot_cv[s], NULL) != 0) {
+            destroy_partial(ctx);
+            free(ctx);
+            return NULL;
+        }
+        ctx->slot_cv_inited[s] = 1;
     }
 
     err = clGetPlatformIDs(0, NULL, &nplat);
@@ -556,9 +575,13 @@ int gpu_fermat_submit(gpu_fermat_ctx *ctx, int slot,
     if (count > ctx->max_batch) count = ctx->max_batch;
 
     pthread_mutex_lock(&ctx->slot_mu[slot]);
-    if (ctx->pending[slot] != 0) {
-        pthread_mutex_unlock(&ctx->slot_mu[slot]);
-        return -1;
+    while (ctx->pending[slot] != 0)
+        pthread_cond_wait(&ctx->slot_cv[slot], &ctx->slot_mu[slot]);
+
+    if (ctx->done_event_valid[slot] && ctx->done_event[slot]) {
+        clReleaseEvent(ctx->done_event[slot]);
+        ctx->done_event[slot] = NULL;
+        ctx->done_event_valid[slot] = 0;
     }
 
     int al = __atomic_load_n(&ctx->active_limbs, __ATOMIC_RELAXED);
@@ -567,12 +590,12 @@ int gpu_fermat_submit(gpu_fermat_ctx *ctx, int slot,
     int stride = al;
 
     cl_int err;
+    cl_event read_event = NULL;
     size_t cands_bytes = count * (size_t)stride * sizeof(uint64_t);
     err = clEnqueueWriteBuffer(ctx->queue[slot], ctx->d_cands[slot], CL_FALSE,
                                0, cands_bytes, candidates, 0, NULL, NULL);
     if (err != CL_SUCCESS) {
-        pthread_mutex_unlock(&ctx->slot_mu[slot]);
-        return -1;
+        goto fail;
     }
     int kidx = kernel_index_for_al(al);
     cl_kernel k = ctx->kernels[kidx] ? ctx->kernels[kidx] : ctx->kernels[KIDX_ALNL];
@@ -584,35 +607,50 @@ int gpu_fermat_submit(gpu_fermat_ctx *ctx, int slot,
     err |= clSetKernelArg(k, 2, sizeof(cl_uint), &ncount);
     err |= clSetKernelArg(k, 3, sizeof(cl_uint), &nstride);
     if (err != CL_SUCCESS) {
-        pthread_mutex_unlock(&ctx->slot_mu[slot]);
-        return -1;
+        goto fail;
     }
 
-    size_t local = local_size_for_al(al);
+    size_t preferred_mul = 0;
+    (void)clGetKernelWorkGroupInfo(k, ctx->device,
+                                   CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
+                                   sizeof(preferred_mul), &preferred_mul, NULL);
+    size_t local = local_size_for_al(al, preferred_mul);
     size_t max_wg = 0;
     if (clGetKernelWorkGroupInfo(k, ctx->device, CL_KERNEL_WORK_GROUP_SIZE,
                                  sizeof(max_wg), &max_wg, NULL) == CL_SUCCESS) {
         if (max_wg > 0 && local > max_wg) local = max_wg;
     }
+    if (preferred_mul > 0 && local > preferred_mul)
+        local = (local / preferred_mul) * preferred_mul;
     if (local < 1) local = 1;
     size_t global = ((count + local - 1) / local) * local;
     err = clEnqueueNDRangeKernel(ctx->queue[slot], k, 1,
                                  NULL, &global, &local, 0, NULL, NULL);
     if (err != CL_SUCCESS) {
-        pthread_mutex_unlock(&ctx->slot_mu[slot]);
-        return -1;
+        goto fail;
     }
 
     err = clEnqueueReadBuffer(ctx->queue[slot], ctx->d_results[slot], CL_FALSE,
-                              0, count, ctx->h_results[slot], 0, NULL, NULL);
+                              0, count, ctx->h_results[slot], 0, NULL, &read_event);
     if (err != CL_SUCCESS) {
-        pthread_mutex_unlock(&ctx->slot_mu[slot]);
-        return -1;
+        goto fail;
     }
 
+    err = clFlush(ctx->queue[slot]);
+    if (err != CL_SUCCESS) {
+        goto fail;
+    }
+
+    ctx->done_event[slot] = read_event;
+    ctx->done_event_valid[slot] = 1;
     ctx->pending[slot] = count;
     pthread_mutex_unlock(&ctx->slot_mu[slot]);
     return 0;
+
+fail:
+    if (read_event) clReleaseEvent(read_event);
+    pthread_mutex_unlock(&ctx->slot_mu[slot]);
+    return -1;
 }
 
 int gpu_fermat_collect(gpu_fermat_ctx *ctx, int slot,
@@ -630,7 +668,16 @@ int gpu_fermat_collect(gpu_fermat_ctx *ctx, int slot,
     size_t n = ctx->pending[slot];
     if (count < n) n = count;
 
-    cl_int err = clFinish(ctx->queue[slot]);
+    cl_int err;
+    if (ctx->done_event_valid[slot] && ctx->done_event[slot]) {
+        err = clWaitForEvents(1, &ctx->done_event[slot]);
+        clReleaseEvent(ctx->done_event[slot]);
+        ctx->done_event[slot] = NULL;
+        ctx->done_event_valid[slot] = 0;
+    } else {
+        /* Fallback path for robustness if submit failed before event record. */
+        err = clFinish(ctx->queue[slot]);
+    }
     if (err != CL_SUCCESS) {
         pthread_mutex_unlock(&ctx->slot_mu[slot]);
         return -1;
@@ -643,6 +690,7 @@ int gpu_fermat_collect(gpu_fermat_ctx *ctx, int slot,
         primes += results[i];
 
     ctx->pending[slot] = 0;
+    pthread_cond_broadcast(&ctx->slot_cv[slot]);
     pthread_mutex_unlock(&ctx->slot_mu[slot]);
     return primes;
 }
