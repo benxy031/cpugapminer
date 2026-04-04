@@ -295,6 +295,84 @@ static uint8_t *g_presieve_tmpl   = NULL;
 static size_t   g_presieve_period = PRESIEVE_PERIOD;
 static size_t   g_presieve_bytes  = 0;
 
+/* ── Multi-table pre-sieve covering primes 3..163 ──
+ * 17 tables (one per prime group) in odd-number encoding, 1-bit=composite.
+ * Sieve = OR of all shifted tables.  Total ≈ 126 KB; fits in L2 cache.
+ * Prime groupings mirror primesieve's PreSieveTables.hpp (same periods)
+ * plus a leading {3,5} table:
+ *   table[0]  = {  3,   5 }     period =     15 bytes
+ *   table[1]  = {  7,  23, 37 } period =  5 957 bytes
+ *   table[2]  = { 11,  19, 31 } period =  6 479 bytes
+ *   table[3]  = { 13,  17, 29 } period =  6 409 bytes
+ *   table[4]  = { 41, 163 }     period =  6 683 bytes
+ *   table[5]  = { 43, 157 }     period =  6 751 bytes
+ *   table[6]  = { 47, 151 }     period =  7 097 bytes
+ *   table[7]  = { 53, 149 }     period =  7 897 bytes
+ *   table[8]  = { 59, 139 }     period =  8 201 bytes
+ *   table[9]  = { 61, 137 }     period =  8 357 bytes
+ *   table[10] = { 67, 131 }     period =  8 777 bytes
+ *   table[11] = { 71, 127 }     period =  9 017 bytes
+ *   table[12] = { 73, 113 }     period =  8 249 bytes
+ *   table[13] = { 79, 109 }     period =  8 611 bytes
+ *   table[14] = { 83, 107 }     period =  8 881 bytes
+ *   table[15] = { 89, 103 }     period =  9 167 bytes
+ *   table[16] = { 97, 101 }     period =  9 797 bytes
+ * MPRESIEVE_SKIP_TO = 38: skip small_primes_cache[0..37] = primes 2..163. */
+#define MPRESIEVE_NTABLES  17
+#define MPRESIEVE_SKIP_TO  38  /* past prime 163; small_primes_cache[37]=163 */
+
+/* Primes in each table (0 = slot unused). */
+static const uint32_t MPS_PRIMES[MPRESIEVE_NTABLES][3] = {
+    {  3,   5,   0 },  /*  0: period =     15 */
+    {  7,  23,  37 },  /*  1: period =  5 957 */
+    { 11,  19,  31 },  /*  2: period =  6 479 */
+    { 13,  17,  29 },  /*  3: period =  6 409 */
+    { 41, 163,   0 },  /*  4: period =  6 683 */
+    { 43, 157,   0 },  /*  5: period =  6 751 */
+    { 47, 151,   0 },  /*  6: period =  7 097 */
+    { 53, 149,   0 },  /*  7: period =  7 897 */
+    { 59, 139,   0 },  /*  8: period =  8 201 */
+    { 61, 137,   0 },  /*  9: period =  8 357 */
+    { 67, 131,   0 },  /* 10: period =  8 777 */
+    { 71, 127,   0 },  /* 11: period =  9 017 */
+    { 73, 113,   0 },  /* 12: period =  8 249 */
+    { 79, 109,   0 },  /* 13: period =  8 611 */
+    { 83, 107,   0 },  /* 14: period =  8 881 */
+    { 89, 103,   0 },  /* 15: period =  9 167 */
+    { 97, 101,   0 },  /* 16: period =  9 797 */
+};
+/* Indices into small_primes_cache[] for each prime:
+ * cache: 2(0) 3(1) 5(2) 7(3) 11(4) 13(5) 17(6) 19(7) 23(8) 29(9) 31(10)
+ *        37(11) 41(12) 43(13) 47(14) 53(15) 59(16) 61(17) 67(18) 71(19)
+ *        73(20) 79(21) 83(22) 89(23) 97(24) 101(25) 103(26) 107(27)
+ *        109(28) 113(29) 127(30) 131(31) 137(32) 139(33) 149(34) 151(35)
+ *        157(36) 163(37)                                                   */
+static const uint8_t MPS_IDX[MPRESIEVE_NTABLES][3] = {
+    {  1,  2,  0 },   /*  3(1),  5(2) */
+    {  3,  8, 11 },   /*  7(3), 23(8), 37(11) */
+    {  4,  7, 10 },   /* 11(4), 19(7), 31(10) */
+    {  5,  6,  9 },   /* 13(5), 17(6), 29(9) */
+    { 12, 37,  0 },   /* 41(12), 163(37) */
+    { 13, 36,  0 },   /* 43(13), 157(36) */
+    { 14, 35,  0 },   /* 47(14), 151(35) */
+    { 15, 34,  0 },   /* 53(15), 149(34) */
+    { 16, 33,  0 },   /* 59(16), 139(33) */
+    { 17, 32,  0 },   /* 61(17), 137(32) */
+    { 18, 31,  0 },   /* 67(18), 131(31) */
+    { 19, 30,  0 },   /* 71(19), 127(30) */
+    { 20, 29,  0 },   /* 73(20), 113(29) */
+    { 21, 28,  0 },   /* 79(21), 109(28) */
+    { 22, 27,  0 },   /* 83(22), 107(27) */
+    { 23, 26,  0 },   /* 89(23), 103(26) */
+    { 24, 25,  0 },   /* 97(24), 101(25) */
+};
+
+static uint8_t  *g_mps_table[MPRESIEVE_NTABLES]; /* period+1 bytes each  */
+static uint32_t  g_mps_period[MPRESIEVE_NTABLES]; /* byte-period per table*/
+static uint32_t  g_mps_inv8[MPRESIEVE_NTABLES];   /* inv(8) mod period    */
+static uint32_t  g_mps_crt_inv[MPRESIEVE_NTABLES][2]; /* CRT inverses     */
+static int       g_mps_ready = 0;
+
 /* Per-thread CRT base residue (base mod primorial), set in set_base_bn(). */
 static __thread uint64_t tls_crt_base_residue = 0;
 
@@ -673,6 +751,199 @@ static void tile_presieve(uint8_t *sieve, size_t sieve_bytes,
             src_byte = nx;
         }
 #endif
+    }
+}
+
+/* ── Multi-table pre-sieve: init + tile ── */
+
+/* Modular inverse of a mod m (extended Euclidean, small values only). */
+static uint32_t mod_inv32(uint32_t a, uint32_t m) {
+    int64_t t = 0, nt = 1, r = (int64_t)m, nr = (int64_t)(a % m);
+    while (nr) {
+        int64_t q = r / nr, tmp;
+        tmp = t;  t = nt;  nt = tmp - q * nt;
+        tmp = r;  r = nr;  nr = tmp - q * nr;
+    }
+    return (uint32_t)(t < 0 ? t + (int64_t)m : t);
+}
+
+/* Build the 17 pre-sieve tables covering primes 3..163.
+   Each table j has period P[j] = product of its primes.
+   Bit b is set if odd number (2b+1) is a multiple of any prime in group j.
+   An extra sentinel byte at table[j][P[j]] = table[j][0] allows the
+   shifted-read code to safely peep one byte past the period boundary.   */
+static void mpresieve_init(void) {
+    int ok = 1;
+    for (int j = 0; j < MPRESIEVE_NTABLES; j++) {
+        uint32_t p0 = MPS_PRIMES[j][0];
+        uint32_t p1 = MPS_PRIMES[j][1];
+        uint32_t p2 = MPS_PRIMES[j][2];
+        uint32_t P  = p0;
+        if (p1) P *= p1;
+        if (p2) P *= p2;
+        g_mps_period[j] = P;
+
+        /* period+1 bytes (last byte = sentinel = first byte, filled below) */
+        g_mps_table[j] = (uint8_t *)calloc((size_t)P + 1, 1);
+        if (!g_mps_table[j]) { ok = 0; break; }
+
+        /* Mark composite bits for each prime in the group.
+           Bit b represents odd value (2b+1); the first composite is (p-1)/2. */
+        uint64_t total_bits = (uint64_t)P * 8;
+        for (int k = 0; k < 3; k++) {
+            uint32_t p = MPS_PRIMES[j][k];
+            if (!p) continue;
+            for (uint64_t b = (uint64_t)(p - 1) / 2; b < total_bits; b += p)
+                g_mps_table[j][b >> 3] |= (uint8_t)(1u << (b & 7));
+        }
+        /* Sentinel */
+        g_mps_table[j][P] = g_mps_table[j][0];
+
+        /* Precompute CRT inverses for offset reconstruction:
+           inv[0] = inv(p0, p1) for 2-prime CRT
+           inv[1] = inv(p0*p1, p2) for 3-prime CRT                         */
+        g_mps_crt_inv[j][0] = p1 ? mod_inv32(p0, p1) : 0;
+        g_mps_crt_inv[j][1] = p2 ? mod_inv32(p0 * p1, p2) : 0;
+
+        /* inv(8) mod P — used to recover byte_offset from odd_idx mod P. */
+        g_mps_inv8[j] = mod_inv32(8, P);
+    }
+    g_mps_ready = ok ? 1 : 0;
+}
+
+/* Tile all 17 pre-sieve tables (OR) into sieve[0..sieve_bytes).
+ *
+ * base_mod_p[k] = base mod small_primes_cache[k], available from tls cache.
+ * bm            = base mod PRESIEVE_2PERIOD (existing CRT reconstruction).
+ * L             = sieve window offset (first odd = base + L).
+ *
+ * For table j with byte-period P[j] and primes {p0, p1[, p2]}:
+ *   shift        = (odd_start_idx) & 7  (shared across all tables)
+ *   byte_off[j]  = (odd_start_idx >> 3) mod P[j]
+ *
+ * odd_start_idx mod P[j] is reconstructed via CRT from the individual
+ * per-prime residues in base_mod_p[].                                      */
+static void mpresieve_tile(uint8_t *sieve, size_t sieve_bytes,
+                           const uint64_t *base_mod_p, uint64_t L,
+                           uint64_t bm) {
+    /* shift = odd_start_idx & 7.
+       odd_start_idx = (base + L - 1) / 2; base >> L so we use bm for low bits:
+       (bm + L - 1)/2 correctly captures the bottom bits since bm = base mod M
+       and bm < 510510, so bm+L-1 fits in a reasonable integer.              */
+    unsigned shift = (unsigned)(((bm + L - 1) / 2) & 7);
+    unsigned inv   = 8u - shift;
+
+    /* Compute byte_off[j] for each table from residues in base_mod_p[]. */
+    size_t src[MPRESIEVE_NTABLES];
+    for (int j = 0; j < MPRESIEVE_NTABLES; j++) {
+        uint32_t p0 = MPS_PRIMES[j][0];
+        uint32_t p1 = MPS_PRIMES[j][1];
+        uint32_t p2 = MPS_PRIMES[j][2];
+        uint32_t P  = g_mps_period[j];
+
+        /* h_i = odd_start_idx mod p_i.
+           odd_start_idx = (base + L - 1)/2.
+           (base + L - 1) mod p = (base_mod_p[idx] + (L-1)%p) % p.
+           Divide by 2 mod p: multiply by inv2 = (p+1)/2.               */
+        uint64_t h0 = (p0) ? ((base_mod_p[MPS_IDX[j][0]] + (L-1) % p0) % p0
+                               * ((p0+1)/2) % p0) : 0;
+        uint64_t h1 = (p1) ? ((base_mod_p[MPS_IDX[j][1]] + (L-1) % p1) % p1
+                               * ((p1+1)/2) % p1) : 0;
+        uint64_t h2 = (p2) ? ((base_mod_p[MPS_IDX[j][2]] + (L-1) % p2) % p2
+                               * ((p2+1)/2) % p2) : 0;
+
+        /* CRT: combine h0, h1[, h2] → odd_start_idx mod P. */
+        uint64_t x = h0;
+        if (p1) {
+            uint64_t delta = ((h1 + p1 - x % p1) % p1
+                              * g_mps_crt_inv[j][0]) % p1;
+            x = h0 + (uint64_t)p0 * delta;
+        }
+        if (p2) {
+            uint64_t p01   = (uint64_t)p0 * p1;
+            uint64_t delta = ((h2 + p2 - x % p2) % p2
+                              * g_mps_crt_inv[j][1]) % p2;
+            x = x + p01 * delta;
+        }
+        /* byte_off[j] = (odd_start_idx >> 3) mod P
+                       = ((odd_start_idx - shift) * inv(8,P)) mod P.  */
+        uint64_t xsh = (x + P - (shift % P)) % P;
+        src[j] = (size_t)(xsh * (uint64_t)g_mps_inv8[j] % P);
+    }
+
+    /* Tile sieve in chunks that fit within each table's period. */
+    size_t out = 0;
+    while (out < sieve_bytes) {
+        /* Largest chunk where no table crosses its period boundary.
+           Each table needs src[j]+chunk <= P[j] (sentinel covers +1).   */
+        size_t chunk = sieve_bytes - out;
+        for (int j = 0; j < MPRESIEVE_NTABLES; j++) {
+            size_t avail = (size_t)g_mps_period[j] - src[j];
+            if (avail < chunk) chunk = avail;
+        }
+
+        size_t i = 0;
+        if (shift == 0) {
+            /* Byte-aligned: OR all tables directly. */
+#ifdef __SSE2__
+            for (; i + 16 <= chunk; i += 16) {
+                __m128i acc = _mm_loadu_si128(
+                    (const __m128i *)(g_mps_table[0] + src[0] + i));
+                for (int j = 1; j < MPRESIEVE_NTABLES; j++)
+                    acc = _mm_or_si128(acc, _mm_loadu_si128(
+                        (const __m128i *)(g_mps_table[j] + src[j] + i)));
+                _mm_storeu_si128((__m128i *)(sieve + out + i), acc);
+            }
+#endif
+            for (; i < chunk; i++) {
+                uint8_t v = g_mps_table[0][src[0] + i];
+                for (int j = 1; j < MPRESIEVE_NTABLES; j++)
+                    v |= g_mps_table[j][src[j] + i];
+                sieve[out + i] = v;
+            }
+        } else {
+            /* Bit-shifted: (t[i] >> shift) | (t[i+1] << inv). */
+#ifdef __SSE2__
+            const __m128i zero16 = _mm_setzero_si128();
+            const __m128i mask8  = _mm_set1_epi16(0x00FF);
+            for (; i + 16 <= chunk; i += 16) {
+                __m128i acc = _mm_setzero_si128();
+                for (int j = 0; j < MPRESIEVE_NTABLES; j++) {
+                    const uint8_t *tp = g_mps_table[j] + src[j] + i;
+                    /* Bytes 0-7 → 8 output bytes */
+                    __m128i lo8a = _mm_loadl_epi64((const __m128i *)tp);
+                    __m128i hi8a = _mm_loadl_epi64((const __m128i *)(tp + 1));
+                    __m128i c16a = _mm_or_si128(_mm_unpacklo_epi8(lo8a, zero16),
+                                   _mm_slli_epi16(_mm_unpacklo_epi8(hi8a, zero16), 8));
+                    __m128i s16a = _mm_and_si128(_mm_srli_epi16(c16a, shift), mask8);
+                    /* Bytes 8-15 → 8 output bytes */
+                    __m128i lo8b = _mm_loadl_epi64((const __m128i *)(tp + 8));
+                    __m128i hi8b = _mm_loadl_epi64((const __m128i *)(tp + 9));
+                    __m128i c16b = _mm_or_si128(_mm_unpacklo_epi8(lo8b, zero16),
+                                   _mm_slli_epi16(_mm_unpacklo_epi8(hi8b, zero16), 8));
+                    __m128i s16b = _mm_and_si128(_mm_srli_epi16(c16b, shift), mask8);
+                    acc = _mm_or_si128(acc, _mm_packus_epi16(s16a, s16b));
+                }
+                _mm_storeu_si128((__m128i *)(sieve + out + i), acc);
+            }
+#endif
+            for (; i < chunk; i++) {
+                uint8_t v = 0;
+                for (int j = 0; j < MPRESIEVE_NTABLES; j++) {
+                    const uint8_t *tp = g_mps_table[j] + src[j] + i;
+                    v |= (uint8_t)((tp[0] >> shift) | (tp[1] << inv));
+                }
+                sieve[out + i] = v;
+            }
+        }
+
+        /* Advance byte offsets, wrapping within each period. */
+        for (int j = 0; j < MPRESIEVE_NTABLES; j++) {
+            src[j] += chunk;
+            if (src[j] >= (size_t)g_mps_period[j])
+                src[j] -= (size_t)g_mps_period[j];
+        }
+        out += chunk;
     }
 }
 
@@ -1094,7 +1365,18 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
             goto sieve_main;
         }
         /* Fallback: presieve or zero (same as original path). */
-        if (g_presieve_tmpl && tls_base_mod_p_ready && tls_base_mod_p
+        if (g_mps_ready && tls_base_mod_p_ready && tls_base_mod_p
+                   && small_primes_count > MPRESIEVE_SKIP_TO) {
+            uint64_t bm = (tls_base_mod_p[1] * 170170ULL
+                         + tls_base_mod_p[2] * 306306ULL
+                         + tls_base_mod_p[3] * 145860ULL
+                         + tls_base_mod_p[4] *  46410ULL
+                         + tls_base_mod_p[5] * 157080ULL
+                         + tls_base_mod_p[6] * 450450ULL)
+                         % PRESIEVE_2PERIOD;
+            mpresieve_tile(bits, bit_size, tls_base_mod_p, L, bm);
+            crt_skip_to = MPRESIEVE_SKIP_TO;
+        } else if (g_presieve_tmpl && tls_base_mod_p_ready && tls_base_mod_p
                    && small_primes_count > 6) {
             uint64_t bm = (tls_base_mod_p[1] * 170170ULL
                          + tls_base_mod_p[2] * 306306ULL
@@ -1139,6 +1421,18 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
         size_t sb = wheel_sieve_start_bit(base_mod_w, L);
         wheel_sieve_tile(bits, bit_size, sb);
         crt_skip_to = (int)wheel_sieve_skip_to();
+    } else if (g_mps_ready && tls_base_mod_p_ready && tls_base_mod_p
+               && small_primes_count > MPRESIEVE_SKIP_TO) {
+        /* Multi-table pre-sieve: covers primes 3..163 (~37 primes). */
+        uint64_t bm = (tls_base_mod_p[1] * 170170ULL
+                     + tls_base_mod_p[2] * 306306ULL
+                     + tls_base_mod_p[3] * 145860ULL
+                     + tls_base_mod_p[4] *  46410ULL
+                     + tls_base_mod_p[5] * 157080ULL
+                     + tls_base_mod_p[6] * 450450ULL)
+                     % PRESIEVE_2PERIOD;
+        mpresieve_tile(bits, bit_size, tls_base_mod_p, L, bm);
+        crt_skip_to = MPRESIEVE_SKIP_TO;
     } else if (g_presieve_tmpl && tls_base_mod_p_ready && tls_base_mod_p
                && small_primes_count > 6) {
         /* Pre-sieve template: mark composites of {3,5,7,11,13,17}.
@@ -5687,16 +5981,25 @@ int main(int argc, char **argv) {
         cli_sieve_prime_limit = 100;
     }
 
-    /* Build generic pre-sieve template (primes 3..17). */
+    /* Build generic pre-sieve template (primes 3..17) and multi-table
+       pre-sieve covering primes 3..163 (17 tables, ~126 KB total). */
     presieve_template_init();
-    log_msg("presieve: %u-byte template built%s\n",
-            (unsigned)g_presieve_bytes,
-#ifdef __AVX2__
-            " (AVX2 tiling)"
+    mpresieve_init();
+    {
+        uint32_t total_kb = 0;
+        for (int j = 0; j < MPRESIEVE_NTABLES; j++)
+            total_kb += g_mps_period[j];
+        log_msg("presieve: %u-byte single-template + multi-table (%d tables, ~%u KB)%s\n",
+                (unsigned)g_presieve_bytes,
+                g_mps_ready ? MPRESIEVE_NTABLES : 0,
+                (total_kb + 512) / 1024,
+#ifdef __SSE2__
+                " (SSE2 OR-tile)"
 #else
-            ""
+                ""
 #endif
-            );
+                );
+    }
     if (use_wheel_sieve) {
         if (wheel_sieve_configure(cli_wheel_sieve) != 0) {
                 log_msg("invalid --wheel-sieve value %u (use 30, 210, 2310, 30030, 510510, or 9699690)\n",
