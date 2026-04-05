@@ -213,6 +213,63 @@ static volatile int use_mr_verify = 0;   /* MR base-3 verify Fermat survivors */
 static volatile int no_primality = 0;   /* skip all probable‑prime filtering */
 static volatile int selftest = 0;        /* run a quick internal test then exit */
 
+/* Extra-verbose live merit stream (log-file only).
+   Emits best-merit updates and qualifying-gap merits while mining. */
+static inline void log_extra_merit_event(const char *kind,
+                                         const char *source,
+                                         double merit,
+                                         uint64_t gap,
+                                         double target) {
+    if (!use_extra_verbose) return;
+    log_file_only("[extra-merit] kind=%s source=%s merit=%.6f gap=%llu last_gap=%llu target=%.2f\n",
+                  kind ? kind : "event",
+                  source ? source : "unknown",
+                  merit,
+                  (unsigned long long)gap,
+                  (unsigned long long)stats_last_gap,
+                  target);
+}
+
+/* Ongoing extra-verbose merit stream (log-file only).
+   Emits one interval-best sample line every 10 seconds per thread. */
+static inline void log_extra_merit_sample(const char *source,
+                                          double merit,
+                                          uint64_t gap,
+                                          double target) {
+    if (!use_extra_verbose) return;
+    static __thread uint64_t tls_last_emit_ms = 0;
+    static __thread double   tls_best_merit = -1.0;
+    static __thread uint64_t tls_best_gap = 0;
+    static __thread double   tls_best_target = 0.0;
+    static __thread const char *tls_best_source = NULL;
+
+    if (merit > tls_best_merit) {
+        tls_best_merit = merit;
+        tls_best_gap = gap;
+        tls_best_target = target;
+        tls_best_source = source;
+    }
+
+    uint64_t now = now_ms();
+    if (tls_last_emit_ms == 0) {
+        tls_last_emit_ms = now;
+        return;
+    }
+
+    if (now - tls_last_emit_ms < 10000)
+        return;
+
+    tls_last_emit_ms = now;
+    if (tls_best_merit >= 0.0) {
+        log_extra_merit_event("sample", tls_best_source ? tls_best_source : source,
+                              tls_best_merit, tls_best_gap, tls_best_target);
+    }
+    tls_best_merit = -1.0;
+    tls_best_gap = 0;
+    tls_best_target = 0.0;
+    tls_best_source = NULL;
+}
+
 #define PARTIAL_SIEVE_MIN_LIMIT     4000000ULL
 #define PARTIAL_SIEVE_ADAPT_EVERY   16U
 #define PARTIAL_SIEVE_COOLDOWN_WIN  12U
@@ -235,12 +292,10 @@ static int cli_sample_stride = DEFAULT_SAMPLE_STRIDE;
    10 rounds cost ~5× more but added negligible confidence.                  */
 static int cli_mr_rounds = 2;
 
-/* Scan-stride merit (non-CRT only).  When > 0, the backward-scan jump stride
-   (needed_gap) is computed from this value instead of --target / network merit.
-   This lets you set a high stride (e.g. 38 for record hunting) while still
-   submitting every gap that meets the network difficulty.
-   0 = use target_local (default: stride == submit threshold). */
-static double g_scan_merit = 0.0;
+/* Scan threshold used by non-CRT smart-scan stride.  This is the effective
+    runtime value after applying defaults and mode-specific safety rules.
+    It is kept for stats/log display alongside the submit threshold. */
+static volatile double g_scan_target_runtime = 20.0;
 /* One-time warning guard for CPU smart-scan stride clamping. */
 static volatile int g_warn_scan_merit_cpu_clamped = 0;
 
@@ -764,6 +819,7 @@ static void tile_presieve(uint8_t *sieve, size_t sieve_bytes,
 #  pragma GCC target("sse2")
 #  include <emmintrin.h>
 #endif
+#include "mpresieve_avx512.h"
 
 /* Modular inverse of a mod m (extended Euclidean, small values only). */
 static uint32_t mod_inv32(uint32_t a, uint32_t m) {
@@ -894,6 +950,11 @@ static void mpresieve_tile(uint8_t *sieve, size_t sieve_bytes,
         size_t i = 0;
         if (shift == 0) {
             /* Byte-aligned: OR all tables directly. */
+#ifdef __AVX512BW__
+            /* AVX-512BW: 64 bytes/iter, masked tail — handles all of chunk. */
+            i = mpresieve_avx512_aligned(sieve + out, chunk,
+                                         g_mps_table, src, MPRESIEVE_NTABLES);
+#endif
 #ifdef __SSE2__
             for (; i + 16 <= chunk; i += 16) {
                 __m128i acc = _mm_loadu_si128(
@@ -912,6 +973,11 @@ static void mpresieve_tile(uint8_t *sieve, size_t sieve_bytes,
             }
         } else {
             /* Bit-shifted: (t[i] >> shift) | (t[i+1] << inv). */
+#ifdef __AVX512BW__
+            /* AVX-512BW: 64 bytes/iter, full blocks only; tail handled below. */
+            i = mpresieve_avx512_shifted(sieve + out, chunk, shift,
+                                         g_mps_table, src, MPRESIEVE_NTABLES);
+#endif
 #ifdef __SSE2__
             const __m128i zero16 = _mm_setzero_si128();
             const __m128i mask8  = _mm_set1_epi16(0x00FF);
@@ -995,18 +1061,57 @@ static double ndiff_to_merit(uint64_t ndiff) {
     return (double)ndiff / (double)(1ULL << 48);
 }
 
-/* Keep runtime target in sync with current pass difficulty unless user
-   explicitly overrode --target. */
-static void refresh_target_from_ndiff(int target_explicit, double *target,
-                                      uint64_t ndiff) {
-    if (!target || target_explicit || ndiff == 0) return;
-    double net_merit = ndiff_to_merit(ndiff);
-    if (fabs(*target - net_merit) > 1e-12) {
-        *target = net_merit;
-        g_mining_target = net_merit;
-        log_msg("network difficulty: %.6f merit (nDifficulty=%llu)\n",
-                net_merit, (unsigned long long)ndiff);
+static double resolve_scan_target(double submit_target, double scan_target_cfg) {
+    double scan_target = (scan_target_cfg > 0.0) ? scan_target_cfg : submit_target;
+
+    if (scan_target > submit_target) {
+    /* Clamp only when CPU smart-scan is active (non-CRT, sample stride > 1).
+       With sample-stride=1, smart-scan is disabled and scan-merit is inert. */
+    int clamp_for_cpu = (g_crt_mode == CRT_MODE_NONE && cli_sample_stride > 1);
+#ifdef WITH_GPU_FERMAT
+    if (clamp_for_cpu)
+        clamp_for_cpu = (g_gpu_count == 0);
+#endif
+        if (clamp_for_cpu) {
+            if (__sync_bool_compare_and_swap(&g_warn_scan_merit_cpu_clamped, 0, 1)) {
+                log_msg("scan-merit %.2f > submit target %.2f on CPU smart-scan; "
+                        "clamping scan threshold to submit target\n",
+                        scan_target, submit_target);
+            }
+            scan_target = submit_target;
+        }
     }
+
+    return scan_target;
+}
+
+/* Keep runtime submit threshold in sync with pass difficulty unless user
+   explicitly overrode --target.  If --scan-merit was not provided (or reset
+   with <=0), scan threshold follows submit threshold. */
+static double refresh_runtime_targets(int target_explicit,
+                                      int scan_target_explicit,
+                                      double *submit_target,
+                                      double *scan_target_cfg,
+                                      uint64_t ndiff) {
+    if (!submit_target || !scan_target_cfg)
+        return 0.0;
+
+    if (!target_explicit && ndiff != 0) {
+        double net_merit = ndiff_to_merit(ndiff);
+        if (fabs(*submit_target - net_merit) > 1e-12) {
+            *submit_target = net_merit;
+            log_msg("network difficulty: %.6f merit (nDifficulty=%llu)\n",
+                    net_merit, (unsigned long long)ndiff);
+        }
+    }
+
+    if (!scan_target_explicit)
+        *scan_target_cfg = *submit_target;
+
+    double scan_target = resolve_scan_target(*submit_target, *scan_target_cfg);
+    g_mining_target = *submit_target;
+    g_scan_target_runtime = scan_target;
+    return scan_target;
 }
 
 static void print_stats(void) {
@@ -1044,6 +1149,7 @@ static void print_stats(void) {
        Est = 1 / (pairs/s × e^(-target)).  Uses the rolling 30s rate
        for responsiveness. */
     double target_m = g_mining_target;
+    double scan_target_m = g_scan_target_runtime;
     char est_buf[64] = "n/a";
     double prob_pair = (target_m > 0) ? exp(-target_m) : 0.0;
     if (pairs_rate > 0 && prob_pair > 0) {
@@ -1083,7 +1189,7 @@ static void print_stats(void) {
         log_msg("STATS: elapsed=%.1fs  sieved=%llu (%.0f/s)  tested=%llu (%.0f/s)  "
             "pps=%.0f  primes=%llu (%.1f%%)  "
             "gaps=%llu (%.3f/s)  built=%llu  submitted=%llu  accepted=%llu  "
-            "prob=%.2e/pair  est=%s  avg_gap=%s (target=%.4f)  best=%.2f (gap=%llu)  last_gap=%llu  last_qual_gap=%llu",
+            "prob=%.2e/pair  est=%s  avg_gap=%s (submit=%.4f scan=%.4f)  best=%.2f (gap=%llu)  last_gap=%llu  last_qual_gap=%llu",
             elapsed,
             (unsigned long long)stats_sieved,  sieve_rate,
             (unsigned long long)stats_tested,  test_rate,
@@ -1094,7 +1200,7 @@ static void print_stats(void) {
             (unsigned long long)stats_blocks,
             (unsigned long long)stats_submits,
             (unsigned long long)stats_success,
-            prob_pair, est_buf, avg_gap_buf, target_m,
+            prob_pair, est_buf, avg_gap_buf, target_m, scan_target_m,
             bm, (unsigned long long)stats_best_gap,
             (unsigned long long)stats_last_gap,
             (unsigned long long)stats_last_qual_gap);
@@ -3499,6 +3605,8 @@ static size_t crt_bkscan_and_submit(
             uint64_t gap = surv[j] - last_prime;
             double merit = (double)gap / logbase;
             last_gap_local = gap;
+            stats_last_gap = gap;
+            log_extra_merit_sample("crt-linear", merit, gap, target);
 
             if (merit > best_merit_loc) {
                 best_merit_loc = merit;
@@ -3517,6 +3625,8 @@ static size_t crt_bkscan_and_submit(
     if (best_merit_loc > stats_best_merit) {
         stats_best_merit = best_merit_loc;
         stats_best_gap = best_gap_local;
+        log_extra_merit_event("best", "crt-linear", best_merit_loc,
+                              best_gap_local, target);
     }
     if (best_gap_local > stats_crt_consumer_best_gap)
         stats_crt_consumer_best_gap = best_gap_local;
@@ -3546,6 +3656,7 @@ static size_t crt_bkscan_and_submit(
 
         __sync_fetch_and_add(&stats_gaps, 1);
         stats_last_qual_gap = gap;
+        log_extra_merit_event("qual", "crt-linear", merit, gap, target);
 
         mpz_t nAdd_prime;
         mpz_init(nAdd_prime);
@@ -3615,9 +3726,11 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
         uint64_t gap = primes[i + 1] - primes[i];
         double merit = (double)gap / logbase;
         stats_last_gap = gap;
+        log_extra_merit_sample("crt-gpu", merit, gap, target);
         if (merit > stats_best_merit) {
             stats_best_merit = merit;
             stats_best_gap   = gap;
+            log_extra_merit_event("best", "crt-gpu", merit, gap, target);
         }
         if (merit < target) continue;
 
@@ -3638,6 +3751,7 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
 
         stats_last_qual_gap = gap;
         __sync_fetch_and_add(&stats_gaps, 1);
+        log_extra_merit_event("qual", "crt-gpu", merit, gap, target);
         mpz_t nAdd_prime;
         mpz_init(nAdd_prime);
         mpz_add_u64(nAdd_prime, nAdd, primes[i]);
@@ -3994,6 +4108,7 @@ struct worker_args {
     int64_t adder_max;
     uint64_t sieve_size;
     double target;
+    double scan_target;
     const char *header;
     const char *rpc_url;
     const char *rpc_user;
@@ -4181,12 +4296,15 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
         uint64_t gap   = q - prev;
         double merit   = (double)gap / logbase;
         stats_last_gap = gap;
+        log_extra_merit_sample("scan-candidates", merit, gap, target_local);
         /* Track best merit seen (lock-free: small races are harmless).
            Updated for ALL pairs so the stats display shows progress.
            Note: smart-scan false gaps may inflate this — cosmetic only. */
         if (merit > stats_best_merit) {
             stats_best_merit = merit;
             stats_best_gap   = gap;
+            log_extra_merit_event("best", "scan-candidates", merit, gap,
+                                  target_local);
         }
         if (merit < target_local)
             continue;
@@ -4258,6 +4376,8 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
 
         stats_last_qual_gap = gap;
         __sync_fetch_and_add(&stats_gaps, 1);
+        log_extra_merit_event("qual", "scan-candidates", merit, gap,
+                      target_local);
         /* nAdd = relative offset = prev (prime = base + nAdd). */
         uint64_t nadd_sc = prev;
         log_msg("\n>>> GAP FOUND\n"
@@ -4466,28 +4586,8 @@ static void *worker_fn(void *arg) {
     int64_t  adder_max_local        = wa->adder_max;
     uint64_t sieve_size_local       = wa->sieve_size;
     double   target_local           = wa->target;
-    /* scan_target controls the backward-scan jump stride (needed_gap).
-       When --scan-merit is set it can be larger than target_local so the
-       scan skips dense prime clusters more aggressively while still submitting
-       every gap >= target_local (network merit).  Defaults to target_local. */
-    double   scan_target            = (g_scan_merit > 0.0) ? g_scan_merit : target_local;
-    /* CPU backward-scan cannot safely guarantee all network-threshold gaps
-       when stride target is raised above submit target.  Clamp on CPU-only
-       runs so share correctness matches estimated target. */
-    if (scan_target > target_local) {
-        int clamp_for_cpu = 1;
-#ifdef WITH_GPU_FERMAT
-        clamp_for_cpu = (g_gpu_count == 0);
-#endif
-        if (clamp_for_cpu) {
-            scan_target = target_local;
-            if (__sync_bool_compare_and_swap(&g_warn_scan_merit_cpu_clamped, 0, 1)) {
-                log_msg("scan-merit %.2f > target %.2f on CPU smart-scan; "
-                        "clamping stride to target for share correctness\n",
-                        g_scan_merit, target_local);
-            }
-        }
-    }
+    /* scan_target controls backward-scan jump stride (needed_gap). */
+    double   scan_target            = wa->scan_target;
     int64_t  adder_base_offset_local = wa->adder_base_offset;
     int      rpc_thread_local       = wa->rpc_thread;
     const char *header_local = NULL, *rpc_url_local = NULL, *rpc_user_local = NULL;
@@ -5431,9 +5531,14 @@ static void *worker_fn(void *arg) {
                             double merit_s = (double)gap_s / logbase;
                             stats_crt_consumer_last_gap = gap_s;
                             stats_last_gap = gap_s;
+                            log_extra_merit_sample("bkscan-sample", merit_s,
+                                                   gap_s, target_local);
                             if (merit_s > stats_best_merit) {
                                 stats_best_merit = merit_s;
                                 stats_best_gap   = gap_s;
+                                log_extra_merit_event("best", "bkscan-sample",
+                                                      merit_s, gap_s,
+                                                      target_local);
                             }
 
                             /* Do not drop qualifying pairs that appear in
@@ -5485,6 +5590,10 @@ static void *worker_fn(void *arg) {
                     if (res_w.best_merit > stats_best_merit) {
                         stats_best_merit = res_w.best_merit;
                         stats_best_gap   = res_w.best_gap;
+                        log_extra_merit_event("best", "bkscan-worker",
+                                              res_w.best_merit,
+                                              res_w.best_gap,
+                                              target_local);
                     }
 
                     /* Submit qualifying gaps */
@@ -5731,11 +5840,11 @@ int main(int argc, char **argv) {
         printf("      --sieve-primes N  number of sieve primes (GapMiner-compatible)\n");
         printf("                        N primes -> largest ~ N*ln(N); default = 900000\n");
         printf("      --target T        minimum merit         (default: 20.0)\n");
-        printf("      --scan-merit M    backward-scan stride merit (non-CRT only).\n");
-        printf("                        When set, the scan jumps M*ln(p) ahead for efficiency\n");
-        printf("                        but still submits all gaps >= --target (or network merit).\n");
-        printf("                        Example: --target 20.4 --scan-merit 38 hunts records\n");
-        printf("                        while still submitting pool shares.\n");
+        printf("      --scan-merit M    scan threshold for non-CRT CPU smart-scan stride.\n");
+        printf("                        submit threshold remains --target (or network merit).\n");
+        printf("                        M<=0 (or omitted) follows submit threshold automatically.\n");
+        printf("                        CPU-only runs clamp scan threshold to submit threshold.\n");
+        printf("                        ignored in CRT mode and non-beneficial on CUDA/OpenCL paths.\n");
         printf("      --threads N       worker threads        (default: 1)\n");
         printf("      --adder-max M     adder upper bound     (default: 2^shift)\n");
         printf("      --fast-fermat     fast primality (fewer Miller-Rabin rounds)\n");
@@ -5744,7 +5853,7 @@ int main(int argc, char **argv) {
         printf("      --partial-sieve       alias for --partial-sieve-auto\n");
         printf("      --adaptive-presieve   skip dense non-CRT windows after presieve\n");
         printf("      --wheel-sieve N      use wheel presieve backend (0 disables; 30, 210, 2310, 30030, 510510, or 9699690)\n");
-        printf("  -e, --extra-verbose  write partial-sieve-auto details to log file\n");
+        printf("  -e, --extra-verbose  write live merit events + partial-sieve-auto details to log file\n");
         printf("      --sample-stride K smart scan: test every Kth survivor (default: 8, 1=off)\n");
         printf("      --mr-rounds N     Miller-Rabin rounds for primality  (default: 2)\n");
         printf("      --mr-verify       MR base-3 verify Fermat/GPU survivors (catches pseudoprimes)\n");
@@ -5776,7 +5885,10 @@ int main(int argc, char **argv) {
        (p = sha256(header) << shift + adder must be unique per header). */
     uint64_t sieve_size = 33554432;
     double target = 20.0;
+    double scan_target_cfg = 0.0;
+    double scan_target_runtime = 20.0;
     int target_explicit = 0;  /* set to 1 if user passes --target */
+    int scan_target_explicit = 0; /* set to 1 if user passes --scan-merit > 0 */
     int cli_sieve_explicit = 0; /* set to 1 if user passes --sieve-primes */
     unsigned int cli_wheel_sieve = 0;
     const char *rpc_url = NULL, *rpc_user = NULL, *rpc_pass = NULL, *rpc_method = "getwork";
@@ -5815,7 +5927,16 @@ int main(int argc, char **argv) {
             /* Limit is computed from count after arg parsing (PNT upper bound). */
         }
         else if (!strcmp(argv[i],"--target") && i+1<argc) { target = atof(argv[++i]); target_explicit = 1; }
-        else if (!strcmp(argv[i],"--scan-merit") && i+1<argc) { g_scan_merit = atof(argv[++i]); }
+        else if (!strcmp(argv[i],"--scan-merit") && i+1<argc) {
+            double scan_merit = atof(argv[++i]);
+            if (scan_merit > 0.0) {
+                scan_target_cfg = scan_merit;
+                scan_target_explicit = 1;
+            } else {
+                scan_target_cfg = 0.0;
+                scan_target_explicit = 0;
+            }
+        }
         else if ((!strcmp(argv[i],"-o") || !strcmp(argv[i],"--host")) && i+1<argc) rpc_host = argv[++i];
         else if ((!strcmp(argv[i],"-p") || !strcmp(argv[i],"--port")) && i+1<argc) rpc_port = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--stratum") && i+1<argc) stratum_arg = argv[++i];
@@ -6303,11 +6424,21 @@ int main(int argc, char **argv) {
              *   merit = nDifficulty / 2^48
              * Use this as the minimum merit threshold unless the user
              * explicitly set --target to override it. */
-            refresh_target_from_ndiff(target_explicit, &target, g_pass.ndiff);
+            scan_target_runtime = refresh_runtime_targets(
+                target_explicit,
+                scan_target_explicit,
+                &target,
+                &scan_target_cfg,
+                g_pass.ndiff);
         }
     }
 #endif
-    g_mining_target = target;   /* publish for print_stats block-prob display */
+    scan_target_runtime = refresh_runtime_targets(
+        target_explicit,
+        scan_target_explicit,
+        &target,
+        &scan_target_cfg,
+        0);
     atexit(print_stats);
     /* free thread-local sieve buffers when the process exits */
     atexit(free_sieve_buffers);
@@ -6332,13 +6463,22 @@ int main(int argc, char **argv) {
         if (cli_sieve_prime_limit > crt_limit) {
             const char *mlabel = (crt_fermat_threads == 0)
                                  ? "monolithic" : "producer-consumer";
-            log_msg("CRT %s: capping sieve-prime-limit %llu -> %llu "
-                    "(gap_scan=%llu)\n",
-                    mlabel,
-                    (unsigned long long)cli_sieve_prime_limit,
-                    (unsigned long long)crt_limit,
-                    (unsigned long long)gap_scan);
-            cli_sieve_prime_limit = crt_limit;
+            if (cli_sieve_explicit) {
+                log_msg("CRT %s: keeping explicit --sieve-primes limit %llu "
+                        "(auto-cap suggestion %llu, gap_scan=%llu)\n",
+                        mlabel,
+                        (unsigned long long)cli_sieve_prime_limit,
+                        (unsigned long long)crt_limit,
+                        (unsigned long long)gap_scan);
+            } else {
+                log_msg("CRT %s: capping sieve-prime-limit %llu -> %llu "
+                        "(gap_scan=%llu)\n",
+                        mlabel,
+                        (unsigned long long)cli_sieve_prime_limit,
+                        (unsigned long long)crt_limit,
+                        (unsigned long long)gap_scan);
+                cli_sieve_prime_limit = crt_limit;
+            }
         }
     }
 
@@ -6413,6 +6553,14 @@ int main(int argc, char **argv) {
                 shift, log_sieve_sz,
                 (unsigned long)small_primes_count,
                 small_primes_count > 0 ? (unsigned long long)small_primes_cache[small_primes_count-1] : 0ULL);
+        log_msg("merit thresholds: submit=%.4f  scan=%.4f\n",
+            target, scan_target_runtime);
+        if (cli_sieve_explicit) {
+            log_msg("sieve-primes explicit: requested_count=%llu  effective_limit=%llu  loaded_count=%lu\n",
+                (unsigned long long)cli_sieve_prime_count,
+                (unsigned long long)cli_sieve_prime_limit,
+                (unsigned long)small_primes_count);
+        }
     }
     if (keep_going)
         log_msg("default behaviour: will continue mining after finding a valid block\n");
@@ -6432,7 +6580,7 @@ int main(int argc, char **argv) {
                 (unsigned long long)PARTIAL_SIEVE_MIN_LIMIT,
                 (unsigned)PARTIAL_SIEVE_COOLDOWN_WIN);
     if (use_extra_verbose)
-        log_file_only("partial sieve auto: extra verbose enabled (-e/--extra-verbose)\n");
+        log_file_only("extra verbose enabled (-e/--extra-verbose): live merit events + partial-sieve-auto details\n");
     if (use_crt_auto_split)
         log_msg("CRT auto split: enabled (--crt-auto-split)\n");
 
@@ -6484,6 +6632,12 @@ int main(int argc, char **argv) {
 #endif
     if (num_threads <= 1) {
         do {
+            scan_target_runtime = refresh_runtime_targets(
+                target_explicit,
+                scan_target_explicit,
+                &target,
+                &scan_target_cfg,
+                0);
             int64_t num_windows = ((int64_t)adder_max + (int64_t)sieve_size - 1) / (int64_t)sieve_size;
             double logbase = uint256_log_approx(h256, shift);
             set_base_bn(h256, shift);
@@ -6731,7 +6885,7 @@ int main(int argc, char **argv) {
                     free(p1_arr);
                     __sync_fetch_and_add(&stats_tested, (uint64_t)p1n);
 
-                    size_t needed = (size_t)(target * logbase);
+                    size_t needed = (size_t)(scan_target_runtime * logbase);
                     if (needed < 2) needed = 2;
 
                     /* Identify gap regions (boundaries only) */
@@ -6948,7 +7102,12 @@ int main(int argc, char **argv) {
                 char sdata[161]; uint64_t sndiff;
                 if (stratum_poll_new_work(g_stratum, sdata, &sndiff)) {
                     build_mining_pass_stratum(sdata, sndiff, shift);
-                    refresh_target_from_ndiff(target_explicit, &target, g_pass.ndiff);
+                    scan_target_runtime = refresh_runtime_targets(
+                        target_explicit,
+                        scan_target_explicit,
+                        &target,
+                        &scan_target_cfg,
+                        g_pass.ndiff);
                     memcpy(h256, g_pass.h256, 32);
                     free((char*)header);
                     header = strdup(g_pass.prevhex);
@@ -6959,7 +7118,12 @@ int main(int argc, char **argv) {
               } else {
                 sq_drain();
                 if (build_mining_pass(rpc_url, rpc_user, rpc_pass, shift)) {
-                    refresh_target_from_ndiff(target_explicit, &target, g_pass.ndiff);
+                    scan_target_runtime = refresh_runtime_targets(
+                        target_explicit,
+                        scan_target_explicit,
+                        &target,
+                        &scan_target_cfg,
+                        g_pass.ndiff);
                     memcpy(h256, g_pass.h256, 32);
                     if (g_pass.prevhex[0] && strcmp(g_pass.prevhex, header ? header : "") != 0) {
                         free((char*)header);
@@ -6996,6 +7160,12 @@ int main(int argc, char **argv) {
         uint64_t split_prev_push_ok = 0, split_prev_push_rep = 0, split_prev_push_drop = 0;
         uint64_t split_prev_pop_ok = 0, split_prev_pop_empty = 0, split_prev_waits = 0;
         do {
+            scan_target_runtime = refresh_runtime_targets(
+                target_explicit,
+                scan_target_explicit,
+                &target,
+                &scan_target_cfg,
+                0);
             g_abort_pass = 0;
             if (use_crt_auto_split && g_crt_mode == CRT_MODE_SOLVER && auto_fermat_threads > 0) {
                 uint64_t cur_push_ok = stats_crt_heap_push_ok;
@@ -7085,6 +7255,7 @@ int main(int argc, char **argv) {
                 wargs[t].shift             = shift;
                 wargs[t].sieve_size        = sieve_size;
                 wargs[t].target            = target;
+                wargs[t].scan_target       = scan_target_runtime;
                 wargs[t].header            = header;
                 wargs[t].rpc_url           = rpc_url;
                 wargs[t].rpc_user          = rpc_user;
@@ -7115,7 +7286,12 @@ int main(int argc, char **argv) {
                 char sdata[161]; uint64_t sndiff;
                 if (stratum_poll_new_work(g_stratum, sdata, &sndiff)) {
                     build_mining_pass_stratum(sdata, sndiff, shift);
-                    refresh_target_from_ndiff(target_explicit, &target, g_pass.ndiff);
+                    scan_target_runtime = refresh_runtime_targets(
+                        target_explicit,
+                        scan_target_explicit,
+                        &target,
+                        &scan_target_cfg,
+                        g_pass.ndiff);
                     memcpy(h256, g_pass.h256, 32);
                     free((char*)header);
                     header = strdup(g_pass.prevhex);
@@ -7126,7 +7302,12 @@ int main(int argc, char **argv) {
                 /* Drain submit queue before getwork to keep mapNewBlock consistent. */
                 sq_drain();
                 if (build_mining_pass(rpc_url, rpc_user, rpc_pass, shift)) {
-                    refresh_target_from_ndiff(target_explicit, &target, g_pass.ndiff);
+                    scan_target_runtime = refresh_runtime_targets(
+                        target_explicit,
+                        scan_target_explicit,
+                        &target,
+                        &scan_target_cfg,
+                        g_pass.ndiff);
                     memcpy(h256, g_pass.h256, 32);
                     if (g_pass.prevhex[0] && strcmp(g_pass.prevhex, header ? header : "") != 0) {
                         free((char*)header);

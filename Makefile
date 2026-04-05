@@ -99,4 +99,7 @@ clean:
 gen_crt: $(BINDIR) tools/gen_crt.c
 	$(CC) -O2 -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -o $(BINDIR)/gen_crt tools/gen_crt.c -lm -lpthread
 
-.PHONY: all clean gen_crt
+gen_crt_exhaust: $(BINDIR) tools/gen_crt_exhaust.c
+	$(CC) -O3 -std=c11 -Wall -Wextra -march=native -o $(BINDIR)/gen_crt_exhaust tools/gen_crt_exhaust.c -lgmp -lm
+
+.PHONY: all clean gen_crt gen_crt_exhaust
