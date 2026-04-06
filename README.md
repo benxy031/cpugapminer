@@ -16,6 +16,8 @@ src/
   sieve_cache.h / .c- sieve-prime and trial-division cache management
   gap_scan.h / .c   - gap scanning helpers (backward scan/interior checks)
   crt_heap.h / .c   - CRT producer-consumer heap queue and work-item helpers
+  crt_gap_scan.h/.c - CRT solver gap-window policy (mode parsing + window
+                      sizing helpers)
   presieve_utils.h/.c
                     - pre-sieve buffer utilities for helper/worker pipeline
   block_utils.h / .c- block serialization/encoding helpers (LE writes,
@@ -221,6 +223,20 @@ bin/gap_miner \
   --crt-file crt/crt_s64_m21.txt
 ```
 
+With CRT gap-window floor tuning (example):
+
+```sh
+bin/gap_miner \
+  --rpc-url  http://127.0.0.1:31397/ \
+  --rpc-user USER \
+  --rpc-pass PASS \
+  --shift 64 \
+  --threads 6 \
+  --fast-fermat \
+  --crt-file crt/crt_s64_m21.txt \
+  --crt-gap-scan original-floor=12000
+```
+
 With CRT at shift 512 (high-merit mining, default monolithic mode):
 
 ```sh
@@ -254,7 +270,7 @@ Capture output to a file as well:
 bin/gap_miner ... --log-file miner.log
 ```
 
-## Recent changes (March 2026)
+## Recent changes (March-April 2026)
 
 This section summarizes behavior that changed recently and may differ from
 older logs, scripts, or command lines.
@@ -351,6 +367,23 @@ Interpretation rule of thumb:
 - When persistent queue underfill is detected, the miner can trigger a
   controlled pass restart so a new split can take effect immediately instead of
   waiting for a naturally ending pass.
+
+### CRT gap-window policy flags
+
+Text CRT solver runs (`--crt-file ...txt`) now expose explicit gap-window
+selection:
+
+- `--crt-gap-scan fixed` (default): `max(2*gap_target,10000)`
+- `--crt-gap-scan original`: `ceil(target*ln(start))`, clamped to `[8,gap_target]`
+- `--crt-gap-scan original-floor`: `max(original,FLOOR)`
+
+The floor can be set with `--crt-gap-scan-floor N` (default `10000`) or inline
+as `--crt-gap-scan original-floor=N`.
+
+Aliases are accepted for convenience:
+
+- `orig`, `dynamic` -> `original`
+- `orig-floor`, `dynamic-floor`, `hybrid` -> `original-floor`
 
 ### 8-at-a-time sieve inner-loop marking
 
@@ -764,26 +797,36 @@ The CRT mining loop:
    At shift 64 with 15 primes, primorial ≈ 2^59 gives only **~15 candidate
    nAdd values** per hash.  At shift 512 with 75 primes, primorial ≈ 2^510
    ≈ 2^shift so there is effectively **one candidate per hash**.
-4. **Sieve** a small forward region (2 × gap_target ≈ 23 424 positions) using
-   ~1M small primes, then **Fermat-test all survivors** (~683 at shift 512)
-   to find consecutive primes and measure the gap.
+4. **Sieve** a small forward region sized by the CRT gap-window policy (`--crt-gap-scan`, default `fixed`) using ~1M small primes, then **Fermat-test all survivors** (~683 at shift 512 in a representative setup) to find consecutive primes and measure the gap.
 5. **Report** — qualifying gaps (merit ≥ target) are passed to the standard
    `scan_candidates` path for block assembly and submission.
+
+CRT gap-window policies (`--crt-gap-scan MODE`, solver text files only):
+
+- **fixed** (default): `max(2*gap_target,10000)`
+- **original**: `ceil(target*ln(start))`, clamped to `[8,gap_target]`
+- **original-floor**: `max(original,FLOOR)`, where `FLOOR` comes from
+  `--crt-gap-scan-floor N` (default 10000)
+
+Inline floor assignment is also accepted:
+`--crt-gap-scan original-floor=12000`.
 
 The normal large windowed sieve is bypassed, so `--sieve-size` and
 `--sample-stride` have no effect in CRT mode.  `--sieve-primes` **is**
 used — it controls how many small primes are applied to the gap-check sieve.
 
 - **Monolithic mode** (no `--fermat-threads`): `--sieve-primes` is
-  automatically capped to `gap_scan × 19` (≈ 190 000 for shift 64, merit 22)
-  since there is no gaplist to tune and primes beyond this add cost with no
-  benefit.
+  automatically capped to `gap_scan × 19` (where `gap_scan` is derived from
+  the selected CRT gap-window mode; in default fixed mode this is
+  ≈ 190 000 for shift 64, merit 22) since there is no gaplist to tune and
+  primes beyond this add cost with no benefit.
 - **Producer-consumer mode** (`--fermat-threads N`): `--sieve-primes` is
   passed through as-is for manual tuning via the gaplist saw-tooth (see
   below).
 
 The relevant flags are `--shift`, `--threads`, `--fast-fermat`, `--target`,
-`--crt-file`, `--fermat-threads`, and `--sieve-primes`.
+`--crt-file`, `--crt-gap-scan`, `--crt-gap-scan-floor`,
+`--fermat-threads`, and `--sieve-primes`.
 
 #### Producer-consumer mode (gaplist)
 
@@ -1084,6 +1127,7 @@ gap scanning.  Multiple GPUs are supported via `--cuda 0,1`.
 | `--sieve-size S`      | 33554432      | Odd candidates per sieve segment |
 | `--sieve-primes P`    | 900000        | Number of small primes used for sieving.  The actual prime value limit is auto-computed from the count via PNT upper bound (900K → primes up to ~15.4M). Used in both normal and CRT modes. |
 | `--target T`          | *(node bits)* | Minimum merit `gap/log(p)` to build a block |
+| `--scan-merit M`      | auto (`--target`) | Non-CRT CPU smart-scan threshold.  Controls stride/jump distance for scanning while submission threshold remains `--target` (or network merit).  Ignored in CRT mode and generally non-beneficial on CUDA/OpenCL paths. |
 | `--threads N`         | 1             | Worker threads; each thread runs the full sieve + primality (Fermat/Miller-Rabin) + gap-scan pipeline over its own disjoint slice of the adder range (`tid, tid+N, tid+2N, …`) |
 | `--rpc-url URL`       | --            | JSON-RPC endpoint of `gapcoind` |
 | `--rpc-user USER`     | --            | RPC username |
@@ -1094,11 +1138,18 @@ gap scanning.  Multiple GPUs are supported via `--cuda 0,1`.
 | `--rpc-sign-key KEY`  | --            | HMAC key to sign payloads |
 | `--log-file FILE`     | --            | Append all log messages to FILE |
 | `--fast-fermat`       | off           | Fast single-base Fermat primality test |
+| `--fast-euler`        | off           | Fast Euler-Plumb base-2 primality path (CPU).  Mutually exclusive with `--fast-fermat`. |
 | `--mr-rounds N`       | 2             | Miller-Rabin rounds for `mpz_probab_prime_p` (default path, not `--fast-fermat`).  Old default was 10; 2 rounds gives false-positive rate < 2^-128 for sieve-filtered candidates. |
 | `--sample-stride K`   | 8             | Controls gap scanning strategy.  K > 1 enables backward-scan (CPU) or two-phase smart-scan (GPU).  Set to 1 for full-test (all survivors tested). |
+| `--partial-sieve-auto` / `--partial-sieve` | off | Adaptive non-CRT sieve-prime limiting.  Adjusts sieve depth periodically based on runtime behavior. |
+| `--adaptive-presieve` | off           | Adaptive non-CRT presieve window skipping for dense windows after presieve. |
+| `--wheel-sieve N`     | 0 (disabled)  | Select wheel-presieve backend for non-CRT runs.  Supported values: `30`, `210`, `2310`, `30030`, `510510`, `9699690`. |
 | `-e` / `--extra-verbose` | off       | Write detailed `--partial-sieve-auto` adjustments to the log file only. |
 | `--crt-file FILE`     | --            | Load a CRT sieve file (binary `.bin` or text `.txt`).  Text files enable CRT-aligned mining; binary files enable template tiling. |
 | `--fermat-threads N` / `-d N` | 0 (monolithic) | Number of Fermat consumer threads for CRT producer-consumer mode.  Default `0` = monolithic (all threads sieve+fermat independently).  Set to `N` to enable producer-consumer with `threads - N` sieve and `N` fermat threads. |
+| `--crt-gap-scan MODE` | `fixed` | CRT solver gap-window policy for text `--crt-file` runs.  `fixed=max(2*gap_target,10000)`, `original=ceil(target*ln(start))` (clamped to `[8,gap_target]`), `original-floor=max(original,FLOOR)`.  Aliases: `orig`, `dynamic`, `orig-floor`, `dynamic-floor`, `hybrid`. |
+| `--crt-gap-scan-floor N` | 10000 | Floor used by `--crt-gap-scan original-floor`.  Can also be set inline via `--crt-gap-scan original-floor=N`.  Ignored by other CRT gap-scan modes. |
+| `--crt-auto-split`    | off           | Enable pass-level adaptive sieve/fermat thread split in CRT solver producer-consumer mode. |
 | `--heap N`            | 4096          | Maximum number of pending CRT windows in the producer-consumer gaplist heap.  Only relevant when `--fermat-threads N` is active.  Larger values allow the sieve producers to run further ahead of the Fermat consumers; useful if producers are significantly faster than consumers. |
 | `--mr-verify`         | off           | Verify gap boundary primes with a Miller-Rabin base-3 check before submission.  Catches Fermat base-2 pseudoprimes with negligible overhead. |
 | `--no-primality`      | off           | Skip primality testing entirely |
@@ -1110,6 +1161,8 @@ gap scanning.  Multiple GPUs are supported via `--cuda 0,1`.
 | `--selftest`          | off           | Run internal prime checks and exit |
 | `--p P --q Q`         | --            | Force primes for `--build-only` runs |
 | `--cuda [DEV,...]`    | off           | Enable CUDA GPU Fermat testing (requires `WITH_CUDA=1` build).  Optional comma-separated `DEV` list selects GPU devices (e.g. `--cuda 0,1`).  Up to 8 GPUs, round-robin dispatch. |
+| `--opencl [DEV,...]`  | off           | Enable OpenCL GPU Fermat path (requires `WITH_OPENCL=1` build).  Optional device list selects GPU devices (e.g. `--opencl 0,1`).  Do not combine with `--cuda` in one run. |
+| `--opencl-platform N` | 0             | OpenCL platform index used with `--opencl`. |
 | `--gpu-batch N`       | 4096          | Accumulate N candidates across CRT windows before flushing to GPU (CRT mode only; non-CRT paths send full sieve windows directly).  Larger values improve GPU utilization at the cost of slightly delayed gap processing. |
 | `--stratum HOST:PORT` | --            | Connect to a Gapcoin stratum pool instead of using RPC/GBT (requires `WITH_RPC=1` build). |
 | `-u` / `--user`       | --            | Alias for `--rpc-user` |

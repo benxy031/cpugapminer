@@ -57,6 +57,7 @@ static int             g_gpu_active_limbs_global = 0;  /* set after GPU init  */
 #include "presieve_utils.h"
 #include "wheel_sieve.h"
 #include "crt_solver.h"
+#include "crt_gap_scan.h"
 #include "uint256_utils.h"
 #include "block_utils.h"
 #include "primality_utils.h"
@@ -336,6 +337,13 @@ static double         g_crt_merit       = 0.0;     /* target merit from file    
 static int            g_crt_shift       = 0;       /* shift from CRT file       */
 static mpz_t          g_crt_primorial_mpz;          /* GMP primorial (any size)  */
 static int            g_crt_primorial_mpz_init = 0; /* 1 once mpz_init'd         */
+
+/* CRT gap-check window policy (solver mode):
+   fixed    = max(2*gap_target, 10000) (current default)
+   original = ceil(target_merit*ln(start)), capped by file gap_target
+              (compatible with upstream GapMiner target_size behavior). */
+static int            g_crt_gap_scan_mode = CRT_GAP_SCAN_FIXED;
+static uint64_t       g_crt_gap_scan_floor = CRT_GAP_SCAN_FLOOR_DEFAULT;
 
 /* ── Generic pre-sieve template for primes {3,5,7,11,13,17} ──
    Marks composites of these 6 smallest odd primes in a bitmap with
@@ -4626,8 +4634,9 @@ static void *worker_fn(void *arg) {
     if (g_crt_mode == CRT_MODE_SOLVER && g_crt_primorial_mpz_init) {
 #ifdef WITH_RPC
         int      tid_local     = wa->tid;
-        int      gap_scan_max  = g_crt_gap_target * 2;
-        if (gap_scan_max < 10000) gap_scan_max = 10000;
+        uint64_t gap_scan_cfg  = crt_gap_scan_template_window(
+            (uint64_t)g_crt_gap_target, g_crt_gap_scan_mode,
+            g_crt_gap_scan_floor);
 
         /* crt_end = 2^shift  (upper bound for nAdd) */
         mpz_t crt_end;
@@ -4700,23 +4709,25 @@ static void *worker_fn(void *arg) {
 
             if (rpc_thread_local) {
                 size_t prim_bits = mpz_sizeinbase(g_crt_primorial_mpz, 2);
-                /* CRT sieve covers [1, gap_scan_max) as an odd-only bitmap */
-                size_t crt_seg    = (size_t)gap_scan_max / 2;
+                /* CRT sieve covers [1, gap_scan) as an odd-only bitmap. */
+                size_t crt_seg    = (size_t)gap_scan_cfg / 2;
                 size_t crt_bytes  = (crt_seg + 7) / 8;
                 if (crt_fermat_threads > 0)
                     log_msg("CRT mining (%dT: %d sieve + %d fermat): "
-                            "primorial~2^%lu  shift=%d  gap_scan=%d  "
+                            "primorial~2^%lu  shift=%d  gap_scan=%llu  "
                             "sieve_bitmap=%zu bytes (%.1f KB)  heap=%d\n",
                             wa->nthreads, n_sieve_threads,
                             crt_fermat_threads,
-                            (unsigned long)prim_bits, shift_local, gap_scan_max,
+                            (unsigned long)prim_bits, shift_local,
+                            (unsigned long long)gap_scan_cfg,
                             crt_bytes, (double)crt_bytes / 1024.0,
                             (int)crt_heap_cap);
                 else
                     log_msg("CRT mining (%dT): primorial~2^%lu  shift=%d"
-                            "  gap_scan=%d  sieve_bitmap=%zu bytes (%.1f KB)\n",
+                            "  gap_scan=%llu  sieve_bitmap=%zu bytes (%.1f KB)\n",
                             nth_local, (unsigned long)prim_bits, shift_local,
-                            gap_scan_max, crt_bytes, (double)crt_bytes / 1024.0);
+                            (unsigned long long)gap_scan_cfg,
+                            crt_bytes, (double)crt_bytes / 1024.0);
             }
 
 #ifdef WITH_RPC
@@ -4803,6 +4814,10 @@ static void *worker_fn(void *arg) {
                 set_base_bn(h256_nonce, shift_local);
                 double logbase_nonce =
                     uint256_log_approx(h256_nonce, shift_local);
+                uint64_t gap_scan_nonce = crt_gap_scan_for_nonce(
+                    target_local, logbase_nonce,
+                    (uint64_t)g_crt_gap_target, g_crt_gap_scan_mode,
+                    g_crt_gap_scan_floor);
 
                 crt_compute_alignment_mpz(nAdd);
                 mpz_set(orig_base_crt, tls_base_mpz);
@@ -4904,7 +4919,7 @@ static void *worker_fn(void *arg) {
                     crt_first_win = 0;
 
                     uint64_t gap_L = 1;
-                    uint64_t gap_R = (uint64_t)gap_scan_max;
+                    uint64_t gap_R = gap_scan_nonce;
                     size_t surv_cnt = 0;
                     uint64_t *surv = sieve_range(gap_L, gap_R,
                                                  &surv_cnt, NULL, 0);
@@ -5858,6 +5873,9 @@ int main(int argc, char **argv) {
         printf("      --mr-rounds N     Miller-Rabin rounds for primality  (default: 2)\n");
         printf("      --mr-verify       MR base-3 verify Fermat/GPU survivors (catches pseudoprimes)\n");
         printf("      --crt-file FILE   load CRT sieve file (binary template or text gap-solver)\n");
+        printf("      --crt-gap-scan MODE  CRT solver gap window: fixed|original|original-floor (default: fixed)\n");
+        printf("                           fixed=max(2*gap_target,10000), original=target*ln(start), original-floor=max(original,FLOOR)\n");
+        printf("      --crt-gap-scan-floor N  FLOOR used by original-floor mode (default: 10000)\n");
         printf("      --fermat-threads N  number of Fermat testing threads for CRT producer-consumer\n");
         printf("                          default: auto = threads-1 for CRT solver with threads>=3\n");
         printf("      --crt-auto-split  adapt CRT sieve/fermat split between passes (opt-in)\n");
@@ -6008,6 +6026,42 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i],"--crt-file") && i+1<argc)
             cli_crt_file = argv[++i];
+        else if (!strcmp(argv[i],"--crt-gap-scan") && i+1<argc) {
+            const char *mode = argv[++i];
+            if (!strncmp(mode, "original-floor=", 15) ||
+                !strncmp(mode, "orig-floor=", 11) ||
+                !strncmp(mode, "dynamic-floor=", 14) ||
+                !strncmp(mode, "hybrid=", 7)) {
+                const char *v = strchr(mode, '=');
+                char *endp = NULL;
+                uint64_t floorv = 0;
+                if (v) v++;
+                if (v) floorv = strtoull(v, &endp, 10);
+                if (!v || v[0] == '\0' || !endp || *endp != '\0' || floorv == 0ULL) {
+                    fprintf(stderr,
+                            "--crt-gap-scan original-floor expects a positive integer value "
+                            "(e.g. original-floor=10000)\n");
+                    return 2;
+                }
+                g_crt_gap_scan_mode = CRT_GAP_SCAN_ORIG_FLOOR;
+                g_crt_gap_scan_floor = floorv;
+            } else if (!crt_gap_scan_mode_parse(mode, &g_crt_gap_scan_mode)) {
+                fprintf(stderr,
+                        "--crt-gap-scan expects fixed|original|original-floor "
+                        "(aliases: orig,dynamic,orig-floor,dynamic-floor,hybrid)\n");
+                return 2;
+            }
+        }
+        else if (!strcmp(argv[i],"--crt-gap-scan-floor") && i+1<argc) {
+            char *endp = NULL;
+            uint64_t floorv = strtoull(argv[++i], &endp, 10);
+            if (!endp || *endp != '\0' || floorv == 0ULL) {
+                fprintf(stderr,
+                        "--crt-gap-scan-floor expects a positive integer\n");
+                return 2;
+            }
+            g_crt_gap_scan_floor = floorv;
+        }
         else if ((!strcmp(argv[i],"--fermat-threads") || !strcmp(argv[i],"-d")) && i+1<argc) {
             crt_fermat_threads = atoi(argv[++i]);
             crt_fermat_explicit = 1;
@@ -6148,6 +6202,24 @@ int main(int argc, char **argv) {
     if (cli_crt_file) {
         if (!load_crt_file(cli_crt_file, shift)) {
             log_msg("Warning: CRT file load failed, continuing without CRT\n");
+        }
+    }
+
+    if (g_crt_mode == CRT_MODE_SOLVER) {
+        if (g_crt_gap_scan_mode == CRT_GAP_SCAN_ORIGINAL) {
+            log_msg("CRT gap-scan mode: original "
+                    "(window=target*ln(start), capped by file gap_target=%d)\n",
+                    g_crt_gap_target);
+        } else if (g_crt_gap_scan_mode == CRT_GAP_SCAN_ORIG_FLOOR) {
+            log_msg("CRT gap-scan mode: original-floor "
+                    "(window=max(target*ln(start),%llu), set by --crt-gap-scan-floor)\n",
+                    (unsigned long long)g_crt_gap_scan_floor);
+        } else {
+            log_msg("CRT gap-scan mode: fixed "
+                    "(window=max(2*gap_target,10000)=%llu)\n",
+                    (unsigned long long)crt_gap_scan_template_window(
+                        (uint64_t)g_crt_gap_target, g_crt_gap_scan_mode,
+                        g_crt_gap_scan_floor));
         }
     }
 
@@ -6456,8 +6528,9 @@ int main(int argc, char **argv) {
        over-sieving when a high --sieve-primes value was left over from
        single-thread use. */
     if (g_crt_mode == CRT_MODE_SOLVER && g_crt_gap_target > 0) {
-        uint64_t gap_scan = (uint64_t)g_crt_gap_target * 2;
-        if (gap_scan < 10000) gap_scan = 10000;
+        uint64_t gap_scan = crt_gap_scan_template_window(
+            (uint64_t)g_crt_gap_target, g_crt_gap_scan_mode,
+            g_crt_gap_scan_floor);
         uint64_t crt_limit = gap_scan * 19;
         if (crt_limit > 500000) crt_limit = 500000;
         if (cli_sieve_prime_limit > crt_limit) {
@@ -6494,8 +6567,9 @@ int main(int argc, char **argv) {
         crt_solver_init(g_crt_max_prime, small_primes_cache, small_primes_count);
         if (g_crt_solver_skip_to > 0 && g_crt_offsets && g_crt_prime_list
                 && g_crt_gap_target > 0) {
-            int gsm = g_crt_gap_target * 2;
-            if (gsm < 10000) gsm = 10000;
+            int gsm = (int)crt_gap_scan_template_window(
+                (uint64_t)g_crt_gap_target, g_crt_gap_scan_mode,
+                g_crt_gap_scan_floor);
             /* adj = nAdd0(base=0) mod 2.
                base = h256<<shift is always even, so candidate = base+nAdd0-adj
                where adj=1 when base+nAdd0 is odd (i.e. nAdd0 is odd).
@@ -6543,9 +6617,9 @@ int main(int argc, char **argv) {
     {
         unsigned long long log_sieve_sz;
         if (g_crt_mode == CRT_MODE_SOLVER && g_crt_gap_target > 0) {
-            int gsm = g_crt_gap_target * 2;
-            if (gsm < 10000) gsm = 10000;
-            log_sieve_sz = (unsigned long long)gsm;
+            log_sieve_sz = (unsigned long long)crt_gap_scan_template_window(
+                (uint64_t)g_crt_gap_target, g_crt_gap_scan_mode,
+                g_crt_gap_scan_floor);
         } else {
             log_sieve_sz = (unsigned long long)sieve_size;
         }
@@ -6645,8 +6719,9 @@ int main(int argc, char **argv) {
             /* ── CRT gap-solver path (single-threaded, GMP/nonce) ── */
             if (g_crt_mode == CRT_MODE_SOLVER && g_crt_primorial_mpz_init) {
 #ifdef WITH_RPC
-                int gap_scan_max = g_crt_gap_target * 2;
-                if (gap_scan_max < 10000) gap_scan_max = 10000;
+                uint64_t gap_scan_cfg = crt_gap_scan_template_window(
+                    (uint64_t)g_crt_gap_target, g_crt_gap_scan_mode,
+                    g_crt_gap_scan_floor);
 
                 mpz_t crt_end, nAdd_st, cand_st, orig_base_st;
                 mpz_inits(crt_end, nAdd_st, cand_st, orig_base_st, NULL);
@@ -6659,11 +6734,12 @@ int main(int argc, char **argv) {
                 static int st_crt_logged = 0;
                 if (!st_crt_logged) {
                     size_t prim_bits = mpz_sizeinbase(g_crt_primorial_mpz, 2);
-                    size_t crt_seg   = (size_t)gap_scan_max / 2;
+                    size_t crt_seg   = (size_t)gap_scan_cfg / 2;
                     size_t crt_bytes = (crt_seg + 7) / 8;
                     log_msg("CRT mining (1T): primorial~2^%lu  shift=%d"
-                            "  gap_scan=%d  sieve_bitmap=%zu bytes (%.1f KB)\n",
-                            (unsigned long)prim_bits, shift, gap_scan_max,
+                        "  gap_scan=%llu  sieve_bitmap=%zu bytes (%.1f KB)\n",
+                        (unsigned long)prim_bits, shift,
+                        (unsigned long long)gap_scan_cfg,
                             crt_bytes, (double)crt_bytes / 1024.0);
                     st_crt_logged = 1;
                 }
@@ -6682,6 +6758,10 @@ int main(int argc, char **argv) {
                     for (int k = 0; k < 32; k++) h256_st[k] = sha_raw_st[31 - k];
                     set_base_bn(h256_st, shift);
                     double logbase_st = uint256_log_approx(h256_st, shift);
+                    uint64_t gap_scan_nonce = crt_gap_scan_for_nonce(
+                        target, logbase_st,
+                        (uint64_t)g_crt_gap_target, g_crt_gap_scan_mode,
+                        g_crt_gap_scan_floor);
 
                     crt_compute_alignment_mpz(nAdd_st);
 
@@ -6730,7 +6810,7 @@ int main(int argc, char **argv) {
                         st_first_win = 0;
 
                         uint64_t gap_L = 1;
-                        uint64_t gap_R = (uint64_t)gap_scan_max;
+                        uint64_t gap_R = gap_scan_nonce;
                         size_t surv_cnt = 0;
                         uint64_t *surv = sieve_range(gap_L, gap_R,
                                                      &surv_cnt, NULL, 0);
