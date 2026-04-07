@@ -12,6 +12,8 @@
 #include <limits.h>
 #ifdef __AVX2__
 #include <immintrin.h>
+#elif defined(__SSE2__)
+#include <emmintrin.h>
 #endif
 #include "compat_win32.h"
 #include <openssl/sha.h>
@@ -804,6 +806,48 @@ static void tile_presieve(uint8_t *sieve, size_t sieve_bytes,
                 src_byte = nx;
             }
         }
+#elif defined(__SSE2__)
+        const __m128i zero16 = _mm_setzero_si128();
+        const __m128i mask8  = _mm_set1_epi16(0x00FF);
+        for (size_t i = 0; i < sieve_bytes; ) {
+            size_t avail = period_bytes - src_byte;
+
+            if (avail >= 17 && sieve_bytes - i >= 16) {
+                /* SSE2 fast path: 16 output bytes from 17 source bytes. */
+                __m128i lo8a = _mm_loadl_epi64(
+                    (const __m128i *)(g_presieve_tmpl + src_byte));
+                __m128i hi8a = _mm_loadl_epi64(
+                    (const __m128i *)(g_presieve_tmpl + src_byte + 1));
+                __m128i c16a = _mm_or_si128(
+                    _mm_unpacklo_epi8(lo8a, zero16),
+                    _mm_slli_epi16(_mm_unpacklo_epi8(hi8a, zero16), 8));
+                __m128i s16a = _mm_and_si128(_mm_srli_epi16(c16a, shift), mask8);
+
+                __m128i lo8b = _mm_loadl_epi64(
+                    (const __m128i *)(g_presieve_tmpl + src_byte + 8));
+                __m128i hi8b = _mm_loadl_epi64(
+                    (const __m128i *)(g_presieve_tmpl + src_byte + 9));
+                __m128i c16b = _mm_or_si128(
+                    _mm_unpacklo_epi8(lo8b, zero16),
+                    _mm_slli_epi16(_mm_unpacklo_epi8(hi8b, zero16), 8));
+                __m128i s16b = _mm_and_si128(_mm_srli_epi16(c16b, shift), mask8);
+
+                _mm_storeu_si128((__m128i *)(sieve + i),
+                                 _mm_packus_epi16(s16a, s16b));
+
+                i += 16;
+                src_byte += 16;
+                if (src_byte >= period_bytes)
+                    src_byte -= period_bytes;
+            } else {
+                /* Scalar: period wrap or < 16 bytes remaining */
+                size_t nx = src_byte + 1;
+                if (nx >= period_bytes) nx = 0;
+                sieve[i++] = (uint8_t)((g_presieve_tmpl[src_byte] >> shift)
+                             | (g_presieve_tmpl[nx] << inv));
+                src_byte = nx;
+            }
+        }
 #else
         for (size_t i = 0; i < sieve_bytes; i++) {
             uint8_t lo = g_presieve_tmpl[src_byte];
@@ -963,6 +1007,16 @@ static void mpresieve_tile(uint8_t *sieve, size_t sieve_bytes,
             i = mpresieve_avx512_aligned(sieve + out, chunk,
                                          g_mps_table, src, MPRESIEVE_NTABLES);
 #endif
+#ifdef __AVX2__
+            for (; i + 32 <= chunk; i += 32) {
+                __m256i acc = _mm256_loadu_si256(
+                    (const __m256i *)(g_mps_table[0] + src[0] + i));
+                for (int j = 1; j < MPRESIEVE_NTABLES; j++)
+                    acc = _mm256_or_si256(acc, _mm256_loadu_si256(
+                        (const __m256i *)(g_mps_table[j] + src[j] + i)));
+                _mm256_storeu_si256((__m256i *)(sieve + out + i), acc);
+            }
+#endif
 #ifdef __SSE2__
             for (; i + 16 <= chunk; i += 16) {
                 __m128i acc = _mm_loadu_si128(
@@ -985,6 +1039,43 @@ static void mpresieve_tile(uint8_t *sieve, size_t sieve_bytes,
             /* AVX-512BW: 64 bytes/iter, full blocks only; tail handled below. */
             i = mpresieve_avx512_shifted(sieve + out, chunk, shift,
                                          g_mps_table, src, MPRESIEVE_NTABLES);
+#endif
+#ifdef __AVX2__
+            const __m256i byte_mask = _mm256_set1_epi16(0x00FF);
+            for (; i + 32 <= chunk; i += 32) {
+                __m256i acc = _mm256_setzero_si256();
+                for (int j = 0; j < MPRESIEVE_NTABLES; j++) {
+                    const uint8_t *tp = g_mps_table[j] + src[j] + i;
+
+                    __m256i lo_a = _mm256_cvtepu8_epi16(
+                        _mm_loadu_si128((const __m128i *)tp));
+                    __m256i hi_a = _mm256_cvtepu8_epi16(
+                        _mm_loadu_si128((const __m128i *)(tp + 1)));
+                    __m256i out_a = _mm256_and_si256(
+                        _mm256_srli_epi16(
+                            _mm256_or_si256(lo_a, _mm256_slli_epi16(hi_a, 8)), shift),
+                        byte_mask);
+                    __m256i pk_a = _mm256_packus_epi16(out_a, _mm256_setzero_si256());
+                    __m128i b16_a = _mm256_castsi256_si128(
+                        _mm256_permute4x64_epi64(pk_a, 0xD8));
+
+                    __m256i lo_b = _mm256_cvtepu8_epi16(
+                        _mm_loadu_si128((const __m128i *)(tp + 16)));
+                    __m256i hi_b = _mm256_cvtepu8_epi16(
+                        _mm_loadu_si128((const __m128i *)(tp + 17)));
+                    __m256i out_b = _mm256_and_si256(
+                        _mm256_srli_epi16(
+                            _mm256_or_si256(lo_b, _mm256_slli_epi16(hi_b, 8)), shift),
+                        byte_mask);
+                    __m256i pk_b = _mm256_packus_epi16(out_b, _mm256_setzero_si256());
+                    __m128i b16_b = _mm256_castsi256_si128(
+                        _mm256_permute4x64_epi64(pk_b, 0xD8));
+
+                    __m256i tbl = _mm256_set_m128i(b16_b, b16_a);
+                    acc = _mm256_or_si256(acc, tbl);
+                }
+                _mm256_storeu_si256((__m256i *)(sieve + out + i), acc);
+            }
 #endif
 #ifdef __SSE2__
             const __m128i zero16 = _mm_setzero_si128();
@@ -1687,6 +1778,64 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
                     }
                     /* Main loop: advance s by p bytes = 8 bit-positions per iter. */
                     uint8_t *s = bits + (pos >> 3);
+#if defined(__AVX2__)
+                    /* AVX2 fast path for low primes: materialize the 8 mark-bits
+                       into a 32/64-byte mask tile and OR it in one or two vector
+                       stores.  Useful when skip_to is low (e.g. wheel mode). */
+                    if (p <= 64) {
+                        uint8_t mlo[32] = {0};
+                        uint8_t mhi[32] = {0};
+                        for (int k = 0; k < 8; k++) {
+                            uint32_t o = off[k];
+                            if (o < 32u) mlo[o] |= msk[k];
+                            else         mhi[o - 32u] |= msk[k];
+                        }
+                        __m256i mask_lo = _mm256_loadu_si256((const __m256i *)mlo);
+                        __m256i mask_hi = _mm256_loadu_si256((const __m256i *)mhi);
+                        size_t span = (p <= 32) ? 32u : 64u;
+                        while (pos + 7 * p < pos_end) {
+                            size_t s_off = (size_t)(s - bits);
+                            if (s_off + span > bit_size) break;
+                            __m256i v0 = _mm256_loadu_si256((const __m256i *)s);
+                            v0 = _mm256_or_si256(v0, mask_lo);
+                            _mm256_storeu_si256((__m256i *)s, v0);
+                            if (span == 64u) {
+                                __m256i v1 = _mm256_loadu_si256((const __m256i *)(s + 32));
+                                v1 = _mm256_or_si256(v1, mask_hi);
+                                _mm256_storeu_si256((__m256i *)(s + 32), v1);
+                            }
+                            s += p; pos += 8 * p;
+                        }
+                    } else
+#endif
+#if defined(__SSE2__)
+                    /* SSE2 fallback for low primes on non-AVX2 x86 builds. */
+                    if (p <= 32) {
+                        uint8_t mlo[16] = {0};
+                        uint8_t mhi[16] = {0};
+                        for (int k = 0; k < 8; k++) {
+                            uint32_t o = off[k];
+                            if (o < 16u) mlo[o] |= msk[k];
+                            else         mhi[o - 16u] |= msk[k];
+                        }
+                        __m128i mask_lo = _mm_loadu_si128((const __m128i *)mlo);
+                        __m128i mask_hi = _mm_loadu_si128((const __m128i *)mhi);
+                        size_t span = (p <= 16) ? 16u : 32u;
+                        while (pos + 7 * p < pos_end) {
+                            size_t s_off = (size_t)(s - bits);
+                            if (s_off + span > bit_size) break;
+                            __m128i v0 = _mm_loadu_si128((const __m128i *)s);
+                            v0 = _mm_or_si128(v0, mask_lo);
+                            _mm_storeu_si128((__m128i *)s, v0);
+                            if (span == 32u) {
+                                __m128i v1 = _mm_loadu_si128((const __m128i *)(s + 16));
+                                v1 = _mm_or_si128(v1, mask_hi);
+                                _mm_storeu_si128((__m128i *)(s + 16), v1);
+                            }
+                            s += p; pos += 8 * p;
+                        }
+                    } else
+#endif
                     while (pos + 7 * p < pos_end) {
                         s[off[0]] |= msk[0]; s[off[1]] |= msk[1];
                         s[off[2]] |= msk[2]; s[off[3]] |= msk[3];
@@ -6177,12 +6326,26 @@ int main(int argc, char **argv) {
                 (unsigned)g_presieve_bytes,
                 g_mps_ready ? MPRESIEVE_NTABLES : 0,
                 (total_kb + 512) / 1024,
-#ifdef __SSE2__
-                " (SSE2 OR-tile)"
-#else
-                ""
-#endif
+    #ifdef __AVX512BW__
+            " (AVX-512BW OR-tile)"
+    #elif defined(__AVX2__)
+            " (AVX2 OR-tile)"
+    #elif defined(__SSE2__)
+            " (SSE2 OR-tile)"
+    #else
+            ""
+    #endif
                 );
+
+        log_msg("sieve marks: 8x unrolled + "
+    #if defined(__AVX2__)
+            "AVX2 low-prime mask-OR (p<=64)"
+    #elif defined(__SSE2__)
+            "SSE2 low-prime mask-OR (p<=32)"
+    #else
+            "scalar"
+    #endif
+            "\n");
     }
     if (use_wheel_sieve) {
         if (wheel_sieve_configure(cli_wheel_sieve) != 0) {
@@ -6191,8 +6354,9 @@ int main(int argc, char **argv) {
             return 2;
         }
         if (wheel_sieve_enabled()) {
-            log_msg("wheel sieve: enabled (W=%u, skip_to=%zu)\n",
-                    wheel_sieve_size(), wheel_sieve_skip_to());
+            log_msg("wheel sieve: enabled (W=%u, skip_to=%zu, tile=%s)\n",
+                    wheel_sieve_size(), wheel_sieve_skip_to(),
+                    wheel_sieve_backend_name());
         } else {
             log_msg("wheel sieve: disabled\n");
         }
