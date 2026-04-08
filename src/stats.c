@@ -46,6 +46,11 @@ volatile uint64_t stats_crt_heap_waits = 0;
 volatile uint64_t stats_crt_heap_hwm = 0;
 volatile uint64_t stats_crt_stale_drop = 0;
 
+volatile uint64_t stats_cramer_scored       = 0;
+volatile uint64_t stats_cramer_skipped      = 0;
+volatile uint64_t stats_cramer_heap_skip    = 0;
+volatile uint64_t stats_cramer_score_sum_e9 = 0;
+
 struct rate_ring_slot rate_ring[RATE_RING_SLOTS];
 int rate_ring_idx = 0;
 int rate_ring_full = 0;

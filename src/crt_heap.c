@@ -52,10 +52,12 @@ void crt_work_free(struct crt_work_item *w) {
     free(w);
 }
 
+/* Max-heap on cramer_score: root holds the item with the highest score
+ * (most promising window — processed first by Fermat consumer). */
 static void crt_heap_sift_up(size_t i) {
     while (i > 0) {
         size_t parent = (i - 1) / 2;
-        if (crt_heap[parent]->surv_cnt <= crt_heap[i]->surv_cnt) break;
+        if (crt_heap[parent]->cramer_score >= crt_heap[i]->cramer_score) break;
         struct crt_work_item *tmp = crt_heap[parent];
         crt_heap[parent] = crt_heap[i];
         crt_heap[i] = tmp;
@@ -65,17 +67,17 @@ static void crt_heap_sift_up(size_t i) {
 
 static void crt_heap_sift_down(size_t i, size_t n) {
     while (1) {
-        size_t smallest = i;
+        size_t largest = i;
         size_t left = 2 * i + 1, right = 2 * i + 2;
-        if (left < n && crt_heap[left]->surv_cnt < crt_heap[smallest]->surv_cnt)
-            smallest = left;
-        if (right < n && crt_heap[right]->surv_cnt < crt_heap[smallest]->surv_cnt)
-            smallest = right;
-        if (smallest == i) break;
-        struct crt_work_item *tmp = crt_heap[smallest];
-        crt_heap[smallest] = crt_heap[i];
+        if (left < n && crt_heap[left]->cramer_score > crt_heap[largest]->cramer_score)
+            largest = left;
+        if (right < n && crt_heap[right]->cramer_score > crt_heap[largest]->cramer_score)
+            largest = right;
+        if (largest == i) break;
+        struct crt_work_item *tmp = crt_heap[largest];
+        crt_heap[largest] = crt_heap[i];
         crt_heap[i] = tmp;
-        i = smallest;
+        i = largest;
     }
 }
 
@@ -99,17 +101,18 @@ int crt_heap_push(struct crt_work_item *w) {
         return 1;
     }
 
+    /* Max-heap: evict the leaf with the lowest cramer_score (worst window). */
     size_t first_leaf = crt_heap_size / 2;
-    size_t max_idx = first_leaf;
+    size_t min_idx = first_leaf;
     for (size_t i = first_leaf + 1; i < crt_heap_size; i++) {
-        if (crt_heap[i]->surv_cnt > crt_heap[max_idx]->surv_cnt)
-            max_idx = i;
+        if (crt_heap[i]->cramer_score < crt_heap[min_idx]->cramer_score)
+            min_idx = i;
     }
-    if (w->surv_cnt < crt_heap[max_idx]->surv_cnt) {
-        crt_work_free(crt_heap[max_idx]);
-        crt_heap[max_idx] = w;
-        crt_heap_sift_up(max_idx);
-        crt_heap_sift_down(max_idx, crt_heap_size);
+    if (w->cramer_score > crt_heap[min_idx]->cramer_score) {
+        crt_work_free(crt_heap[min_idx]);
+        crt_heap[min_idx] = w;
+        crt_heap_sift_up(min_idx);
+        crt_heap_sift_down(min_idx, crt_heap_size);
         __sync_fetch_and_add(&stats_crt_heap_push_replace, 1);
         pthread_cond_signal(&crt_heap_cv);
         pthread_mutex_unlock(&crt_heap_mtx);
@@ -184,17 +187,13 @@ void crt_heap_next_generation(void) {
     __sync_fetch_and_add(&crt_heap_gen, 1);
 }
 
-/* Advisory: when the heap is full, return the surv_cnt of the worst leaf
-   (highest surv_cnt = most expensive to Fermat-test = candidate for eviction).
-   Returns 0 if the heap has room or is empty.
-   Callers use this to skip crt_work_alloc() when the item would be dropped
-   anyway, avoiding malloc + mpz + memcpy overhead for no-op windows.
-   Takes the heap mutex so the answer is definitive (not just a hint). */
+/* Advisory: when the heap is full, return the surv_cnt of the worst leaf.
+   Returns 0 if the heap has room or is empty. */
 size_t crt_heap_worst_surv_advisory(void) {
     pthread_mutex_lock(&crt_heap_mtx);
     if (!crt_heap || crt_heap_size < crt_heap_cap || crt_heap_size == 0) {
         pthread_mutex_unlock(&crt_heap_mtx);
-        return 0;   /* heap has room — caller should try the push */
+        return 0;
     }
     size_t first_leaf = crt_heap_size / 2;
     size_t max_sc = crt_heap[first_leaf]->surv_cnt;
@@ -203,4 +202,22 @@ size_t crt_heap_worst_surv_advisory(void) {
             max_sc = crt_heap[i]->surv_cnt;
     pthread_mutex_unlock(&crt_heap_mtx);
     return max_sc;
+}
+
+/* Advisory: when the heap is full, return the cramer_score of the worst
+   (lowest-score) leaf — the eviction threshold for new pushes.
+   Returns -1.0 if the heap has room or is empty (caller should try push). */
+double crt_heap_worst_score_advisory(void) {
+    pthread_mutex_lock(&crt_heap_mtx);
+    if (!crt_heap || crt_heap_size < crt_heap_cap || crt_heap_size == 0) {
+        pthread_mutex_unlock(&crt_heap_mtx);
+        return -1.0;
+    }
+    size_t first_leaf = crt_heap_size / 2;
+    double min_sc = crt_heap[first_leaf]->cramer_score;
+    for (size_t i = first_leaf + 1; i < crt_heap_size; i++)
+        if (crt_heap[i]->cramer_score < min_sc)
+            min_sc = crt_heap[i]->cramer_score;
+    pthread_mutex_unlock(&crt_heap_mtx);
+    return min_sc;
 }

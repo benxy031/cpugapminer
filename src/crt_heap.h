@@ -15,6 +15,7 @@ struct crt_work_item {
     mpz_t    nAdd;
     uint64_t *survivors;
     size_t   surv_cnt;
+    double   cramer_score;  /* Cramér-model prob of qualifying gap (higher = better) */
     uint32_t nonce;
     int      cand_odd;
     double   logbase;
@@ -45,5 +46,9 @@ void crt_heap_next_generation(void);
    Use as a pre-check before crt_work_alloc() to avoid wasted allocation
    when the new window would be immediately dropped. */
 size_t crt_heap_worst_surv_advisory(void);
+
+/* Advisory: if heap is full, return cramer_score of worst (lowest-score)
+   leaf; else -1.0.  Use to skip windows whose score can't beat the heap. */
+double crt_heap_worst_score_advisory(void);
 
 #endif /* CRT_HEAP_H */

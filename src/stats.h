@@ -44,6 +44,13 @@ extern volatile uint64_t stats_crt_heap_waits;
 extern volatile uint64_t stats_crt_heap_hwm;
 extern volatile uint64_t stats_crt_stale_drop;
 
+/* Cramér-model score stats (CRT paths only). */
+extern volatile uint64_t stats_cramer_scored;       /* windows whose score was computed */
+extern volatile uint64_t stats_cramer_skipped;      /* windows skipped by span<needed_gap (monolithic) */
+extern volatile uint64_t stats_cramer_heap_skip;    /* windows skipped by score<=worst (producer) */
+/* score sum stored as scaled integer (×1e9) to avoid atomic double */
+extern volatile uint64_t stats_cramer_score_sum_e9; /* sum of cramer_score×1e9 */
+
 /* Rolling-window state used by print_stats(). */
 #define RATE_RING_SLOTS 6
 struct rate_ring_slot {

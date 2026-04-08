@@ -126,6 +126,67 @@ static double estimate_sieve_keep_fraction(uint64_t limit) {
     return keep;
 }
 
+/* Cramér-model score for a sieve window.
+ *
+ * Estimates the probability that the window produces at least one prime gap
+ * of size >= needed_gap, based on the survivor (sieve-residual) positions.
+ *
+ * For each ordered pair (i < j) of survivors with surv[j]-surv[i] >= needed_gap,
+ * the two endpoints contribute p^2 (both prime) and the j-i-1 survivors between
+ * them contribute (1-p)^(j-i-1) (all composite).  Summing over all such pairs:
+ *
+ *   score = p^2 * sum_j  sum_{i=0}^{r_j}  q^(j-i-1)
+ *         = p   * sum_j  q^(j-r_j-1) * (1 - q^(r_j+1))
+ *
+ * where p = 1/logbase, q = 1-p, and r_j is the largest i such that
+ * surv[i] <= surv[j] - needed_gap.  Two-pointer over j gives O(n) time.
+ */
+static double compute_cramer_score(const uint64_t *surv, size_t n,
+                                   double logbase, uint64_t needed_gap)
+{
+    if (n < 2 || logbase <= 1.0 || needed_gap == 0)
+        return 0.0;
+
+    double p = 1.0 / logbase;
+    double q = 1.0 - p;
+    double score = 0.0;
+
+    /* Precompute q^i for i in [0, n] to avoid repeated pow() calls. */
+    double *qpow = (double *)malloc((n + 1) * sizeof(double));
+    if (!qpow)
+        return 0.0;
+    qpow[0] = 1.0;
+    for (size_t i = 1; i <= n; i++)
+        qpow[i] = qpow[i - 1] * q;
+
+    /* Two-pointer: r = largest index with surv[r] <= surv[j] - needed_gap.
+     * r is non-decreasing as j increases (thresh = surv[j]-needed_gap grows). */
+    size_t r = 0;
+    for (size_t j = 1; j < n; j++) {
+        if (surv[j] < needed_gap)
+            continue;
+        uint64_t thresh = surv[j] - needed_gap;
+
+        /* Advance r while the next candidate still qualifies (and r+1 < j). */
+        while (r + 1 < j && surv[r + 1] <= thresh)
+            r++;
+
+        /* surv[r] might still be > thresh (nothing qualifies yet). */
+        if (surv[r] > thresh)
+            continue;
+
+        size_t r_j    = r;
+        size_t min_exp = j - r_j - 1;   /* interior survivors in tightest pair */
+        /* sum_{i=0}^{r_j} q^(j-i-1) = q^(j-r_j-1) * (1-q^(r_j+1)) / p */
+        double qmin = qpow[min_exp];
+        double qrp1 = qpow[r_j + 1];
+        score += qmin * (1.0 - qrp1) / p;
+    }
+
+    free(qpow);
+    return p * p * score;
+}
+
 /* shared current-work state so any thread can detect a new block */
 static char     g_prevhash[65]  = {0};
 static pthread_mutex_t g_work_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1396,6 +1457,17 @@ static void print_stats(void) {
                 (unsigned long long)pop_ok,
                 wait_pct,
                 (unsigned long long)stale);
+            uint64_t cs_n   = stats_cramer_scored;
+            uint64_t cs_sum = stats_cramer_score_sum_e9;
+            double   cs_avg = (cs_n > 0) ? ((double)cs_sum / (double)cs_n) * 1e-9 : 0.0;
+            log_msg("  cramer: scored=%llu avg_score=%.3e skip_span=%llu skip_score=%llu",
+                (unsigned long long)cs_n,
+                cs_avg,
+                (unsigned long long)stats_cramer_skipped,
+                (unsigned long long)stats_cramer_heap_skip);
+        } else if (stats_cramer_skipped > 0) {
+            log_msg("  cramer: skip_span=%llu",
+                (unsigned long long)stats_cramer_skipped);
         }
     }
 
@@ -5098,13 +5170,25 @@ static void *worker_fn(void *arg) {
 
                     /* ── Producer-consumer: push to heap ── */
                     if (crt_fermat_threads > 0) {
-                        /* Pre-check: if heap is full and this window has
-                           more survivors than the worst leaf it would be
-                           dropped by crt_heap_push() — skip the expensive
-                           alloc/mpz/memcpy and yield to fermat threads. */
-                        size_t heap_worst = crt_heap_worst_surv_advisory();
-                        if (heap_worst > 0 && surv_cnt >= heap_worst) {
+                        /* Cramér score: estimated probability this window
+                         * produces a qualifying gap (merit >= target_local).
+                         * Computed before the heap pre-check so we can use
+                         * the score as the eviction criterion.              */
+                        uint64_t needed_gap_cs = (uint64_t)(target_local * logbase_nonce);
+                        if (needed_gap_cs < 2) needed_gap_cs = 2;
+                        double cs = compute_cramer_score(surv, surv_cnt,
+                                                         logbase_nonce,
+                                                         needed_gap_cs);
+                        __sync_fetch_and_add(&stats_cramer_scored, 1);
+                        __sync_fetch_and_add(&stats_cramer_score_sum_e9,
+                            (uint64_t)(cs * 1e9));
+
+                        /* Pre-check: skip if heap is full and this window
+                         * scores no better than the worst current item.    */
+                        double heap_worst_sc = crt_heap_worst_score_advisory();
+                        if (heap_worst_sc >= 0.0 && cs <= heap_worst_sc) {
                             __sync_fetch_and_add(&stats_crt_heap_push_drop, 1);
+                            __sync_fetch_and_add(&stats_cramer_heap_skip, 1);
                             struct timespec bt = {0, 200000L}; /* 200 µs */
                             nanosleep(&bt, NULL);
                             mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
@@ -5121,16 +5205,16 @@ static void *worker_fn(void *arg) {
                                        surv_cnt * sizeof(uint64_t));
                             else
                                 surv_cnt = 0;
-                            w->surv_cnt   = surv_cnt;
-                            w->nonce      = nonce_cur;
-                            w->cand_odd   = cand_odd;
-                            w->logbase    = logbase_nonce;
-                            w->generation = crt_heap_gen;
+                            w->surv_cnt    = surv_cnt;
+                            w->cramer_score = cs;
+                            w->nonce       = nonce_cur;
+                            w->cand_odd    = cand_odd;
+                            w->logbase     = logbase_nonce;
+                            w->generation  = crt_heap_gen;
                             if (!crt_heap_push(w)) {
                                 /* Heap full and item was worse than worst leaf.
                                    Back off briefly to let fermat threads drain
-                                   the queue — avoids spinning and burning CPU
-                                   on work that will keep getting dropped. */
+                                   the queue. */
                                 struct timespec bt = {0, 200000L}; /* 200 µs */
                                 nanosleep(&bt, NULL);
                             }
@@ -5140,6 +5224,21 @@ static void *worker_fn(void *arg) {
                     }
 
                     /* ── Monolithic: backward-scan Fermat ── */
+
+                    /* Skip windows where the entire survivor span is smaller
+                     * than needed_gap: no consecutive prime pair in the window
+                     * can produce a qualifying gap, so Fermat testing is wasted.
+                     * Equivalent to compute_cramer_score(...) == 0. O(1) check. */
+                    {
+                        uint64_t ng = (uint64_t)(target_local * logbase_nonce);
+                        if (ng < 2) ng = 2;
+                        if (surv_cnt < 2 ||
+                            surv[surv_cnt - 1] - surv[0] < ng) {
+                            __sync_fetch_and_add(&stats_cramer_skipped, 1);
+                            mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
+                            continue;
+                        }
+                    }
 #ifdef WITH_GPU_FERMAT
                     if (g_gpu_count > 0) {
                         /* GPU path: accumulate survivors for batch Fermat.
@@ -7016,6 +7115,19 @@ int main(int argc, char **argv) {
                         if (!surv || surv_cnt == 0) {
                             mpz_add(nAdd_st, nAdd_st, g_crt_primorial_mpz);
                             continue;
+                        }
+
+                        /* Skip windows where no survivor pair can span needed_gap.
+                         * Same O(1) check as the RPC monolithic path. */
+                        {
+                            uint64_t ng = (uint64_t)(target * logbase_st);
+                            if (ng < 2) ng = 2;
+                            if (surv_cnt < 2 ||
+                                surv[surv_cnt - 1] - surv[0] < ng) {
+                                __sync_fetch_and_add(&stats_cramer_skipped, 1);
+                                mpz_add(nAdd_st, nAdd_st, g_crt_primorial_mpz);
+                                continue;
+                            }
                         }
 
                         /* Backward-scan Fermat (~10-20× fewer tests) */
