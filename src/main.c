@@ -1504,6 +1504,40 @@ static void print_stats(void) {
         log_msg("  sieve_model: keep~%.3e boost~%.1fx (limit=%llu)",
                 sieve_keep, sieve_boost,
                 (unsigned long long)sieve_limit_for_model);
+
+    /* ── Merit sensitivity: ETA sweep + pairs/s needed ──
+       For each merit level from (net-1) to (net+1) in steps of 0.5,
+       show the ETA at the current rolling pairs/s.
+       Also show what pairs/s would be needed to achieve 1h/4h/8h ETA
+       at the exact network merit target.
+       Formula: ETA = 1 / (pairs_rate × e^{-merit})
+                need = e^{merit} / ETA_target                          */
+    if (target_m > 0.5 && pairs_rate > 0) {
+        char eta_buf[320];
+        int  ep = 0;
+        static const double offsets[5] = { -1.0, -0.5, 0.0, +0.5, +1.0 };
+        for (int mi = 0; mi < 5; mi++) {
+            double m = target_m + offsets[mi];
+            if (m <= 0.0) continue;
+            double eta = 1.0 / (pairs_rate * exp(-m));
+            char ebuf[32];
+            format_est(ebuf, sizeof(ebuf), eta);
+            ep += snprintf(eta_buf + ep, (int)sizeof(eta_buf) - ep,
+                           " m=%.1f:%s%s",
+                           m, ebuf, (offsets[mi] == 0.0) ? "(net)" : "");
+        }
+        char need_buf[128];
+        int  np = 0;
+        static const double eta_tgts[3]    = { 3600.0, 14400.0, 28800.0 };
+        static const char  *eta_lbls[3]    = { "1h", "4h", "8h" };
+        for (int ei = 0; ei < 3; ei++) {
+            double need = exp(target_m) / eta_tgts[ei];
+            np += snprintf(need_buf + np, (int)sizeof(need_buf) - np,
+                           " need@%s=%.0f/s", eta_lbls[ei], need);
+        }
+        log_file_only("  merit_sens (net=%.2f  have=%.0f/s):%s  |%s\n",
+                      target_m, pairs_rate, eta_buf, need_buf);
+    }
     log_msg("\n");
 }
 

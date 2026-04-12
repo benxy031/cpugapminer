@@ -420,3 +420,150 @@ int fermat_test_cpu_nlimbs(const uint64_t *n, int nlimbs)
     default: return 0;
     }
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+ * Multi-limb CPU Euler–Plumb test: 2^((n-1)/2) ≡ ±1 (mod n)
+ *
+ * Halves the squaring count vs fermat_test_cpu_nlimbs by using the
+ * exponent (n-1)/2 instead of (n-1).  The final comparison is done
+ * in Montgomery form, avoiding one extra Montgomery multiply per call.
+ *
+ * one_m  = R mod n           (Montgomery form of 1)
+ * nm1_m  = n − one_m         (Montgomery form of n−1, since (n−1)·R ≡ −R mod n)
+ * Accept iff res == one_m  OR  res == nm1_m.
+ *
+ * Covers shifts 25–1024  (nlimbs 5–20).
+ * ═══════════════════════════════════════════════════════════════════ */
+
+static inline int euler_u64(uint64_t n)
+{
+    if (n < 4) return n >= 2;
+    if (!(n & 1)) return 0;
+    uint64_t e = (n - 1) >> 1;
+    uint64_t acc = 1, base = 2 % n;
+    while (e) {
+        if (e & 1) acc = (uint64_t)(((__uint128_t)acc * base) % n);
+        base = (uint64_t)(((__uint128_t)base * base) % n);
+        e >>= 1;
+    }
+    return acc == 1 || acc == n - 1;
+}
+
+#define DECL_EULER_CORE_BUCKET(FN, MONTFN) \
+static inline int FN(const uint64_t *n, int nlimbs) \
+{ \
+    if (nlimbs <= 0 || nlimbs > FERMAT_CPU_MAX_LIMBS) return 0; \
+    if (nlimbs == 1) return euler_u64(n[0]); \
+    if ((n[0] & 1) == 0) return 0; \
+    uint64_t ninv = mont_ninv(n[0]); \
+    /* one_m = R mod n  (Montgomery form of 1, used only for base_m) */ \
+    uint64_t one_m[FERMAT_CPU_MAX_LIMBS]; \
+    cpu_rmodn_n(one_m, n, nlimbs); \
+    /* base_m = 2*one_m mod n  (Montgomery form of 2) */ \
+    uint64_t base_m[FERMAT_CPU_MAX_LIMBS]; \
+    memcpy(base_m, one_m, (size_t)nlimbs * sizeof(uint64_t)); \
+    cpu_moddbl_n(base_m, n, nlimbs); \
+    /* e = (n-1)/2: n is odd so n-1 is even, right-shift is exact. \
+       After the shift the top limb of e may have its high bit clear  \
+       (if the top bit of n was bit 63 of the top limb), so we must    \
+       re-scan to find the actual most-significant set bit.            */ \
+    uint64_t e[FERMAT_CPU_MAX_LIMBS]; \
+    memcpy(e, n, (size_t)nlimbs * sizeof(uint64_t)); \
+    e[0] -= 1; \
+    for (int _i = 0; _i < nlimbs - 1; _i++) \
+        e[_i] = (e[_i] >> 1) | (e[_i + 1] << 63); \
+    e[nlimbs - 1] >>= 1; \
+    /* find top non-zero limb of e (top limb may become 0 after shift) */ \
+    int top = nlimbs - 1; \
+    while (top > 0 && e[top] == 0) top--; \
+    int msb = 63 - __builtin_clzll(e[top]); \
+    /* left-to-right square-and-multiply, init res = base_m (handles MSB=1) */ \
+    uint64_t res[FERMAT_CPU_MAX_LIMBS]; \
+    memcpy(res, base_m, (size_t)nlimbs * sizeof(uint64_t)); \
+    for (int limb = top; limb >= 0; limb--) { \
+        int start = (limb == top) ? msb - 1 : 63; \
+        for (int bit = start; bit >= 0; bit--) { \
+            MONTFN(res, res, res, n, ninv, nlimbs); \
+            if ((e[limb] >> bit) & 1) \
+                MONTFN(res, res, base_m, n, ninv, nlimbs); \
+        } \
+    } \
+    /* Convert res from Montgomery form to standard form. \
+       MONTMUL(res, 1) = res * R^{-1} mod n => standard integer value. */ \
+    uint64_t one[FERMAT_CPU_MAX_LIMBS]; \
+    memset(one, 0, (size_t)nlimbs * sizeof(uint64_t)); \
+    one[0] = 1; \
+    MONTFN(res, res, one, n, ninv, nlimbs); \
+    /* Accept iff res == 1 (result 1) */ \
+    if (res[0] == 1) { \
+        int ok = 1; \
+        for (int _i = 1; _i < nlimbs; _i++) if (res[_i] != 0) { ok = 0; break; } \
+        if (ok) return 1; \
+    } \
+    /* Accept iff res == n-1 (result -1) */ \
+    uint64_t nm1[FERMAT_CPU_MAX_LIMBS]; \
+    uint64_t one_std[FERMAT_CPU_MAX_LIMBS]; \
+    memset(one_std, 0, (size_t)nlimbs * sizeof(uint64_t)); \
+    one_std[0] = 1; \
+    cpu_sub_n(nm1, n, one_std, nlimbs); \
+    int eq_nm1 = 1; \
+    for (int _i = 0; _i < nlimbs; _i++) if (res[_i] != nm1[_i]) { eq_nm1 = 0; break; } \
+    return eq_nm1; \
+}
+
+DECL_EULER_CORE_BUCKET(euler_test_cpu_core_b4,  cpu_montmul_b4)
+DECL_EULER_CORE_BUCKET(euler_test_cpu_core_b8,  cpu_montmul_b8)
+DECL_EULER_CORE_BUCKET(euler_test_cpu_core_b12, cpu_montmul_b12)
+DECL_EULER_CORE_BUCKET(euler_test_cpu_core_b20, cpu_montmul_b20)
+
+#define DECL_EULER_FIXED_BUCKET(NL, CORE) \
+    static inline int euler_test_cpu_nlimbs_##NL(const uint64_t *n) { \
+        return CORE(n, (NL)); \
+    }
+
+DECL_EULER_FIXED_BUCKET(2,  euler_test_cpu_core_b4)
+DECL_EULER_FIXED_BUCKET(3,  euler_test_cpu_core_b4)
+DECL_EULER_FIXED_BUCKET(4,  euler_test_cpu_core_b4)
+DECL_EULER_FIXED_BUCKET(5,  euler_test_cpu_core_b8)
+DECL_EULER_FIXED_BUCKET(6,  euler_test_cpu_core_b8)
+DECL_EULER_FIXED_BUCKET(7,  euler_test_cpu_core_b8)
+DECL_EULER_FIXED_BUCKET(8,  euler_test_cpu_core_b8)
+DECL_EULER_FIXED_BUCKET(9,  euler_test_cpu_core_b12)
+DECL_EULER_FIXED_BUCKET(10, euler_test_cpu_core_b12)
+DECL_EULER_FIXED_BUCKET(11, euler_test_cpu_core_b12)
+DECL_EULER_FIXED_BUCKET(12, euler_test_cpu_core_b12)
+DECL_EULER_FIXED_BUCKET(13, euler_test_cpu_core_b20)
+DECL_EULER_FIXED_BUCKET(14, euler_test_cpu_core_b20)
+DECL_EULER_FIXED_BUCKET(15, euler_test_cpu_core_b20)
+DECL_EULER_FIXED_BUCKET(16, euler_test_cpu_core_b20)
+DECL_EULER_FIXED_BUCKET(17, euler_test_cpu_core_b20)
+DECL_EULER_FIXED_BUCKET(18, euler_test_cpu_core_b20)
+DECL_EULER_FIXED_BUCKET(19, euler_test_cpu_core_b20)
+DECL_EULER_FIXED_BUCKET(20, euler_test_cpu_core_b20)
+
+int euler_test_cpu_nlimbs(const uint64_t *n, int nlimbs)
+{
+    switch (nlimbs) {
+    case 1:  return euler_u64(n[0]);
+    case 2:  return euler_test_cpu_nlimbs_2(n);
+    case 3:  return euler_test_cpu_nlimbs_3(n);
+    case 4:  return euler_test_cpu_nlimbs_4(n);
+    case 5:  return euler_test_cpu_nlimbs_5(n);
+    case 6:  return euler_test_cpu_nlimbs_6(n);
+    case 7:  return euler_test_cpu_nlimbs_7(n);
+    case 8:  return euler_test_cpu_nlimbs_8(n);
+    case 9:  return euler_test_cpu_nlimbs_9(n);
+    case 10: return euler_test_cpu_nlimbs_10(n);
+    case 11: return euler_test_cpu_nlimbs_11(n);
+    case 12: return euler_test_cpu_nlimbs_12(n);
+    case 13: return euler_test_cpu_nlimbs_13(n);
+    case 14: return euler_test_cpu_nlimbs_14(n);
+    case 15: return euler_test_cpu_nlimbs_15(n);
+    case 16: return euler_test_cpu_nlimbs_16(n);
+    case 17: return euler_test_cpu_nlimbs_17(n);
+    case 18: return euler_test_cpu_nlimbs_18(n);
+    case 19: return euler_test_cpu_nlimbs_19(n);
+    case 20: return euler_test_cpu_nlimbs_20(n);
+    default: return 0;
+    }
+}

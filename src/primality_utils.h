@@ -16,4 +16,11 @@ int primality_fast_fermat_u64(uint64_t n);
  * Returns 1 (probably prime) or 0 (composite). */
 int fermat_test_cpu_nlimbs(const uint64_t *n, int nlimbs);
 
+/* Euler–Plumb criterion: 2^((n-1)/2) ≡ ±1 (mod n).
+ * ~50% fewer squarings than fermat_test_cpu_nlimbs.
+ * Same CIOS Montgomery core; comparison done in Montgomery form
+ * (no final de-Montgomery multiply).
+ * Returns 1 (probably prime) or 0 (composite). */
+int euler_test_cpu_nlimbs(const uint64_t *n, int nlimbs);
+
 #endif
