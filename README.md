@@ -1134,6 +1134,7 @@ gap scanning.  Multiple GPUs are supported via `--cuda 0,1`.
 | `--rpc-pass PASS`     | --            | RPC password |
 | `--rpc-method METH`   | `getwork`     | Submission method |
 | `--rpc-rate MS`       | 0             | Minimum ms between submissions |
+| `--rpc-poll-ms MS`    | 1000          | Tip poll interval for `getbestblockhash`; lower reduces stale window |
 | `--rpc-retries N`     | 3             | Retry attempts on failure |
 | `--rpc-sign-key KEY`  | --            | HMAC key to sign payloads |
 | `--log-file FILE`     | --            | Append all log messages to FILE |

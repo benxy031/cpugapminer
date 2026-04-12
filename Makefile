@@ -21,8 +21,8 @@ endif
 ifdef WITH_RPC
 	LIBS=-lcurl -ljansson -lssl -lcrypto $(GMP_LIB) -lm -pthread -lstdc++
 	CFLAGS+=-DWITH_RPC $(GMP_CFLAGS)
-	# build rpc C++ objects
-	RPC_SRCS=$(SRCDIR)/rpc_cwrap.cpp $(SRCDIR)/rpc_globals.cpp $(SRCDIR)/rpc_stubs.cpp $(SRCDIR)/Rpc.cpp
+	# build active RPC wrapper (legacy Rpc.cpp path is excluded)
+	RPC_SRCS=$(SRCDIR)/rpc_cwrap.cpp
 	RPC_OBJS=$(RPC_SRCS:.cpp=.o)
 	STRATUM_OBJ=$(SRCDIR)/stratum.o
 	LINKER=$(CXX)

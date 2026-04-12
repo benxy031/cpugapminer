@@ -38,6 +38,7 @@ extern int      rpc_getwork_data(const char *url, const char *user, const char *
 #endif
 #ifdef WITH_RPC
 #include <curl/curl.h>
+#include <jansson.h>
 #include "stratum.h"
 static stratum_ctx *g_stratum = NULL;   /* non-NULL when mining via stratum pool */
 #endif
@@ -100,6 +101,13 @@ static void log_file_only(const char *fmt, ...) {
 static uint64_t last_submit_ms = 0;
 static int rpc_rate_ms = 0;
 static int rpc_default_retries = 3;
+/* Poll getbestblockhash at this interval to detect tip changes quickly. */
+static int rpc_tip_poll_ms = 1000;
+#ifdef WITH_RPC
+/* Per-thread tip poll state used to keep long scan loops responsive. */
+static __thread int tls_rpc_tip_poll_enabled = 0;
+static __thread uint64_t tls_rpc_tip_last_ms = 0;
+#endif
 
 // helper returning current time in milliseconds since epoch
 static uint64_t now_ms(void) {
@@ -209,20 +217,161 @@ struct pass_state {
     uint64_t net_ndiff;   /* network nDifficulty from header bytes 72-79       */
     char     prevhex[65]; /* previous block hash for change detection          */
     uint64_t height;      /* reserved (not available from getwork header)      */
-    volatile uint64_t pass_seq;  /* incremented on every new mining pass        */
+    uint64_t pass_seq;    /* incremented on every new mining pass              */
 };
 static struct pass_state g_pass = {0};
+static pthread_mutex_t g_pass_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void pass_state_snapshot(struct pass_state *out) {
+    pthread_mutex_lock(&g_pass_lock);
+    *out = g_pass;
+    pthread_mutex_unlock(&g_pass_lock);
+}
+
+static void pass_state_copy_prevhex(char out[65]) {
+    pthread_mutex_lock(&g_pass_lock);
+    memcpy(out, g_pass.prevhex, 65);
+    pthread_mutex_unlock(&g_pass_lock);
+}
+
+static int pass_state_snapshot_if_seq(uint64_t expect_seq,
+                                      struct pass_state *out,
+                                      uint64_t *current_seq_out) {
+    int ok = 1;
+    pthread_mutex_lock(&g_pass_lock);
+    if (current_seq_out)
+        *current_seq_out = g_pass.pass_seq;
+    if (expect_seq && expect_seq != g_pass.pass_seq) {
+        ok = 0;
+    } else if (out) {
+        *out = g_pass;
+    }
+    pthread_mutex_unlock(&g_pass_lock);
+    return ok;
+}
+
+static uint64_t pass_state_publish(const struct pass_state *next) {
+    uint64_t seq;
+    pthread_mutex_lock(&g_pass_lock);
+    g_pass = *next;
+    g_pass.pass_seq++;
+    seq = g_pass.pass_seq;
+    pthread_mutex_unlock(&g_pass_lock);
+    return seq;
+}
+
+static int pass_state_try_advance_nonce(uint64_t expect_seq,
+                                        uint32_t nonce,
+                                        const uint8_t h256[32]) {
+    int ok = 0;
+    pthread_mutex_lock(&g_pass_lock);
+    if (g_pass.pass_seq == expect_seq) {
+        memcpy(g_pass.h256, h256, 32);
+        g_pass.nonce = nonce;
+        g_pass.pass_seq++;
+        ok = 1;
+    }
+    pthread_mutex_unlock(&g_pass_lock);
+    return ok;
+}
 
 /* ── Per-pass stratum dedup ─────────────────────────────────────────────
    Workers loop back over the same adder range and rediscover identical
    (nonce, nAdd) pairs → identical blockhex → pool rejects as duplicate.
    Track FNV-1a 64-bit hash of every submitted blockhex; auto-reset on
    new block (g_pass.pass_seq change). */
-#define DEDUP_STRATUM_MAX 512
-static uint64_t        g_dedup_hashes[DEDUP_STRATUM_MAX];
-static int             g_dedup_count  = 0;
+#define DEDUP_STRATUM_MAX   512
+#define DEDUP_TABLE_SIZE   2048
+#define DEDUP_SLOT_EMPTY      0
+#define DEDUP_SLOT_USED       1
+#define DEDUP_SLOT_TOMB       2
+_Static_assert((DEDUP_TABLE_SIZE & (DEDUP_TABLE_SIZE - 1)) == 0,
+               "DEDUP_TABLE_SIZE must be a power of two");
+
+static uint64_t        g_dedup_ring[DEDUP_STRATUM_MAX];
+static uint32_t        g_dedup_head   = 0;
+static uint32_t        g_dedup_count  = 0;
 static uint64_t        g_dedup_pass   = 0;
+static uint64_t        g_dedup_table_hash[DEDUP_TABLE_SIZE];
+static uint8_t         g_dedup_table_state[DEDUP_TABLE_SIZE];
 static pthread_mutex_t g_dedup_lock   = PTHREAD_MUTEX_INITIALIZER;
+
+static inline uint64_t dedup_mix64(uint64_t x) {
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
+
+static int dedup_table_locate(uint64_t hash, size_t *slot_out, int *found_out) {
+    size_t idx = (size_t)(dedup_mix64(hash) & (DEDUP_TABLE_SIZE - 1));
+    size_t first_tomb = SIZE_MAX;
+
+    for (size_t n = 0; n < DEDUP_TABLE_SIZE; n++) {
+        uint8_t st = g_dedup_table_state[idx];
+        if (st == DEDUP_SLOT_EMPTY) {
+            if (slot_out) {
+                *slot_out = (first_tomb != SIZE_MAX) ? first_tomb : idx;
+            }
+            if (found_out) *found_out = 0;
+            return 1;
+        }
+        if (st == DEDUP_SLOT_USED && g_dedup_table_hash[idx] == hash) {
+            if (slot_out) *slot_out = idx;
+            if (found_out) *found_out = 1;
+            return 1;
+        }
+        if (st == DEDUP_SLOT_TOMB && first_tomb == SIZE_MAX) {
+            first_tomb = idx;
+        }
+        idx = (idx + 1) & (DEDUP_TABLE_SIZE - 1);
+    }
+
+    if (slot_out) *slot_out = first_tomb;
+    if (found_out) *found_out = 0;
+    return (first_tomb != SIZE_MAX);
+}
+
+static int dedup_table_contains(uint64_t hash) {
+    size_t slot = 0;
+    int found = 0;
+    if (!dedup_table_locate(hash, &slot, &found)) return 0;
+    return found;
+}
+
+static int dedup_table_insert(uint64_t hash) {
+    size_t slot = 0;
+    int found = 0;
+    if (!dedup_table_locate(hash, &slot, &found)) return 0;
+    if (found) return 1;
+    g_dedup_table_hash[slot] = hash;
+    g_dedup_table_state[slot] = DEDUP_SLOT_USED;
+    return 1;
+}
+
+static void dedup_table_remove(uint64_t hash) {
+    size_t idx = (size_t)(dedup_mix64(hash) & (DEDUP_TABLE_SIZE - 1));
+    for (size_t n = 0; n < DEDUP_TABLE_SIZE; n++) {
+        uint8_t st = g_dedup_table_state[idx];
+        if (st == DEDUP_SLOT_EMPTY) {
+            return;
+        }
+        if (st == DEDUP_SLOT_USED && g_dedup_table_hash[idx] == hash) {
+            g_dedup_table_state[idx] = DEDUP_SLOT_TOMB;
+            return;
+        }
+        idx = (idx + 1) & (DEDUP_TABLE_SIZE - 1);
+    }
+}
+
+static void dedup_reset_for_pass(uint64_t pass_seq) {
+    g_dedup_head = 0;
+    g_dedup_count = 0;
+    g_dedup_pass = pass_seq;
+    memset(g_dedup_table_state, 0, sizeof(g_dedup_table_state));
+}
 
 static int stratum_dedup(const char *blockhex) {
     uint64_t h = 14695981039346656037ULL;
@@ -230,25 +379,40 @@ static int stratum_dedup(const char *blockhex) {
         h ^= (uint8_t)*p;
         h *= 1099511628211ULL;
     }
+    struct pass_state pass_snap;
+    pass_state_snapshot(&pass_snap);
+    uint64_t cur_seq = pass_snap.pass_seq;
+
     pthread_mutex_lock(&g_dedup_lock);
-    uint64_t cur_seq = g_pass.pass_seq;
     if (cur_seq != g_dedup_pass) {
-        g_dedup_count = 0;
-        g_dedup_pass  = cur_seq;
+        dedup_reset_for_pass(cur_seq);
     }
-    for (int i = 0; i < g_dedup_count; i++) {
-        if (g_dedup_hashes[i] == h) {
-            pthread_mutex_unlock(&g_dedup_lock);
-            return 1;
+
+    if (dedup_table_contains(h)) {
+        pthread_mutex_unlock(&g_dedup_lock);
+        return 1;
+    }
+
+    if (g_dedup_count < DEDUP_STRATUM_MAX) {
+        uint32_t tail = (g_dedup_head + g_dedup_count) % DEDUP_STRATUM_MAX;
+        g_dedup_ring[tail] = h;
+        g_dedup_count++;
+    } else {
+        uint64_t old = g_dedup_ring[g_dedup_head];
+        g_dedup_ring[g_dedup_head] = h;
+        g_dedup_head = (g_dedup_head + 1) % DEDUP_STRATUM_MAX;
+        dedup_table_remove(old);
+    }
+
+    if (!dedup_table_insert(h)) {
+        /* Should never happen at this load factor; recover by full rebuild. */
+        memset(g_dedup_table_state, 0, sizeof(g_dedup_table_state));
+        for (uint32_t i = 0; i < g_dedup_count; i++) {
+            uint32_t pos = (g_dedup_head + i) % DEDUP_STRATUM_MAX;
+            (void)dedup_table_insert(g_dedup_ring[pos]);
         }
     }
-    if (g_dedup_count < DEDUP_STRATUM_MAX) {
-        g_dedup_hashes[g_dedup_count++] = h;
-    } else {
-        memmove(g_dedup_hashes, g_dedup_hashes + 1,
-                (DEDUP_STRATUM_MAX - 1) * sizeof(g_dedup_hashes[0]));
-        g_dedup_hashes[DEDUP_STRATUM_MAX - 1] = h;
-    }
+
     pthread_mutex_unlock(&g_dedup_lock);
     return 0;
 }
@@ -544,9 +708,17 @@ static int load_crt_binary_file(const char *path) {
         fclose(fp); return 0;
     }
 
-    uint32_t *offsets = (uint32_t *)malloc(hdr.ncand * sizeof(uint32_t));
+    if (hdr.ncand > (uint64_t)(SIZE_MAX / sizeof(uint32_t))) {
+        log_msg("CRT: candidate count %llu too large\n",
+                (unsigned long long)hdr.ncand);
+        fclose(fp); return 0;
+    }
+
+    size_t n_offsets = (size_t)hdr.ncand;
+
+    uint32_t *offsets = (uint32_t *)malloc(n_offsets * sizeof(uint32_t));
     if (!offsets) { fclose(fp); return 0; }
-    if (fread(offsets, sizeof(uint32_t), hdr.ncand, fp) != hdr.ncand) {
+    if (fread(offsets, sizeof(uint32_t), n_offsets, fp) != n_offsets) {
         log_msg("CRT: truncated file %s\n", path);
         free(offsets); fclose(fp); return 0;
     }
@@ -564,7 +736,7 @@ static int load_crt_binary_file(const char *path) {
     }
     memset(g_crt_template, 0xFF, g_crt_tmpl_bytes);
 
-    for (uint64_t i = 0; i < hdr.ncand; i++) {
+    for (size_t i = 0; i < n_offsets; i++) {
         uint32_t v = offsets[i];
         if (v < 1 || !(v & 1)) continue;
         size_t bit = (v - 1) / 2;
@@ -637,15 +809,22 @@ static int load_crt_text_file(const char *path, int cmd_shift) {
         int p = 0, o = 0;
         if (sscanf(line, "%d %d", &p, &o) == 2 && p >= 2) {
             if (pair_count >= primes_cap) {
-                primes_cap = primes_cap ? primes_cap * 2 : 64;
-                prime_list  = (int *)realloc(prime_list,
-                                             (size_t)primes_cap * sizeof(int));
-                offset_list = (int *)realloc(offset_list,
-                                             (size_t)primes_cap * sizeof(int));
-                if (!prime_list || !offset_list) {
+                int new_cap = primes_cap ? primes_cap * 2 : 64;
+                int *new_prime_list = (int *)realloc(
+                    prime_list, (size_t)new_cap * sizeof(int));
+                if (!new_prime_list) {
                     free(prime_list); free(offset_list);
                     fclose(fp); return 0;
                 }
+                int *new_offset_list = (int *)realloc(
+                    offset_list, (size_t)new_cap * sizeof(int));
+                if (!new_offset_list) {
+                    free(new_prime_list); free(offset_list);
+                    fclose(fp); return 0;
+                }
+                prime_list = new_prime_list;
+                offset_list = new_offset_list;
+                primes_cap = new_cap;
             }
             prime_list[pair_count]  = p;
             offset_list[pair_count] = o;
@@ -2125,6 +2304,54 @@ char *rpc_getblocktemplate(const char *url, const char *user, const char *pass);
 #endif
 #endif
 #ifdef WITH_RPC
+/* Returns 1 when best hash changed from current_prev, else 0.
+   Logs parse issues to log file only to avoid noisy stdout. */
+static int rpc_tip_changed(const char *url, const char *user, const char *pass,
+                           const char *current_prev, char best_out[65]) {
+    if (!url || !current_prev || !current_prev[0]) return 0;
+
+    char *resp = rpc_call(url, user, pass, "getbestblockhash", NULL);
+    if (!resp) return 0;
+
+    int changed = 0;
+    json_error_t jerr;
+    json_t *root = json_loads(resp, 0, &jerr);
+    if (!root) {
+        log_file_only("[rpc] getbestblockhash parse failed: %s\n", jerr.text);
+        free(resp);
+        return 0;
+    }
+
+    json_t *jerrobj = json_object_get(root, "error");
+    if (jerrobj && !json_is_null(jerrobj)) {
+        char *errdump = json_dumps(jerrobj, JSON_COMPACT);
+        log_file_only("[rpc] getbestblockhash error: %s\n", errdump ? errdump : "(unknown)");
+        if (errdump) free(errdump);
+    } else {
+        json_t *jres = json_object_get(root, "result");
+        if (jres && json_is_string(jres)) {
+            const char *best = json_string_value(jres);
+            if (best && strlen(best) == 64) {
+                if (strcmp(best, current_prev) != 0) {
+                    if (best_out) {
+                        memcpy(best_out, best, 64);
+                        best_out[64] = '\0';
+                    }
+                    changed = 1;
+                }
+            } else {
+                log_file_only("[rpc] getbestblockhash returned unexpected hash length\n");
+            }
+        } else {
+            log_file_only("[rpc] getbestblockhash response missing string result\n");
+        }
+    }
+
+    json_decref(root);
+    free(resp);
+    return changed;
+}
+
 struct submit_job {
     char url[256];
     char user[128];
@@ -2144,6 +2371,7 @@ static pthread_cond_t sq_cond = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t sq_empty_cond = PTHREAD_COND_INITIALIZER;
 static pthread_t sq_thread;
 static int sq_running = 0;
+static size_t sq_inflight = 0;
 
 static void enqueue_job(const struct submit_job *job) {
     pthread_mutex_lock(&sq_lock);
@@ -2169,11 +2397,19 @@ static struct submit_job dequeue_job(void) {
         job = submit_queue[sq_head];
         sq_head = (sq_head + 1) % SUBMIT_QUEUE_MAX;
         sq_count--;
-        if (sq_count == 0)
-            pthread_cond_signal(&sq_empty_cond); /* notify sq_drain() */
+        sq_inflight++;
     }
     pthread_mutex_unlock(&sq_lock);
     return job;
+}
+
+static void sq_complete_one(void) {
+    pthread_mutex_lock(&sq_lock);
+    if (sq_inflight > 0)
+        sq_inflight--;
+    if (sq_count == 0 && sq_inflight == 0)
+        pthread_cond_signal(&sq_empty_cond);
+    pthread_mutex_unlock(&sq_lock);
 }
 
 static void *submit_thread_fn(void *arg) {
@@ -2185,7 +2421,10 @@ static void *submit_thread_fn(void *arg) {
         pthread_mutex_unlock(&sq_lock);
 
         struct submit_job job = dequeue_job();
-        if (!job.hex[0]) continue;
+        if (!job.hex[0]) {
+            sq_complete_one();
+            continue;
+        }
 
         // rate limiting
         uint64_t now = now_ms();
@@ -2225,16 +2464,19 @@ static void *submit_thread_fn(void *arg) {
             g_abort_pass = 1;
             pthread_mutex_lock(&sq_lock);
             sq_head = sq_tail = sq_count = 0;
-            pthread_cond_signal(&sq_empty_cond); /* queue forcibly cleared */
             pthread_mutex_unlock(&sq_lock);
         } else {
             log_msg(">>> FAILED after %d attempts (connection error, async submit)\n", attempt);
         }
+        sq_complete_one();
     }
     return NULL;
 }
 
 static int start_submit_thread(void) {
+    pthread_mutex_lock(&sq_lock);
+    sq_inflight = 0;
+    pthread_mutex_unlock(&sq_lock);
     sq_running = 1;
     if (pthread_create(&sq_thread, NULL, submit_thread_fn, NULL) != 0) {
         sq_running = 0;
@@ -2256,7 +2498,7 @@ static void stop_submit_thread(void) {
    against the current mapNewBlock entry before getwork() evicts it. */
 static void sq_drain(void) {
     pthread_mutex_lock(&sq_lock);
-    while (sq_count > 0)
+    while (sq_count > 0 || sq_inflight > 0)
         pthread_cond_wait(&sq_empty_cond, &sq_lock);
     pthread_mutex_unlock(&sq_lock);
 }
@@ -2523,8 +2765,25 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
                 unsigned char *b = malloc(hlen/2);
                 if (!b) { log_msg("ERROR: malloc tx bytes failed\n"); free(hex); for (size_t j=0;j<tx_count;j++) free(tx_bytes[j]); free(tx_bytes); free(tx_lens); free(coin_tx); return 0; }
                 for (size_t i=0;i<hlen/2;i++) { unsigned int v=0; sscanf(hex+2*i, "%2x", &v); b[i]=(unsigned char)v; }
-                tx_bytes = realloc(tx_bytes, (tx_count+1)*sizeof(unsigned char*));
-                tx_lens = realloc(tx_lens, (tx_count+1)*sizeof(size_t));
+                size_t new_count = tx_count + 1;
+                unsigned char **new_tx_bytes = realloc(tx_bytes,
+                    new_count * sizeof(unsigned char*));
+                size_t *new_tx_lens = realloc(tx_lens,
+                    new_count * sizeof(size_t));
+                if (!new_tx_bytes || !new_tx_lens) {
+                    log_msg("ERROR: realloc tx arrays failed\n");
+                    free(hex);
+                    free(b);
+                    if (new_tx_bytes) tx_bytes = new_tx_bytes;
+                    if (new_tx_lens) tx_lens = new_tx_lens;
+                    for (size_t j = 0; j < tx_count; j++) free(tx_bytes[j]);
+                    free(tx_bytes);
+                    free(tx_lens);
+                    free(coin_tx);
+                    return 0;
+                }
+                tx_bytes = new_tx_bytes;
+                tx_lens = new_tx_lens;
                 tx_bytes[tx_count] = b; tx_lens[tx_count] = hlen/2; tx_count++;
                 free(hex);
                 cur = q2+1;
@@ -2783,17 +3042,18 @@ static int build_mining_pass(const char *url, const char *user, const char *pass
         if (++nonce == 0) break;
     }
     for (int k = 0; k < 32; k++) h256[k] = sha_raw[31-k];
-    /* store in g_pass (hdr80 stays unmodified — nonce is separate) */
-    memcpy(g_pass.h256,  h256,  32);
-    memcpy(g_pass.hdr80, hdr80, 80);
-    g_pass.nonce  = nonce;
-    g_pass.nshift = (uint16_t)shift;
-    g_pass.ndiff  = ndiff;
-    g_pass.net_ndiff = ndiff;  /* solo: share target = network difficulty */
-    strncpy(g_pass.prevhex, prevhex, 64);
-    g_pass.prevhex[64] = '\0';
-    g_pass.height = 0; /* not available from getwork header */
-    __sync_fetch_and_add(&g_pass.pass_seq, 1);
+    /* publish a complete immutable snapshot for workers */
+    struct pass_state next = {0};
+    memcpy(next.h256,  h256,  32);
+    memcpy(next.hdr80, hdr80, 80);
+    next.nonce  = nonce;
+    next.nshift = (uint16_t)shift;
+    next.ndiff  = ndiff;
+    next.net_ndiff = ndiff;  /* solo: share target = network difficulty */
+    strncpy(next.prevhex, prevhex, 64);
+    next.prevhex[64] = '\0';
+    next.height = 0; /* not available from getwork header */
+    pass_state_publish(&next);
     log_file_only("build_mining_pass: nonce=%u ndiff=%llu h256[0..3]=%02x%02x%02x%02x prevhex=%.16s...\n",
                   nonce, (unsigned long long)ndiff,
                   h256[0], h256[1], h256[2], h256[3], prevhex);
@@ -2802,12 +3062,14 @@ static int build_mining_pass(const char *url, const char *user, const char *pass
 
 static int assemble_mining_block(uint64_t nadd_val, uint64_t expect_seq,
                                  char out_hex[16384]) {
+    struct pass_state pass_snap;
+    uint64_t current_seq = 0;
     /* Stale-pass guard: reject if g_pass was overwritten since the worker
        started mining with this header.  This prevents submitting a block
        whose nAdd was computed for a different hash. */
-    if (expect_seq && expect_seq != g_pass.pass_seq) {
+    if (!pass_state_snapshot_if_seq(expect_seq, &pass_snap, &current_seq)) {
         log_msg("[assemble] stale pass (seq %llu vs current %llu) — skipping\n",
-                (unsigned long long)expect_seq, (unsigned long long)g_pass.pass_seq);
+                (unsigned long long)expect_seq, (unsigned long long)current_seq);
         return 0;
     }
     /* getwork submit format: hdr80(80) + nNonce(4,LE) + nShift(2,LE) + nAdd(raw LE, ≥ 1 byte)
@@ -2817,9 +3079,9 @@ static int assemble_mining_block(uint64_t nadd_val, uint64_t expect_seq,
      * nAdd is raw little-endian bytes, NO compact-size prefix. */
     unsigned char buf[512];
     unsigned char *p = buf;
-    memcpy(p, g_pass.hdr80,    80); p += 80;  /* header unchanged */
-    memcpy(p, &g_pass.nonce,    4); p += 4;   /* nNonce LE (offset 80) */
-    memcpy(p, &g_pass.nshift,   2); p += 2;   /* nShift LE (offset 84) */
+    memcpy(p, pass_snap.hdr80,   80); p += 80;  /* header unchanged */
+    memcpy(p, &pass_snap.nonce,   4); p += 4;   /* nNonce LE (offset 80) */
+    memcpy(p, &pass_snap.nshift,  2); p += 2;   /* nShift LE (offset 84) */
     /* nAdd raw LE bytes, minimum 1 byte */
     unsigned char nb[8];
     int nl;
@@ -2849,7 +3111,7 @@ static int assemble_mining_block(uint64_t nadd_val, uint64_t expect_seq,
 
     bytes_to_hex(buf, (size_t)(p - buf), out_hex);
     log_msg("[assemble] block: %zu bytes, nonce=%u nShift=%u nAdd=%llu (0x%llx) nAdd_bytes=%d\n",
-            (size_t)(p - buf), g_pass.nonce, (unsigned)g_pass.nshift,
+            (size_t)(p - buf), pass_snap.nonce, (unsigned)pass_snap.nshift,
             (unsigned long long)nadd_val, (unsigned long long)nadd_val, nl);
     return 1;
 }
@@ -2859,16 +3121,18 @@ static int assemble_mining_block(uint64_t nadd_val, uint64_t expect_seq,
 static int assemble_mining_block_mpz(uint32_t mining_nonce, mpz_t nadd_val,
                                      uint64_t expect_seq,
                                      char out_hex[16384]) {
-    if (expect_seq && expect_seq != g_pass.pass_seq) {
+    struct pass_state pass_snap;
+    uint64_t current_seq = 0;
+    if (!pass_state_snapshot_if_seq(expect_seq, &pass_snap, &current_seq)) {
         log_msg("[assemble] stale pass (seq %llu vs current %llu) — skipping\n",
-                (unsigned long long)expect_seq, (unsigned long long)g_pass.pass_seq);
+                (unsigned long long)expect_seq, (unsigned long long)current_seq);
         return 0;
     }
     unsigned char buf[1024]; /* enough for nAdd up to ~7400 bits */
     unsigned char *p = buf;
-    memcpy(p, g_pass.hdr80,    80); p += 80;
+    memcpy(p, pass_snap.hdr80, 80); p += 80;
     memcpy(p, &mining_nonce,    4); p += 4; /* nNonce at offset 80 */
-    memcpy(p, &g_pass.nshift,   2); p += 2;
+    memcpy(p, &pass_snap.nshift, 2); p += 2;
     /* nAdd raw LE bytes */
     if (mpz_sgn(nadd_val) == 0) {
         *p++ = 0;
@@ -2982,6 +3246,9 @@ static int verify_pow_hex(const char *blockhex) {
     /* Compute merit approximation = gap is not computed here, just log components */
     int hash_bits = (int)mpz_sizeinbase(mpz_hash, 2);
 
+    struct pass_state pass_snap;
+    pass_state_snapshot(&pass_snap);
+
     /* Log diagnostics */
     char hash_hex[65];
     for (int i = 0; i < 32; i++)
@@ -2996,10 +3263,10 @@ static int verify_pow_hex(const char *blockhex) {
         log_msg("[verify_pow] actual_gap=%llu actual_merit=%.6f\n",
                 actual_gap, actual_merit);
 
-    /* Compare header with g_pass.hdr80 */
-    int hdr_match = (memcmp(raw, g_pass.hdr80, 80) == 0);
+    /* Compare header with current pass snapshot */
+    int hdr_match = (memcmp(raw, pass_snap.hdr80, 80) == 0);
     if (!hdr_match)
-        log_msg("[verify_pow] WARNING: header bytes don't match g_pass.hdr80!\n");
+        log_msg("[verify_pow] WARNING: header bytes don't match pass snapshot hdr80!\n");
 
     /* Check actual merit against network target.
        The miner's sieve/Fermat pipeline can produce false gaps (reported gap
@@ -3007,8 +3274,8 @@ static int verify_pow_hex(const char *blockhex) {
        regions or at window boundaries.  Reject any block whose verified gap
        doesn't meet the target difficulty. */
     int merit_ok = 1;
-    if (is_prime && g_pass.ndiff > 0) {
-        double target_merit = (double)g_pass.ndiff / (double)(1ULL << 48);
+    if (is_prime && pass_snap.ndiff > 0) {
+        double target_merit = (double)pass_snap.ndiff / (double)(1ULL << 48);
         if (actual_merit < target_merit * 0.99) {
             log_msg("[verify_pow] REJECT: actual_merit=%.6f < target=%.6f"
                     "  (false gap: reported would be larger)\n",
@@ -3050,7 +3317,9 @@ static void submit_gap_block_common(const char *blockhex, double merit,
         } else if (stratum_dedup(blockhex)) {
             log_msg(">>> SKIPPING duplicate share\n");
         } else if (stratum_submit(g_stratum, blockhex)) {
-            double net_m = ndiff_to_merit(g_pass.net_ndiff);
+            struct pass_state pass_snap;
+            pass_state_snapshot(&pass_snap);
+            double net_m = ndiff_to_merit(pass_snap.net_ndiff);
             log_msg(">>> SUBMITTED via stratum%s  merit=%.6f  (net=%.6f)\n",
                     (merit >= net_m && net_m > 0) ? " (block)" : "",
                     merit, net_m);
@@ -3125,29 +3394,29 @@ static int build_mining_pass_stratum(const char *data_hex, uint64_t ndiff, int s
         if (++nonce == 0) break;
     }
     for (int k = 0; k < 32; k++) h256[k] = sha_raw[31-k];
-    /* store in g_pass */
-    memcpy(g_pass.h256,  h256,  32);
-    memcpy(g_pass.hdr80, hdr80, 80);
-    g_pass.nonce  = nonce;
-    g_pass.nshift = (uint16_t)shift;
-    g_pass.ndiff  = ndiff;
+    struct pass_state next = {0};
+    memcpy(next.h256,  h256,  32);
+    memcpy(next.hdr80, hdr80, 80);
+    next.nonce  = nonce;
+    next.nshift = (uint16_t)shift;
+    next.ndiff  = ndiff;
     /* Extract network nDifficulty from header bytes 72-79 (LE uint64_t) */
     {
         uint64_t net_nd = 0;
         for (int i = 7; i >= 0; i--)
             net_nd = (net_nd << 8) | hdr80[72 + i];
-        g_pass.net_ndiff = net_nd;
+        next.net_ndiff = net_nd;
     }
-    strncpy(g_pass.prevhex, prevhex, 64);
-    g_pass.prevhex[64] = '\0';
-    g_pass.height = 0;
-    __sync_fetch_and_add(&g_pass.pass_seq, 1);
+    strncpy(next.prevhex, prevhex, 64);
+    next.prevhex[64] = '\0';
+    next.height = 0;
+    pass_state_publish(&next);
     /* Signal all workers that the current pass is stale BEFORE returning.
        This closes the race window between g_pass update and the caller's
        g_abort_pass = 1 (which is now redundant but harmless). */
     g_abort_pass = 1;
     log_file_only("build_mining_pass_stratum: nonce=%u ndiff=%llu net_ndiff=%llu h256[0..3]=%02x%02x%02x%02x prevhex=%.16s...\n",
-                  nonce, (unsigned long long)ndiff, (unsigned long long)g_pass.net_ndiff,
+                  nonce, (unsigned long long)ndiff, (unsigned long long)next.net_ndiff,
                   h256[0], h256[1], h256[2], h256[3], prevhex);
     return 1;
 }
@@ -3155,10 +3424,13 @@ static int build_mining_pass_stratum(const char *data_hex, uint64_t ndiff, int s
    the header.  Updates g_pass.nonce, g_pass.h256, and bumps pass_seq.
    Returns 1 on success, 0 if the nonce space is exhausted (2^32 wrap). */
 static int advance_nonce(void) {
+    struct pass_state pass_snap;
+    pass_state_snapshot(&pass_snap);
+
     uint8_t hdr84[84], sha_raw[32];
-    uint32_t nonce = g_pass.nonce + 1;
+    uint32_t nonce = pass_snap.nonce + 1;
     if (nonce == 0) return 0;  /* wrapped around 2^32 */
-    memcpy(hdr84, g_pass.hdr80, 80);
+    memcpy(hdr84, pass_snap.hdr80, 80);
     for (;;) {
         memcpy(hdr84 + 80, &nonce, 4);
         double_sha256(hdr84, 84, sha_raw);
@@ -3167,9 +3439,8 @@ static int advance_nonce(void) {
     }
     uint8_t h256[32];
     for (int k = 0; k < 32; k++) h256[k] = sha_raw[31 - k];
-    memcpy(g_pass.h256, h256, 32);
-    g_pass.nonce = nonce;
-    __sync_fetch_and_add(&g_pass.pass_seq, 1);
+    if (!pass_state_try_advance_nonce(pass_snap.pass_seq, nonce, h256))
+        return 0;
     log_msg("[nonce] advanced to nonce=%u  h256[0..3]=%02x%02x%02x%02x\n",
             nonce, h256[0], h256[1], h256[2], h256[3]);
     return 1;
@@ -4555,6 +4826,33 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
     (void)rpc_method_local; /* method is always "getwork" now */
     if (cnt > 1) __sync_fetch_and_add(&stats_pairs, (uint64_t)(cnt - 1));
     for (size_t i = 0; i + 1 < cnt; i++) {
+#ifdef WITH_RPC
+        /* During long scans, poll tip changes from this thread too.
+           Otherwise, thread 0 may stay busy in this loop for seconds and
+           miss rapid tip transitions until the window ends. */
+        if (tls_rpc_tip_poll_enabled && rpc_url_local && !g_stratum &&
+            ((i & 0x3FFu) == 0u)) {
+            uint64_t now = now_ms();
+            if (now - tls_rpc_tip_last_ms >= (uint64_t)rpc_tip_poll_ms) {
+                char best[65];
+                char prevhex_snap[65];
+                pass_state_copy_prevhex(prevhex_snap);
+                if (rpc_tip_changed(rpc_url_local, rpc_user_local,
+                                    rpc_pass_local, prevhex_snap, best)) {
+                    log_msg("\n*** NEW BLOCK  prevhash=%.16s...  mining on top ***\n\n",
+                            best);
+                    pthread_mutex_lock(&g_work_lock);
+                    strncpy(g_prevhash, best, 64);
+                    g_prevhash[64] = '\0';
+                    pthread_mutex_unlock(&g_work_lock);
+                    g_abort_pass = 1;
+                }
+                tls_rpc_tip_last_ms = now_ms();
+                if (g_abort_pass) return 0;
+            }
+        }
+#endif
+
         uint64_t prev  = pr[i];       /* nAdd of gap start prime */
         uint64_t q     = pr[i + 1];   /* nAdd of gap end prime   */
         uint64_t gap   = q - prev;
@@ -4863,6 +5161,8 @@ static void *worker_fn(void *arg) {
     rpc_pass_local     = wa->rpc_pass;
     rpc_method_local   = wa->rpc_method;
     rpc_sign_key_local = wa->rpc_sign_key;
+    tls_rpc_tip_poll_enabled = rpc_thread_local;
+    tls_rpc_tip_last_ms = now_ms();
 #endif
 
     /* Precompute log(base) = log(h256 << shift) for merit calculation.      */
@@ -4990,7 +5290,11 @@ static void *worker_fn(void *arg) {
             uint64_t gbt_last_ms = now_ms();
 #endif
 
-            uint32_t nonce_cur = g_pass.nonce + 1 + (uint32_t)tid_local;
+            struct pass_state pass_snap_start;
+            pass_state_snapshot(&pass_snap_start);
+            uint32_t nonce_cur = pass_snap_start.nonce + 1 + (uint32_t)tid_local;
+            uint8_t hdr80_for_nonce[80];
+            memcpy(hdr80_for_nonce, pass_snap_start.hdr80, 80);
 
             mpz_t nAdd, candidate, orig_base_crt;
             mpz_inits(nAdd, candidate, orig_base_crt, NULL);
@@ -5001,10 +5305,10 @@ static void *worker_fn(void *arg) {
             while (keep_going && !g_abort_pass) {
 
 #ifdef WITH_RPC
-                /* Poll for new blocks every 5 s (rpc thread only) */
+                                /* Poll for new blocks on a short interval (rpc thread only). */
                 if (rpc_thread_local && rpc_url_local) {
                     uint64_t now = now_ms();
-                    if (now - gbt_last_ms >= 5000) {
+                                        if (now - gbt_last_ms >= (uint64_t)rpc_tip_poll_ms) {
                       if (g_stratum) {
                         /* ── stratum: check for pushed new-work ── */
                         char data_hex[161];
@@ -5019,32 +5323,21 @@ static void *worker_fn(void *arg) {
                             break;
                         }
                       } else {
-                        char *resp = rpc_call(rpc_url_local, rpc_user_local,
-                                              rpc_pass_local,
-                                              "getbestblockhash", NULL);
-                        if (resp) {
-                            const char *q1 = strchr(resp, '"');
-                            if (q1) q1 = strchr(q1+1, '"');
-                            if (q1) q1 = strchr(q1+1, '"');
-                            const char *q2 = q1 ? strchr(q1+1, '"') : NULL;
-                            if (q1 && q2 && (q2-q1-1) == 64) {
-                                char best[65];
-                                memcpy(best, q1+1, 64); best[64] = '\0';
-                                if (g_pass.prevhex[0] &&
-                                    strcmp(best, g_pass.prevhex) != 0) {
-                                    log_msg("\n*** NEW BLOCK  prevhash=%.16s..."
-                                            "  mining on top ***\n\n", best);
-                                    pthread_mutex_lock(&g_work_lock);
-                                    strncpy(g_prevhash, best, 64);
-                                    g_prevhash[64] = '\0';
-                                    pthread_mutex_unlock(&g_work_lock);
-                                    free(resp);
-                                    g_abort_pass = 1;
-                                    crt_heap_signal_shutdown();
-                                    break;
-                                }
-                            }
-                            free(resp);
+                        char best[65];
+                                                char prevhex_snap[65];
+                                                pass_state_copy_prevhex(prevhex_snap);
+                        if (rpc_tip_changed(rpc_url_local, rpc_user_local,
+                                                                                        rpc_pass_local, prevhex_snap,
+                                            best)) {
+                            log_msg("\n*** NEW BLOCK  prevhash=%.16s..."
+                                    "  mining on top ***\n\n", best);
+                            pthread_mutex_lock(&g_work_lock);
+                            strncpy(g_prevhash, best, 64);
+                            g_prevhash[64] = '\0';
+                            pthread_mutex_unlock(&g_work_lock);
+                            g_abort_pass = 1;
+                            crt_heap_signal_shutdown();
+                            break;
                         }
                       }
                         gbt_last_ms = now_ms();
@@ -5054,7 +5347,7 @@ static void *worker_fn(void *arg) {
 
                 /* ── Compute SHA256d for this nonce ── */
                 uint8_t hdr84[84], sha_raw[32], h256_nonce[32];
-                memcpy(hdr84, g_pass.hdr80, 80);
+                memcpy(hdr84, hdr80_for_nonce, 80);
                 memcpy(hdr84 + 80, &nonce_cur, 4);
                 double_sha256(hdr84, 84, sha_raw);
 
@@ -5125,7 +5418,7 @@ static void *worker_fn(void *arg) {
                        so polling only at the nonce boundary is too slow. */
                     if (rpc_thread_local && rpc_url_local) {
                         uint64_t now = now_ms();
-                        if (now - gbt_last_ms >= 5000) {
+                                                if (now - gbt_last_ms >= (uint64_t)rpc_tip_poll_ms) {
                           if (g_stratum) {
                             char data_hex_w[161];
                             uint64_t ndiff_w;
@@ -5139,32 +5432,21 @@ static void *worker_fn(void *arg) {
                                 break;
                             }
                           } else {
-                            char *resp_w = rpc_call(rpc_url_local,
-                                rpc_user_local, rpc_pass_local,
-                                "getbestblockhash", NULL);
-                            if (resp_w) {
-                                const char *q1w = strchr(resp_w, '"');
-                                if (q1w) q1w = strchr(q1w+1, '"');
-                                if (q1w) q1w = strchr(q1w+1, '"');
-                                const char *q2w = q1w ? strchr(q1w+1, '"') : NULL;
-                                if (q1w && q2w && (q2w-q1w-1) == 64) {
-                                    char best_w[65];
-                                    memcpy(best_w, q1w+1, 64); best_w[64] = '\0';
-                                    if (g_pass.prevhex[0] &&
-                                        strcmp(best_w, g_pass.prevhex) != 0) {
-                                        log_msg("\n*** NEW BLOCK  prevhash=%.16s..."
-                                                "  mining on top ***\n\n", best_w);
-                                        pthread_mutex_lock(&g_work_lock);
-                                        strncpy(g_prevhash, best_w, 64);
-                                        g_prevhash[64] = '\0';
-                                        pthread_mutex_unlock(&g_work_lock);
-                                        free(resp_w);
-                                        g_abort_pass = 1;
-                                        crt_heap_signal_shutdown();
-                                        break;
-                                    }
-                                }
-                                free(resp_w);
+                            char best_w[65];
+                            char prevhex_snap_w[65];
+                            pass_state_copy_prevhex(prevhex_snap_w);
+                            if (rpc_tip_changed(rpc_url_local, rpc_user_local,
+                                                rpc_pass_local,
+                                    prevhex_snap_w, best_w)) {
+                                log_msg("\n*** NEW BLOCK  prevhash=%.16s..."
+                                        "  mining on top ***\n\n", best_w);
+                                pthread_mutex_lock(&g_work_lock);
+                                strncpy(g_prevhash, best_w, 64);
+                                g_prevhash[64] = '\0';
+                                pthread_mutex_unlock(&g_work_lock);
+                                g_abort_pass = 1;
+                                crt_heap_signal_shutdown();
+                                break;
                             }
                           }
                           gbt_last_ms = now_ms();
@@ -5420,9 +5702,9 @@ static void *worker_fn(void *arg) {
     pthread_create(&psc.thread, NULL, presieve_helper_fn, &psc);
 
 #ifdef WITH_RPC
-    /* Initialise here (not as static=0) so the first poll fires 5 s after
+    /* Initialise here (not as static=0) so the first poll fires shortly after
        the worker STARTS, not immediately.  A static zero means now_ms()-0
-       is always ≥ 5000, causing an instant getbestblockhash call on the
+       is always ≥ rpc_tip_poll_ms, causing an instant getbestblockhash call on the
        very first window — before any gap is searched — which races with
        build_mining_pass and sets g_abort_pass=1, making built=0 forever. */
     uint64_t gbt_last_ms = now_ms();
@@ -5457,16 +5739,18 @@ static void *worker_fn(void *arg) {
 #ifdef WITH_RPC
             if (rpc_thread_local && rpc_url_local) {
                 uint64_t now = now_ms();
-                if (now - gbt_last_ms >= 5000) {
+                if (now - gbt_last_ms >= (uint64_t)rpc_tip_poll_ms) {
                     if (g_stratum) {
                         /* Stratum: check if pool pushed new work */
                         char sdata[161]; uint64_t sndiff = 0;
                         if (stratum_poll_new_work(g_stratum, sdata, &sndiff)) {
                             build_mining_pass_stratum(sdata, sndiff, shift_local);
+                            struct pass_state pass_snap;
+                            pass_state_snapshot(&pass_snap);
                             log_msg("\n*** NEW BLOCK (stratum)  prevhash=%.16s...  mining on top ***\n\n",
-                                    g_pass.prevhex);
+                                pass_snap.prevhex);
                             pthread_mutex_lock(&g_work_lock);
-                            strncpy(g_prevhash, g_pass.prevhex, 64); g_prevhash[64] = '\0';
+                            strncpy(g_prevhash, pass_snap.prevhex, 64); g_prevhash[64] = '\0';
                             pthread_mutex_unlock(&g_work_lock);
                             g_abort_pass = 1; break;
                         }
@@ -5475,34 +5759,18 @@ static void *worker_fn(void *arg) {
                        touch mapNewBlock.  Calling getwork (no params) here would
                        invoke CreateNewBlock(), clear mapNewBlock, and invalidate
                        the merkle root our pending submission references, causing
-                       every gap found after the 5s poll to return result=false. */
-                    char *resp = rpc_call(rpc_url_local, rpc_user_local, rpc_pass_local,
-                                         "getbestblockhash", NULL);
-                    if (resp) {
-                        /* response: {"result":"<64-hex>","error":null,...}
-                           Three strchr jumps land q1 on the opening quote of
-                           the hash value; q2 is its closing quote 64 chars on. */
-                        const char *q1 = strchr(resp, '"');   /* " before result */
-                        if (q1) q1 = strchr(q1+1, '"');       /* " after  result */
-                        if (q1) q1 = strchr(q1+1, '"');       /* " opening hash  */
-                        const char *q2 = q1 ? strchr(q1+1, '"') : NULL; /* " closing hash */
-                        if (q1 && q2 && (q2-q1-1) == 64) {
-                            char best[65];
-                            memcpy(best, q1+1, 64); best[64] = '\0';
-                            /* g_pass.prevhex is the parent of the block we mine;
-                               if getbestblockhash differs, a new block landed */
-                            if (g_pass.prevhex[0] &&
-                                strcmp(best, g_pass.prevhex) != 0) {
-                                log_msg("\n*** NEW BLOCK  prevhash=%.16s...  mining on top ***\n\n",
-                                        best);
-                                pthread_mutex_lock(&g_work_lock);
-                                strncpy(g_prevhash, best, 64); g_prevhash[64] = '\0';
-                                pthread_mutex_unlock(&g_work_lock);
-                                free(resp);
-                                g_abort_pass = 1; break;
-                            }
-                        }
-                        free(resp);
+                       every gap found after tip polling to return result=false. */
+                    char best[65];
+                        char prevhex_snap[65];
+                        pass_state_copy_prevhex(prevhex_snap);
+                    if (rpc_tip_changed(rpc_url_local, rpc_user_local,
+                                rpc_pass_local, prevhex_snap, best)) {
+                        log_msg("\n*** NEW BLOCK  prevhash=%.16s...  mining on top ***\n\n",
+                                best);
+                        pthread_mutex_lock(&g_work_lock);
+                        strncpy(g_prevhash, best, 64); g_prevhash[64] = '\0';
+                        pthread_mutex_unlock(&g_work_lock);
+                        g_abort_pass = 1; break;
                     }
                     } /* end !g_stratum */
                     gbt_last_ms = now_ms();
@@ -6061,11 +6329,13 @@ static void *worker_fn(void *arg) {
                 char sdata[161]; uint64_t sndiff = 0;
                 if (stratum_poll_new_work(g_stratum, sdata, &sndiff)) {
                     build_mining_pass_stratum(sdata, sndiff, shift_local);
+                    struct pass_state pass_snap;
+                    pass_state_snapshot(&pass_snap);
                     log_msg("\n*** NEW BLOCK (stratum)  prevhash=%.16s..."
                             "  mining on top ***\n\n",
-                            g_pass.prevhex);
+                        pass_snap.prevhex);
                     pthread_mutex_lock(&g_work_lock);
-                    strncpy(g_prevhash, g_pass.prevhex, 64);
+                    strncpy(g_prevhash, pass_snap.prevhex, 64);
                     g_prevhash[64] = '\0';
                     pthread_mutex_unlock(&g_work_lock);
                 } else {
@@ -6183,7 +6453,8 @@ int main(int argc, char **argv) {
         printf("      --stop-after-block  exit after first valid block\n");
         printf("      --log-file FILE   append messages to FILE\n");
         printf("      --header TEXT     override prime base (rarely needed)\n");
-        printf("      --rpc-rate MS     getwork poll interval ms  (default: 5000)\n");
+        printf("      --rpc-rate MS     minimum ms between submissions (default: 0)\n");
+        printf("      --rpc-poll-ms MS  tip poll interval ms via getbestblockhash (default: 1000)\n");
         printf("      --rpc-retries N   submit retries\n");
         printf("      --cuda [DEV,...]  use CUDA GPU(s) for Fermat testing (e.g. --cuda 0,1)\n");
         printf("      --opencl [DEV,...] use OpenCL GPU(s) for Fermat testing scaffold (e.g. --opencl 0)\n");
@@ -6215,6 +6486,7 @@ int main(int argc, char **argv) {
     int rpc_port = 0;
     const char *log_file = NULL;
     unsigned int cli_rpc_rate = 0;
+    unsigned int cli_rpc_poll_ms = 0;
     int cli_rpc_retries = -1;
     int build_only = 0;
     int no_opreturn = 0;
@@ -6262,6 +6534,7 @@ int main(int argc, char **argv) {
         else if ((!strcmp(argv[i],"--pass") || !strcmp(argv[i],"--rpc-pass")) && i+1<argc) rpc_pass = argv[++i];
         else if (!strcmp(argv[i],"--rpc-method") && i+1<argc) rpc_method = argv[++i];
         else if (!strcmp(argv[i],"--rpc-rate") && i+1<argc) cli_rpc_rate = (unsigned int)atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--rpc-poll-ms") && i+1<argc) cli_rpc_poll_ms = (unsigned int)atoi(argv[++i]);
         else if (!strcmp(argv[i],"--rpc-retries") && i+1<argc) cli_rpc_retries = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--rpc-sign-key") && i+1<argc) rpc_sign_key = argv[++i];
         else if (!strcmp(argv[i],"--log-file") && i+1<argc) log_file = argv[++i];
@@ -6798,10 +7071,12 @@ int main(int argc, char **argv) {
             got_work = build_mining_pass(rpc_url, rpc_user, rpc_pass, shift);
         }
         if (got_work) {
-            memcpy(h256, g_pass.h256, 32);
-            if (g_pass.prevhex[0]) {
+            struct pass_state pass_snap;
+            pass_state_snapshot(&pass_snap);
+            memcpy(h256, pass_snap.h256, 32);
+            if (pass_snap.prevhex[0]) {
                 pthread_mutex_lock(&g_work_lock);
-                strncpy(g_prevhash, g_pass.prevhex, 64);
+                strncpy(g_prevhash, pass_snap.prevhex, 64);
                 g_prevhash[64] = '\0';
                 pthread_mutex_unlock(&g_work_lock);
             }
@@ -6815,7 +7090,7 @@ int main(int argc, char **argv) {
                 scan_target_explicit,
                 &target,
                 &scan_target_cfg,
-                g_pass.ndiff);
+                pass_snap.ndiff);
         }
     }
 #endif
@@ -6974,7 +7249,7 @@ int main(int argc, char **argv) {
 
 #ifndef WITH_RPC
     /* suppress unused-but-set warnings when built without RPC */
-    (void)cli_rpc_rate; (void)cli_rpc_retries; (void)build_only; (void)no_opreturn;
+    (void)cli_rpc_rate; (void)cli_rpc_poll_ms; (void)cli_rpc_retries; (void)build_only; (void)no_opreturn;
     (void)build_p; (void)build_q; (void)rpc_url; (void)rpc_user; (void)rpc_pass; (void)rpc_method; (void)rpc_sign_key;
 #endif
 
@@ -6983,6 +7258,10 @@ int main(int argc, char **argv) {
 
 #ifdef WITH_RPC
     if (cli_rpc_rate) rpc_rate_ms = cli_rpc_rate;
+    if (cli_rpc_poll_ms) {
+        if (cli_rpc_poll_ms < 100) cli_rpc_poll_ms = 100;
+        rpc_tip_poll_ms = (int)cli_rpc_poll_ms;
+    }
     if (cli_rpc_retries >= 0) rpc_default_retries = cli_rpc_retries;
     if (rpc_url && !g_stratum) start_submit_thread();
 #ifdef WITH_RPC
@@ -7019,6 +7298,10 @@ int main(int argc, char **argv) {
 #endif
 #endif
     if (num_threads <= 1) {
+#ifdef WITH_RPC
+        tls_rpc_tip_poll_enabled = (rpc_url && !g_stratum) ? 1 : 0;
+        tls_rpc_tip_last_ms = now_ms();
+#endif
         do {
             scan_target_runtime = refresh_runtime_targets(
                 target_explicit,
@@ -7058,12 +7341,16 @@ int main(int argc, char **argv) {
                     st_crt_logged = 1;
                 }
 
-                uint32_t nonce_st = g_pass.nonce + 1;
+                struct pass_state pass_snap_st;
+                pass_state_snapshot(&pass_snap_st);
+                uint32_t nonce_st = pass_snap_st.nonce + 1;
+                uint8_t hdr80_st_base[80];
+                memcpy(hdr80_st_base, pass_snap_st.hdr80, 80);
 
                 while (keep_going && !g_abort_pass) {
                     /* SHA256d for this nonce */
                     uint8_t hdr84_st[84], sha_raw_st[32], h256_st[32];
-                    memcpy(hdr84_st, g_pass.hdr80, 80);
+                    memcpy(hdr84_st, hdr80_st_base, 80);
                     memcpy(hdr84_st + 80, &nonce_st, 4);
                     double_sha256(hdr84_st, 84, sha_raw_st);
 
@@ -7525,15 +7812,17 @@ int main(int argc, char **argv) {
                 char sdata[161]; uint64_t sndiff;
                 if (stratum_poll_new_work(g_stratum, sdata, &sndiff)) {
                     build_mining_pass_stratum(sdata, sndiff, shift);
+                    struct pass_state pass_snap;
+                    pass_state_snapshot(&pass_snap);
                     scan_target_runtime = refresh_runtime_targets(
                         target_explicit,
                         scan_target_explicit,
                         &target,
                         &scan_target_cfg,
-                        g_pass.ndiff);
-                    memcpy(h256, g_pass.h256, 32);
+                        pass_snap.ndiff);
+                    memcpy(h256, pass_snap.h256, 32);
                     free((char*)header);
-                    header = strdup(g_pass.prevhex);
+                    header = strdup(pass_snap.prevhex);
                     if (!g_abort_pass)
                         log_msg("\n*** STRATUM NEW BLOCK ***\n\n");
                     g_abort_pass = 1;
@@ -7541,20 +7830,22 @@ int main(int argc, char **argv) {
               } else {
                 sq_drain();
                 if (build_mining_pass(rpc_url, rpc_user, rpc_pass, shift)) {
+                    struct pass_state pass_snap;
+                    pass_state_snapshot(&pass_snap);
                     scan_target_runtime = refresh_runtime_targets(
                         target_explicit,
                         scan_target_explicit,
                         &target,
                         &scan_target_cfg,
-                        g_pass.ndiff);
-                    memcpy(h256, g_pass.h256, 32);
-                    if (g_pass.prevhex[0] && strcmp(g_pass.prevhex, header ? header : "") != 0) {
+                        pass_snap.ndiff);
+                    memcpy(h256, pass_snap.h256, 32);
+                    if (pass_snap.prevhex[0] && strcmp(pass_snap.prevhex, header ? header : "") != 0) {
                         free((char*)header);
-                        header = strdup(g_pass.prevhex);
+                        header = strdup(pass_snap.prevhex);
                         if (!g_abort_pass)
-                            log_msg("\n*** NEW BLOCK  prevhash=%.16s...  mining on top ***\n\n", g_pass.prevhex);
+                            log_msg("\n*** NEW BLOCK  prevhash=%.16s...  mining on top ***\n\n", pass_snap.prevhex);
                         pthread_mutex_lock(&g_work_lock);
-                        strncpy(g_prevhash, g_pass.prevhex, 64); g_prevhash[64] = '\0';
+                        strncpy(g_prevhash, pass_snap.prevhex, 64); g_prevhash[64] = '\0';
                         pthread_mutex_unlock(&g_work_lock);
                         g_abort_pass = 1;
                     }
@@ -7700,7 +7991,11 @@ int main(int argc, char **argv) {
                g_abort_pass=1.  If we only update h256 when stratum_poll_new_work
                returns true, h256 becomes stale — workers mine with one base but
                blocks are assembled with a different header. */
-            memcpy(h256, g_pass.h256, 32);
+            {
+                struct pass_state pass_snap;
+                pass_state_snapshot(&pass_snap);
+                memcpy(h256, pass_snap.h256, 32);
+            }
 #endif
 
             if (keep_going && rpc_url) {
@@ -7709,15 +8004,17 @@ int main(int argc, char **argv) {
                 char sdata[161]; uint64_t sndiff;
                 if (stratum_poll_new_work(g_stratum, sdata, &sndiff)) {
                     build_mining_pass_stratum(sdata, sndiff, shift);
+                    struct pass_state pass_snap;
+                    pass_state_snapshot(&pass_snap);
                     scan_target_runtime = refresh_runtime_targets(
                         target_explicit,
                         scan_target_explicit,
                         &target,
                         &scan_target_cfg,
-                        g_pass.ndiff);
-                    memcpy(h256, g_pass.h256, 32);
+                        pass_snap.ndiff);
+                    memcpy(h256, pass_snap.h256, 32);
                     free((char*)header);
-                    header = strdup(g_pass.prevhex);
+                    header = strdup(pass_snap.prevhex);
                     if (!g_abort_pass)
                         log_msg("\n*** STRATUM NEW BLOCK ***\n\n");
                 }
@@ -7725,20 +8022,22 @@ int main(int argc, char **argv) {
                 /* Drain submit queue before getwork to keep mapNewBlock consistent. */
                 sq_drain();
                 if (build_mining_pass(rpc_url, rpc_user, rpc_pass, shift)) {
+                    struct pass_state pass_snap;
+                    pass_state_snapshot(&pass_snap);
                     scan_target_runtime = refresh_runtime_targets(
                         target_explicit,
                         scan_target_explicit,
                         &target,
                         &scan_target_cfg,
-                        g_pass.ndiff);
-                    memcpy(h256, g_pass.h256, 32);
-                    if (g_pass.prevhex[0] && strcmp(g_pass.prevhex, header ? header : "") != 0) {
+                        pass_snap.ndiff);
+                    memcpy(h256, pass_snap.h256, 32);
+                    if (pass_snap.prevhex[0] && strcmp(pass_snap.prevhex, header ? header : "") != 0) {
                         free((char*)header);
-                        header = strdup(g_pass.prevhex);
+                        header = strdup(pass_snap.prevhex);
                         if (!g_abort_pass)
-                            log_msg("\n*** NEW BLOCK  prevhash=%.16s...  mining on top ***\n\n", g_pass.prevhex);
+                            log_msg("\n*** NEW BLOCK  prevhash=%.16s...  mining on top ***\n\n", pass_snap.prevhex);
                         pthread_mutex_lock(&g_work_lock);
-                        strncpy(g_prevhash, g_pass.prevhex, 64); g_prevhash[64] = '\0';
+                        strncpy(g_prevhash, pass_snap.prevhex, 64); g_prevhash[64] = '\0';
                         pthread_mutex_unlock(&g_work_lock);
                     }
                 }

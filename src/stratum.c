@@ -27,6 +27,7 @@
 /* ──────────────── constants ──────────────── */
 #define RECONNECT_DELAY_S   15
 #define RECV_BUF_INIT      4096
+#define RECV_BUF_MAX    1048576
 #define SEND_BUF_MAX      32768
 
 /* ──────────────── context ──────────────── */
@@ -179,10 +180,25 @@ static int stratum_recv_line(stratum_ctx *ctx, char **out) {
 
         /* Need more data; grow buffer if needed */
         if (ctx->recv_buf_len + 1024 > ctx->recv_buf_cap) {
-            ctx->recv_buf_cap *= 2;
-            char *tmp = (char *)realloc(ctx->recv_buf, ctx->recv_buf_cap);
+            if (ctx->recv_buf_cap >= RECV_BUF_MAX) {
+                fprintf(stderr,
+                        "[stratum] recv line exceeded %u bytes, reconnecting\n",
+                        (unsigned)RECV_BUF_MAX);
+                return -1;
+            }
+            size_t new_cap = ctx->recv_buf_cap * 2;
+            if (new_cap > RECV_BUF_MAX)
+                new_cap = RECV_BUF_MAX;
+            if (ctx->recv_buf_len + 1024 > new_cap) {
+                fprintf(stderr,
+                        "[stratum] recv line exceeded %u bytes, reconnecting\n",
+                        (unsigned)RECV_BUF_MAX);
+                return -1;
+            }
+            char *tmp = (char *)realloc(ctx->recv_buf, new_cap);
             if (!tmp) return -1;
             ctx->recv_buf = tmp;
+            ctx->recv_buf_cap = new_cap;
         }
 
         int n = recv(ctx->sock, ctx->recv_buf + ctx->recv_buf_len, 1024, 0);

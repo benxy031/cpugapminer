@@ -15,14 +15,24 @@ int rpc_getwork_data(const char *url, const char *user, const char *pass, char d
 }
 
 struct string_s { char *ptr; size_t len; };
-static void init_string_s(struct string_s *s) { s->len = 0; s->ptr = (char*)malloc(1); s->ptr[0] = '\0'; }
+static int init_string_s(struct string_s *s) {
+    s->len = 0;
+    s->ptr = (char*)malloc(1);
+    if (!s->ptr) return 0;
+    s->ptr[0] = '\0';
+    return 1;
+}
 static size_t writefunc_s(void *ptr, size_t size, size_t nmemb, struct string_s *s) {
-    size_t newlen = s->len + size * nmemb;
-    s->ptr = (char*)realloc(s->ptr, newlen + 1);
+    size_t add = size * nmemb;
+    if (add > SIZE_MAX - s->len - 1) return 0;
+    size_t newlen = s->len + add;
+    char *newptr = (char*)realloc(s->ptr, newlen + 1);
+    if (!newptr) return 0;
+    s->ptr = newptr;
     memcpy(s->ptr + s->len, ptr, size * nmemb);
     s->ptr[newlen] = '\0';
     s->len = newlen;
-    return size * nmemb;
+    return add;
 }
 
 int rpc_submit(const char *url, const char *user, const char *pass, const char *method, const char *hex) {
@@ -59,7 +69,13 @@ int rpc_submit(const char *url, const char *user, const char *pass, const char *
     }
 
     curl_easy_setopt(c, CURLOPT_POSTFIELDS, payload);
-    struct string_s s; init_string_s(&s);
+    struct string_s s;
+    if (!init_string_s(&s)) {
+        curl_slist_free_all(h);
+        curl_easy_cleanup(c);
+        free(payload);
+        return -1;
+    }
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, writefunc_s);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &s);
     CURLcode rc = curl_easy_perform(c);
@@ -142,7 +158,12 @@ char *rpc_call(const char *url, const char *user, const char *pass, const char *
     if (params_json) snprintf(payload, sizeof(payload), "{\"jsonrpc\":\"1.0\",\"id\":\"Cminer\",\"method\":\"%s\",\"params\":%s}", method, params_json);
     else snprintf(payload, sizeof(payload), "{\"jsonrpc\":\"1.0\",\"id\":\"Cminer\",\"method\":\"%s\",\"params\":[]}", method);
     curl_easy_setopt(c, CURLOPT_POSTFIELDS, payload);
-    struct string_s s; init_string_s(&s);
+    struct string_s s;
+    if (!init_string_s(&s)) {
+        curl_slist_free_all(h);
+        curl_easy_cleanup(c);
+        return NULL;
+    }
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, writefunc_s);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &s);
     CURLcode rc = curl_easy_perform(c);

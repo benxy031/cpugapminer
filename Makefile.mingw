@@ -46,7 +46,7 @@ WINLIBS=-lws2_32
 ifdef WITH_RPC
 	LIBS=-lcurl -ljansson -lssl -lcrypto $(GMP_LIB) -lm -lpthread -lstdc++ $(WINLIBS)
 	CFLAGS+=-DWITH_RPC $(GMP_CFLAGS)
-	RPC_SRCS=$(SRCDIR)/rpc_cwrap.cpp $(SRCDIR)/rpc_globals.cpp $(SRCDIR)/rpc_stubs.cpp $(SRCDIR)/Rpc.cpp
+	RPC_SRCS=$(SRCDIR)/rpc_cwrap.cpp
 	RPC_OBJS=$(RPC_SRCS:.cpp=.o)
 	STRATUM_OBJ=$(SRCDIR)/stratum.o
 	LINKER=$(CXX)

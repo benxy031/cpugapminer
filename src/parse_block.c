@@ -39,7 +39,20 @@ int main(int argc, char **argv) {
     if (argc >= 2) hex = argv[1];
     else {
         size_t cap=8192; hex = malloc(cap); size_t len=0; int c;
-        while ((c=getchar())!=EOF) { if (len+1>=cap) { cap*=2; hex=realloc(hex,cap); } hex[len++]=c; }
+        if (!hex) { fprintf(stderr, "oom\n"); return 2; }
+        while ((c=getchar())!=EOF) {
+            if (len+1>=cap) {
+                cap*=2;
+                char *tmp = realloc(hex,cap);
+                if (!tmp) {
+                    free(hex);
+                    fprintf(stderr, "oom\n");
+                    return 2;
+                }
+                hex = tmp;
+            }
+            hex[len++]=c;
+        }
         hex[len]='\0';
         while (len>0 && (hex[len-1]=='\n' || hex[len-1]=='\r' || hex[len-1]==' ' || hex[len-1]=='\t')) hex[--len]='\0';
     }

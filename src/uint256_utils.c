@@ -9,6 +9,17 @@
 #define M_LN2 0.693147180559945309417232121458
 #endif
 
+static uint64_t pow2_mod_u64(uint64_t exp, uint64_t mod) {
+    __uint128_t result = 1 % mod;
+    __uint128_t base = 2 % mod;
+    while (exp) {
+        if (exp & 1) result = (result * base) % mod;
+        base = (base * base) % mod;
+        exp >>= 1;
+    }
+    return (uint64_t)result;
+}
+
 void hash_to_256(const char *s, int is_hex, uint8_t out[32]) {
     memset(out, 0, 32);
     if (is_hex) {
@@ -38,9 +49,8 @@ uint64_t uint256_mod_small(const uint8_t h[32], int shift, uint64_t p) {
     for (int i = 0; i < 32; i++)
         rem = (rem * 256 + h[i]) % p;
 
-    __uint128_t pow2 = 1 % p;
-    for (int i = 0; i < shift; i++)
-        pow2 = pow2 * 2 % p;
+    uint64_t shift_u = (shift > 0) ? (uint64_t)shift : 0;
+    __uint128_t pow2 = pow2_mod_u64(shift_u, p);
 
     return (uint64_t)((__uint128_t)rem * pow2 % p);
 }
