@@ -67,7 +67,7 @@ endif
 
 all: $(TARGET)
 
-test: tests/test_rpc_json tests/test_wheel_sieve tests/test_wheel_compare
+test: tests/test_rpc_json tests/test_wheel_sieve tests/test_wheel_compare tests/test_crt_runtime_policy
 
 tests/test_rpc_json: $(SRCDIR)/rpc_json.c tests/test_rpc_json.c
 	$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $(SRCDIR)/rpc_json.c tests/test_rpc_json.c -ljansson
@@ -77,6 +77,9 @@ tests/test_wheel_sieve: $(SRCDIR)/wheel_sieve.c tests/test_wheel_sieve.c
 
 tests/test_wheel_compare: $(SRCDIR)/wheel_sieve.c tests/test_wheel_compare.c
 	$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $(SRCDIR)/wheel_sieve.c tests/test_wheel_compare.c
+
+tests/test_crt_runtime_policy: $(SRCDIR)/crt_runtime.c tests/test_crt_runtime_policy.c
+	$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $(SRCDIR)/crt_runtime.c tests/test_crt_runtime_policy.c
 
 $(BINDIR):
 	mkdir -p $(BINDIR)
@@ -90,8 +93,8 @@ $(SRCDIR)/%.o: $(SRCDIR)/%.cpp
 $(SRCDIR)/gpu_fermat.o: $(SRCDIR)/gpu_fermat.cu $(SRCDIR)/gpu_fermat.h
 	$(NVCC) -O3 $(CUDA_ARCH) $(NVCC_FLAGS) -c $< -o $@
 
-$(TARGET): $(BINDIR) $(SRCDIR)/main.o $(SRCDIR)/stats.o $(SRCDIR)/sieve_cache.o $(SRCDIR)/gap_scan.o $(SRCDIR)/crt_heap.o $(SRCDIR)/crt_solver.o $(SRCDIR)/crt_gap_scan.o $(SRCDIR)/presieve_utils.o $(SRCDIR)/wheel_sieve.o $(SRCDIR)/uint256_utils.o $(SRCDIR)/block_utils.o $(SRCDIR)/primality_utils.o $(RPC_OBJS) $(STRATUM_OBJ) $(GPU_OBJ)
-	$(LINKER) -o $@ $(SRCDIR)/main.o $(SRCDIR)/stats.o $(SRCDIR)/sieve_cache.o $(SRCDIR)/gap_scan.o $(SRCDIR)/crt_heap.o $(SRCDIR)/crt_solver.o $(SRCDIR)/crt_gap_scan.o $(SRCDIR)/presieve_utils.o $(SRCDIR)/wheel_sieve.o $(SRCDIR)/uint256_utils.o $(SRCDIR)/block_utils.o $(SRCDIR)/primality_utils.o $(RPC_OBJS) $(STRATUM_OBJ) $(GPU_OBJ) $(LDFLAGS) $(LIBS)
+$(TARGET): $(BINDIR) $(SRCDIR)/main.o $(SRCDIR)/stats.o $(SRCDIR)/sieve_cache.o $(SRCDIR)/gap_scan.o $(SRCDIR)/crt_heap.o $(SRCDIR)/crt_solver.o $(SRCDIR)/crt_gap_scan.o $(SRCDIR)/crt_runtime.o $(SRCDIR)/crt_runtime_worker.o $(SRCDIR)/crt_runtime_cpu.o $(SRCDIR)/crt_runtime_gpu.o $(SRCDIR)/presieve_utils.o $(SRCDIR)/wheel_sieve.o $(SRCDIR)/uint256_utils.o $(SRCDIR)/block_utils.o $(SRCDIR)/primality_utils.o $(RPC_OBJS) $(STRATUM_OBJ) $(GPU_OBJ)
+	$(LINKER) -o $@ $(SRCDIR)/main.o $(SRCDIR)/stats.o $(SRCDIR)/sieve_cache.o $(SRCDIR)/gap_scan.o $(SRCDIR)/crt_heap.o $(SRCDIR)/crt_solver.o $(SRCDIR)/crt_gap_scan.o $(SRCDIR)/crt_runtime.o $(SRCDIR)/crt_runtime_worker.o $(SRCDIR)/crt_runtime_cpu.o $(SRCDIR)/crt_runtime_gpu.o $(SRCDIR)/presieve_utils.o $(SRCDIR)/wheel_sieve.o $(SRCDIR)/uint256_utils.o $(SRCDIR)/block_utils.o $(SRCDIR)/primality_utils.o $(RPC_OBJS) $(STRATUM_OBJ) $(GPU_OBJ) $(LDFLAGS) $(LIBS)
 
 clean:
 	rm -rf $(BINDIR) $(SRCDIR)/*.o

@@ -10,6 +10,7 @@
 #include <math.h>
 #include <time.h>
 #include <limits.h>
+#include <pthread.h>
 #ifdef __AVX2__
 #include <immintrin.h>
 #elif defined(__SSE2__)
@@ -28,6 +29,8 @@ static int      bn_candidate_is_prime(uint64_t offset);
 #ifdef WITH_RPC
 static int      build_mining_pass(const char *url, const char *user, const char *pass, int shift);
 static int      assemble_mining_block(uint64_t nadd_val, uint64_t expect_seq, char out_hex[16384]);
+static void     pass_state_snapshot_nonce_hdr80(uint32_t *nonce_out,
+                                                uint8_t hdr80_out[80]);
 static void     submit_gap_block_common(const char *blockhex, double merit,
                                         const char *rpc_url,
                                         const char *rpc_user,
@@ -61,16 +64,20 @@ static int             g_gpu_active_limbs_global = 0;  /* set after GPU init  */
 #include "wheel_sieve.h"
 #include "crt_solver.h"
 #include "crt_gap_scan.h"
+#include "crt_runtime.h"
 #include "uint256_utils.h"
 #include "block_utils.h"
 #include "primality_utils.h"
 
 // logging helper (used in both RPC and non-RPC builds)
 static FILE *log_fp = NULL;
+static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static void log_msg(const char *fmt, ...) {
     va_list ap;
+    pthread_mutex_lock(&g_log_mutex);
     va_start(ap, fmt);
     vfprintf(stdout, fmt, ap);
+    va_end(ap);
     if (log_fp) {
         va_list ap2;
         va_start(ap2, fmt);
@@ -79,20 +86,21 @@ static void log_msg(const char *fmt, ...) {
         va_end(ap2);
     }
     fflush(stdout);
-    va_end(ap);
+    pthread_mutex_unlock(&g_log_mutex);
 }
 /* write only to the log file (silent on console); no-op when no log file is open */
 static void log_file_only(const char *fmt, ...) __attribute__((format(printf,1,2)));
 static void log_file_only(const char *fmt, ...) {
     if (!log_fp) return;
+    pthread_mutex_lock(&g_log_mutex);
     va_list ap;
     va_start(ap, fmt);
     vfprintf(log_fp, fmt, ap);
     fflush(log_fp);
     va_end(ap);
+    pthread_mutex_unlock(&g_log_mutex);
 }
 #include <openssl/hmac.h>
-#include <pthread.h>
 #ifndef _WIN32
 #include <sys/time.h>
 #endif
@@ -195,6 +203,160 @@ static double compute_cramer_score(const uint64_t *surv, size_t n,
     return p * p * score;
 }
 
+/* Phase 1 defaults by shift band for CRT solver mode. */
+struct crt_phase1_profile {
+    int min_shift;
+    uint64_t sieve_primes_cpu;
+    uint64_t sieve_primes_gpu;
+    int gpu_batch;
+    size_t heap_cap;
+    int auto_split_bootstrap;
+};
+
+static const struct crt_phase1_profile g_crt_phase1_profiles[] = {
+    { 768, 5000000ULL, 300000ULL, 16384, 8192, 1 },
+    { 384, 3000000ULL, 300000ULL, 8192,  4096, 1 },
+    { 128, 2000000ULL, 500000ULL, 4096,  4096, 2 },
+    {   0, DEFAULT_SIEVE_PRIME_COUNT, DEFAULT_SIEVE_PRIME_COUNT, 2048, 2048, 2 },
+};
+
+static const struct crt_phase1_profile *crt_phase1_pick_profile(int shift) {
+    size_t n = sizeof(g_crt_phase1_profiles) / sizeof(g_crt_phase1_profiles[0]);
+    for (size_t i = 0; i < n; i++) {
+        if (shift >= g_crt_phase1_profiles[i].min_shift)
+            return &g_crt_phase1_profiles[i];
+    }
+    return &g_crt_phase1_profiles[n - 1];
+}
+
+#define CRT_SCORE_ROLL_SLOTS 1024
+struct crt_score_roll_state {
+    pthread_mutex_t mu;
+    double x[CRT_SCORE_ROLL_SLOTS];
+    double y[CRT_SCORE_ROLL_SLOTS];
+    size_t idx;
+    size_t n;
+    long double sx, sy, sxx, syy, sxy;
+    uint64_t total_obs;
+    uint64_t total_surv;
+    uint64_t total_primes;
+    uint64_t total_qual;
+};
+
+struct crt_score_roll_snapshot {
+    uint64_t total_obs;
+    uint64_t total_surv;
+    uint64_t total_primes;
+    uint64_t total_qual;
+    size_t n;
+    double corr;
+    double avg_score;
+    double avg_qual;
+};
+
+static struct crt_score_roll_state g_crt_score_roll = {
+    .mu = PTHREAD_MUTEX_INITIALIZER,
+};
+
+static void __attribute__((unused))
+crt_score_roll_observe(double score,
+                                   uint64_t surv_cnt,
+                                   uint64_t primes_found,
+                                   uint64_t qual_pairs) {
+    if (score < 0.0)
+        score = 0.0;
+
+    pthread_mutex_lock(&g_crt_score_roll.mu);
+
+    size_t slot = g_crt_score_roll.idx;
+    if (g_crt_score_roll.n == CRT_SCORE_ROLL_SLOTS) {
+        long double ox = (long double)g_crt_score_roll.x[slot];
+        long double oy = (long double)g_crt_score_roll.y[slot];
+        g_crt_score_roll.sx  -= ox;
+        g_crt_score_roll.sy  -= oy;
+        g_crt_score_roll.sxx -= ox * ox;
+        g_crt_score_roll.syy -= oy * oy;
+        g_crt_score_roll.sxy -= ox * oy;
+    } else {
+        g_crt_score_roll.n++;
+    }
+
+    g_crt_score_roll.x[slot] = score;
+    g_crt_score_roll.y[slot] = (double)qual_pairs;
+
+    {
+        long double x = (long double)score;
+        long double y = (long double)qual_pairs;
+        g_crt_score_roll.sx  += x;
+        g_crt_score_roll.sy  += y;
+        g_crt_score_roll.sxx += x * x;
+        g_crt_score_roll.syy += y * y;
+        g_crt_score_roll.sxy += x * y;
+    }
+
+    g_crt_score_roll.idx = (slot + 1) % CRT_SCORE_ROLL_SLOTS;
+    g_crt_score_roll.total_obs++;
+    g_crt_score_roll.total_surv   += surv_cnt;
+    g_crt_score_roll.total_primes += primes_found;
+    g_crt_score_roll.total_qual   += qual_pairs;
+
+    pthread_mutex_unlock(&g_crt_score_roll.mu);
+}
+
+static void crt_score_roll_snapshot(struct crt_score_roll_snapshot *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+
+    pthread_mutex_lock(&g_crt_score_roll.mu);
+    out->total_obs = g_crt_score_roll.total_obs;
+    out->total_surv = g_crt_score_roll.total_surv;
+    out->total_primes = g_crt_score_roll.total_primes;
+    out->total_qual = g_crt_score_roll.total_qual;
+    out->n = g_crt_score_roll.n;
+
+    if (g_crt_score_roll.n > 0) {
+        long double n = (long double)g_crt_score_roll.n;
+        long double sx = g_crt_score_roll.sx;
+        long double sy = g_crt_score_roll.sy;
+        long double sxx = g_crt_score_roll.sxx;
+        long double syy = g_crt_score_roll.syy;
+        long double sxy = g_crt_score_roll.sxy;
+
+        out->avg_score = (double)(sx / n);
+        out->avg_qual  = (double)(sy / n);
+
+        if (g_crt_score_roll.n >= 2) {
+            long double num = n * sxy - sx * sy;
+            long double denx = n * sxx - sx * sx;
+            long double deny = n * syy - sy * sy;
+            if (denx > 0.0L && deny > 0.0L) {
+                long double corr = num / sqrtl(denx * deny);
+                if (corr > 1.0L) corr = 1.0L;
+                if (corr < -1.0L) corr = -1.0L;
+                out->corr = (double)corr;
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&g_crt_score_roll.mu);
+}
+
+#ifdef WITH_GPU_FERMAT
+static inline void crt_accum_record_batch(size_t batch_sz) {
+    if (batch_sz <= 512) {
+        __sync_fetch_and_add(&stats_crt_gpu_accum_batch_le_512, 1);
+    } else if (batch_sz <= 1024) {
+        __sync_fetch_and_add(&stats_crt_gpu_accum_batch_le_1024, 1);
+    } else if (batch_sz <= 2048) {
+        __sync_fetch_and_add(&stats_crt_gpu_accum_batch_le_2048, 1);
+    } else if (batch_sz <= 4096) {
+        __sync_fetch_and_add(&stats_crt_gpu_accum_batch_le_4096, 1);
+    } else {
+        __sync_fetch_and_add(&stats_crt_gpu_accum_batch_gt_4096, 1);
+    }
+}
+#endif
+
 /* shared current-work state so any thread can detect a new block */
 static char     g_prevhash[65]  = {0};
 static pthread_mutex_t g_work_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -225,6 +387,16 @@ static pthread_mutex_t g_pass_lock = PTHREAD_MUTEX_INITIALIZER;
 static void pass_state_snapshot(struct pass_state *out) {
     pthread_mutex_lock(&g_pass_lock);
     *out = g_pass;
+    pthread_mutex_unlock(&g_pass_lock);
+}
+
+static void pass_state_snapshot_nonce_hdr80(uint32_t *nonce_out,
+                                            uint8_t hdr80_out[80]) {
+    pthread_mutex_lock(&g_pass_lock);
+    if (nonce_out)
+        *nonce_out = g_pass.nonce;
+    if (hdr80_out)
+        memcpy(hdr80_out, g_pass.hdr80, 80);
     pthread_mutex_unlock(&g_pass_lock);
 }
 
@@ -435,8 +607,59 @@ static volatile int use_partial_sieve_auto = 0;
 static volatile int use_wheel_sieve = 0;
 /* if nonzero, write extra partial-sieve-auto details to the log file. */
 static volatile int use_extra_verbose = 0;
+/* if nonzero, print detailed CRT phase telemetry in periodic STATS output. */
+static volatile int use_stats_verbose = 0;
 /* if nonzero, adapt CRT producer/consumer split between passes. */
 static volatile int use_crt_auto_split = 0;
+/* if nonzero, allow CRT fermat consumers to use GPU accumulator (experimental). */
+static volatile int use_crt_gpu_consumer = 0;
+/* if nonzero, adapt per-nonce CRT window size from heap pressure. */
+static volatile int use_crt_gap_scan_adaptive = 0;
+/* if nonzero, favor CRT correctness/targeting precision over speed. */
+static volatile int use_crt_precision = 0;
+#ifdef WITH_GPU_FERMAT
+/* if nonzero, force preflush before add() under GPU accumulator pressure. */
+static volatile int use_crt_accum_backpressure = 1;
+/* if nonzero, adjust CRT GPU accumulator flush threshold from live telemetry. */
+static volatile int use_crt_gpu_batch_adaptive = 0;
+#endif
+
+/* Policy extracted to src/crt_runtime.c for loop refactor groundwork. */
+static struct crt_gap_scan_adapt_cfg g_crt_gap_scan_adapt_cfg = {
+    .shrink_drop_pct = 2.0,
+    .shrink_fill_pct = 80.0,
+    .shrink_factor = 0.80,
+    .grow_wait_pct = 45.0,
+    .grow_fill_pct = 25.0,
+    .grow_factor = 1.15,
+};
+
+#ifdef WITH_GPU_FERMAT
+static struct crt_accum_backpressure_cfg g_crt_accum_bp_cfg = {
+    .soft_cap_candidates = 24576,
+    .hard_cap_candidates = 65536,
+    .slow_flush_ms = 0.35,
+    .slow_collect_ms = 0.35,
+};
+
+static struct crt_gpu_batch_adapt_cfg g_crt_gpu_batch_adapt_cfg = {
+    .min_batch = 512,
+    .max_batch = 32768,
+    .pressure_fill_pct = 92.0,
+    .grow_fill_pct = 55.0,
+    .slow_flush_ms = 0.55,
+    .slow_collect_ms = 0.55,
+    .fast_flush_ms = 0.20,
+    .fast_collect_ms = 0.20,
+    .shrink_factor = 0.85,
+    .grow_factor = 1.12,
+};
+
+static volatile uint64_t stats_crt_gpu_accum_tune_up = 0;
+static volatile uint64_t stats_crt_gpu_accum_tune_down = 0;
+static volatile uint64_t stats_crt_gpu_accum_tune_hold = 0;
+static volatile uint64_t stats_crt_gpu_accum_threshold_last = 0;
+#endif
 static volatile int use_mr_verify = 0;   /* MR base-3 verify Fermat survivors */
 static volatile int no_primality = 0;   /* skip all probable‑prime filtering */
 static volatile int selftest = 0;        /* run a quick internal test then exit */
@@ -519,6 +742,14 @@ static int cli_sample_stride = DEFAULT_SAMPLE_STRIDE;
    at mining-relevant sizes (false-positive < 2^-128).  The old default of
    10 rounds cost ~5× more but added negligible confidence.                  */
 static int cli_mr_rounds = 2;
+/* Additional probable-prime rounds used by --crt-precision. */
+static int cli_crt_precision_rounds = 8;
+
+static inline int crt_precision_rounds_effective(void) {
+    return (cli_crt_precision_rounds > cli_mr_rounds)
+        ? cli_crt_precision_rounds
+        : cli_mr_rounds;
+}
 
 /* Scan threshold used by non-CRT smart-scan stride.  This is the effective
     runtime value after applying defaults and mode-specific safety rules.
@@ -1636,17 +1867,89 @@ static void print_stats(void) {
                 (unsigned long long)pop_ok,
                 wait_pct,
                 (unsigned long long)stale);
-            uint64_t cs_n   = stats_cramer_scored;
-            uint64_t cs_sum = stats_cramer_score_sum_e9;
-            double   cs_avg = (cs_n > 0) ? ((double)cs_sum / (double)cs_n) * 1e-9 : 0.0;
-            log_msg("  cramer: scored=%llu avg_score=%.3e skip_span=%llu skip_score=%llu",
-                (unsigned long long)cs_n,
-                cs_avg,
-                (unsigned long long)stats_cramer_skipped,
-                (unsigned long long)stats_cramer_heap_skip);
-        } else if (stats_cramer_skipped > 0) {
+            if (use_stats_verbose) {
+                uint64_t cs_n   = stats_cramer_scored;
+                uint64_t cs_sum = stats_cramer_score_sum_e9;
+                double   cs_avg = (cs_n > 0)
+                    ? ((double)cs_sum / (double)cs_n) * 1e-9 : 0.0;
+                log_msg("  cramer: scored=%llu avg_score=%.3e skip_span=%llu skip_score=%llu",
+                    (unsigned long long)cs_n,
+                    cs_avg,
+                    (unsigned long long)stats_cramer_skipped,
+                    (unsigned long long)stats_cramer_heap_skip);
+            }
+        } else if (use_stats_verbose && stats_cramer_skipped > 0) {
             log_msg("  cramer: skip_span=%llu",
                 (unsigned long long)stats_cramer_skipped);
+        }
+
+        if (use_stats_verbose) {
+            uint64_t prod_gen = stats_crt_solver_prod_windows_generated;
+            uint64_t prod_enq = stats_crt_solver_prod_windows_enqueued;
+            uint64_t pre_span_drop = stats_crt_solver_prod_prefilter_span_drop;
+            uint64_t pre_den_drop = stats_crt_solver_prod_prefilter_density_drop;
+            double enq_pct = (prod_gen > 0)
+                ? (100.0 * (double)prod_enq / (double)prod_gen) : 0.0;
+            struct crt_score_roll_snapshot score_snap;
+            crt_score_roll_snapshot(&score_snap);
+
+            log_msg("  phase1: mono_cpu_tests=%llu mono_gpu_tests=%llu consumer_cpu_tests=%llu consumer_gpu_tests=%llu",
+                (unsigned long long)stats_crt_solver_mono_cpu_tests,
+                (unsigned long long)stats_crt_solver_mono_gpu_tests,
+                (unsigned long long)stats_crt_solver_consumer_cpu_tests,
+                (unsigned long long)stats_crt_solver_consumer_gpu_tests);
+            log_msg("  phase1: producer generated=%llu enqueued=%llu consumed=%llu (enq %.1f%%) prefilter span=%llu density=%llu",
+                (unsigned long long)prod_gen,
+                (unsigned long long)prod_enq,
+                (unsigned long long)stats_crt_consumer_windows,
+                enq_pct,
+                (unsigned long long)pre_span_drop,
+                (unsigned long long)pre_den_drop);
+            if (stats_crt_gpu_accum_flush_count > 0 ||
+                stats_crt_gpu_accum_collect_count > 0) {
+                double avg_flush_ms = (stats_crt_gpu_accum_flush_count > 0)
+                    ? (double)stats_crt_gpu_accum_flush_ms /
+                      (double)stats_crt_gpu_accum_flush_count : 0.0;
+                double avg_collect_ms = (stats_crt_gpu_accum_collect_count > 0)
+                    ? (double)stats_crt_gpu_accum_collect_ms /
+                      (double)stats_crt_gpu_accum_collect_count : 0.0;
+                log_msg("  phase1: accum flush=%llu avg_flush_ms=%.2f collect=%llu avg_collect_ms=%.2f",
+                    (unsigned long long)stats_crt_gpu_accum_flush_count,
+                    avg_flush_ms,
+                    (unsigned long long)stats_crt_gpu_accum_collect_count,
+                    avg_collect_ms);
+                log_msg("  phase1: accum batch_hist <=512:%llu <=1k:%llu <=2k:%llu <=4k:%llu >4k:%llu",
+                    (unsigned long long)stats_crt_gpu_accum_batch_le_512,
+                    (unsigned long long)stats_crt_gpu_accum_batch_le_1024,
+                    (unsigned long long)stats_crt_gpu_accum_batch_le_2048,
+                    (unsigned long long)stats_crt_gpu_accum_batch_le_4096,
+                    (unsigned long long)stats_crt_gpu_accum_batch_gt_4096);
+#ifdef WITH_GPU_FERMAT
+                if (use_crt_gpu_batch_adaptive) {
+                    log_msg("  phase1: accum adaptive up=%llu down=%llu hold=%llu last_threshold=%llu",
+                        (unsigned long long)stats_crt_gpu_accum_tune_up,
+                        (unsigned long long)stats_crt_gpu_accum_tune_down,
+                        (unsigned long long)stats_crt_gpu_accum_tune_hold,
+                        (unsigned long long)stats_crt_gpu_accum_threshold_last);
+                }
+#endif
+            }
+            if (score_snap.total_obs > 0) {
+                double avg_surv = (double)score_snap.total_surv /
+                    (double)score_snap.total_obs;
+                double avg_primes = (double)score_snap.total_primes /
+                    (double)score_snap.total_obs;
+                double avg_qual = (double)score_snap.total_qual /
+                    (double)score_snap.total_obs;
+                log_msg("  phase1: score_calib obs=%llu roll=%zu corr(score,qual)=%.3f avg_score=%.3e avg_qual_win=%.3f avg_surv=%.1f avg_primes=%.1f",
+                    (unsigned long long)score_snap.total_obs,
+                    score_snap.n,
+                    score_snap.corr,
+                    score_snap.avg_score,
+                    avg_qual,
+                    avg_surv,
+                    avg_primes);
+            }
         }
     }
 
@@ -3269,17 +3572,23 @@ static int verify_pow_hex(const char *blockhex) {
         log_msg("[verify_pow] WARNING: header bytes don't match pass snapshot hdr80!\n");
 
     /* Check actual merit against network target.
-       The miner's sieve/Fermat pipeline can produce false gaps (reported gap
-       larger than actual) when the smart-scan misses primes in non-flagged
-       regions or at window boundaries.  Reject any block whose verified gap
-       doesn't meet the target difficulty. */
+       This reject path can mean either:
+         1) real local candidate but below current network difficulty, or
+         2) overstated/false local gap merit. */
     int merit_ok = 1;
     if (is_prime && pass_snap.ndiff > 0) {
         double target_merit = (double)pass_snap.ndiff / (double)(1ULL << 48);
         if (actual_merit < target_merit * 0.99) {
-            log_msg("[verify_pow] REJECT: actual_merit=%.6f < target=%.6f"
-                    "  (false gap: reported would be larger)\n",
-                    actual_merit, target_merit);
+            double local_submit_target = g_mining_target;
+            if (actual_merit + 1e-9 >= local_submit_target) {
+                log_msg("[verify_pow] REJECT: actual_merit=%.6f >= local_submit=%.6f"
+                        " but < network_target=%.6f  (valid local gap, below network difficulty)\n",
+                        actual_merit, local_submit_target, target_merit);
+            } else {
+                log_msg("[verify_pow] REJECT: actual_merit=%.6f < local_submit=%.6f"
+                        " and < network_target=%.6f  (overstated/false local merit)\n",
+                        actual_merit, local_submit_target, target_merit);
+            }
             merit_ok = 0;
         }
     }
@@ -3829,7 +4138,12 @@ static int bn_candidate_is_prime(uint64_t offset) {
     tls_cand_last_valid  = 1;
 
     int is_prime;
-    if (use_fast_euler) {
+    if (use_crt_precision && g_crt_mode == CRT_MODE_SOLVER) {
+        /* Precision mode: in CRT solver runs, always use a stronger
+           probable-prime check regardless of fast-path settings. */
+        is_prime = (mpz_probab_prime_p(tls_cand_mpz,
+                          crt_precision_rounds_effective()) > 0);
+    } else if (use_fast_euler) {
         /* Strong base-2 Miller-Rabin (single round).
            Write n-1 = 2^s * d with d odd.  Compute x = 2^d mod n, then
            square up to s-1 more times.  Any prime satisfies at least one
@@ -4113,7 +4427,9 @@ static size_t crt_bkscan_and_submit(
         double logbase, double target, int shift_v,
         uint32_t nonce, int cand_odd, mpz_srcptr nAdd,
         const char *rpc_url, const char *rpc_user,
-        const char *rpc_pass)
+    const char *rpc_pass,
+    size_t *out_primes_found,
+    size_t *out_qual_pairs)
 {
     size_t total_tested = 0;
     size_t primes_found = 0;
@@ -4241,6 +4557,11 @@ static size_t crt_bkscan_and_submit(
     if (primes_found > 1)
         __sync_fetch_and_add(&stats_pairs, (uint64_t)(primes_found - 1));
 
+    if (out_primes_found)
+        *out_primes_found = primes_found;
+    if (out_qual_pairs)
+        *out_qual_pairs = qual_cnt;
+
     return total_tested;
 }
 
@@ -4252,40 +4573,97 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
                              double logbase, uint32_t nonce, int cand_odd,
                              mpz_srcptr nAdd, int shift_v, double target,
                              const char *rpc_url, const char *rpc_user,
-                             const char *rpc_pass) {
+                             const char *rpc_pass,
+                             size_t *out_primes_found,
+                             size_t *out_qual_pairs) {
+    size_t qual_pairs = 0;
     __sync_fetch_and_add(&stats_crt_windows, 1);
+
     __sync_fetch_and_add(&stats_primes_found, (uint64_t)prime_cnt);
-    if (prime_cnt < 2) return;
+    if (prime_cnt < 2) {
+        if (out_primes_found)
+            *out_primes_found = prime_cnt;
+        if (out_qual_pairs)
+            *out_qual_pairs = 0;
+        return;
+    }
     __sync_fetch_and_add(&stats_pairs, (uint64_t)(prime_cnt - 1));
     for (size_t i = 0; i + 1 < prime_cnt; i++) {
         uint64_t gap = primes[i + 1] - primes[i];
         double merit = (double)gap / logbase;
+        int best_needs_validation = (merit >= target) &&
+            (use_crt_precision || use_mr_verify);
         stats_last_gap = gap;
         log_extra_merit_sample("crt-gpu", merit, gap, target);
-        if (merit > stats_best_merit) {
+        if (!best_needs_validation && merit > stats_best_merit) {
             stats_best_merit = merit;
             stats_best_gap   = gap;
             log_extra_merit_event("best", "crt-gpu", merit, gap, target);
         }
         if (merit < target) continue;
 
+        /* Precision mode: only do strict primality checks on candidate
+           gaps that already meet target length (gap-first verification). */
+        if (use_crt_precision) {
+            uint64_t strict_tests = 0;
+
+            strict_tests++;
+            if (!bn_candidate_is_prime(primes[i])) {
+                __sync_fetch_and_add(&stats_tested, strict_tests);
+                continue;
+            }
+
+            strict_tests++;
+            if (!bn_candidate_is_prime(primes[i + 1])) {
+                __sync_fetch_and_add(&stats_tested, strict_tests);
+                continue;
+            }
+
+            int split_gap = 0;
+            uint64_t split_at = 0;
+            for (uint64_t off = primes[i] + 2; off < primes[i + 1]; off += 2) {
+                strict_tests++;
+                if (bn_candidate_is_prime(off)) {
+                    split_gap = 1;
+                    split_at = off - primes[i];
+                    break;
+                }
+            }
+            __sync_fetch_and_add(&stats_tested, strict_tests);
+
+            if (split_gap) {
+                __sync_fetch_and_add(&stats_false_gaps, 1);
+                if (use_extra_verbose) {
+                    log_file_only("[crt_precision] false gap rejected: gap=%llu split_at=+%llu\n",
+                                  (unsigned long long)gap,
+                                  (unsigned long long)split_at);
+                }
+                continue;
+            }
+        }
+
         /* MR base-3 boundary verification for CRT GPU path */
         if (use_mr_verify) {
             ensure_gmp_tls();
-            /* Verify gap start prime: nAdd + primes[i] */
-            mpz_add_u64(tls_cand_mpz, nAdd, primes[i]);
-            if (cand_odd) mpz_sub_ui(tls_cand_mpz, tls_cand_mpz, 1);
+            /* Verify gap start prime: base + primes[i] */
+            mpz_add_u64(tls_cand_mpz, tls_base_mpz, primes[i]);
             tls_cand_last_valid = 0;
             if (!mr_verify_cand()) continue;
-            /* Verify gap end prime: nAdd + primes[i+1] */
-            mpz_add_u64(tls_cand_mpz, nAdd, primes[i + 1]);
-            if (cand_odd) mpz_sub_ui(tls_cand_mpz, tls_cand_mpz, 1);
+            /* Verify gap end prime: base + primes[i+1] */
+            mpz_add_u64(tls_cand_mpz, tls_base_mpz, primes[i + 1]);
             tls_cand_last_valid = 0;
             if (!mr_verify_cand()) continue;
         }
 
+        if (merit > stats_best_merit) {
+            stats_best_merit = merit;
+            stats_best_gap   = gap;
+            log_extra_merit_event("best", "crt-gpu", merit, gap, target);
+        }
+
         stats_last_qual_gap = gap;
         __sync_fetch_and_add(&stats_gaps, 1);
+        qual_pairs++;
         log_extra_merit_event("qual", "crt-gpu", merit, gap, target);
         mpz_t nAdd_prime;
         mpz_init(nAdd_prime);
@@ -4329,6 +4707,11 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
 #endif
         mpz_clear(nAdd_prime);
     }
+
+    if (out_primes_found)
+        *out_primes_found = prime_cnt;
+    if (out_qual_pairs)
+        *out_qual_pairs = qual_pairs;
 }
 
 /* ── GPU batch accumulator (double-buffered async pipeline) ──
@@ -4354,12 +4737,14 @@ struct gpu_accum_win {
     size_t    cand_count;     /* survivors from this window */
     uint64_t *surv;           /* owned copy of survivor offsets */
     size_t    surv_cnt;
+    double    cramer_score;
     uint32_t  nonce;
     int       cand_odd;
     double    logbase;
     double    target;
     int       shift;
     const char *rpc_url, *rpc_user, *rpc_pass;
+    mpz_t     base;           /* base for this window (for exact rechecks) */
     mpz_t     nAdd;           /* owned copy */
     uint8_t   hdr80[80];      /* snapshot of header at time of sieving */
     uint16_t  nshift;         /* snapshot of shift at time of sieving */
@@ -4383,6 +4768,11 @@ struct gpu_accum {
     int       inflight;              /* 0 or 1 or -1: buf with GPU work   */
     int       inflight_slot;         /* slot used by the in-flight batch  */
     int       threshold;             /* flush when total >= this          */
+    size_t    adapt_min_threshold;   /* lower clamp for adaptive threshold */
+    size_t    adapt_max_threshold;   /* upper clamp for adaptive threshold */
+    int       adaptive_enabled;      /* 1 when telemetry-driven tuning is enabled */
+    double    ema_flush_ms;          /* smoothed submit latency */
+    double    ema_collect_ms;        /* smoothed collect latency */
     gpu_fermat_ctx *ctx;             /* assigned GPU context              */
     int       slot_base;             /* preferred GPU slot for this accum */
     int       stride;                /* limbs per candidate (= active_limbs) */
@@ -4390,6 +4780,24 @@ struct gpu_accum {
 };
 
 static __thread struct gpu_accum *tls_gpu_accum;
+
+static double gpu_accum_ema_update(double prev, double sample) {
+    const double alpha = 0.20;
+    if (sample < 0.0)
+        sample = 0.0;
+    if (prev <= 0.0)
+        return sample;
+    return prev + alpha * (sample - prev);
+}
+
+static int gpu_accum_get_stride(const struct gpu_accum *a) {
+    return a ? a->stride : GPU_NLIMBS;
+}
+
+static void gpu_accum_set_owns_ctx(struct gpu_accum *a, int owns_ctx) {
+    if (a)
+        a->owns_ctx = owns_ctx;
+}
 
 static int gpu_accum_buf_init(struct gpu_accum_buf *b, size_t cap, int stride) {
     b->capacity = cap;
@@ -4407,6 +4815,7 @@ static int gpu_accum_buf_init(struct gpu_accum_buf *b, size_t cap, int stride) {
 static void gpu_accum_buf_reset(struct gpu_accum_buf *b) {
     for (size_t i = 0; i < b->win_count; i++) {
         free(b->wins[i].surv);
+        mpz_clear(b->wins[i].base);
         mpz_clear(b->wins[i].nAdd);
     }
     b->total = 0;
@@ -4431,6 +4840,29 @@ static struct gpu_accum *gpu_accum_create(gpu_fermat_ctx *ctx, int threshold) {
     struct gpu_accum *a = (struct gpu_accum *)calloc(1, sizeof(*a));
     if (!a) return NULL;
     a->threshold = threshold > 0 ? threshold : GPU_ACCUM_DEFAULT;
+#ifdef WITH_GPU_FERMAT
+    a->adaptive_enabled = use_crt_gpu_batch_adaptive ? 1 : 0;
+    a->adapt_min_threshold = g_crt_gpu_batch_adapt_cfg.min_batch;
+    a->adapt_max_threshold = g_crt_gpu_batch_adapt_cfg.max_batch;
+    if (a->adapt_min_threshold == 0)
+        a->adapt_min_threshold = 64;
+    if (a->adapt_max_threshold == 0)
+        a->adapt_max_threshold = (size_t)(a->threshold + 4096);
+    if (a->adapt_max_threshold < a->adapt_min_threshold)
+        a->adapt_max_threshold = a->adapt_min_threshold;
+
+    {
+        size_t init_cap = (size_t)(a->threshold + 4096);
+        if (a->adapt_max_threshold > init_cap)
+            a->adapt_max_threshold = init_cap;
+    }
+
+    if ((size_t)a->threshold < a->adapt_min_threshold)
+        a->threshold = (int)a->adapt_min_threshold;
+    if ((size_t)a->threshold > a->adapt_max_threshold)
+        a->threshold = (int)a->adapt_max_threshold;
+    stats_crt_gpu_accum_threshold_last = (uint64_t)a->threshold;
+#endif
     a->ctx = ctx;
     a->slot_base = __sync_fetch_and_add(&g_accum_slot_counter, 1) % 2;
     a->stride = gpu_fermat_get_limbs(ctx);
@@ -4472,17 +4904,45 @@ static void gpu_accum_destroy(struct gpu_accum *a) {
 }
 
 /* Add a window's survivors to the active fill buffer.
-   Returns 1 if threshold reached (caller should call gpu_accum_flush). */
+    Return codes:
+      0 = added, no flush needed
+      1 = added, flush recommended now
+      2 = preflush needed before add (caller should flush+retry once) */
 static int gpu_accum_add(struct gpu_accum *a,
                          const uint64_t base_limbs[GPU_NLIMBS],
                          const uint64_t *offsets, size_t cnt,
+                         double cramer_score,
                          uint32_t nonce, int cand_odd,
                          double logbase, double target_v, int shift_v,
+                         mpz_srcptr base_mpz,
                          mpz_srcptr nAdd,
                          const char *rpc_url, const char *rpc_user,
                          const char *rpc_pass) {
     if (!a || cnt == 0) return 0;
     struct gpu_accum_buf *b = &a->buf[a->fill];
+
+    if (use_crt_accum_backpressure) {
+        double avg_flush_ms = 0.0;
+        double avg_collect_ms = 0.0;
+        if (stats_crt_gpu_accum_flush_count > 0) {
+            avg_flush_ms = (double)stats_crt_gpu_accum_flush_ms /
+                           (double)stats_crt_gpu_accum_flush_count;
+        }
+        if (stats_crt_gpu_accum_collect_count > 0) {
+            avg_collect_ms = (double)stats_crt_gpu_accum_collect_ms /
+                             (double)stats_crt_gpu_accum_collect_count;
+        }
+        if (crt_runtime_accum_need_preflush(
+                b->total,
+                cnt,
+                (a->inflight >= 0),
+                (size_t)a->threshold,
+                avg_flush_ms,
+                avg_collect_ms,
+                &g_crt_accum_bp_cfg)) {
+            return 2;
+        }
+    }
 
     int gpu_al = a->stride;
     /* Grow limbs buffer if needed */
@@ -4527,6 +4987,7 @@ static int gpu_accum_add(struct gpu_accum *a,
     w->surv = (uint64_t *)malloc(cnt * sizeof(uint64_t));
     if (w->surv) memcpy(w->surv, offsets, cnt * sizeof(uint64_t));
     w->surv_cnt   = cnt;
+    w->cramer_score = cramer_score;
     w->nonce      = nonce;
     w->cand_odd   = cand_odd;
     w->logbase    = logbase;
@@ -4535,6 +4996,11 @@ static int gpu_accum_add(struct gpu_accum *a,
     w->rpc_url    = rpc_url;
     w->rpc_user   = rpc_user;
     w->rpc_pass   = rpc_pass;
+    mpz_init(w->base);
+    if (base_mpz)
+        mpz_set(w->base, base_mpz);
+    else
+        mpz_set(w->base, tls_base_mpz);
     mpz_init(w->nAdd);
     mpz_set(w->nAdd, nAdd);
     b->total += cnt;
@@ -4557,7 +5023,13 @@ static void gpu_accum_collect(struct gpu_accum *a) {
     }
 
     /* Wait for GPU results */
+    uint64_t t_collect0 = now_ms();
     int np = gpu_fermat_collect(a->ctx, slot, b->results, b->total);
+    uint64_t t_collect_ms = now_ms() - t_collect0;
+    __sync_fetch_and_add(&stats_crt_gpu_accum_collect_count, 1);
+    __sync_fetch_and_add(&stats_crt_gpu_accum_collect_ms, t_collect_ms);
+    a->ema_collect_ms = gpu_accum_ema_update(a->ema_collect_ms,
+                                             (double)t_collect_ms);
 
     /* Distribute results to each window and scan gaps */
     for (size_t wi = 0; wi < b->win_count; wi++) {
@@ -4565,19 +5037,37 @@ static void gpu_accum_collect(struct gpu_accum *a) {
         if (np < 0 || !w->surv) {
             __sync_fetch_and_add(&stats_crt_windows, 1);
             free(w->surv); w->surv = NULL;
+            mpz_clear(w->base);
             mpz_clear(w->nAdd);
             continue;
         }
         ensure_gmp_tls();
+        if (use_crt_precision || use_mr_verify) {
+            mpz_set(tls_base_mpz, w->base);
+            prime_cache_invalidate_base();
+            for (int i = 0; i < td_extra_count; i++)
+                tls_td_residues[i] = (uint32_t)mpz_fdiv_ui(
+                    tls_base_mpz,
+                    (unsigned long)td_extra_primes[i]);
+        }
         size_t pf = 0;
         for (size_t j = 0; j < w->cand_count; j++) {
             if (b->results[w->cand_start + j])
                 w->surv[pf++] = w->surv[j];
         }
+        size_t w_primes = 0, w_qual = 0;
         scan_gap_results(w->surv, pf, w->logbase, w->nonce, w->cand_odd,
                          w->nAdd, w->shift, w->target,
-                         w->rpc_url, w->rpc_user, w->rpc_pass);
+                         w->rpc_url, w->rpc_user, w->rpc_pass,
+                         &w_primes, &w_qual);
+        if (w->cramer_score > 0.0) {
+            crt_score_roll_observe(w->cramer_score,
+                                   (uint64_t)w->surv_cnt,
+                                   (uint64_t)w_primes,
+                                   (uint64_t)w_qual);
+        }
         free(w->surv); w->surv = NULL;
+        mpz_clear(w->base);
         mpz_clear(w->nAdd);
     }
     b->total = 0;
@@ -4604,14 +5094,46 @@ static void gpu_accum_flush(struct gpu_accum *a) {
        slot assignments will queue inside gpu_fermat_submit for at most
        ~0.3 ms (one GPU batch) — negligible vs the ~80 ms fill cycle. */
     int slot = a->slot_base % 2;
+     size_t observed_batch = b->total;
+    crt_accum_record_batch(b->total);
 
     __sync_fetch_and_add(&stats_gpu_flushes, 1);
     __sync_fetch_and_add(&stats_gpu_batched, b->total);
+    uint64_t t_flush0 = now_ms();
     int rc = gpu_fermat_submit(a->ctx, slot, b->limbs, b->total);
+    uint64_t t_flush_ms = now_ms() - t_flush0;
+    __sync_fetch_and_add(&stats_crt_gpu_accum_flush_count, 1);
+    __sync_fetch_and_add(&stats_crt_gpu_accum_flush_ms, t_flush_ms);
+    a->ema_flush_ms = gpu_accum_ema_update(a->ema_flush_ms,
+                                           (double)t_flush_ms);
     if (rc < 0) {
         /* Genuine GPU error — discard batch */
         gpu_accum_buf_reset(b);
         return;
+    }
+
+    if (a->adaptive_enabled) {
+        struct crt_gpu_batch_adapt_cfg cfg = g_crt_gpu_batch_adapt_cfg;
+        cfg.min_batch = a->adapt_min_threshold;
+        cfg.max_batch = a->adapt_max_threshold;
+        int dir = 0;
+        size_t tuned = crt_runtime_adaptive_gpu_batch_threshold(
+            (size_t)a->threshold,
+            observed_batch,
+            a->ema_flush_ms,
+            a->ema_collect_ms,
+            &cfg,
+            &dir);
+        if (tuned > (size_t)INT_MAX)
+            tuned = (size_t)INT_MAX;
+        a->threshold = (int)tuned;
+        stats_crt_gpu_accum_threshold_last = (uint64_t)a->threshold;
+        if (dir > 0)
+            __sync_fetch_and_add(&stats_crt_gpu_accum_tune_up, 1);
+        else if (dir < 0)
+            __sync_fetch_and_add(&stats_crt_gpu_accum_tune_down, 1);
+        else
+            __sync_fetch_and_add(&stats_crt_gpu_accum_tune_hold, 1);
     }
 
     a->inflight = a->fill;
@@ -4634,27 +5156,7 @@ static void sha256_hex(const char *s, char out[65]) {
     }
     out[64]='\0';
 }
-// Worker struct and function for threaded mining (file-scope)
-struct worker_args {
-    int tid;
-    int nthreads;
-    uint8_t  h256[32];  /* 256-bit base hash (big-endian) */
-    int shift;
-    int64_t adder_max;
-    uint64_t sieve_size;
-    double target;
-    double scan_target;
-    const char *header;
-    const char *rpc_url;
-    const char *rpc_user;
-    const char *rpc_pass;
-    const char *rpc_method;
-    const char *rpc_sign_key;
-    /* per-thread adder-space slice (set by main before spawning) */
-    int64_t adder_base_offset; /* offset into [0, global_adder_max) */
-    int     rpc_thread;        /* 1 for the thread that polls GBT   */
-    int     crt_role;          /* 0=normal/sieve, 1=fermat consumer  */
-};
+#include "crt_runtime_worker.h"
 
 /* ══════════════════════════════════════════════════════════════════════
    CRT Gap-Solver Mining Helpers
@@ -5140,6 +5642,82 @@ static void *presieve_helper_fn(void *arg) {
     return NULL;
 }
 
+#ifdef WITH_RPC
+static void crt_runtime_init_worker_ctx(
+        struct crt_runtime_worker_ctx *ctx,
+        int force_monolithic) {
+    if (!ctx)
+        return;
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->force_monolithic = force_monolithic;
+
+    ctx->keep_going = &keep_going;
+    ctx->g_abort_pass = &g_abort_pass;
+    ctx->use_crt_gpu_consumer = &use_crt_gpu_consumer;
+    ctx->use_crt_gap_scan_adaptive = &use_crt_gap_scan_adaptive;
+    ctx->crt_fermat_threads = &crt_fermat_threads;
+    ctx->g_crt_gap_target = &g_crt_gap_target;
+    ctx->g_crt_gap_scan_mode = &g_crt_gap_scan_mode;
+    ctx->g_crt_gap_scan_floor = &g_crt_gap_scan_floor;
+    ctx->g_crt_gap_scan_runtime_logged = &g_crt_gap_scan_runtime_logged;
+    ctx->g_crt_gap_scan_adapt_cfg = &g_crt_gap_scan_adapt_cfg;
+    ctx->g_crt_primorial_mpz = g_crt_primorial_mpz;
+    ctx->rpc_tip_poll_ms = &rpc_tip_poll_ms;
+    ctx->g_stratum = (void *)g_stratum;
+    ctx->g_work_lock = &g_work_lock;
+    ctx->g_prevhash = g_prevhash;
+#ifdef WITH_GPU_FERMAT
+    ctx->g_gpu_count = &g_gpu_count;
+    ctx->g_gpu_batch_size = &g_gpu_batch_size;
+    ctx->g_gpu_device_ids = g_gpu_device_ids;
+    ctx->g_gpu_active_limbs_global = &g_gpu_active_limbs_global;
+#endif
+    ctx->tls_gmp_inited = &tls_gmp_inited;
+    ctx->tls_base_mpz = tls_base_mpz;
+    ctx->tls_cand_mpz = tls_cand_mpz;
+    ctx->tls_two_mpz = tls_two_mpz;
+    ctx->tls_exp_mpz = tls_exp_mpz;
+    ctx->tls_res_mpz = tls_res_mpz;
+    ctx->tls_mr_d = tls_mr_d;
+    ctx->tls_mr_x = tls_mr_x;
+    ctx->tls_mr_nm1 = tls_mr_nm1;
+    ctx->tls_base_mod_p = &tls_base_mod_p;
+#ifdef WITH_GPU_FERMAT
+    ctx->tls_gpu_accum = &tls_gpu_accum;
+#endif
+
+    ctx->log_msg = log_msg;
+    ctx->now_ms = now_ms;
+    ctx->set_base_bn = set_base_bn;
+    ctx->compute_cramer_score = compute_cramer_score;
+    ctx->rpc_tip_changed = rpc_tip_changed;
+    ctx->build_mining_pass_stratum = build_mining_pass_stratum;
+    ctx->pass_state_copy_prevhex = pass_state_copy_prevhex;
+    ctx->pass_state_snapshot_nonce_hdr80 = pass_state_snapshot_nonce_hdr80;
+    ctx->ensure_gmp_tls = ensure_gmp_tls;
+    ctx->crt_bkscan_and_submit = crt_bkscan_and_submit;
+    ctx->prime_cache_invalidate_base = prime_cache_invalidate_base;
+    ctx->crt_filter_init_residues = crt_filter_init_residues;
+    ctx->crt_filter_step_residues = crt_filter_step_residues;
+    ctx->sieve_range = sieve_range;
+    ctx->crt_compute_alignment_mpz = crt_compute_alignment_mpz;
+    ctx->rebase_for_gap_check = rebase_for_gap_check;
+    ctx->crt_score_roll_observe = crt_score_roll_observe;
+
+#ifdef WITH_GPU_FERMAT
+    ctx->gpu_batch_filter = gpu_batch_filter;
+    ctx->gpu_accum_create = gpu_accum_create;
+    ctx->gpu_accum_add = gpu_accum_add;
+    ctx->gpu_accum_flush = gpu_accum_flush;
+    ctx->gpu_accum_collect = gpu_accum_collect;
+    ctx->gpu_accum_reset = gpu_accum_reset;
+    ctx->gpu_accum_get_stride = gpu_accum_get_stride;
+    ctx->gpu_accum_set_owns_ctx = gpu_accum_set_owns_ctx;
+#endif
+}
+#endif
+
 static void *worker_fn(void *arg) {
     struct worker_args *wa          = (struct worker_args*)arg;
     uint8_t  h256_local[32];
@@ -5163,6 +5741,9 @@ static void *worker_fn(void *arg) {
     rpc_sign_key_local = wa->rpc_sign_key;
     tls_rpc_tip_poll_enabled = rpc_thread_local;
     tls_rpc_tip_last_ms = now_ms();
+#endif
+#ifndef WITH_RPC
+    (void)rpc_thread_local;
 #endif
 
     /* Precompute log(base) = log(h256 << shift) for merit calculation.      */
@@ -5194,6 +5775,9 @@ static void *worker_fn(void *arg) {
             (uint64_t)g_crt_gap_target, g_crt_gap_scan_mode,
             g_crt_gap_scan_floor);
 
+        struct crt_runtime_worker_ctx rt_ctx;
+        crt_runtime_init_worker_ctx(&rt_ctx, 0);
+
         /* crt_end = 2^shift  (upper bound for nAdd) */
         mpz_t crt_end;
         mpz_init(crt_end);
@@ -5204,50 +5788,9 @@ static void *worker_fn(void *arg) {
            Pop the best sieved window from the heap, Fermat-test all
            survivors, scan consecutive prime pairs for qualifying gaps.
            ═══════════════════════════════════════════════════════════ */
-        if (wa->crt_role == 1 && crt_fermat_threads > 0) {
-            ensure_gmp_tls();
-
-            while (keep_going && !g_abort_pass) {
-                struct crt_work_item *w = crt_heap_pop();
-                if (!w) break; /* abort or shutdown */
-
-                /* Discard stale items from previous template */
-                if (w->generation != crt_heap_gen) {
-                    __sync_fetch_and_add(&stats_crt_stale_drop, 1);
-                    crt_work_free(w);
-                    continue;
-                }
-
-                __sync_fetch_and_add(&stats_crt_consumer_windows, 1);
-
-                /* Set thread-local base for Fermat testing */
-                mpz_set(tls_base_mpz, w->base);
-                prime_cache_invalidate_base();
-
-                /* Backward-scan: sample + skip-ahead instead of testing
-                   100% of survivors.  ~10-20× fewer Fermat tests. */
-                crt_bkscan_and_submit(w->survivors, w->surv_cnt,
-                                      w->logbase, target_local,
-                                      shift_local, w->nonce,
-                                      w->cand_odd, w->nAdd,
-                                      rpc_url_local, rpc_user_local,
-                                      rpc_pass_local);
-
-                crt_work_free(w);
-            } /* end fermat consumer loop */
-
-            mpz_clear(crt_end);
-            if (tls_gmp_inited) {
-                mpz_clear(tls_base_mpz);
-                mpz_clear(tls_cand_mpz);
-                mpz_clear(tls_two_mpz);
-                mpz_clear(tls_exp_mpz);
-                mpz_clear(tls_res_mpz);
-                mpz_clear(tls_mr_d);
-                mpz_clear(tls_mr_x);
-                mpz_clear(tls_mr_nm1);
-                tls_gmp_inited = 0;
-            }
+        if (crt_runtime_try_run_consumer_loop(
+            &rt_ctx, wa, crt_end, target_local, shift_local,
+                rpc_url_local, rpc_user_local, rpc_pass_local)) {
             return NULL;
         }
 
@@ -5257,409 +5800,18 @@ static void *worker_fn(void *arg) {
            — If crt_fermat_threads > 0: push sieved windows to heap.
            — If crt_fermat_threads == 0: test inline (original path).
            ═══════════════════════════════════════════════════════════ */
-        {
-            int n_sieve_threads = wa->nthreads - crt_fermat_threads;
-            if (n_sieve_threads < 1) n_sieve_threads = 1;
-            int nth_local = (crt_fermat_threads > 0) ? n_sieve_threads
-                                                     : wa->nthreads;
-
-            if (rpc_thread_local) {
-                size_t prim_bits = mpz_sizeinbase(g_crt_primorial_mpz, 2);
-                /* CRT sieve covers [1, gap_scan) as an odd-only bitmap. */
-                size_t crt_seg    = (size_t)gap_scan_cfg / 2;
-                size_t crt_bytes  = (crt_seg + 7) / 8;
-                if (crt_fermat_threads > 0)
-                    log_msg("CRT mining (%dT: %d sieve + %d fermat): "
-                            "primorial~2^%lu  shift=%d  gap_scan_tmpl=%llu  "
-                            "sieve_bitmap=%zu bytes (%.1f KB)  heap=%d\n",
-                            wa->nthreads, n_sieve_threads,
-                            crt_fermat_threads,
-                            (unsigned long)prim_bits, shift_local,
-                            (unsigned long long)gap_scan_cfg,
-                            crt_bytes, (double)crt_bytes / 1024.0,
-                            (int)crt_heap_cap);
-                else
-                    log_msg("CRT mining (%dT): primorial~2^%lu  shift=%d"
-                            "  gap_scan_tmpl=%llu  sieve_bitmap=%zu bytes (%.1f KB)\n",
-                            nth_local, (unsigned long)prim_bits, shift_local,
-                            (unsigned long long)gap_scan_cfg,
-                            crt_bytes, (double)crt_bytes / 1024.0);
-            }
-
-#ifdef WITH_RPC
-            uint64_t gbt_last_ms = now_ms();
-#endif
-
-            struct pass_state pass_snap_start;
-            pass_state_snapshot(&pass_snap_start);
-            uint32_t nonce_cur = pass_snap_start.nonce + 1 + (uint32_t)tid_local;
-            uint8_t hdr80_for_nonce[80];
-            memcpy(hdr80_for_nonce, pass_snap_start.hdr80, 80);
-
-            mpz_t nAdd, candidate, orig_base_crt;
-            mpz_inits(nAdd, candidate, orig_base_crt, NULL);
-
-            uint64_t *prim_mod_sieve = NULL;
-            size_t    prim_mod_count = 0;
-
-            while (keep_going && !g_abort_pass) {
-
-#ifdef WITH_RPC
-                                /* Poll for new blocks on a short interval (rpc thread only). */
-                if (rpc_thread_local && rpc_url_local) {
-                    uint64_t now = now_ms();
-                                        if (now - gbt_last_ms >= (uint64_t)rpc_tip_poll_ms) {
-                      if (g_stratum) {
-                        /* ── stratum: check for pushed new-work ── */
-                        char data_hex[161];
-                        uint64_t ndiff;
-                        if (stratum_poll_new_work(g_stratum, data_hex,
-                                                  &ndiff)) {
-                            log_msg("\n*** STRATUM NEW BLOCK ***\n\n");
-                            build_mining_pass_stratum(data_hex, ndiff,
-                                                     shift_local);
-                            g_abort_pass = 1;
-                            crt_heap_signal_shutdown();
-                            break;
-                        }
-                      } else {
-                        char best[65];
-                                                char prevhex_snap[65];
-                                                pass_state_copy_prevhex(prevhex_snap);
-                        if (rpc_tip_changed(rpc_url_local, rpc_user_local,
-                                                                                        rpc_pass_local, prevhex_snap,
-                                            best)) {
-                            log_msg("\n*** NEW BLOCK  prevhash=%.16s..."
-                                    "  mining on top ***\n\n", best);
-                            pthread_mutex_lock(&g_work_lock);
-                            strncpy(g_prevhash, best, 64);
-                            g_prevhash[64] = '\0';
-                            pthread_mutex_unlock(&g_work_lock);
-                            g_abort_pass = 1;
-                            crt_heap_signal_shutdown();
-                            break;
-                        }
-                      }
-                        gbt_last_ms = now_ms();
-                    }
-                }
-#endif
-
-                /* ── Compute SHA256d for this nonce ── */
-                uint8_t hdr84[84], sha_raw[32], h256_nonce[32];
-                memcpy(hdr84, hdr80_for_nonce, 80);
-                memcpy(hdr84 + 80, &nonce_cur, 4);
-                double_sha256(hdr84, 84, sha_raw);
-
-                if (sha_raw[31] < 0x80) {
-                    nonce_cur += (uint32_t)nth_local;
-                    if (nonce_cur < (uint32_t)nth_local) break;
-                    continue;
-                }
-
-                for (int k = 0; k < 32; k++)
-                    h256_nonce[k] = sha_raw[31 - k];
-
-                set_base_bn(h256_nonce, shift_local);
-                double logbase_nonce =
-                    uint256_log_approx(h256_nonce, shift_local);
-                uint64_t gap_scan_nonce = crt_gap_scan_for_nonce(
-                    target_local, logbase_nonce,
-                    (uint64_t)g_crt_gap_target, g_crt_gap_scan_mode,
-                    g_crt_gap_scan_floor);
-                if (__sync_bool_compare_and_swap(
-                        &g_crt_gap_scan_runtime_logged, 0, 1)) {
-                    double raw_scan = target_local * logbase_nonce;
-                    if (g_crt_gap_scan_mode == CRT_GAP_SCAN_ORIGINAL) {
-                        log_msg("CRT gap-scan runtime: first nonce window=%llu "
-                                "(raw=%.0f, cap=%d)\n",
-                                (unsigned long long)gap_scan_nonce,
-                                raw_scan, g_crt_gap_target);
-                    } else if (g_crt_gap_scan_mode == CRT_GAP_SCAN_ORIG_FLOOR) {
-                        log_msg("CRT gap-scan runtime: first nonce window=%llu "
-                                "(raw=%.0f, floor=%llu)\n",
-                                (unsigned long long)gap_scan_nonce,
-                                raw_scan,
-                                (unsigned long long)g_crt_gap_scan_floor);
-                    }
-                }
-
-                crt_compute_alignment_mpz(nAdd);
-                mpz_set(orig_base_crt, tls_base_mpz);
-
-                if (!prim_mod_sieve && small_primes_cache &&
-                    small_primes_count > 0) {
-                    prim_mod_count = small_primes_count;
-                    prim_mod_sieve = (uint64_t *)malloc(
-                        prim_mod_count * sizeof(uint64_t));
-                    if (prim_mod_sieve) {
-                        for (size_t pi = 0; pi < prim_mod_count; pi++)
-                            prim_mod_sieve[pi] = mpz_fdiv_ui(
-                                g_crt_primorial_mpz,
-                                (unsigned long)small_primes_cache[pi]);
-                    }
-                }
-
-                mpz_add(candidate, orig_base_crt, nAdd);
-                int cand_odd = mpz_odd_p(candidate);
-                if (cand_odd) mpz_sub_ui(candidate, candidate, 1);
-                rebase_for_gap_check(candidate);
-                /* Static template (built once at startup from fixed CRT offsets)
-                   is returned by crt_solver_get_thread_tmpl() in sieve_range(). */
-                crt_filter_init_residues();
-                int crt_first_win = 1;
-
-                while (mpz_cmp(nAdd, crt_end) < 0 &&
-                       keep_going && !g_abort_pass) {
-
-#ifdef WITH_RPC
-                    /* Poll for new work inside the inner window loop.
-                       At shift=720 a single nonce has ~32K windows (~2 min),
-                       so polling only at the nonce boundary is too slow. */
-                    if (rpc_thread_local && rpc_url_local) {
-                        uint64_t now = now_ms();
-                                                if (now - gbt_last_ms >= (uint64_t)rpc_tip_poll_ms) {
-                          if (g_stratum) {
-                            char data_hex_w[161];
-                            uint64_t ndiff_w;
-                            if (stratum_poll_new_work(g_stratum, data_hex_w,
-                                                     &ndiff_w)) {
-                                log_msg("\n*** STRATUM NEW BLOCK ***\n\n");
-                                build_mining_pass_stratum(data_hex_w, ndiff_w,
-                                                         shift_local);
-                                g_abort_pass = 1;
-                                crt_heap_signal_shutdown();
-                                break;
-                            }
-                          } else {
-                            char best_w[65];
-                            char prevhex_snap_w[65];
-                            pass_state_copy_prevhex(prevhex_snap_w);
-                            if (rpc_tip_changed(rpc_url_local, rpc_user_local,
-                                                rpc_pass_local,
-                                    prevhex_snap_w, best_w)) {
-                                log_msg("\n*** NEW BLOCK  prevhash=%.16s..."
-                                        "  mining on top ***\n\n", best_w);
-                                pthread_mutex_lock(&g_work_lock);
-                                strncpy(g_prevhash, best_w, 64);
-                                g_prevhash[64] = '\0';
-                                pthread_mutex_unlock(&g_work_lock);
-                                g_abort_pass = 1;
-                                crt_heap_signal_shutdown();
-                                break;
-                            }
-                          }
-                          gbt_last_ms = now_ms();
-                        }
-                    }
-                    if (g_abort_pass) break;
-#endif
-
-                    if (!crt_first_win) {
-                        mpz_add(tls_base_mpz, tls_base_mpz,
-                                g_crt_primorial_mpz);
-                            prime_cache_invalidate_base();
-                        if (prim_mod_sieve && tls_base_mod_p) {
-                            for (size_t pi = 0; pi < prim_mod_count; pi++) {
-                                tls_base_mod_p[pi] += prim_mod_sieve[pi];
-                                if (tls_base_mod_p[pi] >=
-                                    small_primes_cache[pi])
-                                    tls_base_mod_p[pi] -=
-                                        small_primes_cache[pi];
-                            }
-                        }
-                        crt_filter_step_residues();
-                    }
-                    crt_first_win = 0;
-
-                    uint64_t gap_L = 1;
-                    uint64_t gap_R = gap_scan_nonce;
-                    size_t surv_cnt = 0;
-                    uint64_t *surv = sieve_range(gap_L, gap_R,
-                                                 &surv_cnt, NULL, 0);
-                    __sync_fetch_and_add(&stats_sieved, gap_R - gap_L);
-
-                    if (!surv || surv_cnt == 0) {
-                        mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
-                        continue;
-                    }
-
-                    /* ── Producer-consumer: push to heap ── */
-                    if (crt_fermat_threads > 0) {
-                        /* Cramér score: estimated probability this window
-                         * produces a qualifying gap (merit >= target_local).
-                         * Computed before the heap pre-check so we can use
-                         * the score as the eviction criterion.              */
-                        uint64_t needed_gap_cs = (uint64_t)(target_local * logbase_nonce);
-                        if (needed_gap_cs < 2) needed_gap_cs = 2;
-                        double cs = compute_cramer_score(surv, surv_cnt,
-                                                         logbase_nonce,
-                                                         needed_gap_cs);
-                        __sync_fetch_and_add(&stats_cramer_scored, 1);
-                        __sync_fetch_and_add(&stats_cramer_score_sum_e9,
-                            (uint64_t)(cs * 1e9));
-
-                        /* Pre-check: skip if heap is full and this window
-                         * scores no better than the worst current item.    */
-                        double heap_worst_sc = crt_heap_worst_score_advisory();
-                        if (heap_worst_sc >= 0.0 && cs <= heap_worst_sc) {
-                            __sync_fetch_and_add(&stats_crt_heap_push_drop, 1);
-                            __sync_fetch_and_add(&stats_cramer_heap_skip, 1);
-                            struct timespec bt = {0, 200000L}; /* 200 µs */
-                            nanosleep(&bt, NULL);
-                            mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
-                            continue;
-                        }
-                        struct crt_work_item *w = crt_work_alloc();
-                        if (w) {
-                            mpz_set(w->base, tls_base_mpz);
-                            mpz_set(w->nAdd, nAdd);
-                            w->survivors = (uint64_t *)malloc(
-                                surv_cnt * sizeof(uint64_t));
-                            if (w->survivors)
-                                memcpy(w->survivors, surv,
-                                       surv_cnt * sizeof(uint64_t));
-                            else
-                                surv_cnt = 0;
-                            w->surv_cnt    = surv_cnt;
-                            w->cramer_score = cs;
-                            w->nonce       = nonce_cur;
-                            w->cand_odd    = cand_odd;
-                            w->logbase     = logbase_nonce;
-                            w->generation  = crt_heap_gen;
-                            if (!crt_heap_push(w)) {
-                                /* Heap full and item was worse than worst leaf.
-                                   Back off briefly to let fermat threads drain
-                                   the queue. */
-                                struct timespec bt = {0, 200000L}; /* 200 µs */
-                                nanosleep(&bt, NULL);
-                            }
-                        }
-                        mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
-                        continue;
-                    }
-
-                    /* ── Monolithic: backward-scan Fermat ── */
-
-                    /* Skip windows where the entire survivor span is smaller
-                     * than needed_gap: no consecutive prime pair in the window
-                     * can produce a qualifying gap, so Fermat testing is wasted.
-                     * Equivalent to compute_cramer_score(...) == 0. O(1) check. */
-                    {
-                        uint64_t ng = (uint64_t)(target_local * logbase_nonce);
-                        if (ng < 2) ng = 2;
-                        if (surv_cnt < 2 ||
-                            surv[surv_cnt - 1] - surv[0] < ng) {
-                            __sync_fetch_and_add(&stats_cramer_skipped, 1);
-                            mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
-                            continue;
-                        }
-                    }
-#ifdef WITH_GPU_FERMAT
-                    if (g_gpu_count > 0) {
-                        /* GPU path: accumulate survivors for batch Fermat.
-                           GPU handles its own gap scanning internally. */
-                        size_t pf = 0;
-                        /* Lazy-init thread-local GPU accumulator.
-                           Each thread creates its own gpu_fermat_ctx so it
-                           gets private GPU slots — no two threads ever block
-                           each other in gpu_fermat_submit().  With a shared
-                           ctx (2 slots, 3 threads/slot) the non-owning threads
-                           are permanently stuck in cond_wait, never sieving. */
-                        if (!tls_gpu_accum) {
-                            static volatile int accum_rr = 0;
-                            int gi = __sync_fetch_and_add(&accum_rr, 1)
-                                     % g_gpu_count;
-                            int batch_size = g_gpu_batch_size > 0
-                                             ? g_gpu_batch_size
-                                             : GPU_ACCUM_DEFAULT;
-                            size_t batch_cap = (size_t)batch_size + 4096;
-                            gpu_fermat_ctx *per_ctx =
-                                gpu_fermat_init(g_gpu_device_ids[gi], batch_cap);
-                            if (per_ctx && g_gpu_active_limbs_global > 0)
-                                gpu_fermat_set_limbs(per_ctx,
-                                                    g_gpu_active_limbs_global);
-                            tls_gpu_accum = gpu_accum_create(per_ctx, batch_size);
-                            if (tls_gpu_accum)
-                                tls_gpu_accum->owns_ctx = 1;
-                            else if (per_ctx)
-                                gpu_fermat_destroy(per_ctx);
-                        }
-                        if (tls_gpu_accum) {
-                            ensure_gmp_tls();
-                            /* Only zero and export the limbs the GPU will
-                               actually read (active_limbs ≤ GPU_NLIMBS). */
-                            int gpu_al_crt = tls_gpu_accum->stride;
-                            uint64_t bl[GPU_NLIMBS];
-                            memset(bl, 0,
-                                   (size_t)gpu_al_crt * sizeof(uint64_t));
-                            size_t nexp = 0;
-                            mpz_export(bl, &nexp, -1, 8, 0, 0,
-                                       tls_base_mpz);
-                            if (nexp <= (size_t)GPU_NLIMBS) {
-                                __sync_fetch_and_add(&stats_tested,
-                                    (uint64_t)surv_cnt);
-                                if (gpu_accum_add(tls_gpu_accum, bl,
-                                        surv, surv_cnt, nonce_cur,
-                                        cand_odd, logbase_nonce,
-                                        target_local, shift_local,
-                                        nAdd, rpc_url_local,
-                                        rpc_user_local, rpc_pass_local))
-                                    gpu_accum_flush(tls_gpu_accum);
-                                mpz_add(nAdd, nAdd,
-                                        g_crt_primorial_mpz);
-                                continue;
-                            }
-                            /* nexp > GPU_NLIMBS: fall through to CPU */
-                        }
-                        /* Accumulator unavailable: direct GPU batch */
-                        pf = gpu_batch_filter(surv, surv_cnt);
-                        __sync_fetch_and_add(&stats_tested,
-                                             (uint64_t)surv_cnt);
-                        /* GPU fallback: scan gaps from filtered primes */
-                        __sync_fetch_and_add(&stats_crt_windows, 1);
-                        __sync_fetch_and_add(&stats_primes_found,
-                                             (uint64_t)pf);
-                        if (pf >= 2)
-                            __sync_fetch_and_add(&stats_pairs,
-                                                 (uint64_t)(pf - 1));
-                        (void)pf; /* gap scan handled by gpu_batch path */
-                    } else
-#endif
-                    {
-                        /* CPU path: backward-scan (~10-20× fewer tests) */
-                        crt_bkscan_and_submit(surv, surv_cnt,
-                                              logbase_nonce, target_local,
-                                              shift_local, nonce_cur,
-                                              cand_odd, nAdd,
-                                              rpc_url_local, rpc_user_local,
-                                              rpc_pass_local);
-                    }
-
-                    mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
-                } /* end CRT candidate loop */
-                nonce_cur += (uint32_t)nth_local;
-                if (nonce_cur < (uint32_t)nth_local) break;
-
-            } /* end nonce loop */
-
-#ifdef WITH_GPU_FERMAT
-            /* Drain any remaining accumulated GPU work once per nonce-loop
-               exit (not once per nonce).  This allows cross-nonce batching,
-               significantly increasing effective gpu_batch in CRT mode. */
-            if (tls_gpu_accum) {
-                if (g_abort_pass)
-                    gpu_accum_reset(tls_gpu_accum);
-                else {
-                    gpu_accum_flush(tls_gpu_accum);
-                    gpu_accum_collect(tls_gpu_accum);
-                }
-            }
-#endif
-
-            mpz_clears(nAdd, candidate, orig_base_crt, crt_end, NULL);
-            free(prim_mod_sieve);
-        }
+        crt_runtime_run_solver_producer_loop(
+            &rt_ctx,
+            wa,
+            tid_local,
+            shift_local,
+            target_local,
+            rpc_thread_local,
+            rpc_url_local,
+            rpc_user_local,
+            rpc_pass_local,
+            gap_scan_cfg,
+            crt_end);
 
         /* ── CRT cleanup ── */
 #ifdef WITH_GPU_FERMAT
@@ -6438,6 +6590,7 @@ int main(int argc, char **argv) {
         printf("      --adaptive-presieve   skip dense non-CRT windows after presieve\n");
         printf("      --wheel-sieve N      use wheel presieve backend (0 disables; 30, 210, 2310, 30030, 510510, or 9699690)\n");
         printf("  -e, --extra-verbose  write live merit events + partial-sieve-auto details to log file\n");
+        printf("      --stats-verbose  include detailed CRT phase telemetry in STATS output\n");
         printf("      --sample-stride K smart scan: test every Kth survivor (default: 8, 1=off)\n");
         printf("      --mr-rounds N     Miller-Rabin rounds for primality  (default: 2)\n");
         printf("      --mr-verify       MR base-3 verify Fermat/GPU survivors (catches pseudoprimes)\n");
@@ -6445,9 +6598,21 @@ int main(int argc, char **argv) {
         printf("      --crt-gap-scan MODE  CRT solver gap window: fixed|original|original-floor (default: fixed)\n");
         printf("                           fixed=max(2*gap_target,10000), original=target*ln(start), original-floor=max(original,FLOOR)\n");
         printf("      --crt-gap-scan-floor N  FLOOR used by original-floor mode (default: 10000)\n");
+        printf("      --crt-gap-scan-adaptive  adapt runtime CRT window from heap pressure (opt-in)\n");
+        printf("      --crt-precision  favor CRT targeting/correctness over speed (strict prime checks)\n");
+        printf("      --no-crt-precision  disable CRT precision mode\n");
+        printf("      --crt-precision-rounds N  probable-prime rounds used by --crt-precision (default: 8)\n");
         printf("      --fermat-threads N  number of Fermat testing threads for CRT producer-consumer\n");
         printf("                          default: auto = threads-1 for CRT solver with threads>=3\n");
         printf("      --crt-auto-split  adapt CRT sieve/fermat split between passes (opt-in)\n");
+        printf("      --crt-gpu-consumer  experimental: use GPU accumulator in CRT fermat consumers\n");
+        printf("      --crt-accum-soft-cap N  GPU accum preflush soft cap candidates (default: 24576)\n");
+        printf("      --crt-accum-hard-cap N  GPU accum preflush hard cap candidates (default: 65536)\n");
+        printf("      --no-crt-accum-backpressure  disable GPU accum preflush controls\n");
+        printf("      --crt-gpu-batch-adaptive  adapt CRT GPU accum threshold from flush/collect telemetry\n");
+        printf("      --no-crt-gpu-batch-adaptive  disable adaptive CRT GPU accum threshold tuning\n");
+        printf("      --crt-gpu-batch-min N  adaptive threshold floor (default: 512)\n");
+        printf("      --crt-gpu-batch-max N  adaptive threshold ceiling (default: 32768)\n");
         printf("      --heap N          max pending CRT windows in heap (default: 4096)\n");
         printf("      --keep-going      continue after block found (default on)\n");
         printf("      --stop-after-block  exit after first valid block\n");
@@ -6478,6 +6643,7 @@ int main(int argc, char **argv) {
     int target_explicit = 0;  /* set to 1 if user passes --target */
     int scan_target_explicit = 0; /* set to 1 if user passes --scan-merit > 0 */
     int cli_sieve_explicit = 0; /* set to 1 if user passes --sieve-primes */
+    int cli_heap_explicit = 0;  /* set to 1 if user passes --heap */
     unsigned int cli_wheel_sieve = 0;
     const char *rpc_url = NULL, *rpc_user = NULL, *rpc_pass = NULL, *rpc_method = "getwork";
     const char *stratum_arg = NULL; /* "host:port" for stratum pool connection */
@@ -6549,7 +6715,68 @@ int main(int argc, char **argv) {
             use_wheel_sieve = 1;
         }
         else if (!strcmp(argv[i],"-e") || !strcmp(argv[i],"--extra-verbose")) use_extra_verbose = 1;
+        else if (!strcmp(argv[i],"--stats-verbose")) use_stats_verbose = 1;
         else if (!strcmp(argv[i],"--crt-auto-split")) use_crt_auto_split = 1;
+        else if (!strcmp(argv[i],"--crt-gpu-consumer")) use_crt_gpu_consumer = 1;
+        else if (!strcmp(argv[i],"--crt-gap-scan-adaptive")) use_crt_gap_scan_adaptive = 1;
+        else if (!strcmp(argv[i],"--crt-precision")) use_crt_precision = 1;
+        else if (!strcmp(argv[i],"--no-crt-precision")) use_crt_precision = 0;
+        else if (!strcmp(argv[i],"--crt-precision-rounds") && i+1<argc) {
+            cli_crt_precision_rounds = atoi(argv[++i]);
+            if (cli_crt_precision_rounds < 1)
+                cli_crt_precision_rounds = 1;
+        }
+#ifdef WITH_GPU_FERMAT
+        else if (!strcmp(argv[i],"--crt-accum-soft-cap") && i+1<argc) {
+            g_crt_accum_bp_cfg.soft_cap_candidates =
+                (size_t)strtoull(argv[++i], NULL, 10);
+        }
+        else if (!strcmp(argv[i],"--crt-accum-hard-cap") && i+1<argc) {
+            g_crt_accum_bp_cfg.hard_cap_candidates =
+                (size_t)strtoull(argv[++i], NULL, 10);
+        }
+        else if (!strcmp(argv[i],"--no-crt-accum-backpressure")) {
+            use_crt_accum_backpressure = 0;
+        }
+        else if (!strcmp(argv[i],"--crt-accum-backpressure")) {
+            use_crt_accum_backpressure = 1;
+        }
+        else if (!strcmp(argv[i],"--crt-gpu-batch-adaptive")) {
+            use_crt_gpu_batch_adaptive = 1;
+        }
+        else if (!strcmp(argv[i],"--no-crt-gpu-batch-adaptive")) {
+            use_crt_gpu_batch_adaptive = 0;
+        }
+        else if (!strcmp(argv[i],"--crt-gpu-batch-min") && i+1<argc) {
+            g_crt_gpu_batch_adapt_cfg.min_batch =
+                (size_t)strtoull(argv[++i], NULL, 10);
+        }
+        else if (!strcmp(argv[i],"--crt-gpu-batch-max") && i+1<argc) {
+            g_crt_gpu_batch_adapt_cfg.max_batch =
+                (size_t)strtoull(argv[++i], NULL, 10);
+        }
+#else
+        else if (!strcmp(argv[i],"--crt-accum-soft-cap") && i+1<argc) {
+            (void)strtoull(argv[++i], NULL, 10);
+        }
+        else if (!strcmp(argv[i],"--crt-accum-hard-cap") && i+1<argc) {
+            (void)strtoull(argv[++i], NULL, 10);
+        }
+        else if (!strcmp(argv[i],"--no-crt-accum-backpressure") ||
+                 !strcmp(argv[i],"--crt-accum-backpressure")) {
+            (void)0;
+        }
+        else if (!strcmp(argv[i],"--crt-gpu-batch-adaptive") ||
+                 !strcmp(argv[i],"--no-crt-gpu-batch-adaptive")) {
+            (void)0;
+        }
+        else if (!strcmp(argv[i],"--crt-gpu-batch-min") && i+1<argc) {
+            (void)strtoull(argv[++i], NULL, 10);
+        }
+        else if (!strcmp(argv[i],"--crt-gpu-batch-max") && i+1<argc) {
+            (void)strtoull(argv[++i], NULL, 10);
+        }
+#endif
         else if (!strcmp(argv[i],"--mr-verify")) use_mr_verify = 1;
         else if (!strcmp(argv[i],"--cuda")) {
             use_cuda = 1;
@@ -6640,7 +6867,10 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i],"--heap") && i+1<argc) {
             int hv = atoi(argv[++i]);
-            if (hv > 0) crt_heap_init((size_t)hv);
+            if (hv > 0) {
+                cli_heap_explicit = 1;
+                crt_heap_init((size_t)hv);
+            }
         }
         else if (!strcmp(argv[i],"--p") && i+1<argc) build_p = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i],"--q") && i+1<argc) build_q = strtoull(argv[++i], NULL, 10);
@@ -6662,6 +6892,35 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Use either --fast-fermat or --fast-euler, not both.\n");
         return 2;
     }
+
+    if (use_crt_precision) {
+        if (cli_crt_precision_rounds < 2)
+            cli_crt_precision_rounds = 2;
+    }
+#ifdef WITH_GPU_FERMAT
+    if (g_crt_accum_bp_cfg.soft_cap_candidates > 0 &&
+        g_crt_accum_bp_cfg.hard_cap_candidates > 0 &&
+        g_crt_accum_bp_cfg.soft_cap_candidates >
+            g_crt_accum_bp_cfg.hard_cap_candidates) {
+        fprintf(stderr,
+                "--crt-accum-soft-cap must be <= --crt-accum-hard-cap\n");
+        return 2;
+    }
+
+    if (g_crt_gpu_batch_adapt_cfg.min_batch < 64)
+        g_crt_gpu_batch_adapt_cfg.min_batch = 64;
+    if (g_crt_gpu_batch_adapt_cfg.max_batch == 0)
+        g_crt_gpu_batch_adapt_cfg.max_batch =
+            g_crt_gpu_batch_adapt_cfg.min_batch;
+    if (g_crt_gpu_batch_adapt_cfg.max_batch > (size_t)GPU_MAX_BATCH)
+        g_crt_gpu_batch_adapt_cfg.max_batch = (size_t)GPU_MAX_BATCH;
+    if (g_crt_gpu_batch_adapt_cfg.min_batch >
+        g_crt_gpu_batch_adapt_cfg.max_batch) {
+        fprintf(stderr,
+                "--crt-gpu-batch-min must be <= --crt-gpu-batch-max\n");
+        return 2;
+    }
+#endif
     /* Build rpc_url from --host / --port if not given explicitly.
        Defaults: host=127.0.0.1, port=31397 (Gapcoin mainnet). */
     static char rpc_url_buf[256];
@@ -6793,6 +7052,12 @@ int main(int argc, char **argv) {
     }
 
     if (g_crt_mode == CRT_MODE_SOLVER) {
+        if (use_crt_precision) {
+            log_msg("CRT precision mode: enabled "
+                    "(strict probable-prime rounds=%d, effective=%d)\n",
+                    cli_crt_precision_rounds,
+                    crt_precision_rounds_effective());
+        }
         if (g_crt_gap_scan_mode == CRT_GAP_SCAN_ORIGINAL) {
             log_msg("CRT gap-scan mode: original "
                     "(runtime window=target*ln(start), max cap=%d)\n",
@@ -6808,55 +7073,84 @@ int main(int argc, char **argv) {
                         (uint64_t)g_crt_gap_target, g_crt_gap_scan_mode,
                         g_crt_gap_scan_floor));
         }
+                if (use_crt_gap_scan_adaptive) {
+                    log_msg("CRT gap-scan adaptive: enabled (drop>=%.1f%% or fill>=%.1f%% => x%.2f, wait>=%.1f%% and fill<=%.1f%% => x%.2f)\n",
+                        g_crt_gap_scan_adapt_cfg.shrink_drop_pct,
+                        g_crt_gap_scan_adapt_cfg.shrink_fill_pct,
+                        g_crt_gap_scan_adapt_cfg.shrink_factor,
+                        g_crt_gap_scan_adapt_cfg.grow_wait_pct,
+                        g_crt_gap_scan_adapt_cfg.grow_fill_pct,
+                        g_crt_gap_scan_adapt_cfg.grow_factor);
+                }
+            #ifdef WITH_GPU_FERMAT
+                if (use_crt_accum_backpressure) {
+                    log_msg("CRT GPU accum backpressure: enabled (soft=%lu hard=%lu slow_flush>=%.2fms slow_collect>=%.2fms)\n",
+                        (unsigned long)g_crt_accum_bp_cfg.soft_cap_candidates,
+                        (unsigned long)g_crt_accum_bp_cfg.hard_cap_candidates,
+                        g_crt_accum_bp_cfg.slow_flush_ms,
+                        g_crt_accum_bp_cfg.slow_collect_ms);
+                }
+                    if (use_crt_gpu_batch_adaptive) {
+                        log_msg("CRT GPU accum adaptive batch: enabled (min=%lu max=%lu pressure_fill>=%.1f%% grow_fill<=%.1f%% slow>=%.2fms/%.2fms fast<=%.2fms/%.2fms)\n",
+                        (unsigned long)g_crt_gpu_batch_adapt_cfg.min_batch,
+                        (unsigned long)g_crt_gpu_batch_adapt_cfg.max_batch,
+                        g_crt_gpu_batch_adapt_cfg.pressure_fill_pct,
+                        g_crt_gpu_batch_adapt_cfg.grow_fill_pct,
+                        g_crt_gpu_batch_adapt_cfg.slow_flush_ms,
+                        g_crt_gpu_batch_adapt_cfg.slow_collect_ms,
+                        g_crt_gpu_batch_adapt_cfg.fast_flush_ms,
+                        g_crt_gpu_batch_adapt_cfg.fast_collect_ms);
+                    }
+            #endif
     }
 
-    /* ── CRT sieve-primes auto-tuning ──
-       In CRT mode (gap-solver) the sieve filters the forward gap-check
-       window (~11K positions at merit 22, shift 512).  Each additional
-       composite eliminated by the sieve saves one Fermat test (~500 µs
-       at shift 512).  The marginal sieve cost is tiny (ns per prime per
-       position), so more sieve primes pay for themselves up to ~5M.
-       Only adjust if the user didn't pass --sieve-primes explicitly. */
-    if (g_crt_mode == CRT_MODE_SOLVER && !cli_sieve_explicit) {
-        uint64_t new_count;
+    /* ── Phase 1 CRT defaults by shift band ──
+       Apply only when the corresponding value was not set explicitly. */
+    if (g_crt_mode == CRT_MODE_SOLVER) {
+        const struct crt_phase1_profile *crt_pf = crt_phase1_pick_profile(shift);
+        int gpu_enabled = 0;
 #ifdef WITH_GPU_FERMAT
-    if (use_cuda || use_opencl) {
-            /* GPU Fermat: keep sieve primes low to feed larger batches.
-               At 300K primes the gap-check sieve keeps the same
-               primes/window as 500K–3M but the sieve runs ~30% faster,
-               giving +35% tested/s and ~21% lower est time (benchmarked
-               on RTX 3060, shift 512, CRT m22, 2 threads).             */
-            if (shift >= 384)
-                new_count = 300000;
-            else
-                new_count = DEFAULT_SIEVE_PRIME_COUNT;
-        } else
+        gpu_enabled = (use_cuda || use_opencl);
 #endif
-        {
-        if (shift >= 768)
-            new_count = 5000000;   /* ~86M limit */
-        else if (shift >= 384)
-            new_count = 3000000;   /* ~52M limit */
-        else if (shift >= 128)
-            new_count = 2000000;   /* ~35M limit */
-        else
-            new_count = DEFAULT_SIEVE_PRIME_COUNT;
-        }
-        if (new_count != cli_sieve_prime_count) {
-            log_msg("CRT auto-tune: sieve-primes %llu -> %llu (shift=%d%s)\n",
-                    (unsigned long long)cli_sieve_prime_count,
-                    (unsigned long long)new_count, shift,
+
+        if (!cli_sieve_explicit) {
+            uint64_t new_count = gpu_enabled
+                ? crt_pf->sieve_primes_gpu
+                : crt_pf->sieve_primes_cpu;
+            if (new_count != cli_sieve_prime_count) {
+                log_msg("CRT phase1 defaults: sieve-primes %llu -> %llu (shift=%d%s)\n",
+                        (unsigned long long)cli_sieve_prime_count,
+                        (unsigned long long)new_count,
+                        shift,
 #ifdef WITH_GPU_FERMAT
-                    use_cuda ? ", cuda" : (use_opencl ? ", opencl" : "")
+                        gpu_enabled ? ", gpu" : ", cpu"
 #else
-                    ""
+                        ", cpu"
 #endif
-                );
-            cli_sieve_prime_count = new_count;
-            /* Recompute the value limit from the new count. */
-            double n = (double)cli_sieve_prime_count;
-            double upper = n * (log(n) + log(log(n)));
-            cli_sieve_prime_limit = (uint64_t)(upper * 1.05);
+                    );
+                cli_sieve_prime_count = new_count;
+                /* Recompute the value limit from the new count. */
+                double n = (double)cli_sieve_prime_count;
+                double upper = n * (log(n) + log(log(n)));
+                cli_sieve_prime_limit = (uint64_t)(upper * 1.05);
+            }
+        }
+
+#ifdef WITH_GPU_FERMAT
+        if (gpu_enabled && g_gpu_batch_size == 0 && crt_pf->gpu_batch > 0) {
+            g_gpu_batch_size = crt_pf->gpu_batch;
+            log_msg("CRT phase1 defaults: gpu-batch=%d (shift=%d)\n",
+                    g_gpu_batch_size, shift);
+        }
+#endif
+
+        if (!cli_heap_explicit && crt_pf->heap_cap > 0 &&
+            crt_heap_cap != crt_pf->heap_cap) {
+            crt_heap_cap = crt_pf->heap_cap;
+            log_msg("CRT phase1 defaults: heap-cap=%lu (shift=%d)\n",
+                    (unsigned long)crt_heap_cap, shift);
+            if (crt_fermat_threads > 0)
+                crt_heap_init(crt_heap_cap);
         }
     }
 
@@ -6926,19 +7220,6 @@ int main(int argc, char **argv) {
     }
 #endif
 
-    /* Warn if --cuda is combined with --fermat-threads: the GPU is only
-       used in the monolithic CRT sieve path.  In producer-consumer mode
-       the fermat consumer threads call CPU Fermat via backward-scan and
-       the GPU is idle.  Use monolithic (no --fermat-threads) for GPU. */
-#if defined(WITH_CUDA) || defined(WITH_OPENCL)
-    if (g_gpu_count > 0 && crt_fermat_threads > 0 &&
-            g_crt_mode == CRT_MODE_SOLVER)
-        log_msg("WARNING: --cuda is ignored in producer-consumer CRT mode "
-                "(--fermat-threads %d).  Remove --fermat-threads to use GPU, "
-                "or remove --cuda to silence this warning.\n",
-                crt_fermat_threads);
-#endif
-
     /* ── OpenCL GPU initialization scaffolding ── */
 #ifdef WITH_OPENCL
     if (use_opencl) {
@@ -6986,6 +7267,31 @@ int main(int argc, char **argv) {
     if (use_opencl) {
         fprintf(stderr, "--opencl requires building with WITH_OPENCL=1\n");
         return 2;
+    }
+#endif
+
+    /* CRT producer-consumer + GPU behavior summary. */
+#if defined(WITH_CUDA) || defined(WITH_OPENCL)
+    if (g_crt_mode == CRT_MODE_SOLVER && crt_fermat_threads > 0) {
+        if (g_gpu_count > 0) {
+            if (use_crt_gpu_consumer) {
+                log_msg("CRT phase2 (experimental): GPU consumer path enabled "
+                        "(--fermat-threads %d, gpu devices=%d)\n",
+                        crt_fermat_threads, g_gpu_count);
+            } else {
+                log_msg("WARNING: GPU is disabled in producer-consumer CRT mode "
+                        "without --crt-gpu-consumer (--fermat-threads %d).\n",
+                        crt_fermat_threads);
+            }
+        } else if (use_crt_gpu_consumer) {
+            log_msg("CRT phase2: --crt-gpu-consumer requested but no GPU device is active; falling back to CPU consumers\n");
+        }
+    } else if (use_crt_gpu_consumer) {
+        log_msg("CRT phase2: --crt-gpu-consumer is only used with CRT solver + --fermat-threads; ignoring flag\n");
+    }
+#else
+    if (use_crt_gpu_consumer) {
+        log_msg("CRT phase2: --crt-gpu-consumer requires WITH_CUDA=1 or WITH_OPENCL=1 build\n");
     }
 #endif
 
@@ -7244,6 +7550,8 @@ int main(int argc, char **argv) {
                 (unsigned)PARTIAL_SIEVE_COOLDOWN_WIN);
     if (use_extra_verbose)
         log_file_only("extra verbose enabled (-e/--extra-verbose): live merit events + partial-sieve-auto details\n");
+    if (use_stats_verbose)
+        log_msg("stats verbosity: detailed (--stats-verbose)\n");
     if (use_crt_auto_split)
         log_msg("CRT auto split: enabled (--crt-auto-split)\n");
 
@@ -7320,229 +7628,48 @@ int main(int argc, char **argv) {
                     (uint64_t)g_crt_gap_target, g_crt_gap_scan_mode,
                     g_crt_gap_scan_floor);
 
-                mpz_t crt_end, nAdd_st, cand_st, orig_base_st;
-                mpz_inits(crt_end, nAdd_st, cand_st, orig_base_st, NULL);
-                mpz_ui_pow_ui(crt_end, 2, (unsigned long)shift);
-
-                /* Precompute primorial % p for incremental rebase. */
-                uint64_t *st_prim_mod = NULL;
-                size_t    st_prim_cnt = 0;
-
                 static int st_crt_logged = 0;
                 if (!st_crt_logged) {
                     size_t prim_bits = mpz_sizeinbase(g_crt_primorial_mpz, 2);
-                    size_t crt_seg   = (size_t)gap_scan_cfg / 2;
+                    size_t crt_seg = (size_t)gap_scan_cfg / 2;
                     size_t crt_bytes = (crt_seg + 7) / 8;
                     log_msg("CRT mining (1T): primorial~2^%lu  shift=%d"
-                        "  gap_scan_tmpl=%llu  sieve_bitmap=%zu bytes (%.1f KB)\n",
-                        (unsigned long)prim_bits, shift,
-                        (unsigned long long)gap_scan_cfg,
+                            "  gap_scan_tmpl=%llu  sieve_bitmap=%zu bytes (%.1f KB)\n",
+                            (unsigned long)prim_bits, shift,
+                            (unsigned long long)gap_scan_cfg,
                             crt_bytes, (double)crt_bytes / 1024.0);
                     st_crt_logged = 1;
                 }
 
-                struct pass_state pass_snap_st;
-                pass_state_snapshot(&pass_snap_st);
-                uint32_t nonce_st = pass_snap_st.nonce + 1;
-                uint8_t hdr80_st_base[80];
-                memcpy(hdr80_st_base, pass_snap_st.hdr80, 80);
+                struct worker_args st_wa;
+                memset(&st_wa, 0, sizeof(st_wa));
+                st_wa.tid = 0;
+                st_wa.nthreads = 1;
+                st_wa.crt_role = 0;
 
-                while (keep_going && !g_abort_pass) {
-                    /* SHA256d for this nonce */
-                    uint8_t hdr84_st[84], sha_raw_st[32], h256_st[32];
-                    memcpy(hdr84_st, hdr80_st_base, 80);
-                    memcpy(hdr84_st + 80, &nonce_st, 4);
-                    double_sha256(hdr84_st, 84, sha_raw_st);
+                struct crt_runtime_worker_ctx rt_ctx_st;
+                crt_runtime_init_worker_ctx(&rt_ctx_st, 1);
 
-                    if (sha_raw_st[31] < 0x80) { nonce_st++; continue; }
+                mpz_t crt_end;
+                mpz_init(crt_end);
+                mpz_ui_pow_ui(crt_end, 2, (unsigned long)shift);
 
-                    for (int k = 0; k < 32; k++) h256_st[k] = sha_raw_st[31 - k];
-                    set_base_bn(h256_st, shift);
-                    double logbase_st = uint256_log_approx(h256_st, shift);
-                    uint64_t gap_scan_nonce = crt_gap_scan_for_nonce(
-                        target, logbase_st,
-                        (uint64_t)g_crt_gap_target, g_crt_gap_scan_mode,
-                        g_crt_gap_scan_floor);
-                    if (__sync_bool_compare_and_swap(
-                            &g_crt_gap_scan_runtime_logged, 0, 1)) {
-                        double raw_scan = target * logbase_st;
-                        if (g_crt_gap_scan_mode == CRT_GAP_SCAN_ORIGINAL) {
-                            log_msg("CRT gap-scan runtime: first nonce window=%llu "
-                                    "(raw=%.0f, cap=%d)\n",
-                                    (unsigned long long)gap_scan_nonce,
-                                    raw_scan, g_crt_gap_target);
-                        } else if (g_crt_gap_scan_mode == CRT_GAP_SCAN_ORIG_FLOOR) {
-                            log_msg("CRT gap-scan runtime: first nonce window=%llu "
-                                    "(raw=%.0f, floor=%llu)\n",
-                                    (unsigned long long)gap_scan_nonce,
-                                    raw_scan,
-                                    (unsigned long long)g_crt_gap_scan_floor);
-                        }
-                    }
+                /* Single-thread keeps explicit post-loop polling below at
+                   st_rpc_poll, so disable in-loop tip polling for this call. */
+                crt_runtime_run_solver_producer_loop(
+                    &rt_ctx_st,
+                    &st_wa,
+                    0,
+                    shift,
+                    target,
+                    0,
+                    rpc_url,
+                    rpc_user,
+                    rpc_pass,
+                    gap_scan_cfg,
+                    crt_end);
 
-                    crt_compute_alignment_mpz(nAdd_st);
-
-                    /* Save original base; lazy-init primorial mod cache. */
-                    mpz_set(orig_base_st, tls_base_mpz);
-                    if (!st_prim_mod && small_primes_cache &&
-                        small_primes_count > 0) {
-                        st_prim_cnt = small_primes_count;
-                        st_prim_mod = (uint64_t *)malloc(
-                            st_prim_cnt * sizeof(uint64_t));
-                        if (st_prim_mod) {
-                            for (size_t pi = 0; pi < st_prim_cnt; pi++)
-                                st_prim_mod[pi] = mpz_fdiv_ui(
-                                    g_crt_primorial_mpz,
-                                    (unsigned long)small_primes_cache[pi]);
-                        }
-                    }
-
-                    /* First window: full rebase. */
-                    mpz_add(cand_st, orig_base_st, nAdd_st);
-                    int st_odd = mpz_odd_p(cand_st);
-                    if (st_odd) mpz_sub_ui(cand_st, cand_st, 1);
-                    rebase_for_gap_check(cand_st);
-                    /* Static template (built once at startup from fixed CRT offsets)
-                       is returned by crt_solver_get_thread_tmpl() in sieve_range(). */
-                    crt_filter_init_residues();
-                    int st_first_win = 1;
-
-                    while (mpz_cmp(nAdd_st, crt_end) < 0 && keep_going && !g_abort_pass) {
-                        if (!st_first_win) {
-                            /* Incremental rebase */
-                            mpz_add(tls_base_mpz, tls_base_mpz,
-                                    g_crt_primorial_mpz);
-                            prime_cache_invalidate_base();
-                            if (st_prim_mod && tls_base_mod_p) {
-                                for (size_t pi = 0; pi < st_prim_cnt; pi++) {
-                                    tls_base_mod_p[pi] += st_prim_mod[pi];
-                                    if (tls_base_mod_p[pi] >=
-                                        small_primes_cache[pi])
-                                        tls_base_mod_p[pi] -=
-                                            small_primes_cache[pi];
-                                }
-                            }
-                            crt_filter_step_residues();
-                        }
-                        st_first_win = 0;
-
-                        uint64_t gap_L = 1;
-                        uint64_t gap_R = gap_scan_nonce;
-                        size_t surv_cnt = 0;
-                        uint64_t *surv = sieve_range(gap_L, gap_R,
-                                                     &surv_cnt, NULL, 0);
-                        __sync_fetch_and_add(&stats_sieved, gap_R - gap_L);
-
-                        if (!surv || surv_cnt == 0) {
-                            mpz_add(nAdd_st, nAdd_st, g_crt_primorial_mpz);
-                            continue;
-                        }
-
-                        /* Skip windows where no survivor pair can span needed_gap.
-                         * Same O(1) check as the RPC monolithic path. */
-                        {
-                            uint64_t ng = (uint64_t)(target * logbase_st);
-                            if (ng < 2) ng = 2;
-                            if (surv_cnt < 2 ||
-                                surv[surv_cnt - 1] - surv[0] < ng) {
-                                __sync_fetch_and_add(&stats_cramer_skipped, 1);
-                                mpz_add(nAdd_st, nAdd_st, g_crt_primorial_mpz);
-                                continue;
-                            }
-                        }
-
-                        /* Backward-scan Fermat (~10-20× fewer tests) */
-#ifdef WITH_GPU_FERMAT
-                        if (g_gpu_count > 0) {
-                            size_t pf = 0;
-                            /* Lazy-init thread-local GPU accumulator (same
-                               per-thread ctx approach as the monolithic path). */
-                            if (!tls_gpu_accum) {
-                                static volatile int st_accum_rr = 0;
-                                int gi = __sync_fetch_and_add(&st_accum_rr, 1)
-                                         % g_gpu_count;
-                                int batch_size = g_gpu_batch_size > 0
-                                                 ? g_gpu_batch_size
-                                                 : GPU_ACCUM_DEFAULT;
-                                size_t batch_cap = (size_t)batch_size + 4096;
-                                gpu_fermat_ctx *per_ctx =
-                                    gpu_fermat_init(g_gpu_device_ids[gi], batch_cap);
-                                if (per_ctx && g_gpu_active_limbs_global > 0)
-                                    gpu_fermat_set_limbs(per_ctx,
-                                                        g_gpu_active_limbs_global);
-                                tls_gpu_accum = gpu_accum_create(per_ctx, batch_size);
-                                if (tls_gpu_accum)
-                                    tls_gpu_accum->owns_ctx = 1;
-                                else if (per_ctx)
-                                    gpu_fermat_destroy(per_ctx);
-                            }
-                            if (tls_gpu_accum) {
-                                ensure_gmp_tls();
-                                int gpu_al_st = tls_gpu_accum->stride;
-                                uint64_t bl[GPU_NLIMBS];
-                                memset(bl, 0,
-                                       (size_t)gpu_al_st * sizeof(uint64_t));
-                                size_t nexp = 0;
-                                mpz_export(bl, &nexp, -1, 8, 0, 0,
-                                           tls_base_mpz);
-                                if (nexp <= (size_t)GPU_NLIMBS) {
-                                    __sync_fetch_and_add(&stats_tested,
-                                        (uint64_t)surv_cnt);
-                                    if (gpu_accum_add(tls_gpu_accum, bl,
-                                            surv, surv_cnt, nonce_st,
-                                            st_odd, logbase_st,
-                                            target, shift,
-                                            nAdd_st, rpc_url,
-                                            rpc_user, rpc_pass))
-                                        gpu_accum_flush(tls_gpu_accum);
-                                    mpz_add(nAdd_st, nAdd_st,
-                                            g_crt_primorial_mpz);
-                                    continue;
-                                }
-                            }
-                            /* Fallback: direct GPU batch */
-                            pf = gpu_batch_filter(surv, surv_cnt);
-                            __sync_fetch_and_add(&stats_tested,
-                                                 (uint64_t)surv_cnt);
-                            __sync_fetch_and_add(&stats_crt_windows, 1);
-                            __sync_fetch_and_add(&stats_primes_found,
-                                                 (uint64_t)pf);
-                            if (pf >= 2)
-                                __sync_fetch_and_add(&stats_pairs,
-                                                     (uint64_t)(pf - 1));
-                            (void)pf;
-                        } else
-#endif
-                        {
-                            crt_bkscan_and_submit(surv, surv_cnt,
-                                                  logbase_st, target,
-                                                  shift, nonce_st,
-                                                  st_odd, nAdd_st,
-                                                  rpc_url, rpc_user,
-                                                  rpc_pass);
-                        }
-
-                        mpz_add(nAdd_st, nAdd_st, g_crt_primorial_mpz);
-                    } /* end CRT candidate loop */
-                    nonce_st++;
-                } /* end nonce loop */
-
-#ifdef WITH_GPU_FERMAT
-                /* Drain any remaining accumulated GPU work once per nonce-loop
-                   exit (not once per nonce).  This allows cross-nonce batching,
-                   significantly increasing effective gpu_batch in CRT mode. */
-                if (tls_gpu_accum) {
-                    if (g_abort_pass)
-                        gpu_accum_reset(tls_gpu_accum);
-                    else {
-                        gpu_accum_flush(tls_gpu_accum);
-                        gpu_accum_collect(tls_gpu_accum);
-                    }
-                }
-#endif
-
-                mpz_clears(crt_end, nAdd_st, cand_st, orig_base_st, NULL);
-                free(st_prim_mod);
+                mpz_clear(crt_end);
                 goto st_rpc_poll;
 #endif /* WITH_RPC — CRT-SOLVER single-thread */
             }
@@ -7805,7 +7932,9 @@ int main(int argc, char **argv) {
                 }
                 if (cnt >= 1) st_carry_last = pr[cnt - 1];
             }
+    #ifdef WITH_RPC
         st_rpc_poll:
+    #endif
             if (keep_going && rpc_url) {
 #ifdef WITH_RPC
               if (g_stratum) {
@@ -7862,7 +7991,11 @@ int main(int argc, char **argv) {
             /* Auto-split needs a producer-consumer baseline. When user did
                not pin --fermat-threads, bootstrap from monolithic mode with
                a conservative initial consumer count. */
-            auto_fermat_threads = (num_threads >= 6) ? 2 : 1;
+            {
+                const struct crt_phase1_profile *crt_pf =
+                    crt_phase1_pick_profile(shift);
+                auto_fermat_threads = crt_pf->auto_split_bootstrap;
+            }
             if (auto_fermat_threads >= num_threads)
                 auto_fermat_threads = num_threads - 1;
             if (auto_fermat_threads < 1)

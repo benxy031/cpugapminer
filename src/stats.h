@@ -44,6 +44,25 @@ extern volatile uint64_t stats_crt_heap_waits;
 extern volatile uint64_t stats_crt_heap_hwm;
 extern volatile uint64_t stats_crt_stale_drop;
 
+/* Phase 1 CRT runtime telemetry. */
+extern volatile uint64_t stats_crt_solver_mono_cpu_tests;
+extern volatile uint64_t stats_crt_solver_mono_gpu_tests;
+extern volatile uint64_t stats_crt_solver_consumer_cpu_tests;
+extern volatile uint64_t stats_crt_solver_consumer_gpu_tests;
+extern volatile uint64_t stats_crt_solver_prod_windows_generated;
+extern volatile uint64_t stats_crt_solver_prod_windows_enqueued;
+extern volatile uint64_t stats_crt_solver_prod_prefilter_span_drop;
+extern volatile uint64_t stats_crt_solver_prod_prefilter_density_drop;
+extern volatile uint64_t stats_crt_gpu_accum_flush_count;
+extern volatile uint64_t stats_crt_gpu_accum_flush_ms;
+extern volatile uint64_t stats_crt_gpu_accum_collect_count;
+extern volatile uint64_t stats_crt_gpu_accum_collect_ms;
+extern volatile uint64_t stats_crt_gpu_accum_batch_le_512;
+extern volatile uint64_t stats_crt_gpu_accum_batch_le_1024;
+extern volatile uint64_t stats_crt_gpu_accum_batch_le_2048;
+extern volatile uint64_t stats_crt_gpu_accum_batch_le_4096;
+extern volatile uint64_t stats_crt_gpu_accum_batch_gt_4096;
+
 /* Cramér-model score stats (CRT paths only). */
 extern volatile uint64_t stats_cramer_scored;       /* windows whose score was computed */
 extern volatile uint64_t stats_cramer_skipped;      /* windows skipped by span<needed_gap (monolithic) */

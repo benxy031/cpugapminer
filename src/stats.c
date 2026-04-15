@@ -46,6 +46,24 @@ volatile uint64_t stats_crt_heap_waits = 0;
 volatile uint64_t stats_crt_heap_hwm = 0;
 volatile uint64_t stats_crt_stale_drop = 0;
 
+volatile uint64_t stats_crt_solver_mono_cpu_tests = 0;
+volatile uint64_t stats_crt_solver_mono_gpu_tests = 0;
+volatile uint64_t stats_crt_solver_consumer_cpu_tests = 0;
+volatile uint64_t stats_crt_solver_consumer_gpu_tests = 0;
+volatile uint64_t stats_crt_solver_prod_windows_generated = 0;
+volatile uint64_t stats_crt_solver_prod_windows_enqueued = 0;
+volatile uint64_t stats_crt_solver_prod_prefilter_span_drop = 0;
+volatile uint64_t stats_crt_solver_prod_prefilter_density_drop = 0;
+volatile uint64_t stats_crt_gpu_accum_flush_count = 0;
+volatile uint64_t stats_crt_gpu_accum_flush_ms = 0;
+volatile uint64_t stats_crt_gpu_accum_collect_count = 0;
+volatile uint64_t stats_crt_gpu_accum_collect_ms = 0;
+volatile uint64_t stats_crt_gpu_accum_batch_le_512 = 0;
+volatile uint64_t stats_crt_gpu_accum_batch_le_1024 = 0;
+volatile uint64_t stats_crt_gpu_accum_batch_le_2048 = 0;
+volatile uint64_t stats_crt_gpu_accum_batch_le_4096 = 0;
+volatile uint64_t stats_crt_gpu_accum_batch_gt_4096 = 0;
+
 volatile uint64_t stats_cramer_scored       = 0;
 volatile uint64_t stats_cramer_skipped      = 0;
 volatile uint64_t stats_cramer_heap_skip    = 0;

@@ -97,9 +97,11 @@ $(SRCDIR)/gpu_fermat.o: $(SRCDIR)/gpu_fermat.cu $(SRCDIR)/gpu_fermat.h
 	"$(NVCC)" -O3 $(CUDA_ARCH) $(NVCC_FLAGS) -c $< -o $@
 
 C_OBJS=$(SRCDIR)/stats.o $(SRCDIR)/sieve_cache.o $(SRCDIR)/gap_scan.o \
-	$(SRCDIR)/crt_heap.o $(SRCDIR)/crt_solver.o $(SRCDIR)/crt_gap_scan.o $(SRCDIR)/presieve_utils.o \
-	$(SRCDIR)/wheel_sieve.o \
-       $(SRCDIR)/uint256_utils.o $(SRCDIR)/block_utils.o $(SRCDIR)/primality_utils.o
+	$(SRCDIR)/crt_heap.o $(SRCDIR)/crt_solver.o $(SRCDIR)/crt_gap_scan.o \
+	$(SRCDIR)/crt_runtime.o $(SRCDIR)/crt_runtime_worker.o \
+	$(SRCDIR)/crt_runtime_cpu.o $(SRCDIR)/crt_runtime_gpu.o \
+	$(SRCDIR)/presieve_utils.o $(SRCDIR)/wheel_sieve.o \
+	$(SRCDIR)/uint256_utils.o $(SRCDIR)/block_utils.o $(SRCDIR)/primality_utils.o
 
 $(TARGET): $(BINDIR) $(SRCDIR)/main.o $(C_OBJS) $(RPC_OBJS) $(STRATUM_OBJ) $(CUDA_OBJ)
 	$(LINKER) -o $@ $(SRCDIR)/main.o $(C_OBJS) $(RPC_OBJS) $(STRATUM_OBJ) $(CUDA_OBJ) $(LDFLAGS) $(LIBS)

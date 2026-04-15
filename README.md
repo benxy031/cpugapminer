@@ -12,14 +12,24 @@ every raw block byte sequence is saved to `/tmp` for forensic inspection.
 src/
   main.c            - core miner orchestration, worker loops, CLI/runtime
                       policy, block assembly glue
+  compat_win32.h    - Windows compatibility helpers for 64-bit-safe code paths
   stats.h / .c      - shared mining statistics counters and stats thread
   sieve_cache.h / .c- sieve-prime and trial-division cache management
+  wheel_sieve.h/.c  - optional wheel-presieve backend for non-CRT mining
   gap_scan.h / .c   - gap scanning helpers (backward scan/interior checks)
+  crt_solver.h / .c - CRT file loading/parsing and solver orchestration
   crt_heap.h / .c   - CRT producer-consumer heap queue and work-item helpers
   crt_gap_scan.h/.c - CRT solver gap-window policy (mode parsing + window
                       sizing helpers)
+  crt_runtime.h/.c  - shared CRT runtime policy helpers (adaptive controls)
+  crt_runtime_worker.h/.c
+                    - CRT runtime facade entrypoints and worker context glue
+  crt_runtime_cpu.h/.c
+                    - CRT CPU runtime loop implementation
+  crt_runtime_gpu.c - CRT GPU runtime path and accumulator integration
   presieve_utils.h/.c
                     - pre-sieve buffer utilities for helper/worker pipeline
+  mpresieve_avx512.h- AVX-512 presieve helpers/constants
   block_utils.h / .c- block serialization/encoding helpers (LE writes,
                       varint/pushdata, hex, double-SHA256)
   uint256_utils.h/.c
@@ -36,6 +46,9 @@ src/
   gpu_fermat.h      - public C API for CUDA batch Fermat testing
   gpu_fermat.cu     - CUDA kernel: configurable-width Montgomery Fermat test
                       (default 1024-bit / 16 limbs, supports shift ≤ 768)
+  gpu_fermat_opencl.c
+                    - OpenCL Fermat backend implementation (experimental)
+  gpu_fermat.def    - Windows export-definition file for GPU Fermat symbols
   Opts.h            - option singleton header
   parse_block.c     - raw block parsing utilities
   utils.h           - small shared helpers
@@ -46,7 +59,10 @@ docs/
   CRT_GENERATION.md - parameter reference for generating CRT files
                       (shifts 64–1024)
 tests/
-  test_rpc_json.c   - unit tests for rpc_json helpers
+  test_rpc_json.c          - unit tests for rpc_json helpers
+  test_wheel_sieve.c       - wheel presieve backend correctness tests
+  test_wheel_compare.c     - wheel vs baseline presieve consistency checks
+  test_crt_runtime_policy.c - CRT runtime policy tests (adaptive/backpressure)
 scripts/
   inspect_tx.py     - Python utility to decode raw block/transaction hex
                       files written to /tmp by the miner
@@ -194,6 +210,9 @@ for parameter tables and ready-to-use commands for shifts 64–1024.
 ```sh
 make test
 ./tests/test_rpc_json
+./tests/test_wheel_sieve
+./tests/test_wheel_compare
+./tests/test_crt_runtime_policy
 ```
 
 ## Quick start
@@ -244,7 +263,7 @@ bin/gap_miner \
   --rpc-url  http://127.0.0.1:31397/ \
   --rpc-user USER \
   --rpc-pass PASS \
-  --shift 513 \
+  --shift 512 \
   --threads 6 \
   --fast-fermat \
   --crt-file crt/crt_s512_m22.txt
@@ -257,7 +276,7 @@ bin/gap_miner \
   --rpc-url  http://127.0.0.1:31397/ \
   --rpc-user USER \
   --rpc-pass PASS \
-  --shift 513 \
+  --shift 512 \
   --threads 16 \
   --fast-fermat \
   --fermat-threads 14 \
@@ -270,10 +289,88 @@ Capture output to a file as well:
 bin/gap_miner ... --log-file miner.log
 ```
 
+### Recommended CRT CLI setup (April 2026)
+
+Based on the latest 5x3 matrix (`shift` 64/160/384/512/768 across monolithic
+CPU, monolithic GPU, and producer-consumer GPU-consumer), the practical
+default on RTX 3060-class hardware is:
+
+- use monolithic CRT with CUDA (`--cuda 0`)
+- enable adaptive CRT GPU batch tuning (`--crt-gpu-batch-adaptive`)
+- keep producer-consumer GPU-consumer as an advanced opt-in (near tie at
+  shift 512; otherwise monolithic won)
+
+`pps` in miner stats means **primes per second**.
+
+Recommended mode by shift (matrix result):
+
+| Shift | Recommended mode |
+|---|---|
+| 64 | Monolithic GPU |
+| 160 | Monolithic GPU |
+| 384 | Monolithic GPU |
+| 512 | Monolithic GPU default (PC GPU-consumer is near-tie advanced option) |
+| 768 | Monolithic GPU |
+
+Recommended baseline command:
+
+```sh
+bin/gap_miner \
+  --rpc-url  http://127.0.0.1:31397/ \
+  --rpc-user USER \
+  --rpc-pass PASS \
+  --shift 512 \
+  --threads 8 \
+  --fast-fermat \
+  --cuda 0 \
+  --crt-gpu-batch-adaptive \
+  --crt-file crt/crt_s512_m22.txt
+```
+
+Optional advanced variant (only when you explicitly want producer-consumer
+GPU consumers):
+
+```sh
+bin/gap_miner \
+  --rpc-url  http://127.0.0.1:31397/ \
+  --rpc-user USER \
+  --rpc-pass PASS \
+  --shift 512 \
+  --threads 8 \
+  --fermat-threads 6 \
+  --fast-fermat \
+  --cuda 0 \
+  --crt-gpu-consumer \
+  --crt-gpu-batch-adaptive \
+  --crt-file crt/crt_s512_m22.txt
+```
+
 ## Recent changes (March-April 2026)
 
 This section summarizes behavior that changed recently and may differ from
 older logs, scripts, or command lines.
+
+### CRT runtime/policy refactor (April 2026)
+
+- CRT runtime loops were split into dedicated modules:
+  - `src/crt_runtime_worker.c` (facade/entrypoints)
+  - `src/crt_runtime_cpu.c` (CPU orchestration)
+  - `src/crt_runtime_gpu.c` (GPU-specific runtime path)
+  - shared policy module: `src/crt_runtime.c` + `src/crt_runtime.h`
+- Single-thread and threaded CRT solver paths now share the same runtime worker
+  context plumbing.
+- New CRT runtime controls were added:
+  - `--crt-gpu-consumer`
+  - `--crt-gap-scan-adaptive`
+  - `--crt-precision`, `--no-crt-precision`
+  - `--crt-precision-rounds N`
+  - `--crt-accum-soft-cap`, `--crt-accum-hard-cap`
+  - `--crt-accum-backpressure`, `--no-crt-accum-backpressure`
+  - `--crt-gpu-batch-adaptive`, `--no-crt-gpu-batch-adaptive`
+  - `--crt-gpu-batch-min`, `--crt-gpu-batch-max`
+- Added policy test coverage in `tests/test_crt_runtime_policy.c` for adaptive
+  gap-window, accumulator preflush/backpressure, density drop, and adaptive GPU
+  batch threshold policy functions.
 
 ### Correctness and platform safety
 
@@ -400,7 +497,7 @@ Benchmarked on NVIDIA GeForce RTX 3060 at shift 64
 | | Before | After | Change |
 |---|---|---|---|
 | Sieve throughput | 562 M/s | 633 M/s | **+12.6%** |
-| Pairs/s (pps) | 737 K | 924 K | **+25.4%** |
+| Primes/s (pps) | 737 K | 924 K | **+25.4%** |
 
 CPU-only runs show no measurable gain because Fermat testing dominates the
 pipeline in CPU mode.  The improvement is visible when CUDA offloads Fermat
@@ -427,6 +524,8 @@ Recommended command line for RTX 3060, shift 64:
 
 - The advisory `merit_trend(k=1): paper~... evt~... target_delta=...` segment
   has been removed from periodic STATS output.
+- Logging writes are now synchronized across threads to prevent interleaved
+  STATS and merit-event lines in console/log output.
 
 ### Benchmark script updates
 
@@ -445,11 +544,10 @@ to the GPU without accumulation.  In CRT monolithic mode, a batch
 accumulator collects candidates from multiple windows and flushes them to
 the GPU in large batches (default 4096) for efficient SM utilization.
 
-> **Note:** `--cuda` is **not** used in CRT producer-consumer mode
-> (`--fermat-threads N`).  The fermat consumer threads run CPU backward-scan
-> (`crt_bkscan_and_submit`) which calls CPU Fermat directly.  Using `--cuda`
-> together with `--fermat-threads` will print a warning and the GPU will be
-> idle.  To use the GPU with CRT, use monolithic mode (omit `--fermat-threads`).
+> **Note:** CRT producer-consumer can use GPU consumers when you opt in with
+> `--crt-gpu-consumer` (and `--cuda`).  Without `--crt-gpu-consumer`,
+> producer-consumer remains CPU consumer mode and `--cuda` +
+> `--fermat-threads` triggers the idle-GPU warning.
 
 OpenCL scaffolding can be selected with `--opencl [DEV,...]` and
 `--opencl-platform N`; this enables the OpenCL Fermat backend.
@@ -524,8 +622,8 @@ bin/gap_miner \
   --crt-file crt/crt_s512_m22.txt
 ```
 
-> Do **not** combine `--cuda` with `--fermat-threads` — the GPU is unused in
-> producer-consumer CRT mode and the miner will warn you.
+> `--cuda` + `--fermat-threads` uses GPU in producer-consumer mode only when
+> `--crt-gpu-consumer` is also set; otherwise consumers stay CPU-based.
 
 Tune GPU batch size for larger flushes:
 
@@ -733,10 +831,11 @@ Fermat testing to the GPU on these paths:
   Fermat tests than full-test.  Cooperative Fermat is disabled
   (`coop.active=0`) so the helper thread only sieves the next window and does
   not waste CPU on redundant Fermat work.
-- **CRT producer-consumer (`--fermat-threads N`)** — GPU is **not used**.
-  The Fermat consumer threads run CPU backward-scan (`crt_bkscan_and_submit`)
-  with GMP Fermat directly.  Combining `--cuda` with `--fermat-threads`
-  prints a warning at startup.
+- **CRT producer-consumer (`--fermat-threads N`)** — CPU consumers by default.
+  With `--crt-gpu-consumer` + `--cuda`, consumer windows are routed through the
+  CRT GPU accumulator path (experimental).  Without `--crt-gpu-consumer`,
+  consumers remain CPU backward-scan (`crt_bkscan_and_submit`) and
+  `--cuda` + `--fermat-threads` emits the idle-GPU warning.
 
 Each candidate is exported as a configurable-width number (default 1024-bit
 / 16×64-bit limbs); the CUDA kernel performs Montgomery-form modular
@@ -811,6 +910,9 @@ CRT gap-window policies (`--crt-gap-scan MODE`, solver text files only):
 Inline floor assignment is also accepted:
 `--crt-gap-scan original-floor=12000`.
 
+Accuracy-first CRT runs can use `--crt-precision`.  In solver mode this
+switches CRT primality checks to stricter probable-prime rounds.
+
 The normal large windowed sieve is bypassed, so `--sieve-size` and
 `--sample-stride` have no effect in CRT mode.  `--sieve-primes` **is**
 used — it controls how many small primes are applied to the gap-check sieve.
@@ -859,7 +961,7 @@ This may help at low shifts (< 128) where the sieve takes longer.
 |----------|---------------|
 | High shift (≥ 256), any thread count | Monolithic (default) — sieve is <1ms, every thread should do Fermat work |
 | Low shift (< 128), many threads | Producer-consumer (`--fermat-threads N`) — sieve takes longer, benefits from dedicated threads |
-| Using `--cuda` with CRT | Monolithic only — GPU is idle in producer-consumer mode |
+| Using `--cuda` with CRT | Prefer monolithic.  Producer-consumer GPU is experimental and requires `--crt-gpu-consumer` |
 
 **Tuning `--sieve-primes` in producer-consumer mode** (GapMiner dev recommendation):
 
@@ -1146,12 +1248,23 @@ gap scanning.  Multiple GPUs are supported via `--cuda 0,1`.
 | `--adaptive-presieve` | off           | Adaptive non-CRT presieve window skipping for dense windows after presieve. |
 | `--wheel-sieve N`     | 0 (disabled)  | Select wheel-presieve backend for non-CRT runs.  Supported values: `30`, `210`, `2310`, `30030`, `510510`, `9699690`. |
 | `-e` / `--extra-verbose` | off       | Write detailed `--partial-sieve-auto` adjustments to the log file only. |
+| `--stats-verbose`     | off           | Include detailed CRT phase telemetry (`cramer`, `phase1`, accumulator histograms, score calibration) in periodic STATS output.  Default output stays concise. |
 | `--crt-file FILE`     | --            | Load a CRT sieve file (binary `.bin` or text `.txt`).  Text files enable CRT-aligned mining; binary files enable template tiling. |
-| `--fermat-threads N` / `-d N` | 0 (monolithic) | Number of Fermat consumer threads for CRT producer-consumer mode.  Default `0` = monolithic (all threads sieve+fermat independently).  Set to `N` to enable producer-consumer with `threads - N` sieve and `N` fermat threads. |
+| `--fermat-threads N` / `-d N` | 0 (monolithic) | Number of Fermat consumer threads for CRT producer-consumer mode.  Default `0` = monolithic (all threads sieve+fermat independently).  Set to `N` to enable producer-consumer with `threads - N` sieve and `N` fermat threads.  Consumers are CPU by default unless `--crt-gpu-consumer` is also set with `--cuda`. |
+| `--crt-gpu-consumer` | off | Experimental CRT producer-consumer mode: route consumer windows through the GPU accumulator path when `--cuda` is active. |
 | `--crt-gap-scan MODE` | `fixed` | CRT solver gap-window policy for text `--crt-file` runs.  `fixed=max(2*gap_target,10000)`, `original=ceil(target*ln(start))` (clamped to `[8,gap_target]`), `original-floor=max(original,FLOOR)`.  Aliases: `orig`, `dynamic`, `orig-floor`, `dynamic-floor`, `hybrid`. |
 | `--crt-gap-scan-floor N` | 10000 | Floor used by `--crt-gap-scan original-floor`.  Can also be set inline via `--crt-gap-scan original-floor=N`.  Ignored by other CRT gap-scan modes. |
+| `--crt-gap-scan-adaptive` | off | Adapt CRT runtime gap-scan window from heap-pressure telemetry (`drop%`, fill, wait) during solver execution. |
+| `--crt-precision` / `--no-crt-precision` | off | Accuracy-first CRT solver mode: uses stricter probable-prime checks in CRT paths. |
+| `--crt-precision-rounds N` | 8 | Number of probable-prime rounds used by `--crt-precision` strict CRT checks (minimum 2). |
 | `--crt-auto-split`    | off           | Enable pass-level adaptive sieve/fermat thread split in CRT solver producer-consumer mode. |
 | `--heap N`            | 4096          | Maximum number of pending CRT windows in the producer-consumer gaplist heap.  Only relevant when `--fermat-threads N` is active.  Larger values allow the sieve producers to run further ahead of the Fermat consumers; useful if producers are significantly faster than consumers. |
+| `--crt-accum-soft-cap N` | 24576 | CRT GPU accumulator soft preflush cap (candidates).  Used by accumulator backpressure policy. |
+| `--crt-accum-hard-cap N` | 65536 | CRT GPU accumulator hard preflush cap (candidates).  Used by accumulator backpressure policy. |
+| `--crt-accum-backpressure` / `--no-crt-accum-backpressure` | on | Enable/disable CRT GPU accumulator preflush/backpressure controls. |
+| `--crt-gpu-batch-adaptive` / `--no-crt-gpu-batch-adaptive` | off | Enable/disable adaptive CRT GPU accumulator threshold tuning from flush/collect telemetry. |
+| `--crt-gpu-batch-min N` | 512 | Lower bound used by adaptive CRT GPU batch threshold tuning. |
+| `--crt-gpu-batch-max N` | 32768 | Upper bound used by adaptive CRT GPU batch threshold tuning. |
 | `--mr-verify`         | off           | Verify gap boundary primes with a Miller-Rabin base-3 check before submission.  Catches Fermat base-2 pseudoprimes with negligible overhead. |
 | `--no-primality`      | off           | Skip primality testing entirely |
 | `--build-only`        | off           | Fetch template and build one block, then exit |
@@ -1164,7 +1277,7 @@ gap scanning.  Multiple GPUs are supported via `--cuda 0,1`.
 | `--cuda [DEV,...]`    | off           | Enable CUDA GPU Fermat testing (requires `WITH_CUDA=1` build).  Optional comma-separated `DEV` list selects GPU devices (e.g. `--cuda 0,1`).  Up to 8 GPUs, round-robin dispatch. |
 | `--opencl [DEV,...]`  | off           | Enable OpenCL GPU Fermat path (requires `WITH_OPENCL=1` build).  Optional device list selects GPU devices (e.g. `--opencl 0,1`).  Do not combine with `--cuda` in one run. |
 | `--opencl-platform N` | 0             | OpenCL platform index used with `--opencl`. |
-| `--gpu-batch N`       | 4096          | Accumulate N candidates across CRT windows before flushing to GPU (CRT mode only; non-CRT paths send full sieve windows directly).  Larger values improve GPU utilization at the cost of slightly delayed gap processing. |
+| `--gpu-batch N`       | 4096          | Accumulate N candidates across CRT windows before flushing to GPU (CRT mode only; non-CRT paths send full sieve windows directly).  Larger values improve GPU utilization at the cost of slightly delayed gap processing.  When unset in CRT+GPU mode, shift-band defaults may apply (`2048/4096/8192/16384`). |
 | `--stratum HOST:PORT` | --            | Connect to a Gapcoin stratum pool instead of using RPC/GBT (requires `WITH_RPC=1` build). |
 | `-u` / `--user`       | --            | Alias for `--rpc-user` |
 | `--pass`              | --            | Alias for `--rpc-pass` |
