@@ -95,5 +95,21 @@ uint64_t crt_gap_scan_for_nonce(double target_merit,
         return gap_scan;
     }
 
-    return crt_gap_scan_fixed_window(gap_target);
+    /* Fixed mode: tighten the window for nonces whose logbase is below
+     * the CRT file's design point.  The standard fixed window is
+     * 2 × gap_target regardless of logbase.  Cap it instead at
+     * ceil(2 × target_merit × logbase) so sieve work scales with the
+     * nonce's actual merit potential while preserving the 2× coverage
+     * factor.  Nonces at or above the design logbase are unaffected. */
+    uint64_t fixed = crt_gap_scan_fixed_window(gap_target);
+    if (logbase > 0.0 && target_merit > 0.0) {
+        double raw = target_merit * logbase * 2.0;
+        if (raw >= 1.0) {
+            uint64_t capped = (uint64_t)ceil(raw);
+            if (capped < 10000ULL) capped = 10000ULL;
+            if (capped < fixed)
+                return capped;
+        }
+    }
+    return fixed;
 }

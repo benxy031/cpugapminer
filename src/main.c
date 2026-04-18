@@ -599,8 +599,10 @@ static volatile int debug_force = 0;    /* if nonzero, pretend any header meets 
    the full deterministic Miller‑Rabin.  This is faster but may misclassify a
    tiny number of composites as primes; use with --fast-fermat. */
 static volatile int use_fast_fermat = 0;
-/* if nonzero the miner uses an Euler-Plumb style base-2 test. */
-static volatile int use_fast_euler = 0;
+/* if nonzero the miner uses an Euler-Plumb style base-2 test.
+   Default 1 (on): skips GMP's internal TD on already-sieved candidates.
+   Use --no-fast-euler to revert to full mpz_probab_prime_p. */
+static volatile int use_fast_euler = 1;
 /* if nonzero, use adaptive sieve-prime limiting on non-CRT windows. */
 static volatile int use_partial_sieve_auto = 0;
 /* if nonzero, use the selectable wheel presieve backend. */
@@ -1819,8 +1821,13 @@ static void print_stats(void) {
                 size_t q_now = crt_heap_count();
                 uint64_t push_total = hp_ok + hp_rep + hp_drop;
 
+                /* With N balanced consumers each handling 1/N of work,
+                 * wait_pct ≈ (N-1)/N at the natural balance point.
+                 * For N=2 that is 50%.  A threshold below 50% mis-fires
+                 * on a perfectly loaded 2-consumer setup.  Use 65% to
+                 * require genuine idle headroom before reducing. */
                 int underfilled = (crt_fermat_threads > 1 &&
-                                   q_now == 0 && wait_pct >= 45.0 &&
+                                   q_now == 0 && wait_pct >= 65.0 &&
                                    drop_pct < 1.0 && (pop_ok + waits) >= 500);
 
                 int overloaded = (push_total >= 500 &&
@@ -2514,7 +2521,7 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
 
             if (surv_ratio > 0.18) {
                 next = cur + (cur >> 5);   /* +3.125% */
-            } else if (surv_ratio < 0.08) {
+            } else if (surv_ratio < 0.05) {
                 next = cur - (cur >> 6);   /* -1.5625% */
             }
 
@@ -6584,7 +6591,8 @@ int main(int argc, char **argv) {
         printf("      --threads N       worker threads        (default: 1)\n");
         printf("      --adder-max M     adder upper bound     (default: 2^shift)\n");
         printf("      --fast-fermat     fast primality (fewer Miller-Rabin rounds)\n");
-        printf("      --fast-euler      fast Euler-Plumb primality (CPU path)\n");
+        printf("      --fast-euler      fast Euler-Plumb primality (CPU path; on by default)\n");
+      printf("      --no-fast-euler   disable fast-euler, use full Miller-Rabin\n");
         printf("      --partial-sieve-auto  adaptive non-CRT sieve-prime limiting (opt-in)\n");
         printf("      --partial-sieve       alias for --partial-sieve-auto\n");
         printf("      --adaptive-presieve   skip dense non-CRT windows after presieve\n");
@@ -6707,8 +6715,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--build-only")) build_only = 1;
         else if (!strcmp(argv[i],"--no-opreturn")) no_opreturn = 1;
         else if (!strcmp(argv[i],"--force-solution")) debug_force = 1;
-        else if (!strcmp(argv[i],"--fast-fermat")) use_fast_fermat = 1;
+        else if (!strcmp(argv[i],"--fast-fermat")) { use_fast_fermat = 1; use_fast_euler = 0; }
         else if (!strcmp(argv[i],"--fast-euler")) use_fast_euler = 1;
+        else if (!strcmp(argv[i],"--no-fast-euler")) use_fast_euler = 0;
         else if (!strcmp(argv[i],"--partial-sieve-auto") || !strcmp(argv[i],"--partial-sieve")) use_partial_sieve_auto = 1;
         else if (!strcmp(argv[i],"--wheel-sieve") && i+1<argc) {
             cli_wheel_sieve = (unsigned int)strtoul(argv[++i], NULL, 10);
@@ -6888,11 +6897,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Use either --cuda or --opencl, not both in one run.\n");
         return 2;
     }
-    if (use_fast_fermat && use_fast_euler) {
-        fprintf(stderr, "Use either --fast-fermat or --fast-euler, not both.\n");
-        return 2;
-    }
-
     if (use_crt_precision) {
         if (cli_crt_precision_rounds < 2)
             cli_crt_precision_rounds = 2;
@@ -7535,14 +7539,14 @@ int main(int argc, char **argv) {
         log_msg("default behaviour: will continue mining after finding a valid block\n");
     else
         log_msg("miner configured to exit when a valid block is found\n");
-    if (use_fast_euler)
-        log_msg("fast Euler-Plumb: GMP mpz_powm base-2 (--fast-euler)%s\n",
-                use_mr_verify ? " + MR base-3 verify (--mr-verify)" : "");
-    else if (use_fast_fermat)
+    if (use_fast_fermat)
         log_msg("fast Fermat: GMP mpz_powm base-2 (--fast-fermat)%s\n",
                 use_mr_verify ? " + MR base-3 verify (--mr-verify)" : "");
+    else if (use_fast_euler)
+        log_msg("fast Euler-Plumb: GMP mpz_powm base-2 (default; --no-fast-euler to disable)%s\n",
+                use_mr_verify ? " + MR base-3 verify (--mr-verify)" : "");
     else
-        log_msg("Miller-Rabin rounds: %d (--mr-rounds to change)\n", cli_mr_rounds);
+        log_msg("Miller-Rabin rounds: %d (--no-fast-euler; --mr-rounds to change)\n", cli_mr_rounds);
     if (use_partial_sieve_auto)
         log_msg("partial sieve auto: enabled (--partial-sieve-auto/--partial-sieve), adapt every %u windows, min limit %llu, cooldown %u windows\n",
                 (unsigned)PARTIAL_SIEVE_ADAPT_EVERY,

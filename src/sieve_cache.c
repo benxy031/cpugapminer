@@ -22,8 +22,8 @@ void populate_td_extra_primes(void) {
     /* Segmented sieve over [lo, hi) to find primes just above the sieve limit. */
     uint64_t lo = (uint64_t)cli_sieve_prime_limit + 1;
     if ((lo & 1) == 0) lo++; /* start on odd */
-    /* A window of 200 000 odd numbers (~11 000 primes) is more than enough. */
-    uint64_t hi = lo + 400000ULL; /* covers ~22 000 primes */
+    /* A window of 200 000 odd numbers is more than enough for TD_EXTRA_CNT=32. */
+    uint64_t hi = lo + 400000ULL;
     size_t   sz = (hi - lo) / 2 + 1;
     uint8_t *sieve = (uint8_t *)calloc(sz, 1);
     if (!sieve) return;

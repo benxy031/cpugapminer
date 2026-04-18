@@ -124,6 +124,14 @@ static int crt_runtime_prepare_solver_nonce(
     set_base_bn(h256_nonce, shift_local);
     out->logbase_nonce = uint256_log_approx(h256_nonce, shift_local);
 
+    /* Skip nonces where the maximum achievable merit is below target.
+     * The largest gap detectable in a CRT window is bounded by gap_target;
+     * if gap_target / logbase_nonce < target, no gap in this window can
+     * ever reach target merit, so the nonce is worthless. */
+    if (g_crt_gap_target > 0 &&
+        (double)g_crt_gap_target / out->logbase_nonce < target_local)
+        return 0;
+
     uint64_t gap_scan_base = crt_gap_scan_for_nonce(
         target_local, out->logbase_nonce,
         (uint64_t)g_crt_gap_target, g_crt_gap_scan_mode,
