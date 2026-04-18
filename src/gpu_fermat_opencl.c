@@ -262,7 +262,7 @@ static const char *g_kernel_src =
 "                montmul_##AL(res, res, res, n, ninv); \\\n"
 "                montmul_##AL(res, res, res, n, ninv); \\\n"
 "            } else { \\\n"
-"                int z = (int)ctz(w); \\\n"
+"                int z = (int)(31 - clz(w & (0u - w))); \\\n"
 "                int sq = 4 - z; \\\n"
 "                for (int s = 0; s < sq; s++) \\\n"
 "                    montmul_##AL(res, res, res, n, ninv); \\\n"
