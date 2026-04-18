@@ -222,24 +222,67 @@ __global__ void fermat_kernel_t(const uint64_t * __restrict__ cands,
 
     int top = AL - 1;
     while (top > 0 && n[top] == 0) top--;
-    int msb = 63 - __clzll(n[top]);
 
+    /* 4-bit sliding-window exponentiation: compute 2^(n-1) mod n.
+     * Precompute 8 odd powers in Montgomery form:
+     *   win[k*AL..] = base_m^(2k+1),  k = 0..7
+     * Matches the CPU CIOS macro strategy (see primality_utils.c). */
+    uint64_t win[8 * AL];
+    uint64_t bsq[AL];
+    for (int i = 0; i < AL; i++) win[i] = base_m[i];          /* win[0] = base^1 */
+    montmul_t<AL>(bsq, base_m, base_m, n, ninv);               /* bsq  = base^2   */
+    for (int k = 1; k < 8; k++)
+        montmul_t<AL>(&win[k * AL], &win[(k-1) * AL], bsq, n, ninv); /* win[k] = base^(2k+1) */
+
+    /* Exponent e = n-1  (n is odd, so e[0] = n[0]-1, no borrow) */
+    uint64_t e[AL];
+    for (int i = 0; i < AL; i++) e[i] = n[i];
+    e[0]--;
+
+    int msb_e = top * 64 + (63 - __clzll(e[top]));
+
+    /* Seed result with the leading 1-bit: res = base_m^1 */
     uint64_t res[AL];
     for (int i = 0; i < AL; i++) res[i] = base_m[i];
 
-    for (int limb = top; limb >= 0; limb--) {
-        int start = (limb == top) ? msb - 1 : 63;
-        for (int bit = start; bit >= 0; bit--) {
+    /* Left-to-right 4-bit fixed-window scan, starting one below MSB */
+    int bit = msb_e - 1;
+    while (bit >= 0) {
+        if (bit < 3) {
+            /* Fewer than 4 bits remain: binary square-and-multiply */
             montmul_t<AL>(res, res, res, n, ninv);
-            /* Exponent is n-1, so only bit 0 differs from n (odd n). */
-            if (((n[limb] >> bit) & 1) && (limb != 0 || bit != 0))
+            if ((e[bit >> 6] >> (bit & 63)) & 1)
                 montmul_t<AL>(res, res, base_m, n, ninv);
+            bit--;
+        } else {
+            /* Extract 4-bit window w = e[bit-3 .. bit] */
+            int lm  = (bit - 3) >> 6;
+            int off = (bit - 3) & 63;
+            uint32_t w = (uint32_t)(e[lm] >> off) & 0xFu;
+            if (off > 60 && lm + 1 < AL)
+                w |= (uint32_t)(e[lm + 1] << (64 - off)) & 0xFu;
+            if (w == 0) {
+                montmul_t<AL>(res, res, res, n, ninv);
+                montmul_t<AL>(res, res, res, n, ninv);
+                montmul_t<AL>(res, res, res, n, ninv);
+                montmul_t<AL>(res, res, res, n, ninv);
+            } else {
+                int z  = __ffs((int)w) - 1;  /* trailing zeros of w */
+                int sq = 4 - z;
+                for (int s = 0; s < sq; s++)
+                    montmul_t<AL>(res, res, res, n, ninv);
+                montmul_t<AL>(res, res, &win[((w >> z) >> 1) * AL], n, ninv);
+                for (int s = 0; s < z; s++)
+                    montmul_t<AL>(res, res, res, n, ninv);
+            }
+            bit -= 4;
         }
     }
 
-    for (int i = 0; i < AL; i++) base_m[i] = 0;
-    base_m[0] = 1;
-    montmul_t<AL>(res, res, base_m, n, ninv);
+    /* from_mont: res = res * R^{-1} mod n  (multiply by 1) */
+    for (int i = 0; i < AL; i++) bsq[i] = 0;
+    bsq[0] = 1;
+    montmul_t<AL>(res, res, bsq, n, ninv);
 
     int ok = (res[0] == 1);
     for (int i = 1; i < AL; i++)
