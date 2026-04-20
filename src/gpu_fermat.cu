@@ -29,16 +29,14 @@
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* Multiply-accumulate: *acc += a × b + carry_in.  Returns carry out.
-   Uses __umul64hi intrinsic for the upper 64 bits of 64×64 multiply. */
+   Pure C — nvcc generates correct mul.lo/mul.hi/add/adc for sm_86. */
 __device__ static __forceinline__
 uint64_t mac(uint64_t *acc, uint64_t a, uint64_t b, uint64_t carry)
 {
     uint64_t lo = a * b;
     uint64_t hi = __umul64hi(a, b);
-    /* lo += carry */
     lo += carry;
     hi += (lo < carry);
-    /* *acc += lo */
     uint64_t prev = *acc;
     *acc = prev + lo;
     hi += (*acc < prev);
@@ -127,7 +125,7 @@ uint64_t compute_ninv(uint64_t n0)
    at each step.  Total: (64*AL - topbit) doublings instead of 64*AL.
    For 976-bit candidates in 1024-bit R, this saves ~48 doublings (~5%). */
 template<int AL>
-__device__ static
+__device__ static __forceinline__
 void compute_rmodn_t(uint64_t *r, const uint64_t *n)
 {
     /* Find topbit = floor(log2(n)). */
@@ -156,7 +154,7 @@ void compute_rmodn_t(uint64_t *r, const uint64_t *n)
    CIOS (Coarsely Integrated Operand Scanning) form.
    Requires n odd, 0 ≤ a,b < n < R. */
 template<int AL>
-__device__ static
+__device__ static __forceinline__
 void montmul_t(uint64_t *      __restrict__ r,
                const uint64_t * __restrict__ a,
                const uint64_t * __restrict__ b,
@@ -195,6 +193,81 @@ void montmul_t(uint64_t *      __restrict__ r,
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ *  Sliding-window modular exponentiation: res = base^(n-1) mod n
+ *
+ *  WIN_BITS selects the precomputed table size vs squaring trade-off:
+ *    WIN_BITS=4  →  8 odd powers  (win[8*AL]) — low AL, low reg pressure
+ *    WIN_BITS=3  →  4 odd powers  (win[4*AL]) — high AL, avoids spilling
+ *                   the win[] table to GPU local memory (e.g. at AL=10
+ *                   this saves 40 uint64 = 320 bytes per thread).
+ *
+ *  __forceinline__ is critical: it lets the compiler see all montmul
+ *  calls together and keep every intermediate value in registers across
+ *  the full exponentiation rather than spilling at call boundaries.
+ * ═══════════════════════════════════════════════════════════════════ */
+template<int AL, int WIN_BITS>
+__device__ static __forceinline__
+void fermat_expmod(uint64_t * __restrict__ res,
+                   const uint64_t * __restrict__ e,
+                   int msb_e,
+                   const uint64_t * __restrict__ n,
+                   uint64_t ninv,
+                   const uint64_t * __restrict__ base_m)
+{
+    constexpr int WIN_SIZE = 1 << (WIN_BITS - 1);    /* 4-bit→8, 3-bit→4 */
+    constexpr uint32_t WIN_MASK = (1u << WIN_BITS) - 1u;
+
+    /* Precompute odd Montgomery powers: win[k] = base_m^(2k+1) */
+    uint64_t win[WIN_SIZE * AL];
+    uint64_t tmp[AL];
+    for (int i = 0; i < AL; i++) win[i] = base_m[i];   /* win[0] = base^1 */
+    montmul_t<AL>(tmp, base_m, base_m, n, ninv);        /* tmp    = base^2  */
+    for (int k = 1; k < WIN_SIZE; k++)
+        montmul_t<AL>(&win[k * AL], &win[(k-1) * AL], tmp, n, ninv);
+
+    /* Seed result with the leading 1-bit: res = base_m */
+    for (int i = 0; i < AL; i++) res[i] = base_m[i];
+
+    /* Left-to-right WIN_BITS-bit sliding-window scan */
+    int bit = msb_e - 1;
+    while (bit >= 0) {
+        if (bit < WIN_BITS - 1) {
+            /* Tail: fewer than WIN_BITS bits remain — binary sq-and-mul */
+            montmul_t<AL>(res, res, res, n, ninv);
+            if ((e[bit >> 6] >> (bit & 63)) & 1)
+                montmul_t<AL>(res, res, base_m, n, ninv);
+            bit--;
+        } else {
+            /* Extract WIN_BITS-bit window: bits [bit-(WIN_BITS-1) .. bit] */
+            int lo  = bit - (WIN_BITS - 1);
+            int lm  = lo >> 6;
+            int off = lo & 63;
+            uint32_t w = (uint32_t)(e[lm] >> off) & WIN_MASK;
+            if (off > 64 - WIN_BITS && lm + 1 < AL)
+                w |= (uint32_t)(e[lm + 1] << (64 - off)) & WIN_MASK;
+            if (w == 0) {
+                for (int s = 0; s < WIN_BITS; s++)
+                    montmul_t<AL>(res, res, res, n, ninv);
+            } else {
+                int z  = __ffs((int)w) - 1;   /* trailing zeros of w */
+                int sq = WIN_BITS - z;
+                for (int s = 0; s < sq; s++)
+                    montmul_t<AL>(res, res, res, n, ninv);
+                montmul_t<AL>(res, res, &win[((w >> z) >> 1) * AL], n, ninv);
+                for (int s = 0; s < z; s++)
+                    montmul_t<AL>(res, res, res, n, ninv);
+            }
+            bit -= WIN_BITS;
+        }
+    }
+
+    /* from_mont: res = res · R⁻¹ mod n  (multiply by 1 in Montgomery) */
+    for (int i = 0; i < AL; i++) tmp[i] = 0;
+    tmp[0] = 1;
+    montmul_t<AL>(res, res, tmp, n, ninv);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  *  Templated Fermat test kernel
  *  AL = arithmetic width (limbs actually used).
  *  Storage width per candidate is compile-time NL (= GPU_NLIMBS).
@@ -223,66 +296,21 @@ __global__ void fermat_kernel_t(const uint64_t * __restrict__ cands,
     int top = AL - 1;
     while (top > 0 && n[top] == 0) top--;
 
-    /* 4-bit sliding-window exponentiation: compute 2^(n-1) mod n.
-     * Precompute 8 odd powers in Montgomery form:
-     *   win[k*AL..] = base_m^(2k+1),  k = 0..7
-     * Matches the CPU CIOS macro strategy (see primality_utils.c). */
-    uint64_t win[8 * AL];
-    uint64_t bsq[AL];
-    for (int i = 0; i < AL; i++) win[i] = base_m[i];          /* win[0] = base^1 */
-    montmul_t<AL>(bsq, base_m, base_m, n, ninv);               /* bsq  = base^2   */
-    for (int k = 1; k < 8; k++)
-        montmul_t<AL>(&win[k * AL], &win[(k-1) * AL], bsq, n, ninv); /* win[k] = base^(2k+1) */
-
     /* Exponent e = n-1  (n is odd, so e[0] = n[0]-1, no borrow) */
     uint64_t e[AL];
     for (int i = 0; i < AL; i++) e[i] = n[i];
     e[0]--;
-
     int msb_e = top * 64 + (63 - __clzll(e[top]));
 
-    /* Seed result with the leading 1-bit: res = base_m^1 */
+    /* Adaptive window: 4-bit for AL≤7 (≤448-bit, low register pressure),
+       3-bit for AL≥8 (≥512-bit) — halves the precomputed table from
+       8×AL to 4×AL entries, keeping win[] in registers not local memory.
+       E.g. shift=384 (AL=10): win[80]→win[40] saves 320 bytes/thread.  */
     uint64_t res[AL];
-    for (int i = 0; i < AL; i++) res[i] = base_m[i];
-
-    /* Left-to-right 4-bit fixed-window scan, starting one below MSB */
-    int bit = msb_e - 1;
-    while (bit >= 0) {
-        if (bit < 3) {
-            /* Fewer than 4 bits remain: binary square-and-multiply */
-            montmul_t<AL>(res, res, res, n, ninv);
-            if ((e[bit >> 6] >> (bit & 63)) & 1)
-                montmul_t<AL>(res, res, base_m, n, ninv);
-            bit--;
-        } else {
-            /* Extract 4-bit window w = e[bit-3 .. bit] */
-            int lm  = (bit - 3) >> 6;
-            int off = (bit - 3) & 63;
-            uint32_t w = (uint32_t)(e[lm] >> off) & 0xFu;
-            if (off > 60 && lm + 1 < AL)
-                w |= (uint32_t)(e[lm + 1] << (64 - off)) & 0xFu;
-            if (w == 0) {
-                montmul_t<AL>(res, res, res, n, ninv);
-                montmul_t<AL>(res, res, res, n, ninv);
-                montmul_t<AL>(res, res, res, n, ninv);
-                montmul_t<AL>(res, res, res, n, ninv);
-            } else {
-                int z  = __ffs((int)w) - 1;  /* trailing zeros of w */
-                int sq = 4 - z;
-                for (int s = 0; s < sq; s++)
-                    montmul_t<AL>(res, res, res, n, ninv);
-                montmul_t<AL>(res, res, &win[((w >> z) >> 1) * AL], n, ninv);
-                for (int s = 0; s < z; s++)
-                    montmul_t<AL>(res, res, res, n, ninv);
-            }
-            bit -= 4;
-        }
-    }
-
-    /* from_mont: res = res * R^{-1} mod n  (multiply by 1) */
-    for (int i = 0; i < AL; i++) bsq[i] = 0;
-    bsq[0] = 1;
-    montmul_t<AL>(res, res, bsq, n, ninv);
+    if constexpr (AL <= 7)
+        fermat_expmod<AL, 4>(res, e, msb_e, n, ninv, base_m);
+    else
+        fermat_expmod<AL, 3>(res, e, msb_e, n, ninv, base_m);
 
     int ok = (res[0] == 1);
     for (int i = 1; i < AL; i++)

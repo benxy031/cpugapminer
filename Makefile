@@ -51,7 +51,7 @@ ifdef WITH_CUDA
 	CUDA_PATH ?= /usr/local/cuda
 	GPU_OBJ=$(SRCDIR)/gpu_fermat.o
 	CFLAGS+=-DWITH_CUDA -DGPU_NLIMBS=$(GPU_NLIMBS) -I$(CUDA_PATH)/include
-	NVCC_FLAGS=-DGPU_NLIMBS=$(GPU_NLIMBS)
+	NVCC_FLAGS=-DGPU_NLIMBS=$(GPU_NLIMBS) -std=c++17
 	LIBS+=-lcudart -L$(CUDA_PATH)/lib64
 endif
 

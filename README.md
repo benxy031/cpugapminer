@@ -684,6 +684,89 @@ bin/gap_miner \
 
 ## Recent changes (April 2026)
 
+### CUDA GPU Fermat kernel optimizations (April 2026)
+
+Several optimizations were applied to the CUDA Montgomery multiplication
+kernel (`src/gpu_fermat.cu`) to improve throughput at large shifts.
+
+#### Per-thread GPU context (fix for halved sieve throughput)
+
+**Root cause:** `gpu_fermat_submit()` blocked all worker threads on 2 shared
+GPU slots via `pthread_cond_wait`.  With 6 mining threads, 4 threads were
+permanently stalled, halving sieve throughput.
+
+**Fix:** each worker thread now lazily creates its own `gpu_fermat_ctx` via
+thread-local storage (`__thread gpu_fermat_ctx *tls_gpu_ctx`).  Per-thread
+contexts are initialized with a 64K batch size (`GPU_THREAD_BATCH = 1<<16`)
+and freed on thread exit in `free_sieve_buffers()`.
+
+A non-blocking `gpu_fermat_submit_try()` variant was added to both the CUDA
+and OpenCL backends so callers can test slot availability without stalling.
+
+**Measured impact at shift=40:** sieved/s: +10%, tested/s: 8.2M → 9.16M (+12%).
+
+#### `__forceinline__` on hot Montgomery helpers
+
+`montmul_t<AL>` and `compute_rmodn_t<AL>` were marked `__forceinline__`.
+Without this, nvcc generates separate PTX functions for each template
+instantiation, causing register spills at call boundaries.  With it, the
+compiler sees all `montmul_t` calls together in `fermat_expmod` and keeps all
+intermediate values in registers across the full exponentiation.
+
+#### Adaptive sliding-window exponentiation (3-bit vs 4-bit)
+
+The modular exponentiation loop was refactored into a `fermat_expmod<AL, WIN_BITS>`
+template, with `WIN_BITS` selected per AL at the call site:
+
+- **AL ≤ 7** (≤ ~448-bit candidates): `WIN_BITS=4` — 8 precomputed odd powers
+  (`win[8*AL]`).  Low register pressure; 4-bit window maximizes squarings
+  skipped.
+- **AL ≥ 8** (≥ ~512-bit candidates): `WIN_BITS=3` — 4 precomputed odd powers
+  (`win[4*AL]`).  Halves the precomputed table size; at AL=10 this saves
+  40 × 8 = 320 bytes of register/local memory per thread, eliminating spills
+  that cost occupancy.
+
+The dispatch in `fermat_kernel_t<AL>` uses `if constexpr` (requires `-std=c++17`,
+added to `NVCC_FLAGS`):
+
+```cpp
+if constexpr (AL <= 7)
+    fermat_expmod<AL, 4>(res, e, msb_e, n, ninv, base_m);
+else
+    fermat_expmod<AL, 3>(res, e, msb_e, n, ninv, base_m);
+```
+
+**Measured impact at shift=384 (AL=10):** tested/s: 854K → 889K (+4%),
+estimated time-to-block: ~36m → ~33m.
+
+#### CUDA kernel performance summary (RTX 3060, shift=384, AL=10)
+
+| Version | tested/s | Est |
+|---|---|---|
+| Baseline | ~854K | ~36m |
+| + `__forceinline__` + 3-bit window | ~889K | ~33m |
+| + per-thread GPU ctx | included above | — |
+
+#### Note on PTX carry-chain mac()
+
+Attempts were made to accelerate `mac()` (the inner multiply-accumulate
+primitive) using PTX inline assembly carry chains.  All approaches failed
+silently — candidates returned composite regardless of implementation.
+
+Key findings:
+
+- `mad.lo.cc.u64` is unreliable for 64-bit in PTX ISA (does not set CF).
+  Only `mad.lo.cc.u32` / `madc.hi.u32` work reliably (as used by projects
+  like mr_blackwell which use 32-bit limbs).
+- `"=l"(tmp)` output constraints for PTX temporaries cause register aliasing
+  with input operands (`a` or `b`), silently overwriting them mid-instruction.
+- PTX `{}` scoped `.reg` declarations are not honored reliably in nvcc inline
+  asm at the PTX IR level.
+
+The current `mac()` uses pure C with `__umul64hi` — nvcc generates the
+same `mul.lo.u64` / `mul.hi.u64` instructions as the PTX attempts, with no
+aliasing risk.
+
 ### Async GPU Fermat pipeline (CUDA)
 
 The CUDA Fermat path was rearchitected to eliminate `cudaStreamSynchronize`
@@ -1194,6 +1277,14 @@ gap scanning.  Multiple GPUs are supported via `--cuda 0,1`.
     GMP CPU overhead from 73.59% → 3.29%.  Cooperative Fermat is disabled
     when GPU is active so the helper thread only sieves.
     Multiple GPUs supported via `--cuda 0,1` with round-robin dispatch.
+    Each worker thread uses a **per-thread GPU context** (TLS,
+    `GPU_THREAD_BATCH=64K`) so threads never contend for GPU slots.
+    The kernel uses `__forceinline__` on `montmul_t` and
+    `compute_rmodn_t` to keep all intermediate values in registers across
+    the full exponentiation.  An **adaptive sliding window** selects
+    4-bit (AL≤7) or 3-bit (AL≥8) exponentiation to cap register pressure
+    at large shifts: at AL=10 (shift=384) this saves 320 bytes of
+    win-table storage per thread (+4% tested/s, ~854K → 889K).
 
 11. **Presieve template** -- A 249 KB precomputed bitmap marks all
     multiples of {3, 5, 7, 11, 13, 17} (product = 510 510, bit-period
