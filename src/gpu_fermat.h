@@ -69,6 +69,13 @@ int gpu_fermat_test_batch(gpu_fermat_ctx *ctx,
 int gpu_fermat_submit(gpu_fermat_ctx *ctx, int slot,
                       const uint64_t *candidates, size_t count);
 
+/* Non-blocking variant of gpu_fermat_submit.
+   Returns -1 immediately (without blocking) if the slot is still busy
+   with a previous submission.  Use this in per-thread contexts where the
+   caller must never stall waiting for another thread's GPU work. */
+int gpu_fermat_submit_try(gpu_fermat_ctx *ctx, int slot,
+                          const uint64_t *candidates, size_t count);
+
 /* Wait for async slot to complete, copy results out.
    Returns number of probable primes found, or -1 on error. */
 int gpu_fermat_collect(gpu_fermat_ctx *ctx, int slot,

@@ -50,7 +50,8 @@ static int             g_gpu_batch_size = 0;  /* --gpu-batch; 0 = use default (4
 #if defined(WITH_CUDA) || defined(WITH_OPENCL)
 #define WITH_GPU_FERMAT 1
 #include "gpu_fermat.h"
-#define GPU_MAX_BATCH (1 << 21)   /* 2M candidates per batch */
+#define GPU_MAX_BATCH   (1 << 21)   /* 2M candidates per batch (CRT accum) */
+#define GPU_THREAD_BATCH (1 << 16)  /* 64K cands per per-thread direct-path ctx */
 static gpu_fermat_ctx *g_gpu_ctx[GPU_MAX_DEVS];
 static int             g_gpu_count = 0;
 static int             g_gpu_device_ids[GPU_MAX_DEVS]; /* parallel to g_gpu_ctx */
@@ -2073,6 +2074,11 @@ static __thread uint64_t *tls_gpu_cands[2] = {NULL, NULL};
 static __thread size_t    tls_gpu_cands_cap = 0;
 static __thread uint8_t  *tls_gpu_res = NULL;
 static __thread size_t    tls_gpu_res_cap = 0;
+/* Per-thread GPU context for direct (non-CRT) gpu_batch_filter path.
+   Each sieve thread owns its own gpu_fermat_ctx so gpu_fermat_submit()
+   never blocks waiting for another thread's slot.  This restores full
+   sieve throughput when running multiple threads with a GPU. */
+static __thread gpu_fermat_ctx *tls_gpu_ctx = NULL;
 #endif
 
 static void free_sieve_buffers(void) {
@@ -2101,6 +2107,10 @@ static void free_sieve_buffers(void) {
     tls_gpu_cands_cap = 0;
     free(tls_gpu_res); tls_gpu_res = NULL;
     tls_gpu_res_cap = 0;
+    if (tls_gpu_ctx) {
+        gpu_fermat_destroy(tls_gpu_ctx);
+        tls_gpu_ctx = NULL;
+    }
 #endif
 }
 
@@ -4234,13 +4244,24 @@ static int gpu_batch_submit_chunk(gpu_fermat_ctx *ctx, int preferred_slot,
 static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
     if (g_gpu_count == 0 || cnt == 0) return 0;
 
-    /* Round-robin GPU selection by thread (tls_tid set per worker) */
-    static __thread int tls_gpu_idx = -1;
-    if (tls_gpu_idx < 0) {
-        static volatile int gpu_rr = 0;
-        tls_gpu_idx = __sync_fetch_and_add(&gpu_rr, 1) % g_gpu_count;
+    /* Per-thread GPU context: lazily created on first call so that each
+       sieve thread owns independent slots.  gpu_fermat_submit() therefore
+       never blocks waiting for another thread's GPU work — the root cause
+       of the sieve throughput halving observed when sharing a 2-slot
+       context across 19+ threads.  Threads round-robin across devices for
+       multi-GPU balance.  Batch size is capped at GPU_THREAD_BATCH (64K)
+       which is far above the per-window survivor count (~2–8K). */
+    gpu_fermat_ctx *ctx = tls_gpu_ctx;
+    if (!ctx) {
+        static volatile int gpu_dev_rr = 0;
+        int dev_slot = __sync_fetch_and_add(&gpu_dev_rr, 1) % g_gpu_count;
+        int dev_id   = g_gpu_device_ids[dev_slot];
+        ctx = gpu_fermat_init(dev_id, (size_t)GPU_THREAD_BATCH);
+        if (!ctx) return 0;
+        if (g_gpu_active_limbs_global > 0)
+            gpu_fermat_set_limbs(ctx, g_gpu_active_limbs_global);
+        tls_gpu_ctx = ctx;
     }
-    gpu_fermat_ctx *ctx = g_gpu_ctx[tls_gpu_idx];
 
     ensure_gmp_tls();
     /* Export base into GPU_NLIMBS LE limb array */
@@ -4265,9 +4286,11 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
         return 0;
     }
 
-    /* Allocate flat candidate buffer: cnt × gpu_al limbs */
+    /* Allocate flat candidate buffer: cnt × gpu_al limbs.
+       Cap at per-thread context batch size (GPU_THREAD_BATCH); the pipeline
+       loop below handles any overflow in subsequent chunks. */
     size_t batch = cnt;
-    if (batch > GPU_MAX_BATCH) batch = GPU_MAX_BATCH;
+    if (batch > (size_t)GPU_THREAD_BATCH) batch = (size_t)GPU_THREAD_BATCH;
 
     /* Reuse per-thread staging buffers to avoid malloc/free in hot path.
        These are file-scope TLS so free_sieve_buffers() releases them on

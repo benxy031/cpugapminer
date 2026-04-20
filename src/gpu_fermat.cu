@@ -546,6 +546,25 @@ fail:
  *  Async double-buffered pipeline
  * ═══════════════════════════════════════════════════════════════════ */
 
+/* Non-blocking variant: returns -1 immediately if the slot is still busy.
+   See header for full contract. */
+int gpu_fermat_submit_try(gpu_fermat_ctx *ctx, int slot,
+                          const uint64_t *candidates, size_t count)
+{
+    if (!ctx || !candidates || count == 0) return -1;
+    if (slot < 0 || slot > 1) return -1;
+    if (count > ctx->max_batch) count = ctx->max_batch;
+
+    pthread_mutex_lock(&ctx->slot_mu[slot]);
+    if (ctx->pending[slot] != 0) {
+        pthread_mutex_unlock(&ctx->slot_mu[slot]);
+        return -1;  /* slot busy — return without blocking */
+    }
+    pthread_mutex_unlock(&ctx->slot_mu[slot]);
+    /* Slot is free; delegate to the blocking submit which will not stall. */
+    return gpu_fermat_submit(ctx, slot, candidates, count);
+}
+
 int gpu_fermat_submit(gpu_fermat_ctx *ctx, int slot,
                       const uint64_t *candidates, size_t count)
 {
