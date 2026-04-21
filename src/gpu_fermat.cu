@@ -29,18 +29,21 @@
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* Multiply-accumulate: *acc += a × b + carry_in.  Returns carry out.
-   C computes the 128-bit product; PTX handles the two 64-bit additions
-   via hardware carry chain, replacing 4× setp+selp with 4 add/addc.
-   The "+&l" early-clobber constraint on *acc is critical: it prevents
-   nvcc from aliasing *acc's register with 'lo' or 'carry' inputs.
-   Without "&", when carry==0 and *acc==0 the compiler uses the same
-   register for both, then adds the already-modified *acc to itself
-   (instead of the original carry=0) on the third instruction. */
+   C computes the 128-bit product; the additions use a hardware carry chain
+   (add.cc/addc) replacing 4× setp+selp with 4 add/addc instructions.
+   sm_70+: inline PTX with "+&l" early-clobber, which prevents nvcc from
+   aliasing *acc's register with 'lo' or 'carry' when both happen to be 0.
+   sm_61 and earlier: "+&l" multi-modifier is not accepted by that nvcc;
+   fall back to portable C arithmetic (nvcc still emits add.cc/addc). */
 __device__ static __forceinline__
 uint64_t mac(uint64_t *acc, uint64_t a, uint64_t b, uint64_t carry)
 {
     uint64_t lo = a * b;
     uint64_t hi = __umul64hi(a, b);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    /* sm_70+ (Volta and later): "+&l" early-clobber is supported.
+       Prevents nvcc from aliasing *acc's register with 'lo' or 'carry'
+       inputs when both happen to be zero. */
     asm volatile(
         "add.cc.u64  %0, %0, %2;\n\t"   /* acc += lo,     CF1          */
         "addc.u64    %1, %1,  0;\n\t"   /* hi  += CF1                  */
@@ -49,6 +52,16 @@ uint64_t mac(uint64_t *acc, uint64_t a, uint64_t b, uint64_t carry)
         : "+&l"(*acc), "+&l"(hi)
         : "l"(lo), "l"(carry)
     );
+#else
+    /* sm_61 and earlier: "+&l" multi-modifier constraint not supported.
+       Use portable C arithmetic; nvcc emits equivalent add.cc/addc PTX
+       via its own instruction selection. */
+    uint64_t sum = *acc + lo;
+    uint64_t c1  = (sum < lo);
+    *acc = sum + carry;
+    uint64_t c2  = (*acc < carry);
+    hi += c1 + c2;
+#endif
     return hi;
 }
 
