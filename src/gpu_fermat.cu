@@ -29,17 +29,26 @@
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* Multiply-accumulate: *acc += a × b + carry_in.  Returns carry out.
-   Pure C — nvcc generates correct mul.lo/mul.hi/add/adc for sm_86. */
+   C computes the 128-bit product; PTX handles the two 64-bit additions
+   via hardware carry chain, replacing 4× setp+selp with 4 add/addc.
+   The "+&l" early-clobber constraint on *acc is critical: it prevents
+   nvcc from aliasing *acc's register with 'lo' or 'carry' inputs.
+   Without "&", when carry==0 and *acc==0 the compiler uses the same
+   register for both, then adds the already-modified *acc to itself
+   (instead of the original carry=0) on the third instruction. */
 __device__ static __forceinline__
 uint64_t mac(uint64_t *acc, uint64_t a, uint64_t b, uint64_t carry)
 {
     uint64_t lo = a * b;
     uint64_t hi = __umul64hi(a, b);
-    lo += carry;
-    hi += (lo < carry);
-    uint64_t prev = *acc;
-    *acc = prev + lo;
-    hi += (*acc < prev);
+    asm volatile(
+        "add.cc.u64  %0, %0, %2;\n\t"   /* acc += lo,     CF1          */
+        "addc.u64    %1, %1,  0;\n\t"   /* hi  += CF1                  */
+        "add.cc.u64  %0, %0, %3;\n\t"   /* acc += carry,  CF2          */
+        "addc.u64    %1, %1,  0;"       /* hi  += CF2  (carry-out)     */
+        : "+&l"(*acc), "+&l"(hi)
+        : "l"(lo), "l"(carry)
+    );
     return hi;
 }
 
