@@ -2287,6 +2287,10 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
        misses by ~30×.  Large primes (≤ 1 hit per block) use a single pass
        since they don't cause cache pressure. */
     int have_cache = tls_base_mod_p_ready && tls_base_mod_p;
+    /* In CRT solver mode L is always 1, so L%p == 1 for all primes p>=3.
+       Using a conditional subtract instead of a 64-bit division saves ~8x
+       on the per-prime start computation (the dominant cost in Phase 2+3). */
+    int L_is_one = (L == 1);
 
     /* L1-block size in BITS (=positions).  32 KB = 262144 bits. */
     #define SIEVE_BLOCK_BITS  (32768ULL * 8)
@@ -2325,7 +2329,13 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
                     base_mod_p = tls_base_mod_p[idx];
                 else
                     base_mod_p = h256 ? uint256_mod_small(h256, shift, p) : (L % p);
-                uint64_t lrem = (base_mod_p + L % p) % p;
+                uint64_t lrem;
+                if (L_is_one) {
+                    lrem = base_mod_p + 1;
+                    if (lrem >= p) lrem -= p;
+                } else {
+                    lrem = (base_mod_p + L % p) % p;
+                }
                 uint64_t start = L + (lrem == 0 ? 0 : p - lrem);
                 if ((start & 1) == 0) start += p;
                 sp_start[i] = start;
@@ -2468,7 +2478,13 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
                 base_mod_p = tls_base_mod_p[idx];
             else
                 base_mod_p = h256 ? uint256_mod_small(h256, shift, p) : (L % p);
-            uint64_t lrem = (base_mod_p + L % p) % p;
+            uint64_t lrem;
+            if (L_is_one) {
+                lrem = base_mod_p + 1;
+                if (lrem >= p) lrem -= p;
+            } else {
+                lrem = (base_mod_p + L % p) % p;
+            }
             uint64_t start = L + (lrem == 0 ? 0 : p - lrem);
             if ((start & 1) == 0) start += p;
             for (uint64_t m = start; m < R; m += 2 * p) {
@@ -2489,7 +2505,13 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
             uint64_t p = g_crt_filter_primes[fi];
             uint64_t r = tls_crt_filt_rmod[fi];
             /* Same start-position logic as the main sieve */
-            uint64_t lrem = (r + L % p) % p;
+            uint64_t lrem;
+            if (L_is_one) {
+                lrem = r + 1;
+                if (lrem >= p) lrem -= p;
+            } else {
+                lrem = (r + L % p) % p;
+            }
             uint64_t start = L + (lrem == 0 ? 0 : p - lrem);
             if ((start & 1) == 0) start += p;  /* odd-only sieve */
             if (start < R) {
@@ -4112,10 +4134,17 @@ static int bn_candidate_is_prime(uint64_t offset) {
     }
 
     /* --- Trial-division pre-filter (disabled when TD_EXTRA_CNT=0) --- */
+    /* td_extra_primes are the 128 primes just above cli_sieve_prime_limit
+       (~242K).  In CRT mode the sieve window is ~12K wide, so offset <
+       td_extra_primes[i] always holds and the division reduces to identity.
+       Use a comparison + conditional subtract instead of two 64-bit divides. */
     for (int i = 0; i < td_extra_count; i++) {
         uint32_t p   = td_extra_primes[i];
-        uint32_t rem = (uint32_t)(((uint64_t)tls_td_residues[i]
-                                   + (uint64_t)(offset % p)) % p);
+        /* off_mod_p = offset % p; skip division when offset < p (CRT common case) */
+        uint32_t off_mod_p = (offset < (uint64_t)p) ? (uint32_t)offset
+                                                      : (uint32_t)(offset % p);
+        uint32_t sum = tls_td_residues[i] + off_mod_p;
+        uint32_t rem = sum >= p ? sum - p : sum;
         if (rem == 0) {
             prime_cache_store(offset, 0);
             return 0;
@@ -4472,9 +4501,12 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
 #endif /* WITH_GPU_FERMAT */
 
 /* ── CRT gap scan + submission ──
-   CRT windows are intentionally small; backward-scan can miss qualifying
-   gaps when needed_gap is comparable to window span.  Use a full linear
-   scan over sieve survivors so every consecutive-prime pair is checked. */
+   Full linear scan over all sieve survivors: test each candidate, track
+   consecutive prime pairs, and submit any pair whose gap ≥ target merit.
+   The window is 2×gap_target wide, so qualifying gaps (≈ gap_target) can
+   comfortably fit: we need two primes separated by merit_threshold×logbase,
+   and the window gives 2×gap_target > merit_threshold×logbase of room.
+   With ~38 primes per window there are ~37 pair opportunities per window. */
 static size_t crt_bkscan_and_submit(
         uint64_t *surv, size_t surv_cnt,
         double logbase, double target, int shift_v,
