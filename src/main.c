@@ -663,6 +663,7 @@ static volatile uint64_t stats_crt_gpu_accum_tune_down = 0;
 static volatile uint64_t stats_crt_gpu_accum_tune_hold = 0;
 static volatile uint64_t stats_crt_gpu_accum_threshold_last = 0;
 #endif
+static volatile int use_cpu_fermat = 0;  /* use custom CPU Montgomery multiply instead of GMP mpz_powm */
 static volatile int use_mr_verify = 0;   /* MR base-3 verify Fermat survivors */
 static volatile int no_primality = 0;   /* skip all probable‑prime filtering */
 static volatile int selftest = 0;        /* run a quick internal test then exit */
@@ -4160,6 +4161,28 @@ static int bn_candidate_is_prime(uint64_t offset) {
            probable-prime check regardless of fast-path settings. */
         is_prime = (mpz_probab_prime_p(tls_cand_mpz,
                           crt_precision_rounds_effective()) > 0);
+    } else if (use_cpu_fermat) {
+        /* Custom CPU Montgomery multiply path (--cpu-fermat).
+           Extracts candidate limbs from tls_cand_mpz into a uint64_t array
+           (little-endian, native-endian words) and calls the custom
+           euler_test_cpu_nlimbs / fermat_test_cpu_nlimbs instead of GMP.
+           Bypasses GMP's mpz_powm entirely; ~2× faster than GMP when the
+           ADX code path is active (MULX+ADCX/ADOX dual carry chains).
+           Note: mr_verify is not applied here — the Euler/Fermat test is
+           already the primary filter; use --mr-verify only with GMP paths. */
+        uint64_t cpu_limbs[FERMAT_CPU_MAX_LIMBS];
+        memset(cpu_limbs, 0, sizeof(cpu_limbs));
+        size_t cpu_count = 0;
+        mpz_export(cpu_limbs, &cpu_count, -1 /* LSW first */,
+                   sizeof(uint64_t), 0 /* native endian */, 0 /* no nails */,
+                   tls_cand_mpz);
+        int cpu_nl = (cpu_count < 1) ? 1
+                   : (cpu_count > FERMAT_CPU_MAX_LIMBS) ? FERMAT_CPU_MAX_LIMBS
+                   : (int)cpu_count;
+        if (use_fast_euler)
+            is_prime = euler_test_cpu_nlimbs(cpu_limbs, cpu_nl);
+        else
+            is_prime = fermat_test_cpu_nlimbs(cpu_limbs, cpu_nl);
     } else if (use_fast_euler) {
         /* Strong base-2 Miller-Rabin (single round).
            Write n-1 = 2^s * d with d odd.  Compute x = 2^d mod n, then
@@ -6616,6 +6639,8 @@ int main(int argc, char **argv) {
         printf("      --fast-fermat     fast primality (fewer Miller-Rabin rounds)\n");
         printf("      --fast-euler      fast Euler-Plumb primality (CPU path; on by default)\n");
       printf("      --no-fast-euler   disable fast-euler, use full Miller-Rabin\n");
+        printf("      --cpu-fermat      use custom CPU Montgomery multiply instead of GMP mpz_powm\n");
+        printf("                        combines with --fast-euler (default) or --fast-fermat\n");
         printf("      --partial-sieve-auto  adaptive non-CRT sieve-prime limiting (opt-in)\n");
         printf("      --partial-sieve       alias for --partial-sieve-auto\n");
         printf("      --adaptive-presieve   skip dense non-CRT windows after presieve\n");
@@ -6741,6 +6766,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--fast-fermat")) { use_fast_fermat = 1; use_fast_euler = 0; }
         else if (!strcmp(argv[i],"--fast-euler")) use_fast_euler = 1;
         else if (!strcmp(argv[i],"--no-fast-euler")) use_fast_euler = 0;
+        else if (!strcmp(argv[i],"--cpu-fermat")) use_cpu_fermat = 1;
+        else if (!strcmp(argv[i],"--no-cpu-fermat")) use_cpu_fermat = 0;
         else if (!strcmp(argv[i],"--partial-sieve-auto") || !strcmp(argv[i],"--partial-sieve")) use_partial_sieve_auto = 1;
         else if (!strcmp(argv[i],"--wheel-sieve") && i+1<argc) {
             cli_wheel_sieve = (unsigned int)strtoul(argv[++i], NULL, 10);
@@ -7570,6 +7597,9 @@ int main(int argc, char **argv) {
                 use_mr_verify ? " + MR base-3 verify (--mr-verify)" : "");
     else
         log_msg("Miller-Rabin rounds: %d (--no-fast-euler; --mr-rounds to change)\n", cli_mr_rounds);
+    if (use_cpu_fermat)
+        log_msg("CPU Montgomery multiply: custom ADX path active (--cpu-fermat); %s\n",
+                use_fast_euler ? "using euler_test_cpu_nlimbs" : "using fermat_test_cpu_nlimbs");
     if (use_partial_sieve_auto)
         log_msg("partial sieve auto: enabled (--partial-sieve-auto/--partial-sieve), adapt every %u windows, min limit %llu, cooldown %u windows\n",
                 (unsigned)PARTIAL_SIEVE_ADAPT_EVERY,
