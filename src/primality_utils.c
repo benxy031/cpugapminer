@@ -734,6 +734,14 @@ DECL_MONTSQR_BUCKET(cpu_montsqr_b20, 20)
 
 #endif /* __x86_64__ && __BMI2__ && __ADX__ */
 
+/* Fallback for CPUs without ADX/BMI2: use the generic CIOS montmul.
+   MONTMUL_EXACT_DISPATCH is only defined in the ADX block above;
+   on non-ADX builds it would be left as an unresolved symbol. */
+#ifndef MONTMUL_EXACT_DISPATCH
+#define MONTMUL_EXACT_DISPATCH(r, a, b, n, ninv, nlimbs) \
+    cpu_montmul_n((r), (a), (b), (n), (ninv), (nlimbs))
+#endif
+
 static int fermat_u64_exact(uint64_t n)
 {
     if (n < 4) return n >= 2;

@@ -2552,9 +2552,17 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
             uint64_t cur = tls_partial_use_limit ? tls_partial_use_limit : use_limit;
             uint64_t next = cur;
 
+            /* GPU can handle much higher survivor densities than CPU Fermat.
+               Use a lower floor (1%) when GPU is active so the controller
+               does not over-sieve and starve the GPU of candidates.        */
+#ifdef WITH_GPU_FERMAT
+            double surv_lo = (g_gpu_count > 0) ? 0.01 : 0.05;
+#else
+            double surv_lo = 0.05;
+#endif
             if (surv_ratio > 0.18) {
                 next = cur + (cur >> 5);   /* +3.125% */
-            } else if (surv_ratio < 0.05) {
+            } else if (surv_ratio < surv_lo) {
                 next = cur - (cur >> 6);   /* -1.5625% */
             }
 
