@@ -665,6 +665,9 @@ static volatile uint64_t stats_crt_gpu_accum_threshold_last = 0;
 #endif
 static volatile int use_cpu_fermat = 0;  /* use custom CPU Montgomery multiply instead of GMP mpz_powm */
 static volatile int use_mr_verify = 0;   /* MR base-3 verify Fermat survivors */
+/* Sieve window size published by main before launching worker threads.
+   Used by set_base_bn() to precompute tls_sieve_mod_p[i] = sieve_size % p[i]. */
+static uint64_t g_sieve_size_for_L_cache = 33554432;
 static volatile int no_primality = 0;   /* skip all probable‑prime filtering */
 static volatile int selftest = 0;        /* run a quick internal test then exit */
 
@@ -2067,6 +2070,18 @@ static __thread size_t    tls_base_mod_p_cap = 0;
    current pass.  Reset to 0 at start of each new pass (set_base_bn call). */
 static __thread int       tls_base_mod_p_ready = 0;
 
+/* Incremental L % p cache: eliminates per-prime 64-bit division in sieve_range.
+   tls_L_mod_p[i]    = (current window's L) % small_primes_cache[i]
+   tls_sieve_mod_p[i]= sieve_size % small_primes_cache[i]  (precomputed once/pass)
+   tls_L_mod_p_L     = the L value for which tls_L_mod_p is currently valid;
+                       UINT64_MAX means "not initialized for this pass".
+   Each window advances tls_L_mod_p[i] by tls_sieve_mod_p[i] (one add + cmp). */
+static __thread uint64_t *tls_L_mod_p        = NULL;
+static __thread size_t    tls_L_mod_p_cap    = 0;
+static __thread uint64_t *tls_sieve_mod_p    = NULL;
+static __thread size_t    tls_sieve_mod_p_cap = 0;
+static __thread uint64_t  tls_L_mod_p_L      = UINT64_MAX;
+
 /* GPU batch-filter double-buffer (used by gpu_batch_filter).  Kept at
    file scope so free_sieve_buffers() can release them when the thread exits,
    eliminating the per-thread 256 MB+ leak in non-CRT GPU mining. */
@@ -2087,15 +2102,22 @@ static void free_sieve_buffers(void) {
     free(tls_bits);
     free(tls_base_mod_p);
     free(tls_sp_start);
+    free(tls_L_mod_p);
+    free(tls_sieve_mod_p);
     tls_pr       = NULL;
     tls_bits     = NULL;
     tls_base_mod_p = NULL;
     tls_sp_start = NULL;
+    tls_L_mod_p  = NULL;
+    tls_sieve_mod_p = NULL;
     tls_cap      = 0;
     tls_bits_cap = 0;
     tls_base_mod_p_cap = 0;
     tls_sp_start_cap = 0;
+    tls_L_mod_p_cap  = 0;
+    tls_sieve_mod_p_cap = 0;
     tls_base_mod_p_ready = 0;
+    tls_L_mod_p_L = UINT64_MAX;
     tls_partial_use_limit = 0;
     tls_partial_windows = 0;
     tls_partial_cooldown = 0;
@@ -2292,7 +2314,41 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
        on the per-prime start computation (the dominant cost in Phase 2+3). */
     int L_is_one = (L == 1);
 
-    /* L1-block size in BITS (=positions).  32 KB = 262144 bits. */
+    /* ── Incremental L % p cache ─────────────────────────────────────────────
+       Maintain tls_L_mod_p[i] = L % p_i without per-prime 64-bit divisions.
+       First call this pass: one division per prime to initialize (amortized).
+       Subsequent calls: advance by tls_sieve_mod_p[i] (= sieve_size % p_i).
+       Skipped for CRT mode (L == 1) since that path uses base_mod_p+1 already. */
+    int have_l_cache = 0;
+    if (!L_is_one && have_cache && tls_sieve_mod_p && tls_L_mod_p) {
+        if (tls_L_mod_p_L == UINT64_MAX) {
+            /* First window this pass: initialize by division (once per pass) */
+            for (size_t i = 1; i < small_primes_count; i++)
+                tls_L_mod_p[i] = L % small_primes_cache[i];
+            tls_L_mod_p_L = L;
+            have_l_cache = 1;
+        } else if (L == tls_L_mod_p_L) {
+            /* Same L as previous call — cache is still valid */
+            have_l_cache = 1;
+        } else if (L > tls_L_mod_p_L) {
+            uint64_t delta = L - tls_L_mod_p_L;
+            if (delta == g_sieve_size_for_L_cache) {
+                /* Common case: consecutive window, advance without division */
+                for (size_t i = 1; i < small_primes_count; i++) {
+                    uint64_t p2 = small_primes_cache[i];
+                    uint64_t v  = tls_L_mod_p[i] + tls_sieve_mod_p[i];
+                    if (v >= p2) v -= p2;
+                    tls_L_mod_p[i] = v;
+                }
+            } else {
+                /* Non-standard delta (last window, partial sieve, etc.) */
+                for (size_t i = 1; i < small_primes_count; i++)
+                    tls_L_mod_p[i] = L % small_primes_cache[i];
+            }
+            tls_L_mod_p_L = L;
+            have_l_cache = 1;
+        }
+    }
     #define SIEVE_BLOCK_BITS  (32768ULL * 8)
     /* Primes with stride 2p covering ≤ 2 hits per block use the
        straight-through path (no blocking benefit). */
@@ -2332,6 +2388,9 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
                 uint64_t lrem;
                 if (L_is_one) {
                     lrem = base_mod_p + 1;
+                    if (lrem >= p) lrem -= p;
+                } else if (have_l_cache) {
+                    lrem = base_mod_p + tls_L_mod_p[idx];
                     if (lrem >= p) lrem -= p;
                 } else {
                     lrem = (base_mod_p + L % p) % p;
@@ -2482,13 +2541,16 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
             if (L_is_one) {
                 lrem = base_mod_p + 1;
                 if (lrem >= p) lrem -= p;
+            } else if (have_l_cache) {
+                lrem = base_mod_p + tls_L_mod_p[idx];
+                if (lrem >= p) lrem -= p;
             } else {
                 lrem = (base_mod_p + L % p) % p;
             }
             uint64_t start = L + (lrem == 0 ? 0 : p - lrem);
             if ((start & 1) == 0) start += p;
             for (uint64_t m = start; m < R; m += 2 * p) {
-                uint64_t pos = (m - L) / 2;
+                uint64_t pos = (m - L) >> 1;
                 bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
             }
         }
@@ -3977,6 +4039,28 @@ static void set_base_bn(const uint8_t h256[32], int shift) {
                 tls_base_mod_p[i] = mpz_fdiv_ui(tls_base_mpz, (unsigned long)p);
             }
             tls_base_mod_p_ready = 1;
+        }
+
+        /* Precompute sieve_size % p for incremental L tracking.
+           This lets sieve_range() avoid L%p divisions on every window:
+           instead it advances tls_L_mod_p[i] by tls_sieve_mod_p[i] per window. */
+        {
+            uint64_t gsz = g_sieve_size_for_L_cache ? g_sieve_size_for_L_cache : 33554432ULL;
+            if (tls_sieve_mod_p_cap < small_primes_count) {
+                free(tls_sieve_mod_p);
+                tls_sieve_mod_p_cap = small_primes_count + 64;
+                tls_sieve_mod_p = malloc(tls_sieve_mod_p_cap * sizeof(uint64_t));
+            }
+            if (tls_L_mod_p_cap < small_primes_count) {
+                free(tls_L_mod_p);
+                tls_L_mod_p_cap = small_primes_count + 64;
+                tls_L_mod_p = malloc(tls_L_mod_p_cap * sizeof(uint64_t));
+            }
+            if (tls_sieve_mod_p && tls_L_mod_p) {
+                for (size_t i = 1; i < small_primes_count; i++)
+                    tls_sieve_mod_p[i] = gsz % small_primes_cache[i];
+            }
+            tls_L_mod_p_L = UINT64_MAX; /* invalidate; re-init on first sieve_range call */
         }
     }
 
@@ -6668,6 +6752,8 @@ int main(int argc, char **argv) {
         printf("      --sieve-size S    sieve size            (default: 33554432)\n");
         printf("      --sieve-primes N  number of sieve primes (GapMiner-compatible)\n");
         printf("                        N primes -> largest ~ N*ln(N); default = 900000\n");
+        printf("      --sieve-limit L   sieve prime VALUE limit (overrides --sieve-primes)\n");
+        printf("                        e.g. --sieve-limit 50000000 sieves up to prime 50M\n");
         printf("      --target T        minimum merit         (default: 20.0)\n");
         printf("      --scan-merit M    scan threshold for non-CRT CPU smart-scan stride.\n");
         printf("                        submit threshold remains --target (or network merit).\n");
@@ -6776,6 +6862,10 @@ int main(int argc, char **argv) {
             cli_sieve_prime_count = strtoull(argv[++i], NULL, 10);
             cli_sieve_explicit = 1;
             /* Limit is computed from count after arg parsing (PNT upper bound). */
+        }
+        else if (!strcmp(argv[i],"--sieve-limit") && i+1<argc) {
+            cli_sieve_prime_limit = strtoull(argv[++i], NULL, 10);
+            cli_sieve_explicit = 1;
         }
         else if (!strcmp(argv[i],"--target") && i+1<argc) { target = atof(argv[++i]); target_explicit = 1; }
         else if (!strcmp(argv[i],"--scan-merit") && i+1<argc) {
@@ -7271,6 +7361,31 @@ int main(int argc, char **argv) {
     if (g_crt_mode == CRT_MODE_SOLVER && crt_fermat_threads > 0)
         crt_heap_init(crt_heap_cap);
 
+    /* ── Non-CRT GPU sieve prime auto-scale ──
+       In GPU non-CRT mode, GPU Fermat cost ∝ shift² while sieve cost ∝ shift.
+       At large shifts, sieving more primes (cheaper per candidate eliminated)
+       is worth more than the extra sieve time costs.  Auto-scale the sieve
+       prime count based on shift when GPU is active and no explicit override. */
+#ifdef WITH_GPU_FERMAT
+    if (!cli_sieve_explicit && g_crt_mode != CRT_MODE_SOLVER &&
+        (use_cuda || use_opencl) && shift > 64) {
+        /* scale = (shift/64)^1.5: at shift=128 →2x, shift=256→6x, shift=512→17x.
+           Cap at 10M primes (prime limit ~185M) to bound init time.           */
+        double scale = pow((double)shift / 64.0, 1.5);
+        uint64_t new_count = (uint64_t)((double)DEFAULT_SIEVE_PRIME_COUNT * scale);
+        if (new_count > 10000000ULL) new_count = 10000000ULL;
+        if (new_count > cli_sieve_prime_count) {
+            log_msg("gpu sieve auto-scale: sieve-primes %llu -> %llu (shift=%d, scale=%.2fx)\n",
+                    (unsigned long long)cli_sieve_prime_count,
+                    (unsigned long long)new_count, shift, scale);
+            cli_sieve_prime_count = new_count;
+            double n = (double)new_count;
+            double upper = n * (log(n) + log(log(n)));
+            cli_sieve_prime_limit = (uint64_t)(upper * 1.05);
+        }
+    }
+#endif
+
     /* ── CUDA GPU initialization ── */
 #ifdef WITH_CUDA
     if (use_cuda) {
@@ -7716,6 +7831,7 @@ int main(int argc, char **argv) {
                 0);
             int64_t num_windows = ((int64_t)adder_max + (int64_t)sieve_size - 1) / (int64_t)sieve_size;
             double logbase = uint256_log_approx(h256, shift);
+            g_sieve_size_for_L_cache = sieve_size;
             set_base_bn(h256, shift);
 
             /* ── CRT gap-solver path (single-threaded, GMP/nonce) ── */
@@ -8198,6 +8314,7 @@ int main(int argc, char **argv) {
                 memcpy(wargs[t].h256, h256, 32);
                 wargs[t].shift             = shift;
                 wargs[t].sieve_size        = sieve_size;
+                g_sieve_size_for_L_cache   = sieve_size;
                 wargs[t].target            = target;
                 wargs[t].scan_target       = scan_target_runtime;
                 wargs[t].header            = header;

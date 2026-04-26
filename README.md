@@ -116,6 +116,21 @@ make
 
 The binary is placed at `bin/gap_miner`.
 
+### CPU architecture requirements
+
+The `primality_utils.c` Montgomery multiplication uses Intel **ADX + BMI2**
+instructions when available (`-march=native` defines `__ADX__` and
+`__BMI2__`).  If your CPU does not support ADX (e.g. Intel Ivy Bridge /
+Xeon E5-2690 v2 and earlier), a portable `__uint128_t` CIOS fallback is
+used automatically — the build succeeds and correctness is preserved, but
+the Montgomery multiplier is roughly 2× slower than the ADX path.  ADX
+support was introduced with Intel Broadwell (2014).
+
+To check ADX support on Linux:
+```sh
+grep -oE 'adx|bmi2' /proc/cpuinfo | sort -u
+```
+
 ### Stable checkpoint build matrix
 
 Before committing refactor slices, validate from a clean object state so
@@ -288,6 +303,35 @@ Capture output to a file as well:
 ```sh
 bin/gap_miner ... --log-file miner.log
 ```
+
+### Best mode for record hunting: GPU non-CRT (April 2026)
+
+Extensive benchmarking on RTX 3060 at shift 128 shows that **GPU non-CRT**
+(normal sieve + CUDA two-phase smart-scan, no CRT file) outperforms every
+CRT+GPU configuration by ~12× for qualifying-gap (record) hunting:
+
+| Config | sieved/s | tested/s | pps | ETA (merit≥27) |
+|---|---|---|---|---|
+| CPU non-CRT (38h baseline) | 248 M | 457 K | 63.6 K | ~62 days |
+| CRT + CUDA GPU-consumer 7T | 17 M | 632 K | 61.4 K | ~5.1 days |
+| **GPU non-CRT 8T** | **485 M** | **5.8 M** | **643 K** | **~3.5 days** |
+
+Recommended command for RTX 3060, shift 128:
+
+```sh
+./bin/gap_miner \
+  --rpc-url http://127.0.0.1:31397 --rpc-user USER --rpc-pass PASS \
+  --shift 128 --threads 8 --fast-euler -e \
+  --cuda --log-file hunt.log
+```
+
+- `--fast-euler` halves CPU boundary-probe cost vs `--fast-fermat` (~29% more pps).
+- `-e` (`--extra-verbose`) logs `partial_auto` adjustments to the log file only.
+- `--partial-sieve-auto` / `--partial-sieve` is needed: the controller
+  bootstraps to ~7.7 M primes and stabilises automatically at GPU-optimal
+  survivor density (~3.4%).
+- The `sieve_model: keep~3.49% boost~28.6x` line in stats reflects the
+  theoretical Mertens-theorem estimate for the prime limit in use.
 
 ### Recommended CRT CLI setup (April 2026)
 
@@ -683,6 +727,33 @@ bin/gap_miner \
 ```
 
 ## Recent changes (April 2026)
+
+### Non-ADX CPU build fix (April 2026)
+
+The `MONTMUL_EXACT_DISPATCH` macro in `src/primality_utils.c` was only
+defined inside the `#if defined(__x86_64__) && defined(__BMI2__) &&
+defined(__ADX__)` block.  On CPUs without ADX/BMI2 (Ivy Bridge and earlier)
+the macro was left undefined, causing linker errors:
+
+```
+undefined reference to `MONTMUL_EXACT_DISPATCH'
+```
+
+A fallback `#ifndef MONTMUL_EXACT_DISPATCH` definition now provides the
+generic `__uint128_t` CIOS path automatically on non-ADX builds.  Builds
+on Xeon E5-2690 v2 and similar Ivy Bridge hardware now succeed without
+any flag changes.
+
+### `partial_auto` GPU floor fix (April 2026)
+
+The adaptive non-CRT sieve-prime controller (`--partial-sieve-auto`) had
+a CPU-tuned survivor-density band: 5%–18%.  GPU non-CRT converges to
+~3.4% density (below the 5% floor), which could cause the controller to
+reduce the prime limit unnecessarily.
+
+The lower bound is now 1% when GPU is active (`g_gpu_count > 0`) and 5%
+for CPU-only builds.  In GPU mode the controller stays at its bootstrap
+value (~7.7 M primes for a 33 M sieve) and `adjusts=0` remains stable.
 
 ### CUDA GPU Fermat kernel optimizations (April 2026)
 
