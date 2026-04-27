@@ -922,10 +922,13 @@ static __thread uint64_t tls_crt_base_residue = 0;
    per prime for the incremental update, plus 1 binary search.       */
 static uint32_t      *g_crt_filter_primes = NULL; /* prime table             */
 static size_t         g_crt_filter_count  = 0;    /* number of filter primes */
-static uint64_t      *g_crt_filter_prim_mod = NULL; /* primorial mod p[i]    */
+/* primorial mod p[i] — fits in uint32_t because p < 2M < 2^21 */
+static uint32_t      *g_crt_filter_prim_mod = NULL;
 
-/* Per-thread residue cache for incremental updates */
-static __thread uint64_t *tls_crt_filt_rmod = NULL; /* base mod p[i]         */
+/* Per-thread residue cache: (base + k*primorial) mod p[i] for current window k.
+   All values < p < 2M < 2^21, so uint32_t suffices and halves the working set
+   (129K entries × 4B = 516KB vs 1MB), which is more likely to stay in L2/L3. */
+static __thread uint32_t *tls_crt_filt_rmod = NULL; /* base mod p[i]         */
 static __thread size_t    tls_crt_filt_cap  = 0;
 static __thread int       tls_crt_filt_ready = 0;
 
@@ -2573,16 +2576,21 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
        so this is O(1) per prime — vastly faster than the old approach
        of binary-searching the extracted survivor array O(log S).       */
     if (tls_crt_filt_ready && g_crt_filter_count > 0) {
+        /* In CRT solver mode L_is_one=1 always.  We merge the per-window
+           residue advance (formerly done by crt_filter_step_residues) into
+           this same loop to cut two L3 cache sweeps of the 129K-entry filter
+           table down to one.  Data volume: 129K × (4+4+4)B = 1.5MB → 0.75MB
+           per pass.  The advance is: r += pmod; if r >= p: r -= p.        */
         for (size_t fi = 0; fi < g_crt_filter_count; fi++) {
-            uint64_t p = g_crt_filter_primes[fi];
-            uint64_t r = tls_crt_filt_rmod[fi];
-            /* Same start-position logic as the main sieve */
-            uint64_t lrem;
+            uint32_t p = g_crt_filter_primes[fi];
+            uint32_t r = tls_crt_filt_rmod[fi];
+            /* Compute hit position in window */
+            uint32_t lrem;
             if (L_is_one) {
                 lrem = r + 1;
                 if (lrem >= p) lrem -= p;
             } else {
-                lrem = (r + L % p) % p;
+                lrem = (uint32_t)((r + L % p) % p);
             }
             uint64_t start = L + (lrem == 0 ? 0 : p - lrem);
             if ((start & 1) == 0) start += p;  /* odd-only sieve */
@@ -2590,6 +2598,13 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
                 uint64_t pos = (start - L) / 2;
                 if (pos < seg_size)
                     bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+            }
+            /* Advance residue for the next window (merged to avoid second
+               pass; only correct when L_is_one=1, i.e. CRT solver mode). */
+            if (L_is_one) {
+                r += g_crt_filter_prim_mod[fi];
+                if (r >= p) r -= p;
+                tls_crt_filt_rmod[fi] = r;
             }
         }
     }
@@ -4107,7 +4122,7 @@ static void build_crt_filter_table(uint64_t filter_limit) {
     size_t est = (size_t)(filter_limit / 10);
     if (est < 1024) est = 1024;
     uint32_t *primes  = (uint32_t *)malloc(est * sizeof(uint32_t));
-    uint64_t *pmod    = (uint64_t *)malloc(est * sizeof(uint64_t));
+    uint32_t *pmod    = (uint32_t *)malloc(est * sizeof(uint32_t));
     if (!primes || !pmod) { free(primes); free(pmod); return; }
 
     /* Simple segmented sieve to enumerate primes in (lo, filter_limit]. */
@@ -4143,14 +4158,15 @@ static void build_crt_filter_table(uint64_t filter_limit) {
             if (cnt >= est) {
                 est *= 2;
                 uint32_t *tp = (uint32_t *)realloc(primes, est * sizeof(uint32_t));
-                uint64_t *tm = (uint64_t *)realloc(pmod,   est * sizeof(uint64_t));
+                uint32_t *tm = (uint32_t *)realloc(pmod,   est * sizeof(uint32_t));
                 if (!tp || !tm) { free(tp ? (void*)tp : (void*)primes);
                                   free(tm ? (void*)tm : (void*)pmod); cnt = 0; goto done; }
                 primes = tp; pmod = tm;
             }
             primes[cnt] = (uint32_t)p;
+            /* primorial mod p fits in uint32_t since p < 2M */
             pmod[cnt]   = g_crt_primorial_mpz_init
-                        ? mpz_fdiv_ui(g_crt_primorial_mpz, (unsigned long)p)
+                        ? (uint32_t)mpz_fdiv_ui(g_crt_primorial_mpz, (unsigned long)p)
                         : 0;
             cnt++;
         }
@@ -4175,21 +4191,27 @@ static void crt_filter_init_residues(void) {
     if (tls_crt_filt_cap < n) {
         free(tls_crt_filt_rmod);
         tls_crt_filt_cap = n + 64;
-        tls_crt_filt_rmod = (uint64_t *)malloc(tls_crt_filt_cap * sizeof(uint64_t));
+        tls_crt_filt_rmod = (uint32_t *)malloc(tls_crt_filt_cap * sizeof(uint32_t));
         if (!tls_crt_filt_rmod) { tls_crt_filt_cap = 0; return; }
     }
     for (size_t i = 0; i < n; i++)
-        tls_crt_filt_rmod[i] = mpz_fdiv_ui(tls_base_mpz,
-                                            (unsigned long)g_crt_filter_primes[i]);
+        /* base mod p fits in uint32_t since p < 2M */
+        tls_crt_filt_rmod[i] = (uint32_t)mpz_fdiv_ui(tls_base_mpz,
+                                                      (unsigned long)g_crt_filter_primes[i]);
     tls_crt_filt_ready = 1;
 }
 
-/*  Per-window: advance residues by one primorial step.                    */
+/*  Per-window: advance residues by one primorial step.
+    NOTE: in CRT solver mode (L_is_one=1) this is now a no-op — the advance
+    is performed inside sieve_range's phase-3 loop so both the bitmap mark
+    and the residue advance happen in a single pass over the filter table,
+    halving the number of L3 cache sweeps per window.                      */
 static inline void crt_filter_step_residues(void) {
+    if (g_crt_mode == CRT_MODE_SOLVER) return; /* merged into sieve_range phase 3 */
     size_t n = g_crt_filter_count;
     for (size_t i = 0; i < n; i++) {
-        uint64_t r = tls_crt_filt_rmod[i] + g_crt_filter_prim_mod[i];
-        uint64_t p = g_crt_filter_primes[i];
+        uint32_t r = tls_crt_filt_rmod[i] + g_crt_filter_prim_mod[i];
+        uint32_t p = g_crt_filter_primes[i];
         if (r >= p) r -= p;
         tls_crt_filt_rmod[i] = r;
     }
@@ -5228,6 +5250,22 @@ static void gpu_accum_collect(struct gpu_accum *a) {
     a->ema_collect_ms = gpu_accum_ema_update(a->ema_collect_ms,
                                              (double)t_collect_ms);
 
+    /* In monolithic mode the producer and consumer are the same thread,
+       so tls_base_mpz belongs to the ongoing sieving loop.
+       scan_gap_results() sets tls_base_mpz = w->base for each window it
+       processes (for --mr-verify / crt-precision boundary checks), which
+       would corrupt the sieving loop's per-window base tracking and cause
+       all subsequent windows to use the wrong GPU base and submit blocks
+       whose nAdd points to an untested (likely composite) number.
+       Save and restore tls_base_mpz around the whole window loop. */
+    int base_saved = 0;
+    mpz_t saved_base;
+    if ((use_mr_verify || use_crt_precision) && b->win_count > 0) {
+        ensure_gmp_tls();
+        mpz_init_set(saved_base, tls_base_mpz);
+        base_saved = 1;
+    }
+
     /* Distribute results to each window and scan gaps */
     for (size_t wi = 0; wi < b->win_count; wi++) {
         struct gpu_accum_win *w = &b->wins[wi];
@@ -5267,6 +5305,18 @@ static void gpu_accum_collect(struct gpu_accum *a) {
         mpz_clear(w->base);
         mpz_clear(w->nAdd);
     }
+
+    /* Restore tls_base_mpz so the sieving loop continues from the correct
+       per-window position after this collect call returns. */
+    if (base_saved) {
+        mpz_set(tls_base_mpz, saved_base);
+        mpz_clear(saved_base);
+        prime_cache_invalidate_base();
+        for (int i = 0; i < td_extra_count; i++)
+            tls_td_residues[i] = (uint32_t)mpz_fdiv_ui(
+                tls_base_mpz, (unsigned long)td_extra_primes[i]);
+    }
+
     b->total = 0;
     b->win_count = 0;
     a->inflight = -1;

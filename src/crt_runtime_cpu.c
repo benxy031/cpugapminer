@@ -495,6 +495,10 @@ crt_runtime_run_solver_nonce_step(
                         }
                     }
                 }
+                /* crt_filter_step_residues() is now a no-op for CRT solver
+                   mode: the advance is merged into sieve_range's phase-3
+                   loop so both the bitmap mark and the residue step happen
+                   in a single pass over the 129K-entry filter table. */
                 crt_filter_step_residues();
             }
             crt_first_win = 0;
