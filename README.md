@@ -1378,6 +1378,149 @@ gap scanning.  Multiple GPUs are supported via `--cuda 0,1`.
 > exponentiation contained a correctness bug for large moduli and was
 > disabled.  All arithmetic now uses GMP's assembly-optimized paths.
 
+## Primorial base alignment (`--primorial`)
+
+### What it does
+
+In standard non-CRT mining the prime search base is `h256 << shift`, a
+random 256+shift-bit number. The sieve then marks composites for every
+small prime (3, 5, 7, …) before extracting surviving candidates, most of
+which are composite for trivial reasons.
+
+`--primorial P` shifts the **starting position** of each sieve window to
+the next multiple of **P# = 2 × 3 × 5 × … × P** above the hash-derived
+base:
+
+```
+align = P# - (base % P#)       # amount to add so base+align ≡ 0 (mod P#)
+L     = align + 1               # first search offset (always odd, since P# is even)
+```
+
+Because `base + align ≡ 0 (mod P#)`, any candidate at odd offset `j`
+from `base + align` satisfies `gcd(j, P#) = 1` **if and only if** j is
+coprime to every prime ≤ P. The existing multi-prime presieve template
+already pre-marks all non-coprime positions in the bitmap, so the Phase 1
+sieve for primes ≤ P costs **zero extra work** — those positions are
+already composite in the template.
+
+`sieve_size` is automatically snapped to the nearest multiple of P# so
+that every successive window (`L += sieve_size`) stays at the same
+residue class (≡ 1 mod P#).  Alignment is therefore maintained for the
+entire mining pass, not just the first window.
+
+### Choosing P
+
+| P  | P#          | φ(P#)  | coprime fraction | snap overhead |
+|----|-------------|--------|-----------------|---------------|
+| 11 | 2 310       | 480    | 20.8 %          | < 0.01 %      |
+| 13 | 30 030      | 5 760  | 19.2 %          | < 0.1 %       |
+| 17 | 510 510     | 92 160 | 18.1 %          | < 1.5 %       |
+| 19 | 9 699 690   | 1 658 880 | 17.1 %       | < 30 % ⚠     |
+| 23 | 223 092 870 | —      | 16.1 %          | not recommended |
+
+**Note:** `--primorial` provides **no throughput benefit** at any supported
+shift (see benchmark results below). The option remains available for
+experimentation. If you do use it, **`--primorial 17`** is the only
+cache-neutral choice: P#=510510 = 2 × presieve tile period (255255),
+so every window starts at the same tile offset. All other P values
+(especially P=13) produce measurable regressions. P ≥ 19 also causes
+large sieve-size snaps (up to 30 % wasted budget).
+
+### Effect on submission
+
+The submitted `nAdd` encodes the absolute offset from the original base
+`h256 << shift`. Because L starts at `align + 1`, every sieve survivor
+**already includes the alignment offset** — no extra arithmetic is needed
+at submission time. gapcoind verifies:
+
+```
+isPrime(h256 << shift + nAdd)   →   nAdd = align + j   (j = coprime residue)
+```
+
+This is identical to standard submission; the protocol is unchanged.
+
+### Interaction with other options
+
+| Option | Interaction |
+|--------|-------------|
+| `--crt-file` | `--primorial` is **silently ignored** in CRT mode.  Use `--crt-file` (which already aligns to its own primorial) instead. |
+| `--sieve-size S` | The sieve size is snapped upward to the nearest multiple of P#.  If you set an explicit `--sieve-size`, it will be adjusted and the actual size is logged at startup. |
+| `--sieve-limit L` / `--sieve-primes N` | Compatible.  Phase 2 (primes > P) is unchanged. |
+| `--threads N` | Full benefit in all threads when `--threads 1` or single-thread path.  Multi-thread splits benefit from alignment per-window regardless of thread count. |
+| `--cuda` / `--opencl` | Fully compatible.  GPU Fermat testing runs as normal on the coprime-aligned survivors. |
+| `--wheel-sieve` | Both can be active; the presieve used at startup selects the best available template (wheel or mpresieve), which covers primes ≤ 163 regardless. |
+
+### Example invocations
+
+**CPU-only, shift 64, 7 threads, P=13:**
+```sh
+bin/gap_miner \
+  --rpc-url http://127.0.0.1:31397/ --rpc-user USER --rpc-pass PASS \
+  --shift 64 --threads 7 --fast-euler \
+  --primorial 13
+```
+
+**CPU + CUDA GPU, shift 64:**
+```sh
+bin/gap_miner \
+  --rpc-url http://127.0.0.1:31397/ --rpc-user USER --rpc-pass PASS \
+  --shift 64 --threads 7 --fast-euler --cuda \
+  --primorial 13
+```
+
+**High-shift (256) with GPU and larger primorial:**
+```sh
+bin/gap_miner \
+  --rpc-url http://127.0.0.1:31397/ --rpc-user USER --rpc-pass PASS \
+  --shift 256 --threads 7 --fast-euler --cuda \
+  --primorial 13
+```
+
+**Verifying alignment at startup** — look for these log lines:
+```
+primorial: P=13 P#=30030 sieve_size=33587370 (snapped to multiple of P#)
+primorial align: 12740 (window start L=12741)
+```
+The `align` value changes every mining pass (every new block header).
+`sieve_size` stays fixed at the snapped value for the entire run.
+
+### Benchmark results and when to use it
+
+**Measured at shift=64, 7 threads, CUDA (RTX 3060):**
+
+| | Baseline | `--primorial 13` | `--primorial 17` |
+|---|---|---|---|
+| sieve_size | 33,554,432 | 33,573,540 | 33,693,660 |
+| sieved/s | 791 M | 782 M | 792 M |
+| pps | 1,237,507 | 1,221,489 | ~1,234,000 |
+| surv/Msieved | 1565.0 | 1561.0 | 1559.5 |
+| vs baseline | — | **−1.4 %** | **−0.3 %** |
+
+**Result: no throughput gain, but P=17 is nearly neutral.**
+
+The existing presieve template adds zero **new** candidate filtering —
+its primes (3,5,7,11,13,17) are a subset of primes already covered.
+However, the P value affects **presieve tile alignment**, which has a
+large impact on cache behaviour:
+
+- **`--primorial 13`** (P#=30030): 30030 does not divide the presieve
+  tile period 255255 (255255/30030 = 8.5). Each new block header lands
+  the window at a *random* offset within the presieve tile, causing
+  cache-line thrashing → **−1.4 % pps**.
+
+- **`--primorial 17`** (P#=510510 = 2 × 255255): P# is an exact
+  multiple of the presieve tile period. Every window starts at *the
+  same* offset within the tile (L ≡ 1 mod 255255), eliminating the
+  tile-offset variation → nearly neutral (**−0.3 % pps**).
+
+Both runs found blocks and had nAdd values verified correct.
+
+**When to use it:** If you want to experiment with primorial alignment,
+use `--primorial 17` — it is the only value whose P# is aligned to the
+presieve tile period, making it cache-neutral. All other P values
+(including P=13) produce measurable regressions. Do not use
+`--primorial` in production — it provides no throughput benefit.
+
 ## Usage reference
 
 ### Key flags
@@ -1428,6 +1571,7 @@ gap scanning.  Multiple GPUs are supported via `--cuda 0,1`.
 | `--crt-gpu-batch-min N` | 512 | Lower bound used by adaptive CRT GPU batch threshold tuning. |
 | `--crt-gpu-batch-max N` | 32768 | Upper bound used by adaptive CRT GPU batch threshold tuning. |
 | `--mr-verify`         | off           | Verify gap boundary primes with a Miller-Rabin base-3 check before submission.  Catches Fermat base-2 pseudoprimes with negligible overhead. |
+| `--primorial P`       | off           | Align every sieve window to multiples of P# = 2×3×5×…×P.  All candidates are guaranteed coprime to every prime ≤ P, so the presieve template handles those composites at zero extra Phase 1 cost.  `sieve-size` is snapped to the nearest multiple of P# so alignment is preserved across consecutive windows.  P must be a prime ≤ 53 (e.g. `13` → P#=30030, `17` → P#=510510, `23` → P#=223092870).  Incompatible with CRT mode (`--crt-file`). |
 | `--no-primality`      | off           | Skip primality testing entirely |
 | `--build-only`        | off           | Fetch template and build one block, then exit |
 | `--no-opreturn`       | off           | Omit OP_RETURN from coinbase |

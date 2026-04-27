@@ -668,6 +668,13 @@ static volatile int use_mr_verify = 0;   /* MR base-3 verify Fermat survivors */
 /* Sieve window size published by main before launching worker threads.
    Used by set_base_bn() to precompute tls_sieve_mod_p[i] = sieve_size % p[i]. */
 static uint64_t g_sieve_size_for_L_cache = 33554432;
+/* --primorial P: align each search window to multiples of P# = 2*3*5*...*P.
+   All candidates in a primorial-aligned window are coprime to primes <= P
+   by construction, so the presieve template handles those composites and
+   Phase 1 need not re-mark them.  sieve_size is snapped to a multiple of P#
+   at startup so alignment is preserved across windows.                       */
+static uint64_t g_primorial_p   = 0;  /* largest prime in primorial (CLI)    */
+static uint64_t g_primorial_val = 0;  /* P# = product of primes <= P         */
 static volatile int no_primality = 0;   /* skip all probable‑prime filtering */
 static volatile int selftest = 0;        /* run a quick internal test then exit */
 
@@ -2081,6 +2088,9 @@ static __thread size_t    tls_L_mod_p_cap    = 0;
 static __thread uint64_t *tls_sieve_mod_p    = NULL;
 static __thread size_t    tls_sieve_mod_p_cap = 0;
 static __thread uint64_t  tls_L_mod_p_L      = UINT64_MAX;
+/* Per-pass align offset for --primorial: (P# - base%P#) % P#.
+   Always even (base is even, P# is even).  Window starts at L = align+1. */
+static __thread uint64_t  tls_primorial_align = 0;
 
 /* GPU batch-filter double-buffer (used by gpu_batch_filter).  Kept at
    file scope so free_sieve_buffers() can release them when the thread exits,
@@ -4062,6 +4072,16 @@ static void set_base_bn(const uint8_t h256[32], int shift) {
             }
             tls_L_mod_p_L = UINT64_MAX; /* invalidate; re-init on first sieve_range call */
         }
+    }
+
+    /* Primorial alignment: compute (P# - base%P#) % P# for window start.
+       All positions at odd offsets j from base+align where gcd(j,P#)=1
+       are guaranteed coprime to all primes <= P; the presieve handles them.
+       align is always even (base is even, P# is even), so L = align+1 is odd. */
+    if (g_primorial_val > 1) {
+        uint64_t bmod = (uint64_t)mpz_fdiv_ui(tls_base_mpz,
+                                               (unsigned long)g_primorial_val);
+        tls_primorial_align = (g_primorial_val - bmod) % g_primorial_val;
     }
 
     /* Precompute TD residues for the extended trial-division table. */
@@ -6754,6 +6774,9 @@ int main(int argc, char **argv) {
         printf("                        N primes -> largest ~ N*ln(N); default = 900000\n");
         printf("      --sieve-limit L   sieve prime VALUE limit (overrides --sieve-primes)\n");
         printf("                        e.g. --sieve-limit 50000000 sieves up to prime 50M\n");
+        printf("      --primorial P     align each window to multiples of P#=2*3*5*...*P\n");
+        printf("                        P must be prime, e.g. 13 (P#=30030) or 17 (P#=510510)\n");
+        printf("                        ensures candidates coprime to all primes <= P\n");
         printf("      --target T        minimum merit         (default: 20.0)\n");
         printf("      --scan-merit M    scan threshold for non-CRT CPU smart-scan stride.\n");
         printf("                        submit threshold remains --target (or network merit).\n");
@@ -6866,6 +6889,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--sieve-limit") && i+1<argc) {
             cli_sieve_prime_limit = strtoull(argv[++i], NULL, 10);
             cli_sieve_explicit = 1;
+        }
+        else if (!strcmp(argv[i],"--primorial") && i+1<argc) {
+            g_primorial_p = (uint64_t)strtoull(argv[++i], NULL, 10);
         }
         else if (!strcmp(argv[i],"--target") && i+1<argc) { target = atof(argv[++i]); target_explicit = 1; }
         else if (!strcmp(argv[i],"--scan-merit") && i+1<argc) {
@@ -7361,6 +7387,34 @@ int main(int argc, char **argv) {
     if (g_crt_mode == CRT_MODE_SOLVER && crt_fermat_threads > 0)
         crt_heap_init(crt_heap_cap);
 
+    /* ── Primorial alignment setup ──
+       Compute P# = 2*3*5*...*P and snap sieve_size to a multiple of P#
+       so that every window begins at a primorial-aligned starting point. */
+    if (g_primorial_p > 0 && g_crt_mode == CRT_MODE_NONE) {
+        static const uint64_t sp[] = {2,3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,0};
+        g_primorial_val = 1;
+        int found = 0;
+        for (int pi = 0; sp[pi] && sp[pi] <= g_primorial_p; pi++) {
+            g_primorial_val *= sp[pi];
+            found = 1;
+        }
+        if (!found || g_primorial_val < 2) {
+            fprintf(stderr, "--primorial: P must be a prime <= 53\n");
+            return 2;
+        }
+        /* Snap sieve_size to nearest multiple of P# >= sieve_size so that
+           each successive window offset (L += sieve_size) stays aligned. */
+        uint64_t periods = (sieve_size + g_primorial_val - 1) / g_primorial_val;
+        sieve_size = periods * g_primorial_val;
+        log_msg("primorial: P=%llu P#=%llu sieve_size=%llu (snapped to multiple of P#)\n",
+                (unsigned long long)g_primorial_p,
+                (unsigned long long)g_primorial_val,
+                (unsigned long long)sieve_size);
+    } else if (g_primorial_p > 0) {
+        log_msg("primorial: --primorial ignored in CRT mode\n");
+        g_primorial_p = 0;
+    }
+
     /* ── Non-CRT GPU sieve prime auto-scale ──
        In GPU non-CRT mode, GPU Fermat cost ∝ shift² while sieve cost ∝ shift.
        At large shifts, sieving more primes (cheaper per candidate eliminated)
@@ -7833,6 +7887,11 @@ int main(int argc, char **argv) {
             double logbase = uint256_log_approx(h256, shift);
             g_sieve_size_for_L_cache = sieve_size;
             set_base_bn(h256, shift);
+            /* Primorial: log the per-pass align offset on first pass */
+            if (g_primorial_val > 1 && tls_primorial_align > 0)
+                log_file_only("primorial align: %llu (window start L=%llu)\n",
+                              (unsigned long long)tls_primorial_align,
+                              (unsigned long long)(tls_primorial_align + 1));
 
             /* ── CRT gap-solver path (single-threaded, GMP/nonce) ── */
             if (g_crt_mode == CRT_MODE_SOLVER && g_crt_primorial_mpz_init) {
@@ -7891,8 +7950,11 @@ int main(int argc, char **argv) {
             uint64_t st_carry_last = 0;
             for (int64_t adder=0; adder<num_windows; ++adder) {
                 /* L, R are relative offsets from h256<<shift (= nAdd range) */
-                uint64_t L = (uint64_t)adder * sieve_size;
-                if ((L & 1) == 0) L++;
+                /* Primorial: start at (align+1) so base+L ≡ 1 (mod P#),
+                   i.e. the first odd position coprime to all primes <= P. */
+                uint64_t prim_off = (g_primorial_val > 1) ? tls_primorial_align + 1 : 1;
+                uint64_t L = prim_off + (uint64_t)adder * sieve_size;
+                if ((L & 1) == 0) L++;  /* safety: ensure odd */
                 uint64_t R = L + sieve_size;
                 if (R > (uint64_t)adder_max) R = (uint64_t)adder_max;
                 if (R <= L) continue;
