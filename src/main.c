@@ -925,10 +925,9 @@ static size_t         g_crt_filter_count  = 0;    /* number of filter primes */
 /* primorial mod p[i] — fits in uint32_t because p < 2M < 2^21 */
 static uint32_t      *g_crt_filter_prim_mod = NULL;
 
-/* Per-thread residue cache: (base + k*primorial) mod p[i] for current window k.
-   All values < p < 2M < 2^21, so uint32_t suffices and halves the working set
-   (129K entries × 4B = 516KB vs 1MB), which is more likely to stay in L2/L3. */
-static __thread uint32_t *tls_crt_filt_rmod = NULL; /* base mod p[i]         */
+/* Per-thread residue cache: base mod p[i], set once at pass start by
+   crt_filter_init_residues() and stepped per window in the L=1 path.      */
+static __thread uint32_t *tls_crt_filt_rmod = NULL; /* base % p[i]           */
 static __thread size_t    tls_crt_filt_cap  = 0;
 static __thread int       tls_crt_filt_ready = 0;
 
@@ -2576,35 +2575,37 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
        so this is O(1) per prime — vastly faster than the old approach
        of binary-searching the extracted survivor array O(log S).       */
     if (tls_crt_filt_ready && g_crt_filter_count > 0) {
-        /* In CRT solver mode L_is_one=1 always.  We merge the per-window
-           residue advance (formerly done by crt_filter_step_residues) into
-           this same loop to cut two L3 cache sweeps of the 129K-entry filter
-           table down to one.  Data volume: 129K × (4+4+4)B = 1.5MB → 0.75MB
-           per pass.  The advance is: r += pmod; if r >= p: r -= p.        */
-        for (size_t fi = 0; fi < g_crt_filter_count; fi++) {
-            uint32_t p = g_crt_filter_primes[fi];
-            uint32_t r = tls_crt_filt_rmod[fi];
-            /* Compute hit position in window */
-            uint32_t lrem;
-            if (L_is_one) {
-                lrem = r + 1;
-                if (lrem >= p) lrem -= p;
-            } else {
-                lrem = (uint32_t)((r + L % p) % p);
-            }
-            uint64_t start = L + (lrem == 0 ? 0 : p - lrem);
-            if ((start & 1) == 0) start += p;  /* odd-only sieve */
-            if (start < R) {
-                uint64_t pos = (start - L) / 2;
-                if (pos < seg_size)
+        if (L_is_one) {
+            /* CRT solver mode (L=1): linear scan with merged residue step.
+               Each prime marks at most 1 bit per window and advances its
+               residue by pmod in one pass — no separate step call needed.  */
+            for (size_t fi = 0; fi < g_crt_filter_count; fi++) {
+                uint32_t p = g_crt_filter_primes[fi];
+                uint32_t r = tls_crt_filt_rmod[fi];
+                /* hit condition: even r in [p-2*seg_size, p-2].
+                   pos = (p - r - 1) / 2 ∈ [0, seg_size).                */
+                if ((r & 1) == 0 && (uint64_t)r + 2ULL * seg_size >= (uint64_t)p) {
+                    uint64_t pos = ((uint64_t)p - r - 1) >> 1;
                     bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
-            }
-            /* Advance residue for the next window (merged to avoid second
-               pass; only correct when L_is_one=1, i.e. CRT solver mode). */
-            if (L_is_one) {
+                }
                 r += g_crt_filter_prim_mod[fi];
                 if (r >= p) r -= p;
                 tls_crt_filt_rmod[fi] = r;
+            }
+        } else {
+            /* Non-CRT-solver mode (L != 1): residues are advanced by
+               crt_filter_step_residues() between windows.                  */
+            for (size_t fi = 0; fi < g_crt_filter_count; fi++) {
+                uint32_t p    = g_crt_filter_primes[fi];
+                uint32_t r    = tls_crt_filt_rmod[fi];
+                uint32_t lrem = (uint32_t)((r + L % p) % p);
+                uint64_t start = L + (lrem == 0 ? 0 : p - lrem);
+                if ((start & 1) == 0) start += p;
+                if (start < R) {
+                    uint64_t pos = (start - L) / 2;
+                    if (pos < seg_size)
+                        bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+                }
             }
         }
     }
@@ -4159,8 +4160,11 @@ static void build_crt_filter_table(uint64_t filter_limit) {
                 est *= 2;
                 uint32_t *tp = (uint32_t *)realloc(primes, est * sizeof(uint32_t));
                 uint32_t *tm = (uint32_t *)realloc(pmod,   est * sizeof(uint32_t));
-                if (!tp || !tm) { free(tp ? (void*)tp : (void*)primes);
-                                  free(tm ? (void*)tm : (void*)pmod); cnt = 0; goto done; }
+                if (!tp || !tm) {
+                    free(tp ? (void*)tp : (void*)primes);
+                    free(tm ? (void*)tm : (void*)pmod);
+                    cnt = 0; goto done;
+                }
                 primes = tp; pmod = tm;
             }
             primes[cnt] = (uint32_t)p;
@@ -4196,18 +4200,18 @@ static void crt_filter_init_residues(void) {
     }
     for (size_t i = 0; i < n; i++)
         /* base mod p fits in uint32_t since p < 2M */
-        tls_crt_filt_rmod[i] = (uint32_t)mpz_fdiv_ui(tls_base_mpz,
+            tls_crt_filt_rmod[i] = (uint32_t)mpz_fdiv_ui(tls_base_mpz,
                                                       (unsigned long)g_crt_filter_primes[i]);
     tls_crt_filt_ready = 1;
 }
 
 /*  Per-window: advance residues by one primorial step.
-    NOTE: in CRT solver mode (L_is_one=1) this is now a no-op — the advance
-    is performed inside sieve_range's phase-3 loop so both the bitmap mark
-    and the residue advance happen in a single pass over the filter table,
-    halving the number of L3 cache sweeps per window.                      */
+    NOTE: in CRT solver mode (L_is_one=1) this is a no-op — the advance is
+    merged into sieve_range's phase-3 linear scan loop so both the bitmap
+    mark and the residue advance happen in a single pass over the filter
+    table, halving the number of L3 cache sweeps per window.              */
 static inline void crt_filter_step_residues(void) {
-    if (g_crt_mode == CRT_MODE_SOLVER) return; /* merged into sieve_range phase 3 */
+    if (g_crt_mode == CRT_MODE_SOLVER) return; /* advance merged in phase-3 */
     size_t n = g_crt_filter_count;
     for (size_t i = 0; i < n; i++) {
         uint32_t r = tls_crt_filt_rmod[i] + g_crt_filter_prim_mod[i];
