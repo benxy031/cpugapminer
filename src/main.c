@@ -1737,11 +1737,20 @@ static void print_stats(void) {
        for responsiveness. */
     double target_m = g_mining_target;
     double scan_target_m = g_scan_target_runtime;
-    char est_buf[64] = "n/a";
+    /* est= calibrated from observed gap rate when possible.
+       Once we have qualifying gaps at target_m, use:
+         est = elapsed / gaps       (actual inter-gap interval)
+       Fallback: Cramér model before any gaps are found. */
     double prob_pair = (target_m > 0) ? exp(-target_m) : 0.0;
-    if (pairs_rate > 0 && prob_pair > 0) {
-        double est_sec = 1.0 / (pairs_rate * prob_pair);
+    char est_buf[64] = "n/a";
+    if (stats_gaps > 0 && elapsed > 0.001) {
+        double est_sec = elapsed / (double)stats_gaps;
         format_est(est_buf, sizeof(est_buf), est_sec);
+    } else {
+        if (pairs_rate > 0 && prob_pair > 0) {
+            double est_sec = 1.0 / (pairs_rate * prob_pair);
+            format_est(est_buf, sizeof(est_buf), est_sec);
+        }
     }
 
     /* Observed average gap interval (elapsed / gaps found). Shows actual
@@ -1798,19 +1807,32 @@ static void print_stats(void) {
         uint64_t crt_p = stats_primes_found;
         double win_rate = (elapsed > 0.001) ? (double)crt_w / elapsed : 0.0;
         double ppw = (crt_w > 0) ? (double)crt_p / (double)crt_w : 0.0;
-        /* CRT ETA: Cramér model — same as network ETA but targeting
-           CRT merit instead of network difficulty.
-           P(gap ≥ G between consecutive primes near N) = e^{-G/ln(N)}
-           = e^{-merit}.  Each window has ~ppw primes giving ~ppw pairs,
-           so pairs_rate already captures CRT throughput.
-           ETA = 1 / (pairs_rate × e^{-crt_merit}).  */
+        /* CRT ETA: calibrated from the observed gap rate when possible.
+           The pure Cramér model (1 / (pairs_rate × e^{-merit})) is
+           systematically too pessimistic because it ignores the CRT
+           pre-selection boost.  Once we have observed qualifying gaps at
+           target_m, we calibrate:
+             r_obs = gaps / elapsed          (actual rate at merit >= target_m)
+             r_crt = r_obs × e^{-(crt_merit - target_m)}
+             crt_est = 1 / r_crt
+                     = avg_gap_sec × exp(crt_merit - target_m)
+           This anchors the estimate to real throughput while correctly
+           scaling the tail probability for the higher merit target.
+           Fallback: pure Cramér model before any gaps have been found. */
         char crt_est_buf[64] = "n/a";
-        if (pairs_rate > 0 && g_crt_merit > 0) {
-            double crt_prob = exp(-g_crt_merit);
-            if (crt_prob > 0) {
-                double crt_est_sec = 1.0 / (pairs_rate * crt_prob);
-                format_est(crt_est_buf, sizeof(crt_est_buf), crt_est_sec);
+        if (g_crt_merit > 0) {
+            double crt_est_sec = 0.0;
+            if (stats_gaps > 0 && elapsed > 0.001 &&
+                target_m > 0.0 && g_crt_merit > target_m) {
+                double avg_gap_sec = elapsed / (double)stats_gaps;
+                crt_est_sec = avg_gap_sec * exp(g_crt_merit - target_m);
+            } else if (pairs_rate > 0) {
+                double crt_prob = exp(-g_crt_merit);
+                if (crt_prob > 0)
+                    crt_est_sec = 1.0 / (pairs_rate * crt_prob);
             }
+            if (crt_est_sec > 0.0)
+                format_est(crt_est_buf, sizeof(crt_est_buf), crt_est_sec);
         }
         double tpw = (crt_w > 0) ? (double)stats_crt_tmpl_hits / (double)crt_w : 0.0;
         uint64_t hp_ok = stats_crt_heap_push_ok;
