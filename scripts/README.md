@@ -1,5 +1,36 @@
 # scripts/
 
+## maxgap_submission_template.py
+
+Builds a submission-ready Markdown report template from one maxgap candidate
+line. It validates the candidate structure, recomputes merit, and pre-fills a
+verification checklist and record-context section.
+
+### Requirements
+
+Python 3 (stdlib only).
+
+### Usage
+
+```bash
+python3 scripts/maxgap_submission_template.py \
+   --candidate "gap=1512 at=4000000000000123457 next=4000000000000124969 merit=15.3421"
+```
+
+Optional flags:
+
+- `--source` source location string (for example `gaps_3.txt:42`)
+- `--scan-command` discovery command used
+- `--host` host label
+- `--cpu` CPU model/name
+- `--out` output markdown file path
+
+By default it writes to:
+
+`scripts/submission_gap<G>_at<L>.md`
+
+---
+
 ## find_records.py
 
 Fetches the prime gap record list and identifies which records are beatable by
