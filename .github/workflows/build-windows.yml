@@ -45,7 +45,7 @@ jobs:
             bc
 
       - name: Build (CPU-only, WITH_RPC)
-        run: make -f Makefile.mingw clean && make -f Makefile.mingw WITH_RPC=1
+        run: make -f Makefile.mingw clean && make -f Makefile.mingw WITH_RPC=1 ARCH_FLAGS='-march=native'
 
       - name: Wheel sieve smoke test
         run: ./bin/gap_miner.exe --wheel-sieve 210 --selftest
@@ -155,7 +155,7 @@ jobs:
 
       - name: Build gap_miner (WITH_RPC + CUDA DLL mode)
         shell: msys2 {0}
-        run: make -f Makefile.mingw clean && make -f Makefile.mingw WITH_RPC=1 WITH_CUDA=1 CUDA_DLL=1 GPU_BITS=1024
+        run: make -f Makefile.mingw clean && make -f Makefile.mingw WITH_RPC=1 WITH_CUDA=1 CUDA_DLL=1 GPU_BITS=1024 ARCH_FLAGS='-march=native'
 
       - name: Stage CUDA DLL for smoke test
         shell: msys2 {0}

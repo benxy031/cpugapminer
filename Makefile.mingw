@@ -13,8 +13,10 @@
 
 CC=gcc
 CXX=g++
-CFLAGS=-O3 -std=c11 -Wall -Wextra -mtune=native
-CXXFLAGS=-O3 -std=c++17 -Wall -Wextra -mtune=native
+# Default keeps portable codegen; callers can override, e.g. ARCH_FLAGS='-march=native'.
+ARCH_FLAGS ?= -mtune=native
+CFLAGS=-O3 -std=c11 -Wall -Wextra $(ARCH_FLAGS)
+CXXFLAGS=-O3 -std=c++17 -Wall -Wextra $(ARCH_FLAGS)
 LDFLAGS=
 SRCDIR=src
 BINDIR=bin
