@@ -1551,6 +1551,9 @@ presieve tile period, making it cache-neutral. All other P values
 | `--sample-stride K`   | 8             | Controls gap scanning strategy.  K > 1 enables backward-scan (CPU) or two-phase smart-scan (GPU).  Set to 1 for full-test (all survivors tested). |
 | `--partial-sieve-auto` / `--partial-sieve` | off | Adaptive non-CRT sieve-prime limiting.  Adjusts sieve depth periodically based on runtime behavior. |
 | `--adaptive-presieve` | off           | Adaptive non-CRT presieve window skipping for dense windows after presieve. |
+| `--adaptive-presieve-ratio R` | 1.08 | Dense-window trigger ratio vs survivor EMA (non-CRT).  A window is considered dense when `survivors > EMA * R`.  Lower values trigger more often. |
+| `--adaptive-presieve-floor-mult X` | 2.0 | Additional floor term for adaptive skip in non-CRT mode: `X * needed_gap`, where `needed_gap = scan_target * logbase`.  Prevents skipping on tiny windows. |
+| `--adaptive-presieve-min-survivors N` | 2048 | Absolute minimum survivors required before adaptive skip can trigger.  Useful as a stability guard during warmup or at small shifts. |
 | `--wheel-sieve N`     | 0 (disabled)  | Select wheel-presieve backend for non-CRT runs.  Supported values: `30`, `210`, `2310`, `30030`, `510510`, `9699690`. |
 | `-e` / `--extra-verbose` | off       | Write detailed `--partial-sieve-auto` adjustments to the log file only. |
 | `--stats-verbose`     | off           | Include detailed CRT phase telemetry (`cramer`, `phase1`, accumulator histograms, score calibration) in periodic STATS output.  Default output stays concise. |
@@ -1604,6 +1607,84 @@ bin/gap_miner \
 The header is selected automatically from `getblocktemplate`.
 Default `--sieve-size` (33 554 432) and `--sieve-primes` (900 000) match
 the original GapMiner and work well for most setups.
+
+### Adaptive presieve tuning (non-CRT CPU)
+
+`--adaptive-presieve` skips unusually dense presieved windows to reduce
+primality work in runs where window density has occasional spikes.
+
+Current trigger (non-CRT):
+
+1. Warmup and cooldown windows must be satisfied.
+2. Dense condition: `survivors > EMA * ratio`.
+3. Floor condition: `survivors >= max(min_survivors, floor_mult * needed_gap)`.
+
+Where:
+
+- `EMA` is the per-thread survivor exponential moving average.
+- `ratio` is `--adaptive-presieve-ratio`.
+- `floor_mult` is `--adaptive-presieve-floor-mult`.
+- `min_survivors` is `--adaptive-presieve-min-survivors`.
+- `needed_gap = scan_target * logbase`.
+
+Recommended calibration workflow:
+
+1. Start conservative and verify skip activates:
+
+```sh
+bin/gap_miner \
+  --rpc-url http://127.0.0.1:31397 \
+  --rpc-user USER \
+  --rpc-pass PASS \
+  --shift 64 \
+  --threads 7 \
+  --fast-euler \
+  --adaptive-presieve \
+  --adaptive-presieve-ratio 1.01 \
+  --adaptive-presieve-floor-mult 0.0 \
+  --adaptive-presieve-min-survivors 7000
+```
+
+2. Run for 8-12 minutes and watch `adaptive_presieve=on windows=... skipped=...` in STATS.
+3. Target a skip rate around 1-10% while keeping `pps` flat or improved.
+4. If skipped stays near 0%, decrease ratio slightly (e.g. `1.01 -> 1.005`).
+5. If skipped becomes too high and `pps` drops, increase ratio (e.g. `1.01 -> 1.02`) and/or increase `min-survivors`.
+
+Notes:
+
+- This feature is non-CRT only.
+- Workloads with very stable survivor density may naturally produce few skips
+  unless ratio is set very close to 1.0.
+- Tune these flags one at a time and compare by sustained `pps`, not short
+  snapshots around block-template changes.
+
+### Smart-scan + sieve-limit quick tuning (non-CRT)
+
+After calibrating adaptive presieve, tune the two biggest non-CRT throughput
+knobs in this order:
+
+1. `--sample-stride K` (smart scan intensity)
+2. `--sieve-limit L` (sieving depth)
+
+Recommended procedure:
+
+1. Fix all other flags (same shift, threads, RPC target, adaptive settings).
+2. Sweep `--sample-stride` first: `6, 8, 10, 12`.
+3. Keep the best stride and sweep `--sieve-limit`: `12M, 20M, 30M, 50M, 80M`.
+4. Compare runs by 10-minute median `pps` (not 30-second snapshots).
+
+Interpretation guide:
+
+- If `tested/s` rises but `pps` falls: likely over-testing or over-sieving.
+- If `sieved/s` rises but `tested/s` collapses: sieve may be too aggressive.
+- Best setting usually keeps `pps` highest with stable `false_gaps` near zero.
+
+Practical notes:
+
+- `--scan-merit` affects non-CRT CPU smart-scan jump distance. On CPU smart-scan,
+  values above submit threshold are clamped to submit threshold.
+- Very short benchmark windows are noisy around new-block/template changes;
+  prefer longer A/B windows for final selection.
 
 ## Forensics and logging
 
