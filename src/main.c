@@ -606,8 +606,18 @@ static volatile int use_fast_fermat = 0;
 static volatile int use_fast_euler = 1;
 /* if nonzero, use adaptive sieve-prime limiting on non-CRT windows. */
 static volatile int use_partial_sieve_auto = 0;
+/* if nonzero, skip unusually dense non-CRT windows after presieve. */
+static volatile int use_adaptive_presieve = 0;
+static volatile uint64_t adaptive_presieve_min_survivors = 2048ULL;
+static volatile double adaptive_presieve_dense_ratio = 1.08;
+static volatile double adaptive_presieve_floor_mult = 2.0;
 /* if nonzero, use the selectable wheel presieve backend. */
 static volatile int use_wheel_sieve = 0;
+/* Shared bootstrap seed for --partial-sieve-auto: the first thread that
+   stabilizes at a good sieve-prime limit writes it here so subsequent
+   threads skip the slow span-based bootstrap.  0 = not yet set.
+   Updated via __sync_val_compare_and_swap (relaxed, best-effort). */
+static volatile uint64_t g_partial_seed_limit = 0;
 /* if nonzero, write extra partial-sieve-auto details to the log file. */
 static volatile int use_extra_verbose = 0;
 /* if nonzero, print detailed CRT phase telemetry in periodic STATS output. */
@@ -736,12 +746,15 @@ static inline void log_extra_merit_sample(const char *source,
 }
 
 #define PARTIAL_SIEVE_MIN_LIMIT     4000000ULL
-#define PARTIAL_SIEVE_ADAPT_EVERY   16U
-#define PARTIAL_SIEVE_COOLDOWN_WIN  12U
+#define PARTIAL_SIEVE_ADAPT_EVERY   8U   /* check every 8 windows for faster convergence */
+#define PARTIAL_SIEVE_COOLDOWN_WIN  10U  /* full cooldown applied only on direction reversal */
 
 /* Adaptive presieve skip thresholds (non-CRT only). */
-#define ADAPTIVE_PRESIEVE_MIN_SURVIVORS 2048ULL
+#define ADAPTIVE_PRESIEVE_MIN_SURVIVORS_DEFAULT 2048ULL
+#define ADAPTIVE_PRESIEVE_DENSE_RATIO_DEFAULT   1.01
+#define ADAPTIVE_PRESIEVE_FLOOR_MULT_DEFAULT    1.0
 #define ADAPTIVE_PRESIEVE_COOLDOWN_WIN  2U
+#define ADAPTIVE_PRESIEVE_WARMUP_WIN    8U
 
 /* Sampling stride for two-phase gap scanning.  In phase 1 only every Kth
    sieve-survivor is Fermat-tested ("sampled"); candidate gap regions (where
@@ -2025,6 +2038,16 @@ static void print_stats(void) {
                 (unsigned long long)((stats_partial_sieve_auto_limit_samples > 0)
                     ? (stats_partial_sieve_auto_limit_sum / stats_partial_sieve_auto_limit_samples)
                     : 0ULL));
+    if (use_adaptive_presieve) {
+        double skip_pct = (stats_adaptive_presieve_windows > 0)
+            ? (100.0 * (double)stats_adaptive_presieve_skipped /
+               (double)stats_adaptive_presieve_windows)
+            : 0.0;
+        log_msg("  adaptive_presieve=on windows=%llu skipped=%llu (%.1f%%)",
+                (unsigned long long)stats_adaptive_presieve_windows,
+                (unsigned long long)stats_adaptive_presieve_skipped,
+                skip_pct);
+    }
     if (g_crt_mode == CRT_MODE_NONE)
         log_msg("  sieve_model: keep~%.3e boost~%.1fx (limit=%llu)",
                 sieve_keep, sieve_boost,
@@ -2084,6 +2107,8 @@ static __thread size_t    tls_sp_start_cap = 0;
 static __thread uint64_t  tls_partial_use_limit = 0;
 static __thread uint32_t  tls_partial_windows   = 0;
 static __thread uint32_t  tls_partial_cooldown  = 0;
+static __thread int       tls_partial_last_dir  = 0;  /* -1=down 0=init +1=up */
+static __thread uint32_t  tls_partial_stable    = 0;  /* consecutive adapt-periods in-band */
 /* Adaptive presieve window filter (opt-in via --adaptive-presieve). */
 static __thread double    tls_adapt_presieve_ema = 0.0;
 static __thread uint32_t  tls_adapt_presieve_windows = 0;
@@ -2155,6 +2180,8 @@ static void free_sieve_buffers(void) {
     tls_partial_use_limit = 0;
     tls_partial_windows = 0;
     tls_partial_cooldown = 0;
+    tls_partial_last_dir = 0;
+    tls_partial_stable = 0;
     tls_adapt_presieve_ema = 0.0;
     tls_adapt_presieve_windows = 0;
     tls_adapt_presieve_cooldown = 0;
@@ -2201,13 +2228,19 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
     uint64_t use_limit = (uint64_t)cli_sieve_prime_limit;
     if (use_partial_sieve_auto && g_crt_mode == CRT_MODE_NONE && use_limit > PARTIAL_SIEVE_MIN_LIMIT) {
         if (tls_partial_use_limit == 0) {
-            uint64_t span = (R > L) ? (R - L) : 0ULL;
-            /* Conservative bootstrap near current static behavior. */
-            if (span <= 2000000ULL)      tls_partial_use_limit = use_limit / 16ULL;
-            else if (span <= 8000000ULL) tls_partial_use_limit = use_limit / 8ULL;
-            else if (span <= 20000000ULL) tls_partial_use_limit = use_limit / 4ULL;
-            else if (span <= 50000000ULL) tls_partial_use_limit = use_limit / 2ULL;
-            else tls_partial_use_limit = use_limit;
+            /* Use shared seed from a sibling thread that already converged,
+               falling back to span-based fractions only when no seed exists. */
+            uint64_t seed = g_partial_seed_limit;
+            if (seed >= PARTIAL_SIEVE_MIN_LIMIT && seed <= use_limit) {
+                tls_partial_use_limit = seed;
+            } else {
+                uint64_t span = (R > L) ? (R - L) : 0ULL;
+                if (span <= 2000000ULL)       tls_partial_use_limit = use_limit / 16ULL;
+                else if (span <= 8000000ULL)  tls_partial_use_limit = use_limit / 8ULL;
+                else if (span <= 20000000ULL) tls_partial_use_limit = use_limit / 4ULL;
+                else if (span <= 50000000ULL) tls_partial_use_limit = use_limit / 2ULL;
+                else                          tls_partial_use_limit = use_limit;
+            }
             __sync_fetch_and_add(&stats_partial_sieve_auto_activations, 1);
         }
         if (tls_partial_use_limit < PARTIAL_SIEVE_MIN_LIMIT)
@@ -2670,26 +2703,53 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
 #else
             double surv_lo = 0.05;
 #endif
-            if (surv_ratio > 0.18) {
-                next = cur + (cur >> 5);   /* +3.125% */
+            /* Multi-tier step sizes: large jumps when far from the target
+               band, fine-tuning near it.  A direction reversal triggers
+               full COOLDOWN_WIN; continuing in the same direction uses a
+               short hold (3 windows) to avoid thrashing.                 */
+            int dir = 0;
+            if (surv_ratio > 0.40) {
+                next = cur + (cur >> 2);              /* +25%: far too dense  */
+                dir = +1;
+            } else if (surv_ratio > 0.25) {
+                next = cur + (cur >> 3) + (cur >> 4); /* +18.75%: still dense */
+                dir = +1;
+            } else if (surv_ratio > 0.18) {
+                next = cur + (cur >> 5);              /* +3.125%: fine-tune   */
+                dir = +1;
             } else if (surv_ratio < surv_lo) {
-                next = cur - (cur >> 6);   /* -1.5625% */
+                next = cur - (cur >> 5);              /* -3.125%: over-sieved */
+                dir = -1;
+            } else {
+                /* In band: track stability and share with other threads. */
+                if (++tls_partial_stable >= 4) {
+                    uint64_t old = g_partial_seed_limit;
+                    if (old != cur)
+                        __sync_val_compare_and_swap(&g_partial_seed_limit, old, cur);
+                }
             }
 
             if (next < PARTIAL_SIEVE_MIN_LIMIT)
                 next = PARTIAL_SIEVE_MIN_LIMIT;
-            if (next > cli_sieve_prime_limit)
-                next = cli_sieve_prime_limit;
+            if (next > (uint64_t)cli_sieve_prime_limit)
+                next = (uint64_t)cli_sieve_prime_limit;
 
             if (next != cur) {
                 tls_partial_use_limit = next;
-                tls_partial_cooldown = PARTIAL_SIEVE_COOLDOWN_WIN;
+                tls_partial_stable = 0;
+                /* Full cooldown on reversal; short hold when same direction. */
+                if (dir != 0 && dir != tls_partial_last_dir && tls_partial_last_dir != 0)
+                    tls_partial_cooldown = PARTIAL_SIEVE_COOLDOWN_WIN;
+                else
+                    tls_partial_cooldown = 3;
+                tls_partial_last_dir = dir;
                 __sync_fetch_and_add(&stats_partial_sieve_auto_adjusts, 1);
                 if (use_extra_verbose)
-                    log_file_only("partial sieve auto: limit %llu -> %llu (survivors=%.3f%%, windows=%u)\n",
+                    log_file_only("partial sieve auto: limit %llu -> %llu (surv=%.3f%% dir=%+d windows=%u)\n",
                                   (unsigned long long)cur,
                                   (unsigned long long)next,
                                   100.0 * surv_ratio,
+                                  dir,
                                   (unsigned)tls_partial_windows);
             }
         }
@@ -6251,6 +6311,48 @@ static void *worker_fn(void *arg) {
             size_t orig_cnt = cnt;
             size_t pf = 0;
             size_t worker_tested = 0;
+            int skip_dense_window = 0;
+
+            if (use_adaptive_presieve && g_crt_mode == CRT_MODE_NONE &&
+                !no_primality && orig_cnt >= adaptive_presieve_min_survivors) {
+                tls_adapt_presieve_windows++;
+                __sync_fetch_and_add(&stats_adaptive_presieve_windows, 1);
+
+                if (tls_adapt_presieve_cooldown > 0)
+                    tls_adapt_presieve_cooldown--;
+
+                double ema_prev = tls_adapt_presieve_ema;
+                if (ema_prev <= 0.0)
+                    ema_prev = (double)orig_cnt;
+
+                if (tls_adapt_presieve_windows > ADAPTIVE_PRESIEVE_WARMUP_WIN &&
+                    tls_adapt_presieve_cooldown == 0) {
+                    double dense_cut = ema_prev * adaptive_presieve_dense_ratio;
+                    double needed_gap = scan_target * logbase;
+                    double dynamic_floor = needed_gap * adaptive_presieve_floor_mult;
+                    if (dynamic_floor < (double)adaptive_presieve_min_survivors)
+                        dynamic_floor = (double)adaptive_presieve_min_survivors;
+                    if ((double)orig_cnt > dense_cut && (double)orig_cnt >= dynamic_floor) {
+                        skip_dense_window = 1;
+                        tls_adapt_presieve_cooldown = ADAPTIVE_PRESIEVE_COOLDOWN_WIN;
+                        __sync_fetch_and_add(&stats_adaptive_presieve_skipped, 1);
+                        if (use_extra_verbose) {
+                            log_file_only("adaptive presieve: skip dense window survivors=%llu ema=%.1f cut=%.1f floor=%.1f windows=%u\n",
+                                          (unsigned long long)orig_cnt,
+                                          ema_prev,
+                                          dense_cut,
+                                          dynamic_floor,
+                                          (unsigned)tls_adapt_presieve_windows);
+                        }
+                    }
+                }
+
+                if (tls_adapt_presieve_ema <= 0.0)
+                    tls_adapt_presieve_ema = (double)orig_cnt;
+                else
+                    tls_adapt_presieve_ema = tls_adapt_presieve_ema * 0.875 +
+                                             (double)orig_cnt * 0.125;
+            }
 
             /* Decide up-front whether to use two-phase smart scanning.
                Pre-allocate phase-1 buffers BEFORE unlocking the mutex so
@@ -6258,6 +6360,8 @@ static void *worker_fn(void *arg) {
             int smart_K = cli_sample_stride;
             int use_smart = (smart_K > 1 && !no_primality
                              && cnt > (size_t)(smart_K * 4));
+            if (skip_dense_window)
+                use_smart = 0;
 
             size_t needed_gap = 0;
 #ifdef WITH_GPU_FERMAT
@@ -6310,7 +6414,7 @@ static void *worker_fn(void *arg) {
             } else
 #endif
             {
-            if (use_smart) {
+            if (use_smart || skip_dense_window) {
                 /* Backward-scan (CPU) / GPU smart-scan: serial algorithm.
                    The backward scan is inherently sequential (each jump
                    depends on the previous prime found).  Helper sieves
@@ -6334,6 +6438,12 @@ static void *worker_fn(void *arg) {
                                    && helper_will_assist) ? 1 : 0;
             }
             pthread_mutex_unlock(&psc.mu);       /* exactly once per window */
+            }
+
+            if (skip_dense_window) {
+                /* Carry is unknown across a skipped dense window. */
+                carry_last_prime = 0;
+                continue;
             }
 
             /* ============================================================= */
@@ -6869,6 +6979,12 @@ int main(int argc, char **argv) {
         printf("      --partial-sieve-auto  adaptive non-CRT sieve-prime limiting (opt-in)\n");
         printf("      --partial-sieve       alias for --partial-sieve-auto\n");
         printf("      --adaptive-presieve   skip dense non-CRT windows after presieve\n");
+         printf("      --adaptive-presieve-ratio R      dense threshold ratio vs EMA (default: %.2f)\n",
+             ADAPTIVE_PRESIEVE_DENSE_RATIO_DEFAULT);
+         printf("      --adaptive-presieve-floor-mult X floor multiplier on needed_gap (default: %.1f)\n",
+             ADAPTIVE_PRESIEVE_FLOOR_MULT_DEFAULT);
+         printf("      --adaptive-presieve-min-survivors N  absolute survivors floor (default: %llu)\n",
+             (unsigned long long)ADAPTIVE_PRESIEVE_MIN_SURVIVORS_DEFAULT);
         printf("      --wheel-sieve N      use wheel presieve backend (0 disables; 30, 210, 2310, 30030, 510510, or 9699690)\n");
         printf("  -e, --extra-verbose  write live merit events + partial-sieve-auto details to log file\n");
         printf("      --stats-verbose  include detailed CRT phase telemetry in STATS output\n");
@@ -7001,6 +7117,26 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--cpu-fermat")) use_cpu_fermat = 1;
         else if (!strcmp(argv[i],"--no-cpu-fermat")) use_cpu_fermat = 0;
         else if (!strcmp(argv[i],"--partial-sieve-auto") || !strcmp(argv[i],"--partial-sieve")) use_partial_sieve_auto = 1;
+        else if (!strcmp(argv[i],"--adaptive-presieve")) use_adaptive_presieve = 1;
+        else if (!strcmp(argv[i],"--adaptive-presieve-ratio") && i+1<argc) {
+            adaptive_presieve_dense_ratio = atof(argv[++i]);
+            if (adaptive_presieve_dense_ratio < 1.0)
+                adaptive_presieve_dense_ratio = 1.0;
+            if (adaptive_presieve_dense_ratio > 2.5)
+                adaptive_presieve_dense_ratio = 2.5;
+        }
+        else if (!strcmp(argv[i],"--adaptive-presieve-floor-mult") && i+1<argc) {
+            adaptive_presieve_floor_mult = atof(argv[++i]);
+            if (adaptive_presieve_floor_mult < 0.0)
+                adaptive_presieve_floor_mult = 0.0;
+            if (adaptive_presieve_floor_mult > 16.0)
+                adaptive_presieve_floor_mult = 16.0;
+        }
+        else if (!strcmp(argv[i],"--adaptive-presieve-min-survivors") && i+1<argc) {
+            adaptive_presieve_min_survivors = strtoull(argv[++i], NULL, 10);
+            if (adaptive_presieve_min_survivors < 1ULL)
+                adaptive_presieve_min_survivors = 1ULL;
+        }
         else if (!strcmp(argv[i],"--wheel-sieve") && i+1<argc) {
             cli_wheel_sieve = (unsigned int)strtoul(argv[++i], NULL, 10);
             use_wheel_sieve = 1;
@@ -7890,6 +8026,13 @@ int main(int argc, char **argv) {
                 (unsigned)PARTIAL_SIEVE_ADAPT_EVERY,
                 (unsigned long long)PARTIAL_SIEVE_MIN_LIMIT,
                 (unsigned)PARTIAL_SIEVE_COOLDOWN_WIN);
+    if (use_adaptive_presieve)
+        log_msg("adaptive presieve: enabled (--adaptive-presieve), dense ratio %.2fx, floor %.1fx(needed_gap=scan_target*logbase), min survivors %llu, warmup %u windows, cooldown %u windows\n",
+            adaptive_presieve_dense_ratio,
+            adaptive_presieve_floor_mult,
+            (unsigned long long)adaptive_presieve_min_survivors,
+                (unsigned)ADAPTIVE_PRESIEVE_WARMUP_WIN,
+                (unsigned)ADAPTIVE_PRESIEVE_COOLDOWN_WIN);
     if (use_extra_verbose)
         log_file_only("extra verbose enabled (-e/--extra-verbose): live merit events + partial-sieve-auto details\n");
     if (use_stats_verbose)
