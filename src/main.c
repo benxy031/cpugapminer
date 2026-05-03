@@ -2634,25 +2634,70 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
             /* CRT solver mode (L=1): linear scan with merged residue step.
                Each prime marks at most 1 bit per window and advances its
                residue by pmod in one pass — no separate step call needed.  */
-            for (size_t fi = 0; fi < g_crt_filter_count; fi++) {
-                uint32_t p = g_crt_filter_primes[fi];
-                uint32_t r = tls_crt_filt_rmod[fi];
-                /* hit condition: even r in [p-2*seg_size, p-2].
-                   pos = (p - r - 1) / 2 ∈ [0, seg_size).                */
-                if ((r & 1) == 0 && (uint64_t)r + 2ULL * seg_size >= (uint64_t)p) {
-                    uint64_t pos = ((uint64_t)p - r - 1) >> 1;
+            const uint32_t *fp = g_crt_filter_primes;
+            const uint32_t *fpm = g_crt_filter_prim_mod;
+            uint32_t *fr = tls_crt_filt_rmod;
+            const size_t fn = g_crt_filter_count;
+            const uint64_t seg2 = 2ULL * seg_size;
+            size_t fi = 0;
+
+            /* Unroll by 4: this hot loop runs for every filter prime on
+               every window in both CRT monolithic and producer-consumer. */
+            for (; fi + 3 < fn; fi += 4) {
+                uint32_t p0 = fp[fi + 0], r0 = fr[fi + 0];
+                uint32_t p1 = fp[fi + 1], r1 = fr[fi + 1];
+                uint32_t p2 = fp[fi + 2], r2 = fr[fi + 2];
+                uint32_t p3 = fp[fi + 3], r3 = fr[fi + 3];
+
+                if ((r0 & 1u) == 0u && (uint64_t)r0 + seg2 >= (uint64_t)p0) {
+                    uint64_t pos = ((uint64_t)p0 - r0 - 1u) >> 1;
                     bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
                 }
-                r += g_crt_filter_prim_mod[fi];
+                if ((r1 & 1u) == 0u && (uint64_t)r1 + seg2 >= (uint64_t)p1) {
+                    uint64_t pos = ((uint64_t)p1 - r1 - 1u) >> 1;
+                    bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+                }
+                if ((r2 & 1u) == 0u && (uint64_t)r2 + seg2 >= (uint64_t)p2) {
+                    uint64_t pos = ((uint64_t)p2 - r2 - 1u) >> 1;
+                    bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+                }
+                if ((r3 & 1u) == 0u && (uint64_t)r3 + seg2 >= (uint64_t)p3) {
+                    uint64_t pos = ((uint64_t)p3 - r3 - 1u) >> 1;
+                    bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+                }
+
+                r0 += fpm[fi + 0]; if (r0 >= p0) r0 -= p0;
+                r1 += fpm[fi + 1]; if (r1 >= p1) r1 -= p1;
+                r2 += fpm[fi + 2]; if (r2 >= p2) r2 -= p2;
+                r3 += fpm[fi + 3]; if (r3 >= p3) r3 -= p3;
+                fr[fi + 0] = r0;
+                fr[fi + 1] = r1;
+                fr[fi + 2] = r2;
+                fr[fi + 3] = r3;
+            }
+
+            for (; fi < fn; fi++) {
+                uint32_t p = fp[fi];
+                uint32_t r = fr[fi];
+                /* hit condition: even r in [p-2*seg_size, p-2].
+                   pos = (p - r - 1) / 2 ∈ [0, seg_size). */
+                if ((r & 1u) == 0u && (uint64_t)r + seg2 >= (uint64_t)p) {
+                    uint64_t pos = ((uint64_t)p - r - 1u) >> 1;
+                    bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+                }
+                r += fpm[fi];
                 if (r >= p) r -= p;
-                tls_crt_filt_rmod[fi] = r;
+                fr[fi] = r;
             }
         } else {
             /* Non-CRT-solver mode (L != 1): residues are advanced by
                crt_filter_step_residues() between windows.                  */
-            for (size_t fi = 0; fi < g_crt_filter_count; fi++) {
-                uint32_t p    = g_crt_filter_primes[fi];
-                uint32_t r    = tls_crt_filt_rmod[fi];
+            const uint32_t *fp = g_crt_filter_primes;
+            const uint32_t *fr = tls_crt_filt_rmod;
+            const size_t fn = g_crt_filter_count;
+            for (size_t fi = 0; fi < fn; fi++) {
+                uint32_t p    = fp[fi];
+                uint32_t r    = fr[fi];
                 uint32_t lrem = (uint32_t)((r + L % p) % p);
                 uint64_t start = L + (lrem == 0 ? 0 : p - lrem);
                 if ((start & 1) == 0) start += p;
@@ -4280,10 +4325,12 @@ static void crt_filter_init_residues(void) {
         tls_crt_filt_rmod = (uint32_t *)malloc(tls_crt_filt_cap * sizeof(uint32_t));
         if (!tls_crt_filt_rmod) { tls_crt_filt_cap = 0; return; }
     }
+
     for (size_t i = 0; i < n; i++)
         /* base mod p fits in uint32_t since p < 2M */
-            tls_crt_filt_rmod[i] = (uint32_t)mpz_fdiv_ui(tls_base_mpz,
-                                                      (unsigned long)g_crt_filter_primes[i]);
+        tls_crt_filt_rmod[i] = (uint32_t)mpz_fdiv_ui(
+            tls_base_mpz,
+            (unsigned long)g_crt_filter_primes[i]);
     tls_crt_filt_ready = 1;
 }
 
@@ -7505,14 +7552,14 @@ int main(int argc, char **argv) {
                         g_crt_gap_scan_adapt_cfg.grow_factor);
                 }
             #ifdef WITH_GPU_FERMAT
-                if (use_crt_accum_backpressure) {
+                if (use_crt_accum_backpressure && crt_fermat_threads > 0) {
                     log_msg("CRT GPU accum backpressure: enabled (soft=%lu hard=%lu slow_flush>=%.2fms slow_collect>=%.2fms)\n",
                         (unsigned long)g_crt_accum_bp_cfg.soft_cap_candidates,
                         (unsigned long)g_crt_accum_bp_cfg.hard_cap_candidates,
                         g_crt_accum_bp_cfg.slow_flush_ms,
                         g_crt_accum_bp_cfg.slow_collect_ms);
                 }
-                    if (use_crt_gpu_batch_adaptive) {
+                    if (use_crt_gpu_batch_adaptive && crt_fermat_threads > 0) {
                         log_msg("CRT GPU accum adaptive batch: enabled (min=%lu max=%lu pressure_fill>=%.1f%% grow_fill<=%.1f%% slow>=%.2fms/%.2fms fast<=%.2fms/%.2fms)\n",
                         (unsigned long)g_crt_gpu_batch_adapt_cfg.min_batch,
                         (unsigned long)g_crt_gpu_batch_adapt_cfg.max_batch,
@@ -7589,6 +7636,20 @@ int main(int argc, char **argv) {
         log_msg("CRT mode: monolithic (all %d threads sieve+fermat)\n",
                 num_threads);
         log_msg("  use --fermat-threads N to enable producer-consumer\n");
+        /* Backpressure and adaptive batch tuning rely on flush/collect EMA
+           from dedicated fermat threads.  In monolithic mode each thread's
+           EMA is contaminated by sieve time, causing premature flushes and
+           shrinking batches.  Disable both features automatically. */
+#ifdef WITH_GPU_FERMAT
+        if (use_crt_accum_backpressure) {
+            use_crt_accum_backpressure = 0;
+            log_msg("CRT GPU accum backpressure: disabled (monolithic mode; use --crt-accum-backpressure to override)\n");
+        }
+        if (use_crt_gpu_batch_adaptive) {
+            use_crt_gpu_batch_adaptive = 0;
+            log_msg("CRT GPU accum adaptive batch: disabled (monolithic mode; use --crt-gpu-batch-adaptive to override)\n");
+        }
+#endif
     }
     if (crt_fermat_threads > 0 && crt_fermat_threads >= num_threads) {
         crt_fermat_threads = num_threads - 1;

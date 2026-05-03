@@ -6,6 +6,7 @@
 #include "stats.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <time.h>
 
@@ -15,10 +16,31 @@ size_t crt_heap_cap = CRT_HEAP_CAP;
 static pthread_mutex_t crt_heap_mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t crt_heap_cv = PTHREAD_COND_INITIALIZER;
 
+/* Cached worst (minimum) cramer_score among heap leaves.
+ * Updated under crt_heap_mtx; read lock-free via atomic load.
+ * Stays -1.0 when the heap has room or is empty. */
+static _Atomic double g_crt_heap_worst_score_cache;
+
 volatile uint64_t crt_heap_gen = 0;
 volatile int crt_fermat_threads = 0;
 int crt_fermat_explicit = 0;
 _Atomic int crt_heap_shutdown = 0;
+
+/* Recompute and cache the worst leaf score.  Must be called with
+ * crt_heap_mtx held.  Sets the cache to -1.0 when the heap has room
+ * or is empty so advisory callers know they should attempt a push. */
+static void crt_heap_refresh_worst_cache_locked(void) {
+    if (!crt_heap || crt_heap_size < crt_heap_cap || crt_heap_size == 0) {
+        atomic_store(&g_crt_heap_worst_score_cache, -1.0);
+        return;
+    }
+    size_t first_leaf = crt_heap_size / 2;
+    double min_sc = crt_heap[first_leaf]->cramer_score;
+    for (size_t i = first_leaf + 1; i < crt_heap_size; i++)
+        if (crt_heap[i]->cramer_score < min_sc)
+            min_sc = crt_heap[i]->cramer_score;
+    atomic_store(&g_crt_heap_worst_score_cache, min_sc);
+}
 
 void crt_heap_init(size_t cap) {
     pthread_mutex_lock(&crt_heap_mtx);
@@ -33,6 +55,7 @@ void crt_heap_init(size_t cap) {
     crt_heap_cap = cap;
     crt_heap = (struct crt_work_item **)calloc(crt_heap_cap,
                                                sizeof(struct crt_work_item *));
+    atomic_store(&g_crt_heap_worst_score_cache, -1.0);
     pthread_mutex_unlock(&crt_heap_mtx);
 }
 
@@ -95,6 +118,7 @@ int crt_heap_push(struct crt_work_item *w) {
         crt_heap_size++;
         if (crt_heap_size > stats_crt_heap_hwm)
             stats_crt_heap_hwm = crt_heap_size;
+        crt_heap_refresh_worst_cache_locked();
         __sync_fetch_and_add(&stats_crt_heap_push_ok, 1);
         pthread_cond_signal(&crt_heap_cv);
         pthread_mutex_unlock(&crt_heap_mtx);
@@ -113,6 +137,7 @@ int crt_heap_push(struct crt_work_item *w) {
         crt_heap[min_idx] = w;
         crt_heap_sift_up(min_idx);
         crt_heap_sift_down(min_idx, crt_heap_size);
+        crt_heap_refresh_worst_cache_locked();
         __sync_fetch_and_add(&stats_crt_heap_push_replace, 1);
         pthread_cond_signal(&crt_heap_cv);
         pthread_mutex_unlock(&crt_heap_mtx);
@@ -150,6 +175,7 @@ struct crt_work_item *crt_heap_pop(void) {
         crt_heap[0] = crt_heap[crt_heap_size];
         crt_heap_sift_down(0, crt_heap_size);
     }
+    crt_heap_refresh_worst_cache_locked();
     __sync_fetch_and_add(&stats_crt_heap_pop_ok, 1);
     pthread_mutex_unlock(&crt_heap_mtx);
     return best;
@@ -160,6 +186,7 @@ void crt_heap_flush(void) {
     for (size_t i = 0; i < crt_heap_size; i++)
         crt_work_free(crt_heap[i]);
     crt_heap_size = 0;
+    atomic_store(&g_crt_heap_worst_score_cache, -1.0);
     pthread_cond_broadcast(&crt_heap_cv);
     pthread_mutex_unlock(&crt_heap_mtx);
 }
@@ -204,20 +231,9 @@ size_t crt_heap_worst_surv_advisory(void) {
     return max_sc;
 }
 
-/* Advisory: when the heap is full, return the cramer_score of the worst
-   (lowest-score) leaf — the eviction threshold for new pushes.
-   Returns -1.0 if the heap has room or is empty (caller should try push). */
+/* Advisory: return the cached worst (lowest) cramer_score among heap leaves.
+   Lock-free O(1) read.  Returns -1.0 when the heap has room or is empty,
+   indicating the caller should attempt a push without pre-filtering. */
 double crt_heap_worst_score_advisory(void) {
-    pthread_mutex_lock(&crt_heap_mtx);
-    if (!crt_heap || crt_heap_size < crt_heap_cap || crt_heap_size == 0) {
-        pthread_mutex_unlock(&crt_heap_mtx);
-        return -1.0;
-    }
-    size_t first_leaf = crt_heap_size / 2;
-    double min_sc = crt_heap[first_leaf]->cramer_score;
-    for (size_t i = first_leaf + 1; i < crt_heap_size; i++)
-        if (crt_heap[i]->cramer_score < min_sc)
-            min_sc = crt_heap[i]->cramer_score;
-    pthread_mutex_unlock(&crt_heap_mtx);
-    return min_sc;
+    return atomic_load(&g_crt_heap_worst_score_cache);
 }
