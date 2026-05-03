@@ -24,6 +24,7 @@ fi
 
 START_TS=$(date +%s)
 declare -a PIDS
+declare -a STARTS
 declare -a SPANS
 declare -a DONE
 DONE_POS=0
@@ -33,6 +34,7 @@ for i in $(seq 0 $((THREADS - 1))); do
     S=$(python3 -c "print($START + $i * $SLICE)")
     E=$(python3 -c "print($START + ($i + 1) * $SLICE)")
     SPAN=$((E - S))
+    STARTS[$i]=$S
     SPANS[$i]=$SPAN
     TOTAL_POS=$((TOTAL_POS + SPAN))
     DONE[$i]=0
@@ -42,7 +44,7 @@ for i in $(seq 0 $((THREADS - 1))); do
         --mingap 1600 --skip 700 --threshold 70 \
         --dual-pass \
         --checkpoint "$OUTDIR/ckpt_${i}.txt" \
-        --progress 300 \
+        --progress 30 \
         > "$OUTDIR/gaps_${i}.txt" 2> "$OUTDIR/prog_${i}.log" &
     PIDS[$i]=$!
     echo "worker $i: $S .. $E  (pid $!)"
@@ -51,16 +53,37 @@ done
 while :; do
     ALIVE=0
     FINISHED=0
+    EST_DONE_POS=0
     for i in $(seq 0 $((THREADS - 1))); do
         pid=${PIDS[$i]}
+        worker_start=${STARTS[$i]}
+        worker_span=${SPANS[$i]}
+        ckpt_file="$OUTDIR/ckpt_${i}.txt"
+
         if kill -0 "$pid" 2>/dev/null; then
             ALIVE=$((ALIVE + 1))
+
+            # Estimate in-progress work from checkpoint current_p when available.
+            worker_done=0
+            if [ -f "$ckpt_file" ]; then
+                current_p=$(awk '/^current_p[[:space:]]+/ {print $2; exit}' "$ckpt_file")
+                if [[ "$current_p" =~ ^[0-9]+$ ]]; then
+                    worker_done=$((current_p - worker_start))
+                    if [ "$worker_done" -lt 0 ]; then
+                        worker_done=0
+                    elif [ "$worker_done" -gt "$worker_span" ]; then
+                        worker_done=$worker_span
+                    fi
+                fi
+            fi
+            EST_DONE_POS=$((EST_DONE_POS + worker_done))
         else
             if [ "${DONE[$i]}" -eq 0 ]; then
                 DONE[$i]=1
                 DONE_POS=$((DONE_POS + SPANS[$i]))
             fi
             FINISHED=$((FINISHED + 1))
+            EST_DONE_POS=$((EST_DONE_POS + worker_span))
         fi
     done
 
@@ -70,8 +93,9 @@ while :; do
         ELAPSED=1
     fi
 
-    RATE=$(awk -v d="$DONE_POS" -v t="$ELAPSED" 'BEGIN { printf "%.2f", d / t }')
-    log_speed "[speed] finished=${FINISHED}/${THREADS} scanned=${DONE_POS}/${TOTAL_POS} elapsed=${ELAPSED}s avg=${RATE} pos/s"
+    RATE_DONE=$(awk -v d="$DONE_POS" -v t="$ELAPSED" 'BEGIN { printf "%.2f", d / t }')
+    RATE_EST=$(awk -v d="$EST_DONE_POS" -v t="$ELAPSED" 'BEGIN { printf "%.2f", d / t }')
+    log_speed "[speed] finished=${FINISHED}/${THREADS} done=${DONE_POS}/${TOTAL_POS} done_avg=${RATE_DONE} pos/s est=${EST_DONE_POS}/${TOTAL_POS} est_avg=${RATE_EST} pos/s elapsed=${ELAPSED}s"
 
     if [ "$ALIVE" -eq 0 ]; then
         break
