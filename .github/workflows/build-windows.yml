@@ -4,9 +4,9 @@
 #   1. gap_miner-win64-cpu   — CPU-only (MinGW GCC, no CUDA)
 #   2. gap_miner-win64-cuda  — CUDA GPU + CPU (nvcc DLL + MinGW)
 #
-# CUDA strategy: compile gpu_fermat.dll with nvcc/MSVC toolchain,
-# create a MinGW-compatible import library (libgpu_fermat.a) via dlltool,
-# then build gap_miner.exe with MinGW linking against that import lib.
+# CUDA strategy: compile gpu_fermat.dll and gpu_sieve.dll with nvcc/MSVC,
+# create MinGW-compatible import libraries via dlltool, then build
+# gap_miner.exe with MinGW linking against those import libs.
 # This avoids all MSVC/MinGW COFF incompatibility issues.
 #
 # Triggered on manual dispatch or release publish.
@@ -128,14 +128,16 @@ jobs:
             make
             bc
 
-      - name: Create MinGW import library for gpu_fermat.dll
+      - name: Create MinGW import libraries for CUDA DLLs
         shell: msys2 {0}
-        run: dlltool --dllname gpu_fermat.dll -d src/gpu_fermat.def -l src/libgpu_fermat.a
+        run: |
+          dlltool --dllname gpu_fermat.dll -d src/gpu_fermat.def -l src/libgpu_fermat.a
+          dlltool --dllname gpu_sieve.dll  -d src/gpu_sieve.def  -l src/libgpu_sieve.a
 
       - name: Setup MSVC (provides cl.exe for nvcc host compiler)
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Build CUDA kernel DLL (nvcc + MSVC)
+      - name: Build CUDA kernel DLLs (nvcc + MSVC)
         shell: pwsh
         run: |
           $nvcc = "$env:CUDA_PATH\bin\nvcc.exe"
@@ -153,13 +155,26 @@ jobs:
             src/gpu_fermat.cu
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+          & $nvcc -O3 `
+            -gencode arch=compute_61,code=sm_61 `
+            -gencode arch=compute_75,code=sm_75 `
+            -gencode arch=compute_86,code=sm_86 `
+            -gencode arch=compute_61,code=compute_61 `
+            --shared `
+            -Xlinker "/DEF:src\gpu_sieve.def" `
+            -o src/gpu_sieve.dll `
+            src/gpu_sieve.cu
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       - name: Build gap_miner (WITH_RPC + CUDA DLL mode)
         shell: msys2 {0}
         run: make -f Makefile.mingw clean && make -f Makefile.mingw WITH_RPC=1 WITH_CUDA=1 CUDA_DLL=1 GPU_BITS=1024 ARCH_FLAGS='-march=native'
 
-      - name: Stage CUDA DLL for smoke test
+      - name: Stage CUDA DLLs for smoke test
         shell: msys2 {0}
-        run: cp src/gpu_fermat.dll bin/
+        run: |
+          cp src/gpu_fermat.dll bin/
+          cp src/gpu_sieve.dll bin/
 
       - name: Wheel sieve smoke test
         shell: msys2 {0}
@@ -176,6 +191,7 @@ jobs:
           cp bin/gap_miner.exe dist-cuda/
           cp bin/gen_crt.exe   dist-cuda/
           cp src/gpu_fermat.dll dist-cuda/
+          cp src/gpu_sieve.dll  dist-cuda/
           cp -r crt dist-cuda/ 2>/dev/null || true
 
           # Copy cudart DLL from CUDA toolkit installation

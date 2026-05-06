@@ -1,0 +1,9 @@
+; gpu_sieve.def — Export definitions for gpu_sieve.dll
+;
+; Used by both MSVC link.exe (to mark DLL exports) and MinGW dlltool
+; (to create an import library). All exported symbols are extern "C".
+LIBRARY gpu_sieve
+EXPORTS
+    gpu_sieve_ctx_alloc
+    gpu_sieve_ctx_free
+    gpu_sieve_mark_batch

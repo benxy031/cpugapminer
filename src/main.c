@@ -69,6 +69,7 @@ static int             g_gpu_active_limbs_global = 0;  /* set after GPU init  */
 #include "uint256_utils.h"
 #include "block_utils.h"
 #include "primality_utils.h"
+#include "presieve_utils.h"
 
 // logging helper (used in both RPC and non-RPC builds)
 static FILE *log_fp = NULL;
@@ -2018,6 +2019,46 @@ static void print_stats(void) {
                 avg_batch);
     }
 #endif
+#ifdef WITH_CUDA
+#ifndef WITH_CRT_GPU_CONSUMER
+    if (stats_gpu_sieve_calls > 0) {
+        double avg_primes = (double)stats_gpu_sieve_primes / (double)stats_gpu_sieve_calls;
+        double calls = (double)stats_gpu_sieve_calls;
+        double avg_base_up = (double)stats_gpu_sieve_us_base_upload / calls;
+        double avg_compute_k0 = (double)stats_gpu_sieve_us_compute_k0 / calls;
+        double avg_mark = (double)stats_gpu_sieve_us_mark / calls;
+        double avg_compact = 0.0;
+        double avg_pack = (double)stats_gpu_sieve_us_pack / calls;
+        double avg_bits_dl = (double)stats_gpu_sieve_us_bits_dl / calls;
+        double avg_merge = (double)stats_gpu_sieve_us_merge / calls;
+        log_msg("  gpu_sieve_calls=%llu  gpu_sieve_primes/call=%.0f  gpu_sieve_fallback=%llu  surv_calls=%llu",
+            (unsigned long long)stats_gpu_sieve_calls,
+            avg_primes,
+            (unsigned long long)stats_gpu_sieve_fallback,
+            (unsigned long long)stats_gpu_sieve_surv_calls);
+        {
+            char timing_line[256];
+            int n = snprintf(timing_line, sizeof(timing_line), "  gpu_sieve_us/call:");
+            if (avg_base_up > 0.0)
+                n += snprintf(timing_line + n, sizeof(timing_line) - (size_t)n, " base_up=%.1f", avg_base_up);
+            if (avg_compute_k0 > 0.0)
+                n += snprintf(timing_line + n, sizeof(timing_line) - (size_t)n, " compute_k0=%.1f", avg_compute_k0);
+            if (avg_mark > 0.0)
+                n += snprintf(timing_line + n, sizeof(timing_line) - (size_t)n, " mark=%.1f", avg_mark);
+            if (avg_compact > 0.0)
+                n += snprintf(timing_line + n, sizeof(timing_line) - (size_t)n, " compact=%.1f", avg_compact);
+            if (avg_pack > 0.0)
+                n += snprintf(timing_line + n, sizeof(timing_line) - (size_t)n, " pack=%.1f", avg_pack);
+            if (avg_bits_dl > 0.0)
+                n += snprintf(timing_line + n, sizeof(timing_line) - (size_t)n, " bits_dl=%.1f", avg_bits_dl);
+            if (avg_merge > 0.0)
+                n += snprintf(timing_line + n, sizeof(timing_line) - (size_t)n, " merge=%.1f", avg_merge);
+            if (n > (int)strlen("  gpu_sieve_us/call:"))
+                log_msg("%s", timing_line);
+        }
+    }
+#endif
+#endif
 
 #ifdef WITH_RPC
     if (g_stratum) {
@@ -2100,6 +2141,9 @@ static __thread size_t    tls_cap  = 0;
 /* Reusable composite-bits bitmap per thread – avoids calloc/free on every sieve call */
 static __thread uint8_t  *tls_bits     = NULL;
 static __thread size_t    tls_bits_cap = 0;
+/* Flat byte-per-candidate scratch buffer for GPU sieve output (one byte per candidate) */
+static __thread uint8_t  *tls_gpu_seg     = NULL;
+static __thread size_t    tls_gpu_seg_cap = 0;
 /* Reusable sieve start-position array per thread */
 static __thread uint64_t *tls_sp_start     = NULL;
 static __thread size_t    tls_sp_start_cap = 0;
@@ -2125,6 +2169,10 @@ static __thread size_t    tls_base_mod_p_cap = 0;
 /* Flag: set to 1 once set_base_bn() has populated tls_base_mod_p for the
    current pass.  Reset to 0 at start of each new pass (set_base_bn call). */
 static __thread int       tls_base_mod_p_ready = 0;
+/* Version counter for GPU sieve's cached d_base_mod_p.  Incremented each time
+    tls_base_mod_p is rebuilt (new block header or rebase).  The GPU ctx
+    re-uploads base_mod_p only when this value changes. */
+static __thread uint64_t  tls_gpu_base_mod_p_gen = 0;
 
 /* Incremental L % p cache: eliminates per-prime 64-bit division in sieve_range.
    tls_L_mod_p[i]    = (current window's L) % small_primes_cache[i]
@@ -2154,6 +2202,7 @@ static __thread size_t    tls_gpu_res_cap = 0;
    never blocks waiting for another thread's slot.  This restores full
    sieve throughput when running multiple threads with a GPU. */
 static __thread gpu_fermat_ctx *tls_gpu_ctx = NULL;
+static __thread int             tls_gpu_ctx_owned = 0;
 #endif
 
 static void free_sieve_buffers(void) {
@@ -2192,8 +2241,10 @@ static void free_sieve_buffers(void) {
     free(tls_gpu_res); tls_gpu_res = NULL;
     tls_gpu_res_cap = 0;
     if (tls_gpu_ctx) {
-        gpu_fermat_destroy(tls_gpu_ctx);
+        if (tls_gpu_ctx_owned)
+            gpu_fermat_destroy(tls_gpu_ctx);
         tls_gpu_ctx = NULL;
+        tls_gpu_ctx_owned = 0;
     }
 #endif
 }
@@ -2222,6 +2273,12 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
         tls_bits_cap = bit_size + 64;
     }
     uint8_t *bits = tls_bits;
+
+    /* Compact GPU survivor mode: when gpu_sieve_mark_segment_batch returns 1,
+     * Phase-2 survivors are fetched via gpu_sieve_last_survivors() and written
+     * directly into tls_pr[] after filtering against the Phase-1 bits[].
+     * The bitmap unpack loop at the end is skipped in this case. */
+    int gpu_sieve_compact_mode = 0;
 
     /* For big primes (256+shift bits), the sieve trial-division limit is
        bounded by the user-configured --sieve-primes (or default).         */
@@ -2595,32 +2652,111 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
             /* sp_start is TLS-owned; no free needed */
         }
 
-        /* --- Phase 2: large primes, single pass (no blocking needed) --- */
-        for (size_t idx = split_idx; idx < small_primes_count; ++idx) {
-            uint64_t p = small_primes_cache[idx];
-            if (p > use_limit) break;
-            uint64_t base_mod_p;
-            if (have_cache)
-                base_mod_p = tls_base_mod_p[idx];
-            else
-                base_mod_p = h256 ? uint256_mod_small(h256, shift, p) : (L % p);
-            uint64_t lrem;
-            if (L_is_one) {
-                lrem = base_mod_p + 1;
-                if (lrem >= p) lrem -= p;
-            } else if (have_l_cache) {
-                lrem = base_mod_p + tls_L_mod_p[idx];
-                if (lrem >= p) lrem -= p;
+        /* --- Phase 2: large primes, single pass ---
+           When GPU sieve is active, hand off primes [split_idx, small_primes_count)
+           to the GPU kernel via a flat byte-per-candidate scratch buffer, then
+           merge the results back into the bit-packed bitmap.
+           Falls back to the CPU loop if GPU sieve is unavailable or disabled. */
+#ifdef WITH_CUDA
+#ifndef WITH_CRT_GPU_CONSUMER
+        {
+            extern int g_gpu_sieve_enable;
+            extern int gpu_sieve_mark_segment_batch(
+                uint8_t *h_bits, size_t bit_len, size_t segment_len,
+                const uint64_t *h_primes, const uint64_t *h_base_mod_p,
+                uint64_t base_mod_p_version, uint64_t wL, uint64_t wR, int n_primes);
+            extern const uint32_t *gpu_sieve_last_survivors(uint32_t *count_out);
+            /* Count Phase-2 primes within use_limit */
+            size_t ph2_end = split_idx;
+            while (ph2_end < small_primes_count && small_primes_cache[ph2_end] <= use_limit)
+                ph2_end++;
+            int n_ph2 = (int)(ph2_end - split_idx);
+
+            if (g_gpu_sieve_enable && n_ph2 > 0 && have_cache) {
+                /* GPU sieve requires base_mod_p to be cached for this block.
+                 * k0 is now computed on-device; we only pass the base_mod_p
+                 * slice and the window bounds as scalars. */
+                if (tls_gpu_seg_cap < bit_size) {
+                    free(tls_gpu_seg);
+                    tls_gpu_seg = (uint8_t *)calloc(bit_size + 64, 1);
+                    tls_gpu_seg_cap = tls_gpu_seg ? bit_size + 64 : 0;
+                }
+                int gpu_ok = 0;
+                if (tls_gpu_seg) {
+                    memset(tls_gpu_seg, 0, bit_size);
+                    const uint64_t *ph2_primes    = small_primes_cache + split_idx;
+                    const uint64_t *ph2_base_mod_p = tls_base_mod_p + split_idx;
+                    int ret = gpu_sieve_mark_segment_batch(
+                        tls_gpu_seg, bit_size, seg_size,
+                        ph2_primes, ph2_base_mod_p,
+                        tls_gpu_base_mod_p_gen, L, R, n_ph2);
+                    if (ret == 0) {
+                        /* Bitmap mode: OR GPU composites into Phase-1 bits[] */
+                        struct timespec _t0, _t1;
+                        clock_gettime(CLOCK_MONOTONIC_RAW, &_t0);
+                        for (size_t byte = 0; byte < bit_size; byte++)
+                            bits[byte] |= tls_gpu_seg[byte];
+                        clock_gettime(CLOCK_MONOTONIC_RAW, &_t1);
+                        {
+                            int64_t _merge_us = (int64_t)(_t1.tv_sec - _t0.tv_sec) * 1000000LL
+                                              + ((int64_t)_t1.tv_nsec - (int64_t)_t0.tv_nsec) / 1000LL;
+                            if (_merge_us > 0)
+                                __sync_fetch_and_add(&stats_gpu_sieve_us_merge, (uint64_t)_merge_us);
+                        }
+                        __sync_fetch_and_add(&stats_gpu_sieve_calls, 1);
+                        __sync_fetch_and_add(&stats_gpu_sieve_primes, (uint64_t)n_ph2);
+                        gpu_ok = 1;
+                    } else if (ret == 1) {
+                        /* Compact mode: Phase-2 survivors returned directly.
+                         * bits[] has Phase-1 composites only (no OR-merge needed).
+                         * We will intersect the compact list with bits[] at the
+                         * end of the function to produce tls_pr[] survivors. */
+                        __sync_fetch_and_add(&stats_gpu_sieve_calls, 1);
+                        __sync_fetch_and_add(&stats_gpu_sieve_primes, (uint64_t)n_ph2);
+                        gpu_sieve_compact_mode = 1;
+                        gpu_ok = 1;
+                    } else {
+                        __sync_fetch_and_add(&stats_gpu_sieve_fallback, 1);
+                    }
+                }
+                if (!gpu_ok) {
+                    /* CPU fallback: GPU unavailable or failed */
+                    for (size_t idx = split_idx; idx < ph2_end; ++idx) {
+                        uint64_t p = small_primes_cache[idx];
+                        uint64_t bmp = tls_base_mod_p[idx];
+                        uint64_t lrem;
+                        if (L_is_one) { lrem = bmp + 1; if (lrem >= p) lrem -= p; }
+                        else if (have_l_cache) { lrem = bmp + tls_L_mod_p[idx]; if (lrem >= p) lrem -= p; }
+                        else lrem = (bmp + L % p) % p;
+                        uint64_t start = L + (lrem == 0 ? 0 : p - lrem);
+                        if ((start & 1) == 0) start += p;
+                        for (uint64_t m = start; m < R; m += 2 * p) {
+                            uint64_t pos = (m - L) >> 1;
+                            bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+                        }
+                    }
+                }
             } else {
-                lrem = (base_mod_p + L % p) % p;
-            }
-            uint64_t start = L + (lrem == 0 ? 0 : p - lrem);
-            if ((start & 1) == 0) start += p;
-            for (uint64_t m = start; m < R; m += 2 * p) {
-                uint64_t pos = (m - L) >> 1;
-                bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+                /* GPU sieve disabled, no Phase-2 primes, or no cache: CPU loop */
+                for (size_t idx = split_idx; idx < ph2_end; ++idx) {
+                    uint64_t p = small_primes_cache[idx];
+                    uint64_t base_mod_p = have_cache ? tls_base_mod_p[idx]
+                        : (h256 ? uint256_mod_small(h256, shift, p) : (L % p));
+                    uint64_t lrem;
+                    if (L_is_one) { lrem = base_mod_p + 1; if (lrem >= p) lrem -= p; }
+                    else if (have_l_cache) { lrem = base_mod_p + tls_L_mod_p[idx]; if (lrem >= p) lrem -= p; }
+                    else lrem = (base_mod_p + L % p) % p;
+                    uint64_t start = L + (lrem == 0 ? 0 : p - lrem);
+                    if ((start & 1) == 0) start += p;
+                    for (uint64_t m = start; m < R; m += 2 * p) {
+                        uint64_t pos = (m - L) >> 1;
+                        bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+                    }
+                }
             }
         }
+#endif /* WITH_CRT_GPU_CONSUMER */
+#endif /* WITH_CUDA */
     }
 
     /* ── Phase 3: CRT post-sieve filter — direct bitmap marking ──
@@ -2811,6 +2947,44 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
         tls_cap = newcap;
     }
 
+    size_t out_cnt = 0;
+
+#ifdef WITH_CUDA
+#ifndef WITH_CRT_GPU_CONSUMER
+    if (gpu_sieve_compact_mode) {
+        /* ── Compact GPU survivor mode ──────────────────────────────────
+         * Phase-2 survivors come from the GPU compact kernel.  bits[] has
+         * only Phase-1 (and Phase-3 CRT filter) composites; Phase-2 was NOT
+         * OR'd in.  Final survivors = GPU_compact_list ∩ ¬bits[].
+         *
+         * Phase-3 CRT filter marks were applied to bits[] above, so this
+         * check catches all three phases at once. */
+        uint32_t surv_count = 0;
+        const uint32_t *survivors = gpu_sieve_last_survivors(&surv_count);
+        if (survivors && surv_count > 0) {
+            /* Grow tls_pr if the compact list could be larger than est_survivors */
+            if (tls_cap < (size_t)surv_count) {
+                tls_pr = realloc(tls_pr, (size_t)surv_count * sizeof(uint64_t));
+                if (!tls_pr) {
+                    *out_count = 0;
+                    return NULL;
+                }
+                tls_cap = (size_t)surv_count;
+            }
+            for (uint32_t i = 0; i < surv_count; i++) {
+                uint32_t pos = survivors[i];
+                if (pos < (uint32_t)seg_size &&
+                    !(bits[pos >> 3] & (uint8_t)(1u << (pos & 7)))) {
+                    tls_pr[out_cnt++] = L + (uint64_t)pos * 2;
+                }
+            }
+        }
+        *out_count = out_cnt;
+        return tls_pr;
+    }
+#endif /* !WITH_CRT_GPU_CONSUMER */
+#endif /* WITH_CUDA */
+
     /* ── Vectorized extraction using 64-bit word scan + CTZ ──
      *
      * Instead of checking one bit at a time, we process 64 bits (128 odd
@@ -2825,7 +2999,6 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
      * On modern x86-64 with BMI1, __builtin_ctzll compiles to a single
      * TZCNT instruction (1 cycle, no branch).  This is ~8× fewer
      * iterations than the old per-bit scan for typical sieve densities. */
-    size_t out_cnt = 0;
     size_t full_words = bit_size / 8;
     for (size_t wi = 0; wi < full_words; wi++) {
         uint64_t word;
@@ -4192,6 +4365,7 @@ static void set_base_bn(const uint8_t h256[32], int shift) {
                 tls_base_mod_p[i] = mpz_fdiv_ui(tls_base_mpz, (unsigned long)p);
             }
             tls_base_mod_p_ready = 1;
+            tls_gpu_base_mod_p_gen++; /* invalidate GPU d_base_mod_p cache */
         }
 
         /* Precompute sieve_size % p for incremental L tracking.
@@ -4576,9 +4750,18 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
         int dev_slot = __sync_fetch_and_add(&gpu_dev_rr, 1) % g_gpu_count;
         int dev_id   = g_gpu_device_ids[dev_slot];
         ctx = gpu_fermat_init(dev_id, (size_t)GPU_THREAD_BATCH);
-        if (!ctx) return 0;
-        if (g_gpu_active_limbs_global > 0)
-            gpu_fermat_set_limbs(ctx, g_gpu_active_limbs_global);
+        if (ctx) {
+            tls_gpu_ctx_owned = 1;
+            if (g_gpu_active_limbs_global > 0)
+                gpu_fermat_set_limbs(ctx, g_gpu_active_limbs_global);
+        } else {
+            /* VRAM is exhausted for per-thread direct-path contexts.
+               Fall back to the already-initialized shared device context so
+               mining continues without repeated OOM allocation attempts. */
+            ctx = g_gpu_ctx[dev_slot];
+            if (!ctx) return 0;
+            tls_gpu_ctx_owned = 0;
+        }
         tls_gpu_ctx = ctx;
     }
 
@@ -4930,6 +5113,32 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
                              size_t *out_qual_pairs) {
     size_t qual_pairs = 0;
     __sync_fetch_and_add(&stats_crt_windows, 1);
+
+    /* GPU batches should preserve ascending offsets, but guard anyway.
+       A rare ordering glitch can underflow (next - current) and produce
+       absurd 2^64-scale fake gaps/merits. */
+    if (prime_cnt >= 2) {
+        int non_monotonic = 0;
+        for (size_t i = 1; i < prime_cnt; i++) {
+            if (primes[i] <= primes[i - 1]) {
+                non_monotonic = 1;
+                break;
+            }
+        }
+        if (non_monotonic) {
+            qsort(primes, prime_cnt, sizeof(uint64_t), cmp_u64);
+            size_t uniq = 1;
+            for (size_t i = 1; i < prime_cnt; i++) {
+                if (primes[i] != primes[uniq - 1])
+                    primes[uniq++] = primes[i];
+            }
+            prime_cnt = uniq;
+            if (use_extra_verbose) {
+                log_file_only("[extra-merit] source=crt-gpu note=sorted-dedup survivors=%zu\n",
+                              prime_cnt);
+            }
+        }
+    }
 
     __sync_fetch_and_add(&stats_primes_found, (uint64_t)prime_cnt);
     if (prime_cnt < 2) {
@@ -5675,6 +5884,14 @@ static void rebase_for_gap_check(mpz_t new_base) {
         tls_base_mod_p_ready = 1;
     }
     /* Recompute trial-division residues */
+        if (tls_base_mod_p && small_primes_cache) {
+            for (size_t i = 0; i < small_primes_count; i++)
+                tls_base_mod_p[i] = mpz_fdiv_ui(tls_base_mpz,
+                                                 (unsigned long)small_primes_cache[i]);
+            tls_base_mod_p_ready = 1;
+            tls_gpu_base_mod_p_gen++; /* invalidate GPU d_base_mod_p cache */
+        }
+        /* Recompute trial-division residues */
     for (int i = 0; i < td_extra_count; i++)
         tls_td_residues[i] = (uint32_t)mpz_fdiv_ui(tls_base_mpz,
                                         (unsigned long)td_extra_primes[i]);
@@ -7286,6 +7503,18 @@ int main(int argc, char **argv) {
             g_gpu_batch_size = atoi(argv[++i]);
             if (g_gpu_batch_size < 64) g_gpu_batch_size = 64;
         }
+#ifdef WITH_CUDA
+#ifndef WITH_CRT_GPU_CONSUMER
+        else if (!strcmp(argv[i],"--gpu-sieve")) {
+            extern int g_gpu_sieve_enable;
+            g_gpu_sieve_enable = 1;
+        }
+        else if (!strcmp(argv[i],"--no-gpu-sieve")) {
+            extern int g_gpu_sieve_enable;
+            g_gpu_sieve_enable = 0;
+        }
+#endif
+#endif
         else if (!strcmp(argv[i],"--no-primality")) no_primality = 1;
         else if (!strcmp(argv[i],"--selftest")) selftest = 1;
         else if (!strcmp(argv[i],"--threads") && i+1<argc) num_threads = atoi(argv[++i]);
@@ -8044,6 +8273,49 @@ int main(int argc, char **argv) {
         if (filt_limit > cli_sieve_prime_limit)
             build_crt_filter_table(filt_limit);
     }
+
+    /* Initialize GPU sieve if enabled and WITH_CUDA (CRT monolithic or non-CRT mode) */
+#ifdef WITH_CUDA
+#ifndef WITH_CRT_GPU_CONSUMER
+    if (use_cuda) {
+        extern int gpu_sieve_set_devices(const int *device_ids, int n_devices);
+        extern int gpu_sieve_get_devices(int *out_device_ids, int max_ids);
+        if (cuda_ndevs > 0)
+            (void)gpu_sieve_set_devices(cuda_devices, cuda_ndevs);
+        /* Size device buffers from actual CLI-resolved values:
+           seg_cap  = sieve_size/2 + 1  (candidates per window, one byte each)
+           primes_cap = small_primes_count + 64  (Phase-2 primes after split) */
+        size_t gpu_seg_cap    = (size_t)(sieve_size / 2 + 1) + 64;
+        size_t gpu_primes_cap = (small_primes_count > 0 ? small_primes_count : 1200000) + 64;
+        if (g_gpu_sieve_enable) {
+            if (gpu_sieve_init(gpu_seg_cap, gpu_primes_cap) == 0) {
+                int sieve_ids[32];
+                int sieve_n = gpu_sieve_get_devices(sieve_ids, 32);
+                char dev_list[256];
+                int pos = 0;
+                dev_list[0] = '\0';
+                for (int si = 0; si < sieve_n && pos < (int)sizeof(dev_list) - 1; si++) {
+                    pos += snprintf(dev_list + pos, sizeof(dev_list) - (size_t)pos,
+                                    "%s%d", (si == 0) ? "" : ",", sieve_ids[si]);
+                    if (pos < 0 || pos >= (int)sizeof(dev_list)) {
+                        dev_list[sizeof(dev_list) - 1] = '\0';
+                        break;
+                    }
+                }
+                log_msg("GPU sieve: ready (pooled-per-device, seg=%zu MB, primes=%zu)\n",
+                        (gpu_seg_cap + (1<<20) - 1) >> 20, gpu_primes_cap);
+                log_msg("GPU sieve: devices=[%s]\n", sieve_n > 0 ? dev_list : "none");
+            } else {
+                log_msg("GPU sieve: init failed, using CPU presieve only\n");
+            }
+        } else {
+            log_msg("GPU sieve: disabled, using CPU presieve only\n");
+        }
+        /* Register cleanup on exit */
+        atexit(gpu_sieve_cleanup);
+    }
+#endif
+#endif
 
     {
         unsigned long long log_sieve_sz;

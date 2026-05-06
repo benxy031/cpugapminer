@@ -49,7 +49,7 @@ ifdef WITH_CUDA
 	NVCC ?= nvcc
 	CUDA_ARCH ?= -arch=sm_86
 	CUDA_PATH ?= /usr/local/cuda
-	GPU_OBJ=$(SRCDIR)/gpu_fermat.o
+	GPU_OBJ=$(SRCDIR)/gpu_fermat.o $(SRCDIR)/gpu_sieve.o
 	CFLAGS+=-DWITH_CUDA -DGPU_NLIMBS=$(GPU_NLIMBS) -I$(CUDA_PATH)/include
 	NVCC_FLAGS=-DGPU_NLIMBS=$(GPU_NLIMBS) -std=c++17
 	LIBS+=-lcudart -L$(CUDA_PATH)/lib64
@@ -91,6 +91,9 @@ $(SRCDIR)/%.o: $(SRCDIR)/%.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(SRCDIR)/gpu_fermat.o: $(SRCDIR)/gpu_fermat.cu $(SRCDIR)/gpu_fermat.h
+	$(NVCC) -O3 $(CUDA_ARCH) $(NVCC_FLAGS) -c $< -o $@
+
+$(SRCDIR)/gpu_sieve.o: $(SRCDIR)/gpu_sieve.cu $(SRCDIR)/gpu_sieve.h
 	$(NVCC) -O3 $(CUDA_ARCH) $(NVCC_FLAGS) -c $< -o $@
 
 $(TARGET): $(BINDIR) $(SRCDIR)/main.o $(SRCDIR)/stats.o $(SRCDIR)/sieve_cache.o $(SRCDIR)/gap_scan.o $(SRCDIR)/crt_heap.o $(SRCDIR)/crt_solver.o $(SRCDIR)/crt_gap_scan.o $(SRCDIR)/crt_runtime.o $(SRCDIR)/crt_runtime_worker.o $(SRCDIR)/crt_runtime_cpu.o $(SRCDIR)/crt_runtime_gpu.o $(SRCDIR)/presieve_utils.o $(SRCDIR)/wheel_sieve.o $(SRCDIR)/uint256_utils.o $(SRCDIR)/block_utils.o $(SRCDIR)/primality_utils.o $(RPC_OBJS) $(STRATUM_OBJ) $(GPU_OBJ)

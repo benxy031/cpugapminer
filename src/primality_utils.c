@@ -612,6 +612,76 @@ DECL_MONTMUL_EXACT_ADX(cpu_montmul_n20, 20, adx_addmul_20)
         } \
     } while (0)
 
+/*
+ * ADX exact-NL Montgomery squaring: SOS triangle shortcut.
+ * Phase 1: upper-triangle cross products via adx_addmul.  NL(NL-1)/2 mulx.
+ * Phase 2: double tbuf in-place (NL constant → GCC fully unrolls the loop).
+ * Phase 3: diagonal a[i]^2 via adx_addmul_1 (always_inline, writes tbuf[2i..2i+2]).
+ * Phase 4: SOS reduction using REDFN (exact-NL addmul → no dispatch overhead).
+ * Total mulx: NL(NL-1)/2 + NL + NL² ≈ 3NL²/2  vs  2NL² for CIOS montmul.
+ * Net ~22% fewer mulx for NL=5-20; particularly impactful at NL=6 (shift=68-128).
+ */
+#define DECL_MONTSQR_EXACT_ADX(FN, NL, REDFN) \
+__attribute__((noinline, unused)) \
+static void FN(uint64_t *r, \
+               const uint64_t *a, \
+               const uint64_t *b_unused, \
+               const uint64_t *n, \
+               uint64_t ninv) \
+{ \
+    (void)b_unused; \
+    uint64_t tbuf[2*(NL)+4] = {0}; \
+    /* Phase 1: upper-triangle; NL constant → GCC unrolls, resolves adx_addmul switch */ \
+    for (int i = 0; i < (NL)-1; i++) \
+        adx_addmul(tbuf + 2*i + 1, a[i], a + i + 1, (NL)-1-i); \
+    /* Phase 2: double tbuf (NL constant → loop fully unrolled by GCC at -O3) */ \
+    { uint64_t cy = 0; \
+      for (int k = 0; k < 2*(NL)+2; k++) { \
+          uint64_t ncy = tbuf[k] >> 63; \
+          tbuf[k] = (tbuf[k] << 1) | cy; cy = ncy; } \
+      tbuf[2*(NL)+2] = cy; } \
+    /* Phase 3: diagonal a[i]^2; adx_addmul_1 (always_inline) writes tbuf[2i..2i+2] */ \
+    for (int i = 0; i < (NL); i++) \
+        adx_addmul_1(tbuf + 2*i, a[i], a + i); \
+    /* Phase 4: SOS reduction — NL² mulx, same as CIOS but NL now constant */ \
+    for (int i = 0; i < (NL); i++) { \
+        uint64_t m = tbuf[i] * ninv; \
+        REDFN(tbuf + i, m, n); \
+    } \
+    uint64_t *t = tbuf + (NL); \
+    if (t[NL] || cpu_gte_n(t, n, (NL))) \
+        cpu_sub_n(r, t, n, (NL)); \
+    else \
+        for (int i = 0; i < (NL); i++) r[i] = t[i]; \
+}
+
+DECL_MONTSQR_EXACT_ADX(cpu_montsqr_n2,  2,  adx_addmul_2)
+DECL_MONTSQR_EXACT_ADX(cpu_montsqr_n3,  3,  adx_addmul_3)
+DECL_MONTSQR_EXACT_ADX(cpu_montsqr_n4,  4,  adx_addmul_4)
+DECL_MONTSQR_EXACT_ADX(cpu_montsqr_n5,  5,  adx_addmul_5)
+DECL_MONTSQR_EXACT_ADX(cpu_montsqr_n6,  6,  adx_addmul_6)
+DECL_MONTSQR_EXACT_ADX(cpu_montsqr_n7,  7,  adx_addmul_7)
+DECL_MONTSQR_EXACT_ADX(cpu_montsqr_n8,  8,  adx_addmul_8)
+DECL_MONTSQR_EXACT_ADX(cpu_montsqr_n9,  9,  adx_addmul_9)
+DECL_MONTSQR_EXACT_ADX(cpu_montsqr_n10, 10, adx_addmul_10)
+DECL_MONTSQR_EXACT_ADX(cpu_montsqr_n11, 11, adx_addmul_11)
+DECL_MONTSQR_EXACT_ADX(cpu_montsqr_n12, 12, adx_addmul_12)
+DECL_MONTSQR_EXACT_ADX(cpu_montsqr_n13, 13, adx_addmul_13)
+DECL_MONTSQR_EXACT_ADX(cpu_montsqr_n14, 14, adx_addmul_14)
+DECL_MONTSQR_EXACT_ADX(cpu_montsqr_n15, 15, adx_addmul_15)
+DECL_MONTSQR_EXACT_ADX(cpu_montsqr_n16, 16, adx_addmul_16)
+DECL_MONTSQR_EXACT_ADX(cpu_montsqr_n17, 17, adx_addmul_17)
+DECL_MONTSQR_EXACT_ADX(cpu_montsqr_n18, 18, adx_addmul_18)
+DECL_MONTSQR_EXACT_ADX(cpu_montsqr_n19, 19, adx_addmul_19)
+DECL_MONTSQR_EXACT_ADX(cpu_montsqr_n20, 20, adx_addmul_20)
+
+/* ADX CIOS montmul with ping-pong carry (ADCX/ADOX) is already optimal.
+ * Benchmarks show SOS Phase-2 bit-shift dependency chain costs more than the
+ * cross-product mulx savings for all tested NL on ADX hardware.  Use montmul
+ * for squarings; cpu_montsqr_nN functions kept for potential future use. */
+#define MONTSQR_EXACT_DISPATCH(r, a, b, n, ninv, nlimbs) \
+    MONTMUL_EXACT_DISPATCH((r), (a), (b), (n), (ninv), (nlimbs))
+
 
 /* Phase 1 — cross products: adx_addmul(tbuf+2i+1, a[i], a+i+1, n-1-i)
  *   places a[i]*a[j] (j>i) at tbuf[i+j].  n*(n-1)/2 mulx ops.
@@ -732,6 +802,111 @@ DECL_MONTSQR_BUCKET(cpu_montsqr_b8,  8)
 DECL_MONTSQR_BUCKET(cpu_montsqr_b12, 12)
 DECL_MONTSQR_BUCKET(cpu_montsqr_b20, 20)
 
+/*
+ * Non-ADX exact-NL Montgomery squaring: SOS triangle shortcut via cpu_mac.
+ * Phase 1: upper-triangle cross products.  NL(NL-1)/2 multiplications.
+ * Phase 2: double tbuf in-place (NL constant → GCC fully unrolls at -O3).
+ * Phase 3: diagonal a[i]^2 added to tbuf[2i]; carry ripples to tbuf[2i+2].
+ * Phase 4: SOS Montgomery reduction.  NL² multiplications.
+ * Total muls: NL(NL-1)/2 + NL + NL² ≈ 3NL²/2  vs  2NL² for CIOS montmul.
+ * Net ~22% fewer MUL/MAC ops for NL≥5; ~19% for NL=6 (shift=68-128, Xeon E5).
+ * Key for Ivy Bridge (E5-2690 v2): no MULX/ADCX/ADOX, but MUL throughput
+ * is the bottleneck → every saved multiply directly reduces wall time.
+ */
+#define DECL_MONTSQR_EXACT(NL) \
+__attribute__((noinline)) \
+static void cpu_montsqr_n##NL(uint64_t *r, \
+                               const uint64_t *a, \
+                               const uint64_t *b_unused, \
+                               const uint64_t *n, \
+                               uint64_t ninv) \
+{ \
+    (void)b_unused; \
+    uint64_t tbuf[2*(NL)+4] = {0}; \
+    /* Phase 1: upper-triangle; each row's carry flushed to tbuf[i+NL..i+NL+1] */ \
+    for (int i = 0; i < (NL)-1; i++) { \
+        uint64_t ai = a[i], c = 0; \
+        for (int j = i+1; j < (NL); j++) \
+            c = cpu_mac(&tbuf[i+j], ai, a[j], c); \
+        uint64_t old = tbuf[i+(NL)]; \
+        tbuf[i+(NL)] += c; \
+        tbuf[i+(NL)+1] += (tbuf[i+(NL)] < old); \
+    } \
+    /* Phase 2: double tbuf (NL constant → loop fully unrolled by GCC at -O3) */ \
+    { uint64_t cy = 0; \
+      for (int k = 0; k < 2*(NL)+2; k++) { \
+          uint64_t ncy = tbuf[k] >> 63; \
+          tbuf[k] = (tbuf[k] << 1) | cy; cy = ncy; } \
+      tbuf[2*(NL)+2] = cy; } \
+    /* Phase 3: diagonal a[i]^2.  Adding hi to tbuf[2i+1] can overflow; carry \
+     * propagates at most 2 words (tbuf is bounded by 2*(cross-products) after \
+     * Phase 2, so tbuf[2i+2] <= 2^64-2 and the second carry always terminates). */ \
+    for (int i = 0; i < (NL); i++) { \
+        uint64_t hi = cpu_mac(&tbuf[2*i], a[i], a[i], 0); \
+        uint64_t old1 = tbuf[2*i+1]; tbuf[2*i+1] += hi; \
+        if (tbuf[2*i+1] < old1) { \
+            uint64_t old2 = ++tbuf[2*i+2]; \
+            if (old2 == 0) tbuf[2*i+3]++; \
+        } \
+    } \
+    /* Phase 4: SOS Montgomery reduction */ \
+    for (int i = 0; i < (NL); i++) { \
+        uint64_t m = tbuf[i] * ninv, c = 0; \
+        for (int j = 0; j < (NL); j++) \
+            c = cpu_mac(&tbuf[i+j], m, n[j], c); \
+        uint64_t old = tbuf[i+(NL)]; \
+        tbuf[i+(NL)] += c; \
+        tbuf[i+(NL)+1] += (tbuf[i+(NL)] < old); \
+    } \
+    uint64_t *t = tbuf + (NL); \
+    if (t[NL] || cpu_gte_n(t, n, (NL))) \
+        cpu_sub_n(r, t, n, (NL)); \
+    else \
+        for (int i = 0; i < (NL); i++) r[i] = t[i]; \
+}
+
+DECL_MONTSQR_EXACT(2)
+DECL_MONTSQR_EXACT(3)
+DECL_MONTSQR_EXACT(4)
+DECL_MONTSQR_EXACT(5)
+DECL_MONTSQR_EXACT(6)
+DECL_MONTSQR_EXACT(7)
+DECL_MONTSQR_EXACT(8)
+DECL_MONTSQR_EXACT(9)
+DECL_MONTSQR_EXACT(10)
+DECL_MONTSQR_EXACT(11)
+DECL_MONTSQR_EXACT(12)
+DECL_MONTSQR_EXACT(13)
+DECL_MONTSQR_EXACT(14)
+DECL_MONTSQR_EXACT(15)
+DECL_MONTSQR_EXACT(16)
+DECL_MONTSQR_EXACT(17)
+DECL_MONTSQR_EXACT(18)
+DECL_MONTSQR_EXACT(19)
+DECL_MONTSQR_EXACT(20)
+
+/* SOS squaring threshold: noinline call overhead exceeds savings for small NL.
+ * NL≤9:  fall back to cpu_montmul_n (inlined CIOS, zero call overhead).
+ * NL≥10: SOS saves NL(NL-1)/2 MUL ops; benchmarked +13-26% for NL=10-18
+ *         on non-ADX hardware (E5-2690 v2, Ivy Bridge target). */
+#define MONTSQR_EXACT_DISPATCH(r, a, b, n, ninv, nlimbs) \
+    do { \
+        switch (nlimbs) { \
+        case 10: cpu_montsqr_n10(r,a,b,n,ninv); break; \
+        case 11: cpu_montsqr_n11(r,a,b,n,ninv); break; \
+        case 12: cpu_montsqr_n12(r,a,b,n,ninv); break; \
+        case 13: cpu_montsqr_n13(r,a,b,n,ninv); break; \
+        case 14: cpu_montsqr_n14(r,a,b,n,ninv); break; \
+        case 15: cpu_montsqr_n15(r,a,b,n,ninv); break; \
+        case 16: cpu_montsqr_n16(r,a,b,n,ninv); break; \
+        case 17: cpu_montsqr_n17(r,a,b,n,ninv); break; \
+        case 18: cpu_montsqr_n18(r,a,b,n,ninv); break; \
+        case 19: cpu_montsqr_n19(r,a,b,n,ninv); break; \
+        case 20: cpu_montsqr_n20(r,a,b,n,ninv); break; \
+        default: MONTMUL_EXACT_DISPATCH((r),(a),(b),(n),(ninv),(nlimbs)); break; \
+        } \
+    } while (0)
+
 #endif /* __x86_64__ && __BMI2__ && __ADX__ */
 
 /* Fallback for CPUs without ADX/BMI2: use the generic CIOS montmul.
@@ -740,6 +915,14 @@ DECL_MONTSQR_BUCKET(cpu_montsqr_b20, 20)
 #ifndef MONTMUL_EXACT_DISPATCH
 #define MONTMUL_EXACT_DISPATCH(r, a, b, n, ninv, nlimbs) \
     cpu_montmul_n((r), (a), (b), (n), (ninv), (nlimbs))
+#endif
+
+/* If no squaring dispatch was defined (portable non-x86 build), fall back
+   to the montmul dispatch.  On ADX and non-ADX x86 builds it is already
+   defined above via DECL_MONTSQR_EXACT_ADX / DECL_MONTSQR_EXACT. */
+#ifndef MONTSQR_EXACT_DISPATCH
+#define MONTSQR_EXACT_DISPATCH(r, a, b, n, ninv, nlimbs) \
+    MONTMUL_EXACT_DISPATCH((r), (a), (b), (n), (ninv), (nlimbs))
 #endif
 
 static int fermat_u64_exact(uint64_t n)
@@ -897,7 +1080,7 @@ static int fermat_test_cpu_nlimbs_##NL(const uint64_t *n) \
     memcpy(base_m, one_m, (NL) * sizeof(uint64_t)); \
     cpu_moddbl_n(base_m, n, (NL)); \
     memcpy(win[0], base_m, (NL) * sizeof(uint64_t)); \
-    MONTMUL_EXACT_DISPATCH(base2_m, base_m, base_m, n, ninv, (NL)); \
+    MONTSQR_EXACT_DISPATCH(base2_m, base_m, base_m, n, ninv, (NL)); \
     for (int _w = 1; _w < FERMAT_WINSZ / 2; _w++) \
         MONTMUL_EXACT_DISPATCH(win[_w], win[_w-1], base2_m, n, ninv, (NL)); \
     uint64_t e[NL]; \
@@ -911,26 +1094,26 @@ static int fermat_test_cpu_nlimbs_##NL(const uint64_t *n) \
     int bit = msb - 1; \
     while (bit >= 0) { \
         if (bit < FERMAT_WIN - 1) { \
-            MONTMUL_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
+            MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
             if ((e[bit >> 6] >> (bit & 63)) & 1) \
                 MONTMUL_EXACT_DISPATCH(res, res, base_m, n, ninv, (NL)); \
             bit--; \
         } else { \
             uint32_t w = cpu_get_bits4(e, bit - (FERMAT_WIN - 1)); \
             if (w == 0) { \
-                MONTMUL_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
-                MONTMUL_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
-                MONTMUL_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
-                MONTMUL_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
+                MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
+                MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
+                MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
+                MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
                 bit -= FERMAT_WIN; \
             } else { \
                 int z = __builtin_ctz(w); \
                 int sq = FERMAT_WIN - z; \
                 for (int _s = 0; _s < sq; _s++) \
-                    MONTMUL_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
+                    MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
                 MONTMUL_EXACT_DISPATCH(res, res, win[(w >> z) >> 1], n, ninv, (NL)); \
                 for (int _s = 0; _s < z; _s++) \
-                    MONTMUL_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
+                    MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
                 bit -= FERMAT_WIN; \
             } \
         } \
@@ -1127,7 +1310,7 @@ static int euler_test_cpu_nlimbs_##NL(const uint64_t *n) \
     memcpy(base_m, one_m, (NL) * sizeof(uint64_t)); \
     cpu_moddbl_n(base_m, n, (NL)); \
     memcpy(win[0], base_m, (NL) * sizeof(uint64_t)); \
-    MONTMUL_EXACT_DISPATCH(base2_m, base_m, base_m, n, ninv, (NL)); \
+    MONTSQR_EXACT_DISPATCH(base2_m, base_m, base_m, n, ninv, (NL)); \
     for (int _w = 1; _w < FERMAT_WINSZ / 2; _w++) \
         MONTMUL_EXACT_DISPATCH(win[_w], win[_w-1], base2_m, n, ninv, (NL)); \
     uint64_t e[NL]; \
@@ -1144,26 +1327,26 @@ static int euler_test_cpu_nlimbs_##NL(const uint64_t *n) \
     int bit = msb - 1; \
     while (bit >= 0) { \
         if (bit < FERMAT_WIN - 1) { \
-            MONTMUL_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
+            MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
             if ((e[bit >> 6] >> (bit & 63)) & 1) \
                 MONTMUL_EXACT_DISPATCH(res, res, base_m, n, ninv, (NL)); \
             bit--; \
         } else { \
             uint32_t w = cpu_get_bits4(e, bit - (FERMAT_WIN - 1)); \
             if (w == 0) { \
-                MONTMUL_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
-                MONTMUL_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
-                MONTMUL_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
-                MONTMUL_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
+                MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
+                MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
+                MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
+                MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
                 bit -= FERMAT_WIN; \
             } else { \
                 int z = __builtin_ctz(w); \
                 int sq = FERMAT_WIN - z; \
                 for (int _s = 0; _s < sq; _s++) \
-                    MONTMUL_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
+                    MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
                 MONTMUL_EXACT_DISPATCH(res, res, win[(w >> z) >> 1], n, ninv, (NL)); \
                 for (int _s = 0; _s < z; _s++) \
-                    MONTMUL_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
+                    MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, (NL)); \
                 bit -= FERMAT_WIN; \
             } \
         } \

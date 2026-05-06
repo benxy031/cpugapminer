@@ -10,6 +10,8 @@
 #             mingw-w64-x86_64-openssl make
 #
 # For CUDA, install the NVIDIA CUDA Toolkit for Windows and set CUDA_PATH.
+# In CUDA_DLL mode, the Windows workflow builds gpu_fermat.dll and
+# gpu_sieve.dll with nvcc/MSVC, then links MinGW against import libraries.
 
 CC=gcc
 CXX=g++
@@ -63,17 +65,19 @@ ifdef WITH_CUDA
 	GPU_BITS ?= 1024
 	GPU_NLIMBS := $(shell echo '$(GPU_BITS) / 64' | bc)
 	CFLAGS+=-DWITH_CUDA -DGPU_NLIMBS=$(GPU_NLIMBS)
+ifdef CUDA_PATH
+	CFLAGS+=-I"$(CUDA_PATH)/include"
+endif
 ifdef CUDA_DLL
 	# DLL mode (Windows CI): link against pre-built import library.
-	# The DLL is built with the MSVC toolchain — see build-windows.yml.
+	# The DLLs are built with the MSVC toolchain — see build-windows.yml.
 	# This avoids all MSVC/MinGW COFF incompatibilities.
-	CUDA_OBJ=$(SRCDIR)/libgpu_fermat.a
+	CUDA_OBJS=$(SRCDIR)/libgpu_fermat.a $(SRCDIR)/libgpu_sieve.a
 else
 	NVCC ?= nvcc
 	CUDA_ARCH ?= -arch=sm_86
 	CUDA_PATH ?= C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4
-	CUDA_OBJ=$(SRCDIR)/gpu_fermat.o
-	CFLAGS+=-I"$(CUDA_PATH)/include"
+	CUDA_OBJS=$(SRCDIR)/gpu_fermat.o $(SRCDIR)/gpu_sieve.o
 	NVCC_FLAGS=-DGPU_NLIMBS=$(GPU_NLIMBS)
 	LIBS+=-lcudart -L"$(CUDA_PATH)/lib/x64"
 	# nvcc/MSVC objects reference CRT symbols (fprintf etc.) that MinGW GCC 15+
@@ -81,7 +85,7 @@ else
 	LIBS+=-lucrt
 endif
 else
-	CUDA_OBJ=
+	CUDA_OBJS=
 endif
 
 all: $(TARGET)
@@ -98,6 +102,9 @@ $(SRCDIR)/%.o: $(SRCDIR)/%.cpp
 $(SRCDIR)/gpu_fermat.o: $(SRCDIR)/gpu_fermat.cu $(SRCDIR)/gpu_fermat.h
 	"$(NVCC)" -O3 $(CUDA_ARCH) $(NVCC_FLAGS) -c $< -o $@
 
+$(SRCDIR)/gpu_sieve.o: $(SRCDIR)/gpu_sieve.cu $(SRCDIR)/gpu_sieve.h
+	"$(NVCC)" -O3 $(CUDA_ARCH) $(NVCC_FLAGS) -c $< -o $@
+
 C_OBJS=$(SRCDIR)/stats.o $(SRCDIR)/sieve_cache.o $(SRCDIR)/gap_scan.o \
 	$(SRCDIR)/crt_heap.o $(SRCDIR)/crt_solver.o $(SRCDIR)/crt_gap_scan.o \
 	$(SRCDIR)/crt_runtime.o $(SRCDIR)/crt_runtime_worker.o \
@@ -105,8 +112,8 @@ C_OBJS=$(SRCDIR)/stats.o $(SRCDIR)/sieve_cache.o $(SRCDIR)/gap_scan.o \
 	$(SRCDIR)/presieve_utils.o $(SRCDIR)/wheel_sieve.o \
 	$(SRCDIR)/uint256_utils.o $(SRCDIR)/block_utils.o $(SRCDIR)/primality_utils.o
 
-$(TARGET): $(BINDIR) $(SRCDIR)/main.o $(C_OBJS) $(RPC_OBJS) $(STRATUM_OBJ) $(CUDA_OBJ)
-	$(LINKER) -o $@ $(SRCDIR)/main.o $(C_OBJS) $(RPC_OBJS) $(STRATUM_OBJ) $(CUDA_OBJ) $(LDFLAGS) $(LIBS)
+$(TARGET): $(BINDIR) $(SRCDIR)/main.o $(C_OBJS) $(RPC_OBJS) $(STRATUM_OBJ) $(CUDA_OBJS)
+	$(LINKER) -o $@ $(SRCDIR)/main.o $(C_OBJS) $(RPC_OBJS) $(STRATUM_OBJ) $(CUDA_OBJS) $(LDFLAGS) $(LIBS)
 
 clean:
 	rm -rf $(BINDIR) $(SRCDIR)/*.o

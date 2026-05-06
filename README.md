@@ -49,6 +49,11 @@ src/
   gpu_fermat_opencl.c
                     - OpenCL Fermat backend implementation (experimental)
   gpu_fermat.def    - Windows export-definition file for GPU Fermat symbols
+  gpu_sieve.h       - public C API for GPU Phase 2 sieve context and operations
+  gpu_sieve.cu      - CUDA kernel: odd-only composite marking for sieve Phase 2
+                      (one thread per prime; byte-per-candidate output merged
+                       into the bit-packed bitmap by the host)
+  gpu_sieve.def     - Windows export-definition file for GPU sieve symbols
   Opts.h            - option singleton header
   parse_block.c     - raw block parsing utilities
   utils.h           - small shared helpers
@@ -173,6 +178,23 @@ Build with CUDA enabled:
 make clean
 make WITH_RPC=1 WITH_CUDA=1
 ```
+
+On Windows (MSYS2 / MinGW-w64), use the MinGW makefile:
+
+```sh
+make -f Makefile.mingw clean
+make -f Makefile.mingw WITH_RPC=1 WITH_CUDA=1
+```
+
+The Windows CUDA build now includes both GPU backends:
+
+- `gpu_fermat` for batch Fermat testing
+- `gpu_sieve` for Phase 2 large-prime sieve offload
+
+In GitHub Actions, the Windows workflow builds `gpu_fermat.dll` and
+`gpu_sieve.dll` with `nvcc`/MSVC, creates MinGW import libraries with
+`dlltool`, and links `gap_miner.exe` against those import libraries via
+`Makefile.mingw`.
 
 Build with OpenCL host scaffolding enabled (CLI + device/platform selection):
 
@@ -389,6 +411,124 @@ bin/gap_miner \
   --crt-file crt/crt_s512_m22.txt
 ```
 
+## Recent changes (May 2026)
+
+### GPU sieve Phase 2 integration (May 2026)
+
+The sieve is still a mixed CPU/GPU pipeline. Only Phase 2, the large-prime
+marking loop over `[split_idx, ph2_end)`, is GPU-accelerated. Phase 1,
+Phase 3, final survivor materialization, gap testing, and all control flow
+remain on the CPU.
+
+**What still runs on the CPU:**
+
+- Phase 1 presieve / low-prime bitmap marking into `bits[]`
+- Phase 3 CRT post-filter marking into `bits[]`
+- Selection of the Phase 2 prime slice for the current window
+- Construction and versioning of the host `base_mod_p[]` cache
+- GPU context-pool management (`src/presieve_utils.c`)
+- CPU fallback Phase 2 loop if GPU sieve is disabled or errors
+- Final survivor materialization used by the primality / gap pipeline
+
+**What runs on the GPU:**
+
+- Device-resident cache of Phase 2 primes (`d_primes`)
+- Device-resident cache of `base_mod_p` for the current header (`d_base_mod_p`)
+- `kernel_compute_k0`: compute first-hit offsets `k0[j]` from `base_mod_p[j]`
+  plus the current window start `L`
+- `kernel_mark_composites`: mark Phase 2 composites into a byte-per-candidate
+  scratch buffer (`d_segment`)
+- `kernel_pack_bits`: pack `d_segment` into a bit-packed bitmap (`d_bits`)
+- `kernel_compact_survivors`: try to compact Phase 2 survivors into a fixed-cap
+  `uint32_t` list before falling back to bitmap mode
+
+**Current window pipeline:**
+
+1. CPU marks Phase 1 composites in `bits[]`.
+2. CPU chooses the Phase 2 prime slice and dispatches it to a pooled GPU context.
+3. GPU computes `k0`, marks composites, and then tries compact survivor
+   extraction.
+4. If the compact survivor count fits in `GPU_SIEVE_SURV_CAP`, the GPU returns
+   survivor positions directly.
+5. Otherwise the GPU falls back to bitmap mode, downloads `d_bits`, and the CPU
+   OR-merges that bitmap into `bits[]`.
+6. CPU applies the Phase 3 CRT filter, then turns the final bitmap (or the
+   compact survivor list intersected with `bits[]`) into the `tls_pr[]`
+   survivor array used by later primality / gap checks.
+
+**Transfer and caching behavior:**
+
+- `primes[]` are uploaded only when the Phase 2 slice pointer or count changes
+- `base_mod_p[]` is uploaded only when the header/base version changes
+- Each pooled context has its own non-blocking CUDA stream
+- Bitmap downloads use pinned host staging plus `cudaMemcpyAsync`
+- Compact survivor mode uses a fixed-cap pinned host buffer and falls back to
+  bitmap mode on overflow
+
+Compact survivor mode is intentionally conservative in the current first pass.
+For dense-survivor workloads it can avoid the full bitmap download; for the
+common current workload it usually overflows and falls back cleanly to the
+existing bitmap path.
+
+**New CLI flags:**
+
+| Flag | Effect |
+|------|--------|
+| `--gpu-sieve` | Enable GPU Phase 2 sieve (default: on when `--cuda` is active) |
+| `--no-gpu-sieve` | Disable GPU Phase 2 sieve; use CPU loop |
+
+**Device buffer sizes** (allocated at startup from actual CLI values):
+
+| Buffer | Sizing |
+|--------|--------|
+| Segment (byte array) | `sieve_size / 2 + 1` bytes — matches any `--sieve-size` |
+| Primes array | `small_primes_count` entries — matches any `--sieve-primes` |
+| Packed bitmap | `(sieve_size / 2 + 8) / 8` bytes |
+| Compact survivors | `GPU_SIEVE_SURV_CAP * sizeof(uint32_t)` bytes per pooled context |
+
+`--sieve-size` and `--sieve-primes` work freely with `--gpu-sieve`; device
+buffers are sized from the finalized CLI values at startup, not hardcoded.
+
+**GPU-sieve environment knobs:**
+
+| Variable | Effect |
+|----------|--------|
+| `GPU_SIEVE_POOL` | pooled contexts per selected CUDA device (default `2`, max `4`) |
+| `GPU_SIEVE_TIMING` | enable per-stage CUDA timing collection |
+| `GPU_SIEVE_SURV_CAP` | compact survivor cap before bitmap fallback |
+
+**New stats fields** (visible in STATS output when GPU sieve is active):
+
+```
+gpu_sieve_calls=152  gpu_sieve_primes/call=984398  gpu_sieve_fallback=0  surv_calls=0
+```
+
+- `gpu_sieve_calls` — number of GPU Phase 2 kernel invocations
+- `gpu_sieve_primes/call` — average primes handed to the GPU per call
+- `gpu_sieve_fallback` — calls that fell back to CPU (should be 0)
+- `surv_calls` — calls that returned compact survivors rather than a bitmap
+
+When `GPU_SIEVE_TIMING=1`, a second line may appear:
+
+```
+gpu_sieve_us/call: base_up=... compute_k0=... mark=... pack=... bits_dl=... merge=...
+```
+
+Zero-valued stages are omitted. If all timing averages are zero, this line is
+suppressed entirely.
+
+**Performance note:**
+
+Measured results vary significantly with `--shift`, `--sieve-size`,
+`--sieve-primes`, thread count, GPU pool size, and whether the workload is in a
+compact-survivor or bitmap-fallback regime. Use the `STATS:` line, plus
+`gpu_sieve_fallback` and `surv_calls`, to determine which path is active for a
+given run.
+
+**Scope:** active when built with `WITH_CUDA=1` and without
+`WITH_CRT_GPU_CONSUMER`.  The GPU sieve initializes for all `--cuda` modes
+(CRT monolithic and non-CRT).
+
 ## Recent changes (March-April 2026)
 
 This section summarizes behavior that changed recently and may differ from
@@ -468,8 +608,9 @@ Examples:
 - Even stronger wheel presieve with the 9699690 cycle:
   `./bin/gap_miner --shift 20 --sieve-size 33554432 --wheel-sieve 9699690 ...`
 - Windows build from GitHub Actions:
-  the Windows workflow now compiles the wheel module and runs a smoke test
-  with `--wheel-sieve 210 --selftest`.
+  the Windows workflow now compiles the wheel module, builds both CUDA DLLs
+  (`gpu_fermat.dll` and `gpu_sieve.dll`) for the CUDA artifact, and runs a
+  smoke test with `--wheel-sieve 210 --selftest`.
 
 Notes:
 
