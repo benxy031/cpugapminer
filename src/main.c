@@ -17,6 +17,7 @@
 #include <emmintrin.h>
 #endif
 #include "compat_win32.h"
+#include "rgm_check.h"
 #include <openssl/sha.h>
 #include <openssl/bn.h>
 #include <gmp.h>
@@ -365,6 +366,9 @@ static pthread_mutex_t g_work_lock = PTHREAD_MUTEX_INITIALIZER;
 /* set to 1 by thread-0 when a new block is detected; all workers break their
    adder loop and the main thread restarts the pass with fresh work */
 static _Atomic int g_abort_pass = 0;
+/* set to 1 by advance_nonce(): main loop should skip getwork and reuse the
+   h256 already computed by advance_nonce().  Cleared at each pass start. */
+static _Atomic int g_nonce_advanced = 0;
 
 #ifdef WITH_RPC
 /* Pre-built mining pass: set once per getwork fetch, read-only during a pass.
@@ -1754,8 +1758,21 @@ static void print_stats(void) {
     /* est= calibrated from observed gap rate when possible.
        Once we have qualifying gaps at target_m, use:
          est = elapsed / gaps       (actual inter-gap interval)
-       Fallback: Cramér model before any gaps are found. */
+       Fallback: Cramér model before any gaps are found.
+       Option C: if empirical qualifying-gap probability p_emp is available
+       from rgm_accum_qual, use it in the cold-start estimate instead of the
+       theoretical e^{-merit} — it captures clustering effects. */
     double prob_pair = (target_m > 0) ? exp(-target_m) : 0.0;
+    /* Option C: empirical p from rgm_qual_prob_snapshot */
+    {
+        double p_emp; uint64_t ep, eq; double etgt;
+        if (rgm_qual_prob_snapshot(&p_emp, &ep, &eq, &etgt)
+                && ep >= 10000ULL && p_emp > 0.0) {
+            /* Scale empirical p from its observed target to current target_m */
+            double scale = exp(etgt - target_m);
+            prob_pair = p_emp * scale;
+        }
+    }
     char est_buf[64] = "n/a";
     if (stats_gaps > 0 && elapsed > 0.001) {
         double est_sec = elapsed / (double)stats_gaps;
@@ -2126,6 +2143,72 @@ static void print_stats(void) {
         }
         log_file_only("  merit_sens (net=%.2f  have=%.0f/s):%s  |%s\n",
                       target_m, pairs_rate, eta_buf, need_buf);
+    }
+
+    /* ── Mean-gap health check (primary primality validator) ─────────────
+       E[gap between consecutive primes near x] = log(x) by the PNT.
+       This is invariant to gap clustering or correlations.
+       A persistent deviation > 5% indicates a primality pipeline bug:
+         gap < logbase → composites passing the Fermat/Euler test
+         gap > logbase → real primes being incorrectly rejected         */
+    {
+        double mg_mean, mg_logbase;
+        uint64_t mg_cnt;
+        if (rgm_mean_gap_snapshot(&mg_mean, &mg_logbase, &mg_cnt)
+                && mg_cnt >= 1000ULL && mg_logbase > 1.0) {
+            double dev_pct = 100.0 * (mg_mean - mg_logbase) / mg_logbase;
+            log_file_only("  mean_gap_check: observed=%.4f  theory(logbase)=%.4f"
+                          "  dev=%+.3f%%  gaps=%llu%s\n",
+                          mg_mean, mg_logbase, dev_pct,
+                          (unsigned long long)mg_cnt,
+                          (fabs(dev_pct) > 5.0) ? "  *** FAIL ***" : "");
+            if (fabs(dev_pct) > 5.0)
+                log_msg("  MEAN-GAP WARNING: observed=%.4f  expected(logbase)=%.4f"
+                        "  dev=%+.3f%%  gaps=%llu"
+                        " — primality pipeline may be incorrect!\n",
+                        mg_mean, mg_logbase, dev_pct,
+                        (unsigned long long)mg_cnt);
+        }
+    }
+
+    /* ── Option C: empirical qualifying-gap probability (log file only) ─
+       Shows observed p_emp vs theoretical e^{-merit}. In the cold-start
+       ETA estimate (before any qualifying gaps), prob_pair is already
+       updated from p_emp.  This log entry shows the calibration quality. */
+    {
+        double p_emp; uint64_t ep, eq; double etgt;
+        if (rgm_qual_prob_snapshot(&p_emp, &ep, &eq, &etgt) && ep >= 1000ULL) {
+            double p_theory = exp(-etgt);
+            double ratio = (p_theory > 0.0) ? p_emp / p_theory : 0.0;
+            log_file_only("  qual_prob: empirical=%.4e  theory(e^-merit)=%.4e"
+                          "  ratio=%.3f  pairs=%llu  quals=%llu  target=%.4f\n",
+                          p_emp, p_theory, ratio,
+                          (unsigned long long)ep,
+                          (unsigned long long)eq,
+                          etgt);
+        }
+    }
+
+    /* ── RGM info table (log file only, informational) ───────────────────
+       NOTE: real prime gaps are correlated/clustered (not i.i.d. exponential),
+       so RGM is systematically below the i.i.d.-exponential theory (~-26% at
+       logbase≈200, ~-66% at logbase≈21).  These numbers are fingerprints
+       only and are NOT used to trigger health warnings.                  */
+    {
+        int rgm_any = 0;
+        for (int n = 2; n <= RGM_MAX_N; n++) {
+            double gm, theory;
+            uint64_t cnt;
+            if (!rgm_snapshot(n, &gm, &theory, &cnt)) continue;
+            if (cnt < 1000ULL) continue;
+            if (!rgm_any) {
+                log_file_only("  rgm_info: n=gaps/win  observed    theory(iid)  dev%%    samples\n");
+                rgm_any = 1;
+            }
+            double dev_pct = 100.0 * (gm - theory) / theory;
+            log_file_only("  rgm_info: n=%2d  gm=%.4f  theory=%.4f  dev=%+.3f%%  samples=%llu\n",
+                          n, gm, theory, dev_pct, (unsigned long long)cnt);
+        }
     }
     log_msg("\n");
 }
@@ -4220,6 +4303,7 @@ static int advance_nonce(void) {
     for (int k = 0; k < 32; k++) h256[k] = sha_raw[31 - k];
     if (!pass_state_try_advance_nonce(pass_snap.pass_seq, nonce, h256))
         return 0;
+    g_nonce_advanced = 1; /* tell main loop: skip getwork, reuse h256 */
     log_msg("[nonce] advanced to nonce=%u  h256[0..3]=%02x%02x%02x%02x\n",
             nonce, h256[0], h256[1], h256[2], h256[3]);
     return 1;
@@ -5042,6 +5126,9 @@ static size_t crt_bkscan_and_submit(
         have_last = 1;
     }
 
+    /* RGM convergence check only applies to natural random-window primes,
+       not CRT-sieved survivors (which have a different gap distribution). */
+
     if (best_merit_loc > stats_best_merit) {
         stats_best_merit = best_merit_loc;
         stats_best_gap = best_gap_local;
@@ -5302,6 +5389,9 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
 #endif
         mpz_clear(nAdd_prime);
     }
+
+    /* RGM convergence check only applies to natural random-window primes,
+       not CRT-sieved survivors (which have a different gap distribution). */
 
     if (out_primes_found)
         *out_primes_found = prime_cnt;
@@ -5957,7 +6047,9 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
                            const char *rpc_sign_key_local) {
     (void)header_local;     /* param kept for API compat; abort uses g_abort_pass */
     (void)rpc_method_local; /* method is always "getwork" now */
-    if (cnt > 1) __sync_fetch_and_add(&stats_pairs, (uint64_t)(cnt - 1));
+    uint64_t sc_pairs   = (cnt > 1) ? (uint64_t)(cnt - 1) : 0;
+    uint64_t sc_quals   = 0;   /* qualifying gaps submitted this call */
+    if (sc_pairs > 0) __sync_fetch_and_add(&stats_pairs, sc_pairs);
     for (size_t i = 0; i + 1 < cnt; i++) {
 #ifdef WITH_RPC
         /* During long scans, poll tip changes from this thread too.
@@ -6071,6 +6163,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
 
         stats_last_qual_gap = gap;
         __sync_fetch_and_add(&stats_gaps, 1);
+        sc_quals++;
         log_extra_merit_event("qual", "scan-candidates", merit, gap,
                       target_local);
         /* nAdd = relative offset = prev (prime = base + nAdd). */
@@ -6102,7 +6195,10 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
                                                 rpc_pass_local,
                                                 rpc_sign_key_local,
                                                 " (mining continues)");
-                        if (!keep_going) return 1;
+                        if (!keep_going) {
+                            rgm_accum_qual(sc_pairs, sc_quals, target_local);
+                            return 1;
+                        }
                         else log_msg("continuing mining after success\n");
                     }
                 } else {
@@ -6111,6 +6207,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
             }
 #endif
     }   /* end for */
+    rgm_accum_qual(sc_pairs, sc_quals, target_local);
     return 0;
 }
 
@@ -6805,6 +6902,25 @@ static void *worker_fn(void *arg) {
                                 gpu_reg_alive[r] = 1;
                         }
                     }
+
+                    /* Option B: score regions using sampled-prime gap spread.
+                       Regions whose interior spread is far below the calibrated
+                       RGM baseline are uniformly dense — no qualifying gap inside.
+                       skip_thresh=0.7: conservative (≈30% below baseline to skip).
+                       Requires 500k calibration samples before activating.
+                       Only effective when --sample-stride 1 has been run at least
+                       briefly to build the baseline; safe to call always. */
+                    if (gpu_reg_alive && sp_cnt >= 3) {
+                        rgm_score_regions(
+                            sampled_primes, sp_cnt,
+                            gap_reg_lo, gap_reg_hi,
+                            gpu_reg_alive, n_gap_regions,
+                            gpu_rth,   /* target_gap = target_local * logbase */
+                            10,        /* chunk_n bucket used as baseline      */
+                            0.7,       /* skip_thresh in sigma units           */
+                            500000ULL  /* cal_min_samples                      */
+                        );
+                    }
                     /* Collect verification candidates from surviving regions */
                     size_t v_alloc = cnt > 0 ? cnt : 1;
                     uint64_t *verify = (uint64_t *)malloc(v_alloc * sizeof(uint64_t));
@@ -7138,6 +7254,13 @@ static void *worker_fn(void *arg) {
                                         rpc_method_local, rpc_sign_key_local))
                         goto worker_done;
                 }
+                /* RGM check: pr[] contains all confirmed primes in this window.
+                   Only valid here — smart-scan never builds a complete prime array. */
+                if (cnt >= 11) {
+                    rgm_accumulate_window(pr, cnt, 10);
+                    rgm_accumulate_window(pr, cnt, 20);
+                    rgm_accumulate_mean_gap(pr, cnt, logbase);
+                }
                 if (scan_candidates(pr, cnt, target_local, logbase,
                                     shift_local,
                                     header_local,
@@ -7185,15 +7308,25 @@ static void *worker_fn(void *arg) {
             }
             break; /* exit outer loop — main loop will respawn with new h256 */
         } else if (rpc_url_local) {
-            /* RPC (non-stratum): adder range exhausted.
-               Loop back and re-mine the same nonce/header — the 5-second
-               getbestblockhash poll in the window loop will catch new blocks
-               and set g_abort_pass.  Advancing the nonce here caused an
-               excessive getwork-call storm at small shifts (e.g. shift=25
-               where the entire 2^25 adder range is exhausted in <1 s).
-               Qualifying-gap probability per pair (~1e-9) makes duplicate
-               re-submission of the same gap negligibly rare.               */
-            /* fall through — outer while loop re-mines naturally */
+            /* RPC (non-stratum): adder range exhausted — advance nonce.
+               IMPORTANT: only do this when the window loop ran to clean
+               completion (g_abort_pass still 0).  If the loop broke early
+               because rpc_tip_changed detected a real new block,
+               g_abort_pass is already 1 here; in that case we must NOT
+               advance the nonce — the main loop needs to call
+               build_mining_pass() to fetch the new block's header and
+               update g_pass.prevhex.  Skipping that (via g_nonce_advanced)
+               would leave g_pass.prevhex stale, causing rpc_tip_changed to
+               fire on every subsequent pass in a tight loop.               */
+            if (rpc_thread_local && !g_abort_pass) {
+                if (!advance_nonce()) {
+                    /* 2^32 nonce space fully wrapped — need fresh work */
+                    g_abort_pass = 1;
+                    break;
+                }
+                g_abort_pass = 1;
+                break;
+            }
         }
 #endif
         /* Pass complete without abort: loop back and mine the same slice */
@@ -8787,6 +8920,13 @@ int main(int argc, char **argv) {
                         pr[0] = st_carry_last;
                         cnt++;
                     }
+                    /* RGM check: pr[] contains all confirmed primes in this window.
+                       Only valid here — smart-scan never builds a complete prime array. */
+                    if (cnt >= 11) {
+                        rgm_accumulate_window(pr, cnt, 10);
+                        rgm_accumulate_window(pr, cnt, 20);
+                        rgm_accumulate_mean_gap(pr, cnt, logbase);
+                    }
                     if (scan_candidates(pr, cnt, target, logbase,
                                        shift, header,
                                        rpc_url, rpc_user, rpc_pass,
@@ -9016,8 +9156,19 @@ int main(int argc, char **argv) {
                     if (!g_abort_pass)
                         log_msg("\n*** STRATUM NEW BLOCK ***\n\n");
                 }
+              } else if (g_nonce_advanced) {
+                /* Workers advanced the nonce in-place via advance_nonce().
+                   h256 is already updated in g_pass — no getwork call needed.
+                   Just sync h256 and targets from g_pass for the next pass.  */
+                g_nonce_advanced = 0;
+                struct pass_state pass_snap_na;
+                pass_state_snapshot(&pass_snap_na);
+                memcpy(h256, pass_snap_na.h256, 32);
+                scan_target_runtime = refresh_runtime_targets(
+                    target_explicit, scan_target_explicit,
+                    &target, &scan_target_cfg, pass_snap_na.ndiff);
               } else {
-                /* Drain submit queue before getwork to keep mapNewBlock consistent. */
+                /* Real new block or 2^32 nonce exhaustion — fetch fresh work. */
                 sq_drain();
                 if (build_mining_pass(rpc_url, rpc_user, rpc_pass, shift)) {
                     struct pass_state pass_snap;
