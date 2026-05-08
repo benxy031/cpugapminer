@@ -505,17 +505,126 @@ static int kick_weakest_prime(int *offsets, int n_primes, int gap_size,
                               int fixed, uint8_t *buf, unsigned *rng);
 
 /* ------------------------------------------------------------------ */
-/* Evolutionary algorithm                                              */
-/* Tournament selection, uniform crossover on non-fixed primes,        */
-/* random mutation + local-search refinement.                          */
+/* Evolutionary algorithm — Memetic EA with parallel child generation  */
+/*                                                                     */
+/* Each generation spawns n_threads worker threads.  Each worker:      */
+/*   1. Tournament-selects 2 parents from the population (read-only).  */
+/*   2. Uniform crossover on free primes.                              */
+/*   3. Mutates exactly 1 free prime (2 when stale).                   */
+/*   4. Runs local_search_sweep to bring the child to a local optimum. */
+/*   5. Evaluates the child.                                           */
+/* The main thread then inserts improvements into the population.      */
+/*                                                                     */
+/* Applying full local search to every child converts the EA into a    */
+/* Memetic Algorithm.  Greedy already reaches good local optima; the   */
+/* EA's job is to recombine partial solutions from different greedy     */
+/* starts and escape to new basins via crossover + repair.             */
 /* ------------------------------------------------------------------ */
-static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
-                   int fixed, int max_gens, unsigned *rng) {
-    int     *child = (int *)malloc((size_t)n_primes * sizeof(int));
-    uint8_t *buf   = (uint8_t *)calloc((size_t)(gap_size + 1), 1);
-    uint8_t *buf2  = (uint8_t *)calloc((size_t)(gap_size + 1), 1);
-    if (!child || !buf || !buf2) { perror("alloc"); exit(1); }
+typedef struct {
+    int             n_primes;
+    int             gap_size;
+    int             fixed;
+    int             nfree;
+    unsigned        rng;
+    const Solution *pop;       /* read-only during child generation     */
+    int             pop_size;
+    int            *offsets;   /* output: child offsets                 */
+    int             n_candidates;
+    double          w_score;
+    int             stale;     /* input: guides extra mutation          */
+    int             mut_level; /* adaptive mutation intensity (0..4)    */
+    int             max_gens;  /* input: stale threshold denominator    */
+    uint8_t        *buf;       /* pre-allocated (gap_size+1) bytes      */
+} EvoChildArgs;
 
+static void *evo_child_fn(void *arg) {
+    EvoChildArgs *a   = (EvoChildArgs *)arg;
+    int np    = a->n_primes, gs = a->gap_size;
+    int fixed = a->fixed,  nfree = a->nfree;
+    unsigned rng = a->rng;
+
+    /* tournament select two parents */
+    int ai = (int)(rand_r(&rng) % (unsigned)a->pop_size);
+    int bi = (int)(rand_r(&rng) % (unsigned)a->pop_size);
+    int p1 = solution_better(&a->pop[ai], &a->pop[bi]) ? ai : bi;
+    ai = (int)(rand_r(&rng) % (unsigned)a->pop_size);
+    bi = (int)(rand_r(&rng) % (unsigned)a->pop_size);
+    int p2 = solution_better(&a->pop[ai], &a->pop[bi]) ? ai : bi;
+
+    /* uniform crossover: fixed primes from p1, free primes random */
+    int *child = a->offsets;
+    for (int i = 0; i < np; i++) {
+        child[i] = (i < fixed || (rand_r(&rng) & 1))
+                   ? a->pop[p1].offsets[i]
+                   : a->pop[p2].offsets[i];
+    }
+
+    /* Adaptive mutation pressure (Gapben-style level escalation).
+     * Level rises when generations stall, and drops after improvements. */
+    if (nfree > 0) {
+        int kicks = 1;
+        if (a->mut_level == 1) {
+            kicks = 2;
+        } else if (a->mut_level == 2) {
+            kicks = 3 + (int)(rand_r(&rng) % 3u);
+        } else if (a->mut_level == 3) {
+            kicks = 5 + (int)(rand_r(&rng) % 4u);
+            kick_weakest_prime(child, np, gs, fixed, a->buf, &rng);
+        } else if (a->mut_level >= 4) {
+            if ((rand_r(&rng) & 3) == 0) {
+                for (int i = fixed; i < np; i++) {
+                    int p = PRIMES[i];
+                    child[i] = 1 + (int)(rand_r(&rng) % (unsigned)(p - 1));
+                }
+            }
+            kicks = 8 + (int)(rand_r(&rng) % 5u);
+            kick_weakest_prime(child, np, gs, fixed, a->buf, &rng);
+        }
+
+        for (int m = 0; m < kicks; m++) {
+            int idx = fixed + (int)(rand_r(&rng) % (unsigned)nfree);
+            int p   = PRIMES[idx];
+            child[idx] = 1 + (int)(rand_r(&rng) % (unsigned)(p - 1));
+        }
+    }
+
+    /* memetic core: bring child to the nearest local optimum */
+    local_search_sweep(child, np, gs, fixed, a->buf);
+
+    /* evaluate */
+    a->n_candidates = evaluate(child, np, gs, a->buf, &a->w_score);
+
+    /* write back advanced RNG state so the next generation gets a
+     * different seed even when reusing the same EvoChildArgs slot */
+    a->rng = rng;
+
+    return NULL;
+}
+
+static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
+                   int fixed, int max_gens, unsigned *rng, int n_threads) {
+    int nfree = n_primes - fixed;
+
+    /* allocate per-thread state once; reuse across all generations */
+    EvoChildArgs *wargs = (EvoChildArgs *)malloc((size_t)n_threads * sizeof(EvoChildArgs));
+    pthread_t    *tids  = (pthread_t    *)malloc((size_t)n_threads * sizeof(pthread_t));
+    if (!wargs || !tids) { perror("alloc"); exit(1); }
+
+    for (int t = 0; t < n_threads; t++) {
+        wargs[t].n_primes  = n_primes;
+        wargs[t].gap_size  = gap_size;
+        wargs[t].fixed     = fixed;
+        wargs[t].nfree     = nfree;
+        wargs[t].rng       = *rng ^ ((unsigned)t * 2246822519u);
+        wargs[t].pop       = pop;
+        wargs[t].pop_size  = pop_size;
+        wargs[t].max_gens  = max_gens;
+        wargs[t].offsets   = (int     *)malloc((size_t)n_primes * sizeof(int));
+        wargs[t].buf       = (uint8_t *)calloc((size_t)(gap_size + 1), 1);
+        if (!wargs[t].offsets || !wargs[t].buf) { perror("alloc"); exit(1); }
+    }
+
+    /* find initial best */
     int    best_ever_cnt = INT_MAX;
     double best_ever_w   = 1e18;
     for (int i = 0; i < pop_size; i++) {
@@ -527,68 +636,20 @@ static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
     }
 
     int stale = 0;
+    int mut_level = 0;
+    int no_improve_gens = 0;
 
     for (int gen = 0; gen < max_gens; gen++) {
-        /* tournament select two parents */
-        int a = (int)(rand_r(rng) % (unsigned)pop_size);
-        int b = (int)(rand_r(rng) % (unsigned)pop_size);
-        int p1 = solution_better(&pop[a], &pop[b]) ? a : b;
-        a = (int)(rand_r(rng) % (unsigned)pop_size);
-        b = (int)(rand_r(rng) % (unsigned)pop_size);
-        int p2 = solution_better(&pop[a], &pop[b]) ? a : b;
-
-        /* uniform crossover */
-        for (int i = 0; i < n_primes; i++) {
-            if (i < fixed)
-                child[i] = pop[p1].offsets[i];
-            else
-                child[i] = (rand_r(rng) & 1) ? pop[p1].offsets[i]
-                                              : pop[p2].offsets[i];
+        /* spawn n_threads children in parallel */
+        for (int t = 0; t < n_threads; t++) {
+            wargs[t].stale = stale;
+            wargs[t].mut_level = mut_level;
+            pthread_create(&tids[t], NULL, evo_child_fn, &wargs[t]);
         }
+        for (int t = 0; t < n_threads; t++)
+            pthread_join(tids[t], NULL);
 
-        /* random mutation: adaptive rate — ramp up when stale */
-        int mut_thresh = (stale > 10000) ? n_primes / 2 : 2;
-        for (int i = fixed; i < n_primes; i++) {
-            if ((int)(rand_r(rng) % (unsigned)n_primes) < mut_thresh)
-                child[i] = (int)(rand_r(rng) % (unsigned)PRIMES[i]);
-        }
-
-        /* local-search refinement is intentionally sparse; greedy already
-         * does most of the useful work. */
-        if ((int)(rand_r(rng) % 25) == 0 && fixed < n_primes) {
-            int nfree = n_primes - fixed;
-            if (nfree >= 2 && (rand_r(rng) & 1)) {
-                /* pair search: jointly optimise two random primes */
-                int ia = fixed + (int)(rand_r(rng) % (unsigned)nfree);
-                int ib = fixed + (int)(rand_r(rng) % (unsigned)nfree);
-                while (ib == ia) ib = fixed + (int)(rand_r(rng) % (unsigned)nfree);
-                local_search_pair(child, n_primes, gap_size,
-                                  ia, ib, buf, buf2);
-            } else {
-                int idx = fixed + (int)(rand_r(rng) % (unsigned)(n_primes - fixed));
-                local_search_one(child, n_primes, gap_size, idx, buf);
-            }
-        }
-
-        /* Controlled escape: jump one weakest prime, then repair locally. */
-        if (fixed < n_primes && (stale > 8000 || (int)(rand_r(rng) % 24) == 0)) {
-            int weak_idx = kick_weakest_prime(child, n_primes, gap_size,
-                                             fixed, buf2, rng);
-            if (weak_idx >= 0) {
-                local_search_one(child, n_primes, gap_size, weak_idx, buf);
-                if ((rand_r(rng) & 1) && weak_idx + 1 < n_primes)
-                    local_search_pair(child, n_primes, gap_size,
-                                      weak_idx,
-                                      weak_idx + 1,
-                                      buf, buf2);
-            }
-        }
-
-        /* evaluate */
-        double fitness_w;
-        int fitness = evaluate(child, n_primes, gap_size, buf, &fitness_w);
-
-        /* replace worst if child is better */
+        /* find worst in population */
         int worst = 0;
         for (int i = 1; i < pop_size; i++) {
             if (pop[i].n_candidates > pop[worst].n_candidates ||
@@ -597,38 +658,66 @@ static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
                 worst = i;
         }
 
-        if (solution_better_metrics(fitness, fitness_w,
-                                    pop[worst].n_candidates,
-                                    pop[worst].w_score)) {
-            memcpy(pop[worst].offsets, child, (size_t)n_primes * sizeof(int));
-            pop[worst].n_candidates = fitness;
-            pop[worst].w_score      = fitness_w;
+        /* insert each child that beats the current worst */
+        bool any_improved = false;
+        for (int t = 0; t < n_threads; t++) {
+            EvoChildArgs *w = &wargs[t];
+            if (solution_better_metrics(w->n_candidates, w->w_score,
+                                        pop[worst].n_candidates,
+                                        pop[worst].w_score)) {
+                memcpy(pop[worst].offsets, w->offsets,
+                       (size_t)n_primes * sizeof(int));
+                pop[worst].n_candidates = w->n_candidates;
+                pop[worst].w_score      = w->w_score;
+                /* re-find worst after each insertion */
+                worst = 0;
+                for (int i = 1; i < pop_size; i++) {
+                    if (pop[i].n_candidates > pop[worst].n_candidates ||
+                        (pop[i].n_candidates == pop[worst].n_candidates &&
+                         pop[i].w_score > pop[worst].w_score))
+                        worst = i;
+                }
+            }
+            if (solution_better_metrics(w->n_candidates, w->w_score,
+                                        best_ever_cnt, best_ever_w)) {
+                best_ever_cnt = w->n_candidates;
+                best_ever_w   = w->w_score;
+                any_improved  = true;
+            }
         }
 
-        if (solution_better_metrics(fitness, fitness_w,
-                                    best_ever_cnt, best_ever_w)) {
-            best_ever_cnt = fitness;
-            best_ever_w   = fitness_w;
+        if (any_improved) {
             stale = 0;
+            no_improve_gens = 0;
+            if (mut_level > 0)
+                mut_level--;
         } else {
             stale++;
+            no_improve_gens++;
+            if (no_improve_gens % 40 == 0 && mut_level < 4)
+                mut_level++;
         }
 
         /* progress */
-        if ((gen + 1) % 10000 == 0 || gen == max_gens - 1) {
-            fprintf(stderr, "\r  evolution: gen %d/%d  best=%d  stale=%d     ",
-                    gen + 1, max_gens, best_ever_cnt, stale);
+        if ((gen + 1) % 200 == 0 || gen == max_gens - 1) {
+            fprintf(stderr,
+                "\r  evolution: gen %d/%d  best=%d  stale=%d  lvl=%d     ",
+                gen + 1, max_gens, best_ever_cnt, stale, mut_level);
             fflush(stderr);
         }
 
-        /* early stop if no improvement for a long time */
-        if (stale > max_gens / 10 && stale > 8000) break;
+        /* early stop when no improvement for half the budget */
+        if (stale > max_gens / 2 && stale > 100) break;
     }
 
     fprintf(stderr, "\n");
-    free(child);
-    free(buf);
-    free(buf2);
+
+    for (int t = 0; t < n_threads; t++) {
+        free(wargs[t].offsets);
+        free(wargs[t].buf);
+    }
+    free(wargs);
+    free(tids);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1063,62 +1152,11 @@ int main(int argc, char **argv) {
         free(wargs);
         free(tids);
 
-        /* Keep a small elite bank of the best greedy solutions. */
-        int elite_keep = pop_size < 8 ? pop_size : 8;
-        Solution *elite_bank = (Solution *)calloc((size_t)elite_keep,
-                                                  sizeof(Solution));
-        bool *picked = (bool *)calloc((size_t)pop_size, sizeof(bool));
-        uint8_t *seed_buf = NULL;
-        if (!elite_bank || !picked) { perror("calloc"); exit(1); }
-
-        for (int i = 0; i < elite_keep; i++)
-            elite_bank[i].offsets = NULL;
-
-        for (int e = 0; e < elite_keep; e++) {
-            int best_idx = -1;
-            for (int i = 0; i < pop_size; i++) {
-                if (picked[i]) continue;
-                if (best_idx < 0 || solution_better(&pop[i], &pop[best_idx]))
-                    best_idx = i;
-            }
-            picked[best_idx] = true;
-            elite_bank[e] = sol_clone(&pop[best_idx]);
-        }
-
-        if (ctr_evolution && pop_size > 1) {
-            seed_buf = (uint8_t *)calloc((size_t)(gs + 1), 1);
-            if (!seed_buf) { perror("calloc"); exit(1); }
-
-            /* Rebuild the population around the elite bank. */
-            for (int i = 0; i < pop_size; i++) {
-                int src = i % elite_keep;
-                memcpy(pop[i].offsets, elite_bank[src].offsets,
-                       (size_t)np * sizeof(int));
-
-                if (i >= elite_keep) {
-                    unsigned pop_rng = (unsigned)time(NULL) ^ ((unsigned)i * 1234567u);
-                    int weak_idx = kick_weakest_prime(pop[i].offsets, np, gs,
-                                                      ctr_fixed, seed_buf, &pop_rng);
-                    if (weak_idx >= 0) {
-                        local_search_one(pop[i].offsets, np, gs, weak_idx,
-                                         seed_buf);
-                        if ((i & 1) == 0 && weak_idx + 1 < np)
-                            local_search_pair(pop[i].offsets, np, gs,
-                                              weak_idx, weak_idx + 1,
-                                              seed_buf, buf);
-                    }
-                }
-
-                pop[i].n_candidates = evaluate(pop[i].offsets, np, gs,
-                                               seed_buf, &pop[i].w_score);
-            }
-        }
-
-        for (int i = 0; i < elite_keep; i++)
-            sol_free(&elite_bank[i]);
-        free(elite_bank);
-        free(picked);
-        free(seed_buf);
+        /* The greedy pool in pop[] already contains pop_size diverse,
+         * locally-optimal solutions (every greedy restart ends with a full
+         * local_search_sweep).  Do NOT rebuild around a handful of elite
+         * seeds — that collapses the structural diversity that makes
+         * crossover between different greedy basins effective. */
 
         /* ---- Phase 2: evolution ---- */
         if (ctr_evolution && pop_size > 1) {
@@ -1127,13 +1165,17 @@ int main(int argc, char **argv) {
             int adj_fixed = ctr_fixed;
             if (adj_fixed > np) adj_fixed = np;
 
-            /* adaptive generation count: keep evolution as a light
-             * refinement pass, not a second full search. */
-            int gens = np * pop_size * 1200;
-            if (gens < 30000)  gens = 30000;
-            if (gens > 400000) gens = 400000;
+            /* Each generation produces n_threads locally-optimal children
+             * (full local_search_sweep per child = memetic EA).  Fewer
+             * generations are needed because every child is locally polished
+             * before it competes for a population slot.  Wall time target:
+             * ~30 s for typical shift=256 runs on 8 threads. */
+            int gens = pop_size;
+            if (gens < 1000)  gens = 1000;
+            if (gens > 6000)  gens = 6000;
 
-            evolve(pop, pop_size, np, gs, adj_fixed, gens, &evo_rng);
+            evolve(pop, pop_size, np, gs, adj_fixed, gens, &evo_rng,
+                   actual_threads);
         }
 
         /* ---- Phase 3: Iterated Local Search (ILS), parallel ---- */

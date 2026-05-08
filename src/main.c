@@ -2693,10 +2693,18 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
                     if (ret == 0) {
                         /* Bitmap mode: OR GPU composites into Phase-1 bits[] */
                         struct timespec _t0, _t1;
+#ifdef CLOCK_MONOTONIC_RAW
                         clock_gettime(CLOCK_MONOTONIC_RAW, &_t0);
+#else
+                        clock_gettime(CLOCK_MONOTONIC, &_t0);
+#endif
                         for (size_t byte = 0; byte < bit_size; byte++)
                             bits[byte] |= tls_gpu_seg[byte];
+#ifdef CLOCK_MONOTONIC_RAW
                         clock_gettime(CLOCK_MONOTONIC_RAW, &_t1);
+#else
+                        clock_gettime(CLOCK_MONOTONIC, &_t1);
+#endif
                         {
                             int64_t _merge_us = (int64_t)(_t1.tv_sec - _t0.tv_sec) * 1000000LL
                                               + ((int64_t)_t1.tv_nsec - (int64_t)_t0.tv_nsec) / 1000LL;
@@ -5134,8 +5142,8 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
             }
             prime_cnt = uniq;
             if (use_extra_verbose) {
-                log_file_only("[extra-merit] source=crt-gpu note=sorted-dedup survivors=%zu\n",
-                              prime_cnt);
+                log_file_only("[extra-merit] source=crt-gpu note=sorted-dedup survivors=%lu\n",
+                              (unsigned long)prime_cnt);
             }
         }
     }
