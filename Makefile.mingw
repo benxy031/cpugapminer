@@ -72,6 +72,9 @@ ifdef CUDA_DLL
 	# DLL mode (Windows CI): link against pre-built import library.
 	# The DLLs are built with the MSVC toolchain — see build-windows.yml.
 	# This avoids all MSVC/MinGW COFF incompatibilities.
+	# -DCUDA_DLL tells presieve_utils.c not to call cudaGetDeviceCount() directly
+	# (the symbol lives in the DLL, not in a linked cudart).
+	CFLAGS+=-DCUDA_DLL
 	CUDA_OBJS=$(SRCDIR)/libgpu_fermat.a $(SRCDIR)/libgpu_sieve.a
 else
 	NVCC ?= nvcc

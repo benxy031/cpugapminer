@@ -96,6 +96,7 @@ int gpu_sieve_init(size_t seg_cap, size_t primes_cap) {
         return 0;
 
     if (g_gpu_sieve_num_devices <= 0) {
+#ifndef CUDA_DLL
         int dev_count = 0;
         cudaError_t cerr = cudaGetDeviceCount(&dev_count);
         if (cerr != cudaSuccess || dev_count <= 0)
@@ -105,6 +106,14 @@ int gpu_sieve_init(size_t seg_cap, size_t primes_cap) {
         for (int i = 0; i < dev_count; i++)
             g_gpu_sieve_devices[i] = i;
         g_gpu_sieve_num_devices = dev_count;
+#else
+        /* CUDA_DLL: runtime lives in the DLL; cudaGetDeviceCount not linked.
+           gpu_sieve_set_devices() must be called first to populate the list.
+           If it wasn't, default to device 0 and let gpu_sieve_ctx_alloc fail
+           gracefully if no GPU is present. */
+        g_gpu_sieve_devices[0] = 0;
+        g_gpu_sieve_num_devices = 1;
+#endif
     }
 
     /* Stash capacity params for lazy per-thread context allocation. */
@@ -157,10 +166,15 @@ int gpu_sieve_set_devices(const int *device_ids, int n_devices) {
     if (n_devices > GPU_SIEVE_MAX_DEVS)
         n_devices = GPU_SIEVE_MAX_DEVS;
 
+#ifndef CUDA_DLL
     int dev_count = 0;
     cudaError_t cerr = cudaGetDeviceCount(&dev_count);
     if (cerr != cudaSuccess || dev_count <= 0)
         return -1;
+#else
+    /* CUDA_DLL: trust provided IDs; validation happens inside the DLL. */
+    int dev_count = GPU_SIEVE_MAX_DEVS;
+#endif
 
     int out = 0;
     for (int i = 0; i < n_devices; i++) {

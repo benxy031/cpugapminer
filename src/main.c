@@ -2384,10 +2384,36 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
         }
     } else if (use_wheel_sieve && g_crt_mode == CRT_MODE_NONE
                && wheel_sieve_enabled() && h256) {
-        uint64_t base_mod_w = uint256_mod_small(h256, shift, wheel_sieve_size());
-        size_t sb = wheel_sieve_start_bit(base_mod_w, L);
+        /* When primorial alignment is active and the wheel size equals P#,
+           (base+L) % P# = 1 every window, so start_bit = (1-1)/2 = 0.
+           Skip the 256-bit mod entirely. */
+        size_t sb;
+        if (g_primorial_val > 1
+                && wheel_sieve_size() == (unsigned int)g_primorial_val) {
+            sb = 0;
+        } else {
+            uint64_t base_mod_w = uint256_mod_small(h256, shift, wheel_sieve_size());
+            sb = wheel_sieve_start_bit(base_mod_w, L);
+        }
         wheel_sieve_tile(bits, bit_size, sb);
         crt_skip_to = (int)wheel_sieve_skip_to();
+        /* Extend composite removal to primes 3..163 by layering the
+         * multi-table presieve on top if base_mod_p is already cached.
+         * OR-merge is idempotent — overlap with wheel primes (3..19) is safe.
+         * Phase 1 then starts from prime index 38 instead of 8, skipping
+         * 30 extra primes that would otherwise be marked in the hot loop. */
+        if (g_mps_ready && tls_base_mod_p_ready && tls_base_mod_p
+                && small_primes_count > MPRESIEVE_SKIP_TO) {
+            uint64_t bm = (tls_base_mod_p[1] * 170170ULL
+                         + tls_base_mod_p[2] * 306306ULL
+                         + tls_base_mod_p[3] * 145860ULL
+                         + tls_base_mod_p[4] *  46410ULL
+                         + tls_base_mod_p[5] * 157080ULL
+                         + tls_base_mod_p[6] * 450450ULL)
+                         % PRESIEVE_2PERIOD;
+            mpresieve_tile(bits, bit_size, tls_base_mod_p, L, bm);
+            crt_skip_to = MPRESIEVE_SKIP_TO;
+        }
     } else if (g_mps_ready && tls_base_mod_p_ready && tls_base_mod_p
                && small_primes_count > MPRESIEVE_SKIP_TO) {
         /* Multi-table pre-sieve: covers primes 3..163 (~37 primes). */
@@ -7920,6 +7946,9 @@ int main(int argc, char **argv) {
                 (unsigned long long)g_primorial_p,
                 (unsigned long long)g_primorial_val,
                 (unsigned long long)sieve_size);
+        /* Note: when combined with --wheel-sieve W=P#, (base+L) % P# = 1
+           every window, so wheel_sieve_tile() always uses start_bit=0
+           (the fast memcpy path, no bit-shifting). */
     } else if (g_primorial_p > 0) {
         log_msg("primorial: --primorial ignored in CRT mode\n");
         g_primorial_p = 0;
