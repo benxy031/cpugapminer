@@ -6047,9 +6047,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
                            const char *rpc_sign_key_local) {
     (void)header_local;     /* param kept for API compat; abort uses g_abort_pass */
     (void)rpc_method_local; /* method is always "getwork" now */
-    uint64_t sc_pairs   = (cnt > 1) ? (uint64_t)(cnt - 1) : 0;
-    uint64_t sc_quals   = 0;   /* qualifying gaps submitted this call */
-    if (sc_pairs > 0) __sync_fetch_and_add(&stats_pairs, sc_pairs);
+    if (cnt > 1) __sync_fetch_and_add(&stats_pairs, (uint64_t)(cnt - 1));
     for (size_t i = 0; i + 1 < cnt; i++) {
 #ifdef WITH_RPC
         /* During long scans, poll tip changes from this thread too.
@@ -6163,7 +6161,6 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
 
         stats_last_qual_gap = gap;
         __sync_fetch_and_add(&stats_gaps, 1);
-        sc_quals++;
         log_extra_merit_event("qual", "scan-candidates", merit, gap,
                       target_local);
         /* nAdd = relative offset = prev (prime = base + nAdd). */
@@ -6195,10 +6192,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
                                                 rpc_pass_local,
                                                 rpc_sign_key_local,
                                                 " (mining continues)");
-                        if (!keep_going) {
-                            rgm_accum_qual(sc_pairs, sc_quals, target_local);
-                            return 1;
-                        }
+                        if (!keep_going) return 1;
                         else log_msg("continuing mining after success\n");
                     }
                 } else {
@@ -6207,7 +6201,6 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
             }
 #endif
     }   /* end for */
-    rgm_accum_qual(sc_pairs, sc_quals, target_local);
     return 0;
 }
 
@@ -7243,6 +7236,12 @@ static void *worker_fn(void *arg) {
             /* Smart-scan path handles gap scanning internally (region-based).
                Only run scan_candidates for full-test and no_primality. */
             if (!use_smart && cnt >= 2) {
+                /* Snapshot gaps counter before scanning this window.
+                   scan_candidates() returns 1 only when keep_going=0; with
+                   keep_going=1 it always returns 0 even after submitting a
+                   qualifying gap.  Use the stats_gaps delta instead so
+                   rgm_accum_qual receives the true qualifying-gap count. */
+                uint64_t gaps_snap = stats_gaps;
                 /* Cross-window gap: check the carry→pr[0] pair first without
                    shifting the array (avoids an O(cnt) memmove every window). */
                 if (carry_last_prime && carry_last_prime < pr[0]) {
@@ -7254,19 +7253,32 @@ static void *worker_fn(void *arg) {
                                         rpc_method_local, rpc_sign_key_local))
                         goto worker_done;
                 }
-                /* RGM check: pr[] contains all confirmed primes in this window.
-                   Only valid here — smart-scan never builds a complete prime array. */
+                /* RGM / qual-prob check: pr[] has all confirmed primes in this
+                   window — only valid in !use_smart (smart-scan never builds a
+                   complete unbiased prime array, same reason we skip RGM there). */
                 if (cnt >= 11) {
                     rgm_accumulate_window(pr, cnt, 10);
                     rgm_accumulate_window(pr, cnt, 20);
                     rgm_accumulate_mean_gap(pr, cnt, logbase);
                 }
-                if (scan_candidates(pr, cnt, target_local, logbase,
+                {
+                    int sc_ret = scan_candidates(pr, cnt, target_local, logbase,
                                     shift_local,
                                     header_local,
                                     rpc_url_local, rpc_user_local, rpc_pass_local,
-                                    rpc_method_local, rpc_sign_key_local))
-                    goto worker_done; /* stop-after-block: exit immediately */
+                                    rpc_method_local, rpc_sign_key_local);
+                    /* Accumulate empirical qual probability from unbiased pairs.
+                       cnt-1 gives the full window pair count.  quals_found is
+                       the stats_gaps delta across both the cross-window check
+                       and the main scan — correct regardless of keep_going.
+                       Not called in smart-scan mode — region-only pairs would
+                       bias the rate by ~10-15× and corrupt the ETA estimate. */
+                    if (cnt >= 2) {
+                        uint64_t new_quals = stats_gaps - gaps_snap;
+                        rgm_accum_qual((uint64_t)(cnt - 1), new_quals, target_local);
+                    }
+                    if (sc_ret) goto worker_done;
+                }
             }
             /* Update carry for next window */
             if (cnt >= 1)
