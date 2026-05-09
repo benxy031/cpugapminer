@@ -2847,6 +2847,7 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
                         else lrem = (bmp + L % p) % p;
                         uint64_t start = L + (lrem == 0 ? 0 : p - lrem);
                         if ((start & 1) == 0) start += p;
+                        if (start >= R) continue;
                         for (uint64_t m = start; m < R; m += 2 * p) {
                             uint64_t pos = (m - L) >> 1;
                             bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
@@ -2865,6 +2866,7 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
                     else lrem = (base_mod_p + L % p) % p;
                     uint64_t start = L + (lrem == 0 ? 0 : p - lrem);
                     if ((start & 1) == 0) start += p;
+                    if (start >= R) continue;
                     for (uint64_t m = start; m < R; m += 2 * p) {
                         uint64_t pos = (m - L) >> 1;
                         bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
