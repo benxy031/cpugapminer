@@ -5071,12 +5071,10 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
 #endif /* WITH_GPU_FERMAT */
 
 /* ── CRT gap scan + submission ──
-   Full linear scan over all sieve survivors: test each candidate, track
-   consecutive prime pairs, and submit any pair whose gap ≥ target merit.
-   The window is 2×gap_target wide, so qualifying gaps (≈ gap_target) can
-   comfortably fit: we need two primes separated by merit_threshold×logbase,
-   and the window gives 2×gap_target > merit_threshold×logbase of room.
-   With ~38 primes per window there are ~37 pair opportunities per window. */
+    Two-stage CPU scan for CRT survivors:
+    1) sample a small prefix to keep live best/last-gap stats responsive,
+    2) run backward_scan_segment() for bounded skip-ahead search and
+        qualifying-gap discovery with fewer Fermat tests than full linear scan. */
 static size_t crt_bkscan_and_submit(
         uint64_t *surv, size_t surv_cnt,
         double logbase, double target, int shift_v,
@@ -5092,40 +5090,91 @@ static size_t crt_bkscan_and_submit(
     uint64_t qual_pairs[64][2];
     size_t   qual_cnt = 0;
 
-    uint64_t last_prime = 0;
-    int      have_last = 0;
+    uint64_t last_sample_prime = 0;
+    int      have_sample_prime = 0;
     uint64_t best_gap_local = 0;
     double   best_merit_loc = 0.0;
     uint64_t last_gap_local = 0;
+    size_t   first_idx = surv_cnt;
 
     __sync_fetch_and_add(&stats_crt_windows, 1);
 
-    /* Full linear scan: evaluate every survivor and every consecutive prime
-       pair in this window. */
-    for (size_t j = 0; j < surv_cnt; j++) {
+    /* Sample prefix for live best/last-gap stats and early qualifying pairs.
+       This keeps UI metrics responsive without forcing a full linear scan. */
+    size_t sample_end = surv_cnt;
+    if (sample_end > 192)
+        sample_end = 192;
+    for (size_t j = 0; j < sample_end; j++) {
         total_tested++;
         if (!bn_candidate_is_prime(surv[j])) continue;
         primes_found++;
 
-        if (have_last) {
-            uint64_t gap = surv[j] - last_prime;
+        if (have_sample_prime) {
+            uint64_t gap = surv[j] - last_sample_prime;
             double merit = (double)gap / logbase;
             last_gap_local = gap;
             stats_last_gap = gap;
-            log_extra_merit_sample("crt-linear", merit, gap, target);
+            log_extra_merit_sample("crt-bkscan-sample", merit, gap, target);
 
             if (merit > best_merit_loc) {
                 best_merit_loc = merit;
                 best_gap_local = gap;
             }
             if (merit >= target && qual_cnt < 64) {
-                qual_pairs[qual_cnt][0] = last_prime;
+                qual_pairs[qual_cnt][0] = last_sample_prime;
                 qual_pairs[qual_cnt][1] = surv[j];
                 qual_cnt++;
             }
         }
-        last_prime = surv[j];
-        have_last = 1;
+        last_sample_prime = surv[j];
+        have_sample_prime = 1;
+        first_idx = j; /* Start bounded scan from latest sampled prime. */
+    }
+
+    /* If no prime found in sample (rare), keep searching until first prime. */
+    if (first_idx == surv_cnt) {
+        for (size_t j = sample_end; j < surv_cnt; j++) {
+            total_tested++;
+            if (bn_candidate_is_prime(surv[j])) {
+                primes_found++;
+                first_idx = j;
+                break;
+            }
+        }
+    }
+
+    if (first_idx < surv_cnt) {
+        size_t needed_gap = (size_t)(target * logbase);
+        if (needed_gap < 2)
+            needed_gap = 2;
+
+        struct bkscan_result res;
+        backward_scan_segment(surv, first_idx, surv_cnt,
+                              needed_gap, logbase, target,
+                              bn_candidate_is_prime, &res);
+
+        /* backward_scan_segment re-tests the first prime at first_idx. */
+        if (res.tested > 0)
+            total_tested += (res.tested - 1);
+        if (res.primes_found > 0)
+            primes_found += (res.primes_found - 1);
+
+        if (res.best_merit > best_merit_loc) {
+            best_merit_loc = res.best_merit;
+            best_gap_local = res.best_gap;
+        }
+        if (res.best_gap > 0) {
+            last_gap_local = res.best_gap;
+            stats_last_gap = res.best_gap;
+            log_extra_merit_sample("crt-bkscan", res.best_merit,
+                                   res.best_gap, target);
+        }
+
+        for (size_t qi = 0; qi < res.qual_cnt && qual_cnt < 64; qi++) {
+            qual_pairs[qual_cnt][0] = res.qual_pairs[qi][0];
+            qual_pairs[qual_cnt][1] = res.qual_pairs[qi][1];
+            qual_cnt++;
+        }
     }
 
     /* RGM convergence check only applies to natural random-window primes,
@@ -5134,7 +5183,7 @@ static size_t crt_bkscan_and_submit(
     if (best_merit_loc > stats_best_merit) {
         stats_best_merit = best_merit_loc;
         stats_best_gap = best_gap_local;
-        log_extra_merit_event("best", "crt-linear", best_merit_loc,
+        log_extra_merit_event("best", "crt-bkscan", best_merit_loc,
                               best_gap_local, target);
     }
     if (best_gap_local > stats_crt_consumer_best_gap)
@@ -5165,7 +5214,7 @@ static size_t crt_bkscan_and_submit(
 
         __sync_fetch_and_add(&stats_gaps, 1);
         stats_last_qual_gap = gap;
-        log_extra_merit_event("qual", "crt-linear", merit, gap, target);
+        log_extra_merit_event("qual", "crt-bkscan", merit, gap, target);
 
         mpz_t nAdd_prime;
         mpz_init(nAdd_prime);
