@@ -29,7 +29,8 @@ typedef struct {
     size_t    d_bits_cap;     /* max packed bitmap bytes allocated */
     size_t    d_primes_cap;   /* max primes in device array */
     const uint64_t *loaded_primes_src; /* last host prime slice uploaded */
-    int       loaded_n_primes;/* last prime count uploaded */
+    uint64_t *h_primes_shadow; /* host shadow of last uploaded prime slice */
+    int       loaded_primes_n; /* last prime count uploaded */
     int       device_id;      /* GPU device ordinal (0–7) */
     int       initialized;    /* 1 = allocations succeeded */
     /* base_mod_p cache: d_base_mod_p[j] = (big_base) % primes[j].
@@ -37,6 +38,8 @@ typedef struct {
     uint64_t *d_base_mod_p;          /* device memory: base_mod_p per prime */
     const uint64_t *loaded_base_mod_p_src; /* last host base_mod_p slice uploaded */
     uint64_t  loaded_base_mod_p_version; /* version counter from caller; re-upload on mismatch */
+    uint64_t *h_base_mod_p_shadow;    /* host shadow of last uploaded base_mod_p slice */
+    int       loaded_base_mod_p_n;    /* last base_mod_p count uploaded */
     uint8_t  *h_bits_pinned;         /* pinned host staging for async D->H bitmap copy */
     size_t    h_bits_pinned_cap;     /* bytes allocated in h_bits_pinned */
     void     *stream;                /* cudaStream_t stored as opaque pointer */
@@ -120,6 +123,7 @@ int gpu_sieve_mark_batch(
     uint8_t *h_bits,              /* host output bitmap (packed, seg_len/8 bytes) */
     size_t bit_len,               /* capacity of h_bits in bytes */
     size_t segment_len,           /* segment size in odd candidates */
+    const uint8_t *h_phase1_bits, /* optional host phase-1 bitmap for final survivor compaction */
     const uint64_t *h_primes,     /* host prime slice (stride per thread) */
     const uint64_t *h_base_mod_p, /* host base_mod_p slice (one entry per prime) */
     uint64_t base_mod_p_version,  /* caller-incremented on header change */

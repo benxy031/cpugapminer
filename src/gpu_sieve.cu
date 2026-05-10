@@ -42,6 +42,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 #include <cuda_runtime.h>
 
 #define GPU_SIEVE_THREADS_PER_BLOCK 256
@@ -53,6 +54,21 @@ static int gpu_sieve_timing_enabled(void)
         return cached;
     {
         const char *v = getenv("GPU_SIEVE_TIMING");
+        cached = (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
+    }
+    return cached;
+}
+
+/* Experimental path switch:
+ * 0 (default): keep legacy compact logic (phase-2-only compact attempt).
+ * 1: enable phase1-aware final survivor compaction path. */
+static int gpu_sieve_final_compact_enabled(void)
+{
+    static int cached = -1;
+    if (cached >= 0)
+        return cached;
+    {
+        const char *v = getenv("GPU_SIEVE_FINAL_COMPACT");
         cached = (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
     }
     return cached;
@@ -72,6 +88,53 @@ static uint32_t gpu_sieve_get_surv_cap(void)
     }
     if (!cached) cached = 262144; /* 256 K entries = 1 MB pinned */
     return cached;
+}
+
+/* Decide whether compact survivor mode is worth attempting.
+ *
+ * Compact currently counts Phase-2 survivors before Phase-1 intersection.
+ * For large non-CRT windows, this almost always overflows survivors_cap and
+ * adds extra kernel + sync overhead with no benefit. Keep compact enabled for
+ * small windows (e.g. CRT-sized windows), but skip it when overflow is nearly
+ * certain.
+ */
+static int gpu_sieve_should_try_compact(
+    size_t segment_len,
+    uint32_t survivors_cap,
+    const uint64_t *h_primes,
+    int n_primes)
+{
+    if (survivors_cap == 0 || !h_primes || n_primes <= 0)
+        return 0;
+
+    if (segment_len <= (size_t)survivors_cap)
+        return 1;
+
+    /* If window is massively larger than cap, overflow is effectively certain
+     * in Phase-2-only survivor space. */
+    if (segment_len > (size_t)survivors_cap * 32u)
+        return 0;
+
+    uint64_t pmin = h_primes[0];
+    uint64_t pmax = h_primes[n_primes - 1];
+    if (pmin < 3 || pmax <= pmin)
+        return (segment_len <= (size_t)survivors_cap * 2u);
+
+    /* Mertens-style range estimate for keep ratio over [pmin, pmax]:
+     *   keep ~= log(pmin)/log(pmax)
+     * Use a generous 2x cap margin to avoid false "skip compact" in small
+     * or unusual windows where compact might still fit. */
+    double lpmin = log((double)pmin);
+    double lpmax = log((double)pmax);
+    if (!(lpmin > 0.0) || !(lpmax > lpmin))
+        return (segment_len <= (size_t)survivors_cap * 2u);
+
+    double keep = lpmin / lpmax;
+    if (keep < 0.0) keep = 0.0;
+    if (keep > 1.0) keep = 1.0;
+
+    double est_surv = (double)segment_len * keep;
+    return est_surv <= (double)survivors_cap * 2.0;
 }
 
 /* Simple CUDA error check (inline) */
@@ -187,6 +250,45 @@ __global__ static void kernel_compact_survivors(
     }
 }
 
+/* Kernel: compact survivors that pass both Phase-2 marks and Phase-1 bitmap.
+ *
+ * phase1_bits is a packed bitmap where bit=1 means composite from Phase-1.
+ * A survivor position must satisfy:
+ *   segment[pos] == 0  (not marked by Phase-2)
+ *   phase1_bits[pos] == 0 (not marked by Phase-1)
+ */
+__global__ static void kernel_compact_survivors_with_phase1(
+    const uint8_t *segment,
+    const uint8_t *phase1_bits,
+    uint32_t       seg_len,
+    uint32_t      *out_indices,
+    uint32_t      *out_count,
+    uint32_t       cap
+) {
+    uint32_t pos = (uint32_t)(blockIdx.x * blockDim.x + threadIdx.x);
+    int is_surv = 0;
+    if (pos < seg_len && segment[pos] == 0) {
+        uint8_t b = phase1_bits[pos >> 3];
+        is_surv = ((b & (uint8_t)(1u << (pos & 7))) == 0);
+    }
+
+    unsigned ballot = __ballot_sync(0xFFFFFFFFu, is_surv);
+    uint32_t warp_count = (uint32_t)__popc(ballot);
+    int lane = (int)(threadIdx.x & 31u);
+
+    uint32_t warp_start = 0;
+    if (lane == 0 && warp_count > 0)
+        warp_start = atomicAdd(out_count, warp_count);
+    warp_start = __shfl_sync(0xFFFFFFFFu, warp_start, 0);
+
+    if (is_surv) {
+        uint32_t offset = (uint32_t)__popc(ballot & ((1u << lane) - 1u));
+        uint32_t gpos = warp_start + offset;
+        if (gpos < cap)
+            out_indices[gpos] = pos;
+    }
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Public API Implementation
 /* Kernel: compute k0[j] = first composite index in [0, segment_len) for
@@ -204,6 +306,7 @@ __global__ static void kernel_compute_k0(
     const uint64_t *primes,
     const uint64_t *base_mod_p,
     uint64_t L, uint64_t R, size_t segment_len,
+    uint32_t L_u32, int L_fits_u32,
     int n_primes
 )
 {
@@ -212,7 +315,12 @@ __global__ static void kernel_compute_k0(
 
     uint64_t p = primes[idx];
     /* lrem = (big_base + L) % p = (base_mod_p + L%p) % p */
-    uint64_t lmod = L % p;
+    uint64_t lmod;
+    if (L_fits_u32 && p <= 0xFFFFFFFFULL) {
+        lmod = (uint64_t)(L_u32 % (uint32_t)p);
+    } else {
+        lmod = L % p;
+    }
     uint64_t lrem = base_mod_p[idx] + lmod;
     if (lrem >= p) lrem -= p;
     /* First candidate offset m where p | (big_base + m), with m odd */
@@ -459,6 +567,22 @@ int gpu_sieve_ctx_alloc(
         return -1;
     }
 
+    ctx->h_base_mod_p_shadow = (uint64_t *)malloc(ctx->d_primes_cap * sizeof(uint64_t));
+    if (!ctx->h_base_mod_p_shadow) {
+        fprintf(stderr, "GPU sieve: malloc(base_mod_p_shadow, %zu) failed\n",
+                ctx->d_primes_cap * sizeof(uint64_t));
+        gpu_sieve_ctx_free(ctx);
+        return -1;
+    }
+
+    ctx->h_primes_shadow = (uint64_t *)malloc(ctx->d_primes_cap * sizeof(uint64_t));
+    if (!ctx->h_primes_shadow) {
+        fprintf(stderr, "GPU sieve: malloc(primes_shadow, %zu) failed\n",
+                ctx->d_primes_cap * sizeof(uint64_t));
+        gpu_sieve_ctx_free(ctx);
+        return -1;
+    }
+
     ctx->initialized = 1;
     return 0;
 }
@@ -479,6 +603,16 @@ void gpu_sieve_ctx_free(gpu_sieve_ctx_t *ctx)
         cudaFreeHost(ctx->h_bits_pinned);
         ctx->h_bits_pinned = NULL;
         ctx->h_bits_pinned_cap = 0;
+    }
+
+    if (ctx->h_base_mod_p_shadow) {
+        free(ctx->h_base_mod_p_shadow);
+        ctx->h_base_mod_p_shadow = NULL;
+    }
+
+    if (ctx->h_primes_shadow) {
+        free(ctx->h_primes_shadow);
+        ctx->h_primes_shadow = NULL;
     }
 
     if (ctx->h_surv_count_pinned) {
@@ -528,7 +662,8 @@ void gpu_sieve_ctx_free(gpu_sieve_ctx_t *ctx)
 
     ctx->loaded_primes_src = NULL;
     ctx->loaded_base_mod_p_src = NULL;
-    ctx->loaded_n_primes = 0;
+    ctx->loaded_primes_n = 0;
+    ctx->loaded_base_mod_p_n = 0;
     ctx->loaded_base_mod_p_version = (uint64_t)-1;
     ctx->initialized = 0;
 }
@@ -542,6 +677,7 @@ int gpu_sieve_mark_batch(
     uint8_t *h_bits,
     size_t bit_len,
     size_t segment_len,
+    const uint8_t *h_phase1_bits,
     const uint64_t *h_primes,
     const uint64_t *h_base_mod_p,
     uint64_t base_mod_p_version,
@@ -589,6 +725,10 @@ int gpu_sieve_mark_batch(
     if (!ctx->stream)
         return -1;
     cudaStream_t stream = (cudaStream_t)ctx->stream;
+    size_t primes_bytes = 0;
+    int need_primes_upload = 0;
+    int L_fits_u32 = (L <= 0xFFFFFFFFULL) ? 1 : 0;
+    uint32_t L_u32 = (uint32_t)L;
 
     int timing = gpu_sieve_timing_enabled();
     /* 7 CUDA events: base_upload (ev0/ev1), compute_k0 (ev1/ev2),
@@ -606,32 +746,50 @@ int gpu_sieve_mark_batch(
 
     /* ── Stage 0 (rare): H→D base_mod_p upload ──────────────────── */
     if (timing) cudaEventRecord(ev0, stream);
-    if (ctx->loaded_base_mod_p_src != h_base_mod_p ||
-        ctx->loaded_base_mod_p_version != base_mod_p_version ||
-        ctx->loaded_n_primes != n_primes) {
+    size_t base_mod_p_bytes = (size_t)n_primes * sizeof(uint64_t);
+    int need_base_mod_p_upload =
+        (ctx->loaded_base_mod_p_version != base_mod_p_version) ||
+        (ctx->loaded_base_mod_p_n != n_primes) ||
+        (ctx->h_base_mod_p_shadow == NULL);
+
+    if (need_base_mod_p_upload) {
         err = cudaMemcpy(ctx->d_base_mod_p, h_base_mod_p,
-                 (size_t)n_primes * sizeof(uint64_t), cudaMemcpyHostToDevice);
+                 base_mod_p_bytes, cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
             fprintf(stderr, "GPU sieve: cudaMemcpy(H→D base_mod_p) failed: %s\n",
                     cudaGetErrorString(err));
             goto timing_cleanup;
         }
+        memcpy(ctx->h_base_mod_p_shadow, h_base_mod_p, base_mod_p_bytes);
         ctx->loaded_base_mod_p_src = h_base_mod_p;
         ctx->loaded_base_mod_p_version = base_mod_p_version;
+        ctx->loaded_base_mod_p_n = n_primes;
+    } else {
+        ctx->loaded_base_mod_p_src = h_base_mod_p;
     }
     if (timing) cudaEventRecord(ev1, stream); /* ev0..ev1 = base_mod_p upload (0 ms when cached) */
 
-    /* Upload primes only when the slice pointer/count changes. */
-    if (ctx->loaded_primes_src != h_primes || ctx->loaded_n_primes != n_primes) {
+    /* Upload primes on count/pointer change. The prime slice is immutable for
+     * a given run, so full-buffer memcmp here only adds host-side overhead. */
+    primes_bytes = (size_t)n_primes * sizeof(uint64_t);
+    need_primes_upload =
+        (ctx->loaded_primes_n != n_primes) ||
+        (ctx->h_primes_shadow == NULL) ||
+        (ctx->loaded_primes_src != h_primes);
+
+    if (need_primes_upload) {
         err = cudaMemcpy(ctx->d_primes, h_primes,
-                 (size_t)n_primes * sizeof(uint64_t), cudaMemcpyHostToDevice);
+                 primes_bytes, cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
             fprintf(stderr, "GPU sieve: cudaMemcpy(H→D primes) failed: %s\n",
                     cudaGetErrorString(err));
             goto timing_cleanup;
         }
+        memcpy(ctx->h_primes_shadow, h_primes, primes_bytes);
         ctx->loaded_primes_src = h_primes;
-        ctx->loaded_n_primes = n_primes;
+        ctx->loaded_primes_n = n_primes;
+    } else {
+        ctx->loaded_primes_src = h_primes;
     }
 
     /* Zero the segment scratch buffer for this window. */
@@ -644,7 +802,7 @@ int gpu_sieve_mark_batch(
     /* ── Stage 1: compute k0 on GPU ─────────────────────────────── */
     kernel_compute_k0<<<blocks, GPU_SIEVE_THREADS_PER_BLOCK, 0, stream>>>(
         ctx->d_k0, ctx->d_primes, ctx->d_base_mod_p,
-        L, R, segment_len, n_primes);
+        L, R, segment_len, L_u32, L_fits_u32, n_primes);
     if (timing) cudaEventRecord(ev2, stream); /* ev1..ev2 = compute_k0 kernel */
     err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -669,7 +827,24 @@ int gpu_sieve_mark_batch(
         int has_surv_buf = (ctx->d_survivors && ctx->d_surv_count &&
                             ctx->h_surv_pinned && ctx->h_surv_count_pinned &&
                             ctx->survivors_cap > 0);
-        if (has_surv_buf) {
+        int use_phase1_compact = (h_phase1_bits != NULL) && gpu_sieve_final_compact_enabled();
+        int try_compact = has_surv_buf &&
+            (use_phase1_compact || gpu_sieve_should_try_compact(
+                segment_len, ctx->survivors_cap, h_primes, n_primes));
+
+        if (try_compact) {
+            if (use_phase1_compact) {
+                err = cudaMemcpyAsync(ctx->d_bits, h_phase1_bits, out_bytes,
+                                      cudaMemcpyHostToDevice, stream);
+                if (err != cudaSuccess) {
+                    fprintf(stderr, "GPU sieve: phase1 bitmap H→D failed, falling back to bitmap path: %s\n",
+                            cudaGetErrorString(err));
+                    try_compact = 0;
+                }
+            }
+        }
+
+        if (try_compact) {
             err = cudaMemsetAsync(ctx->d_surv_count, 0, sizeof(uint32_t), stream);
             if (err != cudaSuccess) {
                 fprintf(stderr, "GPU sieve: cudaMemsetAsync(d_surv_count) failed: %s\n",
@@ -678,9 +853,15 @@ int gpu_sieve_mark_batch(
             }
             int surv_blocks = (int)((segment_len + GPU_SIEVE_THREADS_PER_BLOCK - 1)
                                     / GPU_SIEVE_THREADS_PER_BLOCK);
-            kernel_compact_survivors<<<surv_blocks, GPU_SIEVE_THREADS_PER_BLOCK, 0, stream>>>(
-                ctx->d_segment, (uint32_t)segment_len,
-                ctx->d_survivors, ctx->d_surv_count, ctx->survivors_cap);
+            if (use_phase1_compact) {
+                kernel_compact_survivors_with_phase1<<<surv_blocks, GPU_SIEVE_THREADS_PER_BLOCK, 0, stream>>>(
+                    ctx->d_segment, ctx->d_bits, (uint32_t)segment_len,
+                    ctx->d_survivors, ctx->d_surv_count, ctx->survivors_cap);
+            } else {
+                kernel_compact_survivors<<<surv_blocks, GPU_SIEVE_THREADS_PER_BLOCK, 0, stream>>>(
+                    ctx->d_segment, (uint32_t)segment_len,
+                    ctx->d_survivors, ctx->d_surv_count, ctx->survivors_cap);
+            }
             err = cudaGetLastError();
             if (err != cudaSuccess) {
                 fprintf(stderr, "GPU sieve: kernel_compact_survivors launch failed: %s\n",
@@ -689,9 +870,56 @@ int gpu_sieve_mark_batch(
             }
         }
         if (timing) cudaEventRecord(ev4, stream); /* ev3..ev4 = compact kernel */
+
+        /* Fast path: try compact mode first, and only fall back to bitmap pack
+         * if survivor count exceeds cap (or compact transfer fails). */
+        if (try_compact) {
+            err = cudaMemcpyAsync(ctx->h_surv_count_pinned, ctx->d_surv_count,
+                                  sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
+            if (err == cudaSuccess)
+                err = cudaStreamSynchronize(stream);
+            if (err == cudaSuccess) {
+                uint32_t surv_count = *ctx->h_surv_count_pinned;
+                if (surv_count <= ctx->survivors_cap) {
+                    size_t surv_bytes = (size_t)surv_count * sizeof(uint32_t);
+                    if (surv_bytes > 0) {
+                        err = cudaMemcpyAsync(ctx->h_surv_pinned, ctx->d_survivors,
+                                              surv_bytes, cudaMemcpyDeviceToHost, stream);
+                        if (err == cudaSuccess)
+                            err = cudaStreamSynchronize(stream);
+                    }
+                    if (err == cudaSuccess) {
+                        ctx->last_surv_count = surv_count;
+                        if (timing) {
+                            float ms;
+                            cudaEventSynchronize(ev4);
+                            if (cudaEventElapsedTime(&ms, ev0, ev1) == cudaSuccess)
+                                ctx->last_us_base_upload = (uint64_t)(ms * 1000.0f + 0.5f);
+                            if (cudaEventElapsedTime(&ms, ev1, ev2) == cudaSuccess)
+                                ctx->last_us_compute_k0 = (uint64_t)(ms * 1000.0f + 0.5f);
+                            if (cudaEventElapsedTime(&ms, ev2, ev3) == cudaSuccess)
+                                ctx->last_us_mark = (uint64_t)(ms * 1000.0f + 0.5f);
+                            if (cudaEventElapsedTime(&ms, ev3, ev4) == cudaSuccess)
+                                ctx->last_us_compact = (uint64_t)(ms * 1000.0f + 0.5f);
+                            cudaEventDestroy(ev0); cudaEventDestroy(ev1);
+                            cudaEventDestroy(ev2); cudaEventDestroy(ev3);
+                            cudaEventDestroy(ev4); cudaEventDestroy(ev5);
+                            cudaEventDestroy(ev6);
+                        }
+                        /* h_bits is intentionally not filled in compact mode. */
+                        return 1;
+                    }
+                    fprintf(stderr, "GPU sieve: compact survivor D→H failed, falling back to bitmap: %s\n",
+                            cudaGetErrorString(err));
+                }
+            } else {
+                fprintf(stderr, "GPU sieve: survivor-count D→H failed, falling back to bitmap: %s\n",
+                        cudaGetErrorString(err));
+            }
+        }
     }
 
-    /* ── Stage 3: kernel_pack_bits (always; used for bitmap fallback) ── */
+    /* ── Stage 3: kernel_pack_bits (bitmap fallback path) ───────── */
     {
         int pack_blocks = (int)((out_bytes + GPU_SIEVE_THREADS_PER_BLOCK - 1)
                                 / GPU_SIEVE_THREADS_PER_BLOCK);
@@ -706,20 +934,7 @@ int gpu_sieve_mark_batch(
         goto timing_cleanup;
     }
 
-    /* ── Stage 4: download survivor count + choose compact vs bitmap ── */
-
-    /* Download surv count (4 bytes) — runs after both compact + pack kernels */
-    if (ctx->d_surv_count && ctx->h_surv_count_pinned) {
-        err = cudaMemcpyAsync(ctx->h_surv_count_pinned, ctx->d_surv_count,
-                              sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "GPU sieve: cudaMemcpy(D→H surv_count) failed: %s\n",
-                    cudaGetErrorString(err));
-            /* non-fatal: fall through to bitmap path */
-        }
-    }
-
-    /* Async download d_bits (bitmap fallback data; will be used if compact overflows) */
+    /* ── Stage 4: bitmap download (fallback path) ───────────────── */
     if (ctx->h_bits_pinned && out_bytes <= ctx->h_bits_pinned_cap) {
         err = cudaMemcpyAsync(ctx->h_bits_pinned, ctx->d_bits, out_bytes,
                               cudaMemcpyDeviceToHost, stream);
@@ -773,31 +988,6 @@ int gpu_sieve_mark_batch(
         cudaEventDestroy(ev6);
     }
 
-    /* Decide compact vs bitmap based on survivor count */
-    if (ctx->h_surv_count_pinned && ctx->h_surv_pinned && ctx->d_survivors) {
-        uint32_t surv_count = *ctx->h_surv_count_pinned;
-        if (surv_count <= ctx->survivors_cap) {
-            /* Compact mode: download survivor indices (separate sync) */
-            size_t surv_bytes = (size_t)surv_count * sizeof(uint32_t);
-            if (surv_bytes > 0) {
-                err = cudaMemcpyAsync(ctx->h_surv_pinned, ctx->d_survivors,
-                                     surv_bytes, cudaMemcpyDeviceToHost, stream);
-                if (err == cudaSuccess)
-                    err = cudaStreamSynchronize(stream);
-                if (err != cudaSuccess) {
-                    fprintf(stderr, "GPU sieve: compact survivor D→H failed: %s\n",
-                            cudaGetErrorString(err));
-                    /* Fall through to bitmap path */
-                    goto bitmap_path;
-                }
-            }
-            ctx->last_surv_count = surv_count;
-            /* h_bits is NOT filled in compact mode; caller uses h_surv_pinned */
-            return 1; /* compact mode */
-        }
-    }
-
-bitmap_path:
     /* Bitmap mode: copy from pinned staging to caller h_bits */
     if (ctx->h_bits_pinned && out_bytes <= ctx->h_bits_pinned_cap) {
         memcpy(h_bits, ctx->h_bits_pinned, out_bytes);

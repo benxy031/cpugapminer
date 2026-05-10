@@ -33,6 +33,7 @@ extern volatile uint64_t stats_gpu_sieve_fallback;
 extern volatile uint64_t stats_gpu_sieve_us_base_upload;
 extern volatile uint64_t stats_gpu_sieve_us_compute_k0;
 extern volatile uint64_t stats_gpu_sieve_us_mark;
+extern volatile uint64_t stats_gpu_sieve_us_compact;
 extern volatile uint64_t stats_gpu_sieve_us_pack;
 extern volatile uint64_t stats_gpu_sieve_us_bits_dl;
 extern volatile uint64_t stats_gpu_sieve_us_merge;

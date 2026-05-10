@@ -35,6 +35,7 @@ volatile uint64_t stats_gpu_sieve_fallback = 0;
 volatile uint64_t stats_gpu_sieve_us_base_upload = 0;
 volatile uint64_t stats_gpu_sieve_us_compute_k0 = 0;
 volatile uint64_t stats_gpu_sieve_us_mark = 0;
+volatile uint64_t stats_gpu_sieve_us_compact = 0;
 volatile uint64_t stats_gpu_sieve_us_pack = 0;
 volatile uint64_t stats_gpu_sieve_us_bits_dl = 0;
 volatile uint64_t stats_gpu_sieve_us_merge = 0;

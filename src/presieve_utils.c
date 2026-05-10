@@ -34,13 +34,22 @@ static __thread uint32_t *tls_surv_buf     = NULL;
 static __thread uint32_t  tls_surv_count   = 0;
 static __thread size_t    tls_surv_buf_cap = 0; /* in entries */
 
+static int cmp_u32_asc(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *)a;
+    uint32_t y = *(const uint32_t *)b;
+    if (x < y) return -1;
+    if (x > y) return 1;
+    return 0;
+}
+
 /* Parameters captured at gpu_sieve_init() time; used for lazy per-thread alloc. */
 static size_t g_gpu_seg_cap    = 0;
 static size_t g_gpu_primes_cap = 0;
 static int    g_gpu_init_done  = 0;   /* startup init called */
 static int    g_gpu_sieve_devices[GPU_SIEVE_MAX_DEVS];
 static int    g_gpu_sieve_num_devices = 0;
-static int    g_gpu_sieve_target_pool = 2;
+static int    g_gpu_sieve_target_pool = 3;
 static volatile int g_gpu_sieve_rr = 0;
 
 /* Global runtime flag: 1 = try to use GPU sieve, 0 = use CPU presieve only */
@@ -81,7 +90,7 @@ int presieve_window(int64_t widx, uint64_t base,
 int gpu_sieve_init(size_t seg_cap, size_t primes_cap) {
         if (g_gpu_sieve_target_pool < 1 || g_gpu_sieve_target_pool > GPU_SIEVE_POOL_MAX_PER_DEVICE) {
             const char *pool_env = getenv("GPU_SIEVE_POOL");
-            int cfg = 2;
+            int cfg = 3;
             if (pool_env && *pool_env) {
                 int parsed = atoi(pool_env);
                 if (parsed >= 1 && parsed <= GPU_SIEVE_POOL_MAX_PER_DEVICE)
@@ -212,6 +221,7 @@ int gpu_sieve_mark_segment_batch(
     uint8_t *h_bits,
     size_t bit_len,
     size_t segment_len,
+    const uint8_t *h_phase1_bits,
     const uint64_t *h_primes,
     const uint64_t *h_base_mod_p,
     uint64_t base_mod_p_version,
@@ -270,6 +280,7 @@ int gpu_sieve_mark_segment_batch(
         h_bits,
         bit_len,
         segment_len,
+        h_phase1_bits,
         h_primes,
         h_base_mod_p,
         base_mod_p_version,
@@ -278,16 +289,27 @@ int gpu_sieve_mark_segment_batch(
     );
 
     if (rc == 0 || rc == 1) {
-        __sync_fetch_and_add(&stats_gpu_sieve_us_base_upload, g_gpu_sieve_ctx[idx][slot].last_us_base_upload);
-        __sync_fetch_and_add(&stats_gpu_sieve_us_compute_k0,  g_gpu_sieve_ctx[idx][slot].last_us_compute_k0);
-        __sync_fetch_and_add(&stats_gpu_sieve_us_mark,        g_gpu_sieve_ctx[idx][slot].last_us_mark);
-        __sync_fetch_and_add(&stats_gpu_sieve_us_pack,        g_gpu_sieve_ctx[idx][slot].last_us_pack);
-        __sync_fetch_and_add(&stats_gpu_sieve_us_bits_dl,     g_gpu_sieve_ctx[idx][slot].last_us_bits_dl);
+        uint64_t us_base_up = g_gpu_sieve_ctx[idx][slot].last_us_base_upload;
+        uint64_t us_k0 = g_gpu_sieve_ctx[idx][slot].last_us_compute_k0;
+        uint64_t us_mark = g_gpu_sieve_ctx[idx][slot].last_us_mark;
+        uint64_t us_compact = g_gpu_sieve_ctx[idx][slot].last_us_compact;
+        uint64_t us_pack = g_gpu_sieve_ctx[idx][slot].last_us_pack;
+        uint64_t us_bits_dl = g_gpu_sieve_ctx[idx][slot].last_us_bits_dl;
+
+        /* When GPU_SIEVE_TIMING is off, these stay zero; skip hot-path atomics. */
+        if ((us_base_up | us_k0 | us_mark | us_compact | us_pack | us_bits_dl) != 0) {
+            __atomic_fetch_add(&stats_gpu_sieve_us_base_upload, us_base_up, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&stats_gpu_sieve_us_compute_k0,  us_k0, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&stats_gpu_sieve_us_mark,        us_mark, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&stats_gpu_sieve_us_compact,     us_compact, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&stats_gpu_sieve_us_pack,        us_pack, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&stats_gpu_sieve_us_bits_dl,     us_bits_dl, __ATOMIC_RELAXED);
+        }
     }
 
     /* Compact mode (rc == 1): copy survivors to TLS buffer before releasing ctx */
     if (rc == 1) {
-        __sync_fetch_and_add(&stats_gpu_sieve_surv_calls, 1);
+        __atomic_fetch_add(&stats_gpu_sieve_surv_calls, 1, __ATOMIC_RELAXED);
         uint32_t sc = g_gpu_sieve_ctx[idx][slot].last_surv_count;
         tls_surv_count = 0;
         if (sc > 0) {
@@ -299,6 +321,15 @@ int gpu_sieve_mark_segment_batch(
             if (tls_surv_buf && g_gpu_sieve_ctx[idx][slot].h_surv_pinned) {
                 memcpy(tls_surv_buf, g_gpu_sieve_ctx[idx][slot].h_surv_pinned,
                        (size_t)sc * sizeof(uint32_t));
+                if (sc > 1) {
+                    qsort(tls_surv_buf, (size_t)sc, sizeof(uint32_t), cmp_u32_asc);
+                    uint32_t w = 1;
+                    for (uint32_t i = 1; i < sc; i++) {
+                        if (tls_surv_buf[i] != tls_surv_buf[w - 1])
+                            tls_surv_buf[w++] = tls_surv_buf[i];
+                    }
+                    sc = w;
+                }
                 tls_surv_count = sc;
             } else {
                 rc = 0; /* copy failed; treat as bitmap mode (h_bits may be stale) */

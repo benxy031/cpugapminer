@@ -55,6 +55,7 @@ int gpu_sieve_mark_segment_batch(
     uint8_t *h_bits,
     size_t bit_len,
     size_t segment_len,
+    const uint8_t *h_phase1_bits,
     const uint64_t *h_primes,
     const uint64_t *h_base_mod_p,
     uint64_t base_mod_p_version,

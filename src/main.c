@@ -145,6 +145,40 @@ static double estimate_sieve_keep_fraction(uint64_t limit) {
     return keep;
 }
 
+/* Merge GPU Phase-2 composite marks into the phase-1 bitmap. */
+static inline void bitmap_or_merge(uint8_t *dst, const uint8_t *src, size_t n)
+{
+    size_t i = 0;
+#if defined(__AVX2__)
+    for (; i + 32 <= n; i += 32) {
+        __m256i a = _mm256_loadu_si256((const __m256i *)(dst + i));
+        __m256i b = _mm256_loadu_si256((const __m256i *)(src + i));
+        _mm256_storeu_si256((__m256i *)(dst + i), _mm256_or_si256(a, b));
+    }
+#elif defined(__SSE2__)
+    for (; i + 16 <= n; i += 16) {
+        __m128i a = _mm_loadu_si128((const __m128i *)(dst + i));
+        __m128i b = _mm_loadu_si128((const __m128i *)(src + i));
+        _mm_storeu_si128((__m128i *)(dst + i), _mm_or_si128(a, b));
+    }
+#endif
+    for (; i < n; i++)
+        dst[i] |= src[i];
+}
+
+/* Host-side timing for GPU sieve merge stats, controlled by GPU_SIEVE_TIMING.
+ * Keep this off in default runs to avoid per-call clock_gettime overhead. */
+static int gpu_sieve_merge_timing_enabled(void)
+{
+    static int cached = -1;
+    if (cached >= 0)
+        return cached;
+
+    const char *env = getenv("GPU_SIEVE_TIMING");
+    cached = (env && *env && strcmp(env, "0") != 0) ? 1 : 0;
+    return cached;
+}
+
 /* Cramér-model score for a sieve window.
  *
  * Estimates the probability that the window produces at least one prime gap
@@ -2044,7 +2078,7 @@ static void print_stats(void) {
         double avg_base_up = (double)stats_gpu_sieve_us_base_upload / calls;
         double avg_compute_k0 = (double)stats_gpu_sieve_us_compute_k0 / calls;
         double avg_mark = (double)stats_gpu_sieve_us_mark / calls;
-        double avg_compact = 0.0;
+        double avg_compact = (double)stats_gpu_sieve_us_compact / calls;
         double avg_pack = (double)stats_gpu_sieve_us_pack / calls;
         double avg_bits_dl = (double)stats_gpu_sieve_us_bits_dl / calls;
         double avg_merge = (double)stats_gpu_sieve_us_merge / calls;
@@ -2772,6 +2806,7 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
             extern int g_gpu_sieve_enable;
             extern int gpu_sieve_mark_segment_batch(
                 uint8_t *h_bits, size_t bit_len, size_t segment_len,
+                const uint8_t *h_phase1_bits,
                 const uint64_t *h_primes, const uint64_t *h_base_mod_p,
                 uint64_t base_mod_p_version, uint64_t wL, uint64_t wR, int n_primes);
             extern const uint32_t *gpu_sieve_last_survivors(uint32_t *count_out);
@@ -2792,48 +2827,52 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
                 }
                 int gpu_ok = 0;
                 if (tls_gpu_seg) {
-                    memset(tls_gpu_seg, 0, bit_size);
                     const uint64_t *ph2_primes    = small_primes_cache + split_idx;
                     const uint64_t *ph2_base_mod_p = tls_base_mod_p + split_idx;
                     int ret = gpu_sieve_mark_segment_batch(
                         tls_gpu_seg, bit_size, seg_size,
+                        bits,
                         ph2_primes, ph2_base_mod_p,
                         tls_gpu_base_mod_p_gen, L, R, n_ph2);
                     if (ret == 0) {
                         /* Bitmap mode: OR GPU composites into Phase-1 bits[] */
+                        int track_merge_us = gpu_sieve_merge_timing_enabled();
                         struct timespec _t0, _t1;
 #ifdef CLOCK_MONOTONIC_RAW
-                        clock_gettime(CLOCK_MONOTONIC_RAW, &_t0);
+                        if (track_merge_us)
+                            clock_gettime(CLOCK_MONOTONIC_RAW, &_t0);
 #else
-                        clock_gettime(CLOCK_MONOTONIC, &_t0);
+                        if (track_merge_us)
+                            clock_gettime(CLOCK_MONOTONIC, &_t0);
 #endif
-                        for (size_t byte = 0; byte < bit_size; byte++)
-                            bits[byte] |= tls_gpu_seg[byte];
+                        bitmap_or_merge(bits, tls_gpu_seg, bit_size);
 #ifdef CLOCK_MONOTONIC_RAW
-                        clock_gettime(CLOCK_MONOTONIC_RAW, &_t1);
+                        if (track_merge_us)
+                            clock_gettime(CLOCK_MONOTONIC_RAW, &_t1);
 #else
-                        clock_gettime(CLOCK_MONOTONIC, &_t1);
+                        if (track_merge_us)
+                            clock_gettime(CLOCK_MONOTONIC, &_t1);
 #endif
-                        {
+                        if (track_merge_us) {
                             int64_t _merge_us = (int64_t)(_t1.tv_sec - _t0.tv_sec) * 1000000LL
                                               + ((int64_t)_t1.tv_nsec - (int64_t)_t0.tv_nsec) / 1000LL;
                             if (_merge_us > 0)
-                                __sync_fetch_and_add(&stats_gpu_sieve_us_merge, (uint64_t)_merge_us);
+                                __atomic_fetch_add(&stats_gpu_sieve_us_merge, (uint64_t)_merge_us, __ATOMIC_RELAXED);
                         }
-                        __sync_fetch_and_add(&stats_gpu_sieve_calls, 1);
-                        __sync_fetch_and_add(&stats_gpu_sieve_primes, (uint64_t)n_ph2);
+                        __atomic_fetch_add(&stats_gpu_sieve_calls, 1, __ATOMIC_RELAXED);
+                        __atomic_fetch_add(&stats_gpu_sieve_primes, (uint64_t)n_ph2, __ATOMIC_RELAXED);
                         gpu_ok = 1;
                     } else if (ret == 1) {
                         /* Compact mode: Phase-2 survivors returned directly.
                          * bits[] has Phase-1 composites only (no OR-merge needed).
                          * We will intersect the compact list with bits[] at the
                          * end of the function to produce tls_pr[] survivors. */
-                        __sync_fetch_and_add(&stats_gpu_sieve_calls, 1);
-                        __sync_fetch_and_add(&stats_gpu_sieve_primes, (uint64_t)n_ph2);
+                        __atomic_fetch_add(&stats_gpu_sieve_calls, 1, __ATOMIC_RELAXED);
+                        __atomic_fetch_add(&stats_gpu_sieve_primes, (uint64_t)n_ph2, __ATOMIC_RELAXED);
                         gpu_sieve_compact_mode = 1;
                         gpu_ok = 1;
                     } else {
-                        __sync_fetch_and_add(&stats_gpu_sieve_fallback, 1);
+                        __atomic_fetch_add(&stats_gpu_sieve_fallback, 1, __ATOMIC_RELAXED);
                     }
                 }
                 if (!gpu_ok) {
