@@ -750,6 +750,7 @@ int gpu_sieve_mark_batch(
     int need_base_mod_p_upload =
         (ctx->loaded_base_mod_p_version != base_mod_p_version) ||
         (ctx->loaded_base_mod_p_n != n_primes) ||
+        (ctx->loaded_base_mod_p_src != h_base_mod_p) ||
         (ctx->h_base_mod_p_shadow == NULL);
 
     if (need_base_mod_p_upload) {
