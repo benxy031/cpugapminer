@@ -64,6 +64,7 @@ static int             g_gpu_active_limbs_global = 0;  /* set after GPU init  */
 #include "crt_heap.h"
 #include "presieve_utils.h"
 #include "wheel_sieve.h"
+#include "sievegap.h"
 #include "crt_solver.h"
 #include "crt_gap_scan.h"
 #include "crt_runtime.h"
@@ -145,6 +146,7 @@ static double estimate_sieve_keep_fraction(uint64_t limit) {
     return keep;
 }
 
+#ifdef WITH_CUDA
 /* Merge GPU Phase-2 composite marks into the phase-1 bitmap. */
 static inline void bitmap_or_merge(uint8_t *dst, const uint8_t *src, size_t n)
 {
@@ -178,6 +180,7 @@ static int gpu_sieve_merge_timing_enabled(void)
     cached = (env && *env && strcmp(env, "0") != 0) ? 1 : 0;
     return cached;
 }
+#endif
 
 /* Cramér-model score for a sieve window.
  *
@@ -652,6 +655,8 @@ static volatile double adaptive_presieve_dense_ratio = 1.08;
 static volatile double adaptive_presieve_floor_mult = 2.0;
 /* if nonzero, use the selectable wheel presieve backend. */
 static volatile int use_wheel_sieve = 0;
+/* if nonzero, use standalone sievegap module for non-CRT windows. */
+static volatile int use_sievegap = 0;
 /* Shared bootstrap seed for --partial-sieve-auto: the first thread that
    stabilizes at a good sieve-prime limit writes it here so subsequent
    threads skip the slow span-based bootstrap.  0 = not yet set.
@@ -2255,12 +2260,15 @@ static void print_stats(void) {
    released at program exit. */
 static __thread uint64_t *tls_pr   = NULL;
 static __thread size_t    tls_cap  = 0;
+static __thread size_t    tls_last_out = 0;
 /* Reusable composite-bits bitmap per thread – avoids calloc/free on every sieve call */
 static __thread uint8_t  *tls_bits     = NULL;
 static __thread size_t    tls_bits_cap = 0;
 /* Flat byte-per-candidate scratch buffer for GPU sieve output (one byte per candidate) */
+#ifdef WITH_CUDA
 static __thread uint8_t  *tls_gpu_seg     = NULL;
 static __thread size_t    tls_gpu_seg_cap = 0;
+#endif
 /* Reusable sieve start-position array per thread */
 static __thread uint64_t *tls_sp_start     = NULL;
 static __thread size_t    tls_sp_start_cap = 0;
@@ -2336,6 +2344,7 @@ static void free_sieve_buffers(void) {
     tls_L_mod_p  = NULL;
     tls_sieve_mod_p = NULL;
     tls_cap      = 0;
+    tls_last_out = 0;
     tls_bits_cap = 0;
     tls_base_mod_p_cap = 0;
     tls_sp_start_cap = 0;
@@ -2348,9 +2357,15 @@ static void free_sieve_buffers(void) {
     tls_partial_cooldown = 0;
     tls_partial_last_dir = 0;
     tls_partial_stable = 0;
+    sievegap_free_tls_buffers();
     tls_adapt_presieve_ema = 0.0;
     tls_adapt_presieve_windows = 0;
     tls_adapt_presieve_cooldown = 0;
+#ifdef WITH_CUDA
+    free(tls_gpu_seg);
+    tls_gpu_seg = NULL;
+    tls_gpu_seg_cap = 0;
+#endif
 #ifdef WITH_GPU_FERMAT
     free(tls_gpu_cands[0]); tls_gpu_cands[0] = NULL;
     free(tls_gpu_cands[1]); tls_gpu_cands[1] = NULL;
@@ -2364,6 +2379,81 @@ static void free_sieve_buffers(void) {
         tls_gpu_ctx_owned = 0;
     }
 #endif
+}
+
+/* Grow per-thread survivor buffer with geometric expansion.
+   This avoids a full pre-scan of the bitmap just to size tls_pr. */
+static int ensure_tls_pr_capacity(size_t need) {
+    if (need <= tls_cap)
+        return 0;
+    if (need > (SIZE_MAX / sizeof(uint64_t)))
+        return -1;
+
+    size_t newcap = tls_cap ? tls_cap : 65536;
+    while (newcap < need) {
+        size_t grown = newcap + (newcap >> 1) + 1024;
+        if (grown <= newcap) {
+            newcap = need;
+            break;
+        }
+        newcap = grown;
+    }
+
+    uint64_t *newbuf = (uint64_t *)realloc(tls_pr, newcap * sizeof(uint64_t));
+    if (!newbuf)
+        return -1;
+    tls_pr = newbuf;
+    tls_cap = newcap;
+    return 0;
+}
+
+/* Legacy phase-2 CPU marker over a full window [L, R).
+   Uses 8-way unrolled byte-phase stepping for primes with enough hits,
+   falling back to scalar marks for short spans. */
+static inline void legacy_mark_phase2_cpu(uint8_t *bits,
+                                          size_t bit_size,
+                                          uint64_t L,
+                                          uint64_t R,
+                                          uint64_t p,
+                                          uint64_t start) {
+    if (start >= R)
+        return;
+
+    uint64_t pos = (start - L) >> 1;
+    uint64_t pos_end = (R - L) >> 1;
+
+    if (pos + 7 * p >= pos_end) {
+        for (; pos < pos_end; pos += p)
+            bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+        return;
+    }
+
+    uint64_t q = p >> 3;
+    uint64_t r = p & 7;
+    uint64_t b = pos & 7;
+    uint32_t off[8];
+    uint8_t msk[8];
+    uint64_t acc = b;
+    for (int k = 0; k < 8; k++, acc += r) {
+        off[k] = (uint32_t)((uint64_t)k * q + (acc >> 3));
+        msk[k] = (uint8_t)(1u << (acc & 7));
+    }
+
+    uint8_t *s = bits + (pos >> 3);
+    while (pos + 7 * p < pos_end) {
+        size_t s_off = (size_t)(s - bits);
+        if (s_off + off[7] >= bit_size)
+            break;
+        s[off[0]] |= msk[0]; s[off[1]] |= msk[1];
+        s[off[2]] |= msk[2]; s[off[3]] |= msk[3];
+        s[off[4]] |= msk[4]; s[off[5]] |= msk[5];
+        s[off[6]] |= msk[6]; s[off[7]] |= msk[7];
+        s += p;
+        pos += 8 * p;
+    }
+
+    for (; pos < pos_end; pos += p)
+        bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
 }
 
 /* sieve_range: segmented odd-only sieve over RELATIVE offsets [L, R) from
@@ -2380,6 +2470,20 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
     /* L must be odd so that (even_base + L) is odd */
     if ((L & 1) == 0) L++;
     if ((R & 1) == 0) R++;
+    pthread_once(&small_primes_once, populate_small_primes_cache);
+
+    if (use_sievegap && g_crt_mode == CRT_MODE_NONE) {
+        int have_cache = (tls_base_mod_p_ready && tls_base_mod_p &&
+                          tls_base_mod_p_cap >= small_primes_count);
+        return sievegap_run_range(L, R, out_count,
+                                  h256, shift,
+                                  small_primes_cache, small_primes_count,
+                                  (uint64_t)cli_sieve_prime_limit,
+                                  have_cache ? tls_base_mod_p : NULL,
+                                  have_cache,
+                                  tls_gpu_base_mod_p_gen);
+    }
+
     uint64_t seg_size = (R - L) / 2 + 1;
     size_t bit_size = (seg_size + 7) / 8;
     /* Reuse thread-local bits buffer; grow only when needed (memset << calloc) */
@@ -2395,7 +2499,9 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
      * Phase-2 survivors are fetched via gpu_sieve_last_survivors() and written
      * directly into tls_pr[] after filtering against the Phase-1 bits[].
      * The bitmap unpack loop at the end is skipped in this case. */
+#ifdef WITH_CUDA
     int gpu_sieve_compact_mode = 0;
+#endif
 
     /* For big primes (256+shift bits), the sieve trial-division limit is
        bounded by the user-configured --sieve-primes (or default).         */
@@ -2427,8 +2533,6 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
         __sync_fetch_and_add(&stats_partial_sieve_auto_windows, 1);
         use_limit = tls_partial_use_limit;
     }
-    pthread_once(&small_primes_once, populate_small_primes_cache);
-
     /* ── CRT fast-init path ──
        If a CRT template is loaded (mode=TEMPLATE), tile it into the bitmap
        instead of memset(0) + small-prime sieve.  The template already marks
@@ -2672,19 +2776,17 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
                 uint64_t blk_end = blk_pos + SIEVE_BLOCK_BITS;
                 if (blk_end > seg_size) blk_end = seg_size;
                 /* Translate block bounds to absolute offsets */
-                uint64_t blk_L = L + blk_pos * 2;
                 uint64_t blk_R = L + blk_end * 2;
                 if (blk_R > R) blk_R = R;
 
                 for (size_t i = 0; i < sp_count; i++) {
                     uint64_t p = small_primes_cache[i + (size_t)sieve_start];
-                    uint64_t stride = 2 * p;
                     uint64_t m = sp_start[i];
-                    /* Advance start into this block if needed */
-                    if (m < blk_L) {
-                        uint64_t skip = (blk_L - m + stride - 1) / stride;
-                        m += skip * stride;
-                    }
+
+                    /* Carry invariant: sp_start[i] is persisted as the first
+                       mark position >= previous block end (blk_R), so for
+                       contiguous blocks it is already >= current blk_L.
+                       This avoids a per-block ceil-division in the hot path. */
                     if (m >= blk_R) { sp_start[i] = m; continue; }
 
                     /* 8-at-a-time unrolled marking (Kim Walisch / danaj style).
@@ -2886,11 +2988,7 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
                         else lrem = (bmp + L % p) % p;
                         uint64_t start = L + (lrem == 0 ? 0 : p - lrem);
                         if ((start & 1) == 0) start += p;
-                        if (start >= R) continue;
-                        for (uint64_t m = start; m < R; m += 2 * p) {
-                            uint64_t pos = (m - L) >> 1;
-                            bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
-                        }
+                        legacy_mark_phase2_cpu(bits, bit_size, L, R, p, start);
                     }
                 }
             } else {
@@ -2905,11 +3003,7 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
                     else lrem = (base_mod_p + L % p) % p;
                     uint64_t start = L + (lrem == 0 ? 0 : p - lrem);
                     if ((start & 1) == 0) start += p;
-                    if (start >= R) continue;
-                    for (uint64_t m = start; m < R; m += 2 * p) {
-                        uint64_t pos = (m - L) >> 1;
-                        bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
-                    }
+                    legacy_mark_phase2_cpu(bits, bit_size, L, R, p, start);
                 }
             }
         }
@@ -3004,21 +3098,25 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
         }
     }
 
-    /* Count survivors via popcount before allocating the result array.
-       Each 0-bit in the bitmap is a survivor; total survivors =
-       seg_size - popcount(bits).  This avoids allocating seg_size × 8 bytes
-       (e.g. 536 MB for --sieve-size 134M) when only ~3-7% survive.      */
-    size_t set_bits = 0;
+    /* Warm-start survivor buffer once per thread; extraction below grows it
+       on-demand if needed, avoiding a full bitmap pre-scan per window. */
     {
-        const uint64_t *wp = (const uint64_t *)bits;
-        size_t nw = bit_size / 8;
-        for (size_t i = 0; i < nw; i++)
-            set_bits += (size_t)__builtin_popcountll(wp[i]);
-        for (size_t i = nw * 8; i < bit_size; i++)
-            set_bits += (size_t)__builtin_popcount((unsigned)bits[i]);
+        size_t reserve = 0;
+        if (tls_last_out > 0) {
+            reserve = tls_last_out + (tls_last_out >> 3) + 1024;
+        } else {
+            reserve = (size_t)(seg_size >> 5);
+            if (reserve < 32768)
+                reserve = 32768;
+            reserve += 1024;
+        }
+        if (reserve > (size_t)seg_size)
+            reserve = (size_t)seg_size;
+        if (ensure_tls_pr_capacity(reserve) != 0) {
+            *out_count = 0;
+            return NULL;
+        }
     }
-    size_t est_survivors = (seg_size > set_bits) ? seg_size - set_bits : 0;
-    est_survivors += 64;  /* small safety margin for rounding */
 
     /* Adaptive non-CRT partial-sieve controller.
        Goal: keep survivor density in a broad, stable band by nudging the
@@ -3030,6 +3128,17 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
             tls_partial_cooldown--;
         if (tls_partial_cooldown == 0
                 && (tls_partial_windows % PARTIAL_SIEVE_ADAPT_EVERY) == 0) {
+            size_t set_bits = 0;
+            {
+                const uint64_t *wp = (const uint64_t *)bits;
+                size_t nw = bit_size / 8;
+                for (size_t i = 0; i < nw; i++)
+                    set_bits += (size_t)__builtin_popcountll(wp[i]);
+                for (size_t i = nw * 8; i < bit_size; i++)
+                    set_bits += (size_t)__builtin_popcount((unsigned)bits[i]);
+            }
+            size_t est_survivors = (seg_size > set_bits) ? seg_size - set_bits : 0;
+            est_survivors += 64;  /* small safety margin for rounding */
             double surv_ratio = (double)est_survivors / (double)seg_size;
             uint64_t cur = tls_partial_use_limit ? tls_partial_use_limit : use_limit;
             uint64_t next = cur;
@@ -3094,18 +3203,8 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
         }
     }
 
-    /* ensure the tls_pr buffer is large enough */
-    if (tls_cap < est_survivors) {
-        size_t newcap = est_survivors;
-        tls_pr = realloc(tls_pr, newcap * sizeof(uint64_t));
-        if (!tls_pr) {
-            *out_count = 0;
-            return NULL;
-        }
-        tls_cap = newcap;
-    }
-
     size_t out_cnt = 0;
+    uint64_t odd_count = (R > L) ? ((R - L) >> 1) : 0;
 
 #ifdef WITH_CUDA
 #ifndef WITH_CRT_GPU_CONSUMER
@@ -3120,23 +3219,24 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
         uint32_t surv_count = 0;
         const uint32_t *survivors = gpu_sieve_last_survivors(&surv_count);
         if (survivors && surv_count > 0) {
-            /* Grow tls_pr if the compact list could be larger than est_survivors */
-            if (tls_cap < (size_t)surv_count) {
-                tls_pr = realloc(tls_pr, (size_t)surv_count * sizeof(uint64_t));
-                if (!tls_pr) {
-                    *out_count = 0;
-                    return NULL;
-                }
-                tls_cap = (size_t)surv_count;
+            /* Grow tls_pr if the compact list could exceed current reserve. */
+            if (ensure_tls_pr_capacity((size_t)surv_count) != 0) {
+                *out_count = 0;
+                return NULL;
             }
             for (uint32_t i = 0; i < surv_count; i++) {
                 uint32_t pos = survivors[i];
-                if (pos < (uint32_t)seg_size &&
+                if ((uint64_t)pos < odd_count &&
                     !(bits[pos >> 3] & (uint8_t)(1u << (pos & 7)))) {
+                    if (out_cnt == tls_cap && ensure_tls_pr_capacity(out_cnt + 1024) != 0) {
+                        *out_count = 0;
+                        return NULL;
+                    }
                     tls_pr[out_cnt++] = L + (uint64_t)pos * 2;
                 }
             }
         }
+        tls_last_out = out_cnt;
         *out_count = out_cnt;
         return tls_pr;
     }
@@ -3157,33 +3257,41 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
      * On modern x86-64 with BMI1, __builtin_ctzll compiles to a single
      * TZCNT instruction (1 cycle, no branch).  This is ~8× fewer
      * iterations than the old per-bit scan for typical sieve densities. */
-    size_t full_words = bit_size / 8;
+    size_t full_words = (size_t)(odd_count >> 6);
+    uint64_t rem_bits = odd_count & 63ULL;
+
     for (size_t wi = 0; wi < full_words; wi++) {
         uint64_t word;
-        memcpy(&word, bits + wi * 8, 8);
+        memcpy(&word, bits + (wi << 3), sizeof(word));
         word = ~word;  /* invert: survivors (0-bits) become 1-bits */
         while (word) {
             int bit = __builtin_ctzll(word);
-            uint64_t pos = (uint64_t)wi * 64 + (uint64_t)bit;
-            if (pos < seg_size) {
-                tls_pr[out_cnt++] = L + pos * 2;
+            if (out_cnt == tls_cap && ensure_tls_pr_capacity(out_cnt + 1024) != 0) {
+                *out_count = 0;
+                return NULL;
             }
+            tls_pr[out_cnt++] = L + ((((uint64_t)wi << 6) + (uint64_t)bit) << 1);
             word &= word - 1;  /* clear lowest set bit */
         }
     }
-    /* Handle remaining bytes (< 8) at tail */
-    size_t tail_start = full_words * 8;
-    for (size_t bi = tail_start; bi < bit_size; bi++) {
-        uint8_t byte = ~bits[bi];  /* invert */
-        while (byte) {
-            int bit = __builtin_ctz((unsigned)byte);
-            uint64_t pos = (uint64_t)bi * 8 + (uint64_t)bit;
-            if (pos < seg_size) {
-                tls_pr[out_cnt++] = L + pos * 2;
+
+    if (rem_bits) {
+        uint64_t word = 0;
+        size_t rem_bytes = (size_t)((rem_bits + 7ULL) >> 3);
+        memcpy(&word, bits + (full_words << 3), rem_bytes);
+        word = ~word;
+        word &= (1ULL << rem_bits) - 1ULL;
+        while (word) {
+            int bit = __builtin_ctzll(word);
+            if (out_cnt == tls_cap && ensure_tls_pr_capacity(out_cnt + 1024) != 0) {
+                *out_count = 0;
+                return NULL;
             }
-            byte &= (uint8_t)(byte - 1);
+            tls_pr[out_cnt++] = L + ((((uint64_t)full_words << 6) + (uint64_t)bit) << 1);
+            word &= word - 1;
         }
     }
+    tls_last_out = out_cnt;
     *out_count = out_cnt;
     return tls_pr;
 }
@@ -7518,6 +7626,7 @@ int main(int argc, char **argv) {
              ADAPTIVE_PRESIEVE_FLOOR_MULT_DEFAULT);
          printf("      --adaptive-presieve-min-survivors N  absolute survivors floor (default: %llu)\n",
              (unsigned long long)ADAPTIVE_PRESIEVE_MIN_SURVIVORS_DEFAULT);
+           printf("      --sievegap          standalone sieve module for non-CRT mode (bypasses legacy presieve/wheel path; implies --no-gpu-sieve)\n");
         printf("      --wheel-sieve N      use wheel presieve backend (0 disables; 30, 210, 2310, 30030, 510510, or 9699690)\n");
         printf("  -e, --extra-verbose  write live merit events + partial-sieve-auto details to log file\n");
         printf("      --stats-verbose  include detailed CRT phase telemetry in STATS output\n");
@@ -7651,6 +7760,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--no-cpu-fermat")) use_cpu_fermat = 0;
         else if (!strcmp(argv[i],"--partial-sieve-auto") || !strcmp(argv[i],"--partial-sieve")) use_partial_sieve_auto = 1;
         else if (!strcmp(argv[i],"--adaptive-presieve")) use_adaptive_presieve = 1;
+        else if (!strcmp(argv[i],"--sievegap")) use_sievegap = 1;
         else if (!strcmp(argv[i],"--adaptive-presieve-ratio") && i+1<argc) {
             adaptive_presieve_dense_ratio = atof(argv[++i]);
             if (adaptive_presieve_dense_ratio < 1.0)
@@ -7996,6 +8106,32 @@ int main(int argc, char **argv) {
     #endif
             "\n");
     }
+    if (use_sievegap) {
+        if (g_crt_mode != CRT_MODE_NONE) {
+            log_msg("sievegap: ignored because CRT mode is active\n");
+            use_sievegap = 0;
+        } else {
+            if (use_partial_sieve_auto || use_adaptive_presieve || use_wheel_sieve) {
+                log_msg("sievegap: disabling legacy non-CRT sieve options (--partial-sieve-auto, --adaptive-presieve, --wheel-sieve)\n");
+            }
+            use_partial_sieve_auto = 0;
+            use_adaptive_presieve = 0;
+            use_wheel_sieve = 0;
+            cli_wheel_sieve = 0;
+#ifdef WITH_CUDA
+#ifndef WITH_CRT_GPU_CONSUMER
+            {
+                extern int g_gpu_sieve_enable;
+                if (g_gpu_sieve_enable) {
+                    log_msg("sievegap: disabling GPU Phase-2 sieve (--no-gpu-sieve implied)\n");
+                    g_gpu_sieve_enable = 0;
+                }
+            }
+#endif
+#endif
+        }
+    }
+
     if (use_wheel_sieve) {
         if (wheel_sieve_configure(cli_wheel_sieve) != 0) {
                 log_msg("invalid --wheel-sieve value %u (use 30, 210, 2310, 30030, 510510, or 9699690)\n",
@@ -8626,6 +8762,18 @@ int main(int argc, char **argv) {
     if (use_cpu_fermat)
         log_msg("CPU Montgomery multiply: custom ADX path active (--cpu-fermat); %s\n",
                 use_fast_euler ? "using euler_test_cpu_nlimbs" : "using fermat_test_cpu_nlimbs");
+    if (use_sievegap) {
+        log_msg("sievegap: standalone non-CRT mode enabled (legacy presieve/wheel path bypassed)\n");
+        fprintf(stderr, "sievegap: SIMD mark path active: ");
+    #if defined(__AVX2__)
+        fprintf(stderr, "AVX2\n");
+    #elif defined(__SSE2__)
+        fprintf(stderr, "SSE2\n");
+    #else
+        fprintf(stderr, "scalar\n");
+    #endif
+        fflush(stderr);
+        }
     if (use_partial_sieve_auto)
         log_msg("partial sieve auto: enabled (--partial-sieve-auto/--partial-sieve), adapt every %u windows, min limit %llu, cooldown %u windows\n",
                 (unsigned)PARTIAL_SIEVE_ADAPT_EVERY,

@@ -6,6 +6,7 @@ LDFLAGS=-flto
 SRCDIR=src
 BINDIR=bin
 TARGET=$(BINDIR)/gap_miner
+BUILD_CFG_FILE=$(SRCDIR)/.build_config
 
 # Optional: GMP_PREFIX=/path/to/gmp  to use a custom (e.g. --enable-fat) build.
 # Static linking avoids runtime dependency on non-system libgmp.
@@ -67,7 +68,9 @@ endif
 
 all: $(TARGET)
 
-test: tests/test_rpc_json tests/test_wheel_sieve tests/test_wheel_compare tests/test_crt_runtime_policy
+TEST_CFLAGS=$(filter-out -DWITH_CUDA -DWITH_OPENCL,$(CFLAGS))
+
+test: tests/test_rpc_json tests/test_wheel_sieve tests/test_wheel_compare tests/test_crt_runtime_policy tests/test_sievegap
 
 tests/test_rpc_json: $(SRCDIR)/rpc_json.c tests/test_rpc_json.c
 	$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $(SRCDIR)/rpc_json.c tests/test_rpc_json.c -ljansson
@@ -81,13 +84,29 @@ tests/test_wheel_compare: $(SRCDIR)/wheel_sieve.c tests/test_wheel_compare.c
 tests/test_crt_runtime_policy: $(SRCDIR)/crt_runtime.c tests/test_crt_runtime_policy.c
 	$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $(SRCDIR)/crt_runtime.c tests/test_crt_runtime_policy.c
 
+tests/test_sievegap: $(SRCDIR)/sievegap.c $(SRCDIR)/uint256_utils.c tests/test_sievegap.c
+	$(CC) $(TEST_CFLAGS) -I$(SRCDIR) -o $@ $(SRCDIR)/sievegap.c $(SRCDIR)/uint256_utils.c tests/test_sievegap.c -lcrypto -lm
+
+tests/bench_sievegap: $(SRCDIR)/sievegap.c $(SRCDIR)/uint256_utils.c tests/bench_sievegap.c
+	$(CC) -O3 $(TEST_CFLAGS) -I$(SRCDIR) -o $@ $(SRCDIR)/sievegap.c $(SRCDIR)/uint256_utils.c tests/bench_sievegap.c -lcrypto -lm
+
 $(BINDIR):
 	mkdir -p $(BINDIR)
 
-$(SRCDIR)/%.o: $(SRCDIR)/%.c
+$(BUILD_CFG_FILE): | $(BINDIR)
+	@tmp_file="$$(mktemp)"; \
+	printf "WITH_RPC=%s\nWITH_CUDA=%s\nWITH_OPENCL=%s\nGPU_BITS=%s\nCUDA_ARCH=%s\n" \
+		"$(WITH_RPC)" "$(WITH_CUDA)" "$(WITH_OPENCL)" "$(GPU_BITS)" "$(CUDA_ARCH)" > "$$tmp_file"; \
+	if [ ! -f "$@" ] || ! cmp -s "$$tmp_file" "$@"; then \
+		mv "$$tmp_file" "$@"; \
+	else \
+		rm -f "$$tmp_file"; \
+	fi
+
+$(SRCDIR)/%.o: $(SRCDIR)/%.c $(BUILD_CFG_FILE)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(SRCDIR)/%.o: $(SRCDIR)/%.cpp
+$(SRCDIR)/%.o: $(SRCDIR)/%.cpp $(BUILD_CFG_FILE)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(SRCDIR)/gpu_fermat.o: $(SRCDIR)/gpu_fermat.cu $(SRCDIR)/gpu_fermat.h
@@ -96,11 +115,11 @@ $(SRCDIR)/gpu_fermat.o: $(SRCDIR)/gpu_fermat.cu $(SRCDIR)/gpu_fermat.h
 $(SRCDIR)/gpu_sieve.o: $(SRCDIR)/gpu_sieve.cu $(SRCDIR)/gpu_sieve.h
 	$(NVCC) -O3 $(CUDA_ARCH) $(NVCC_FLAGS) -c $< -o $@
 
-$(TARGET): $(BINDIR) $(SRCDIR)/main.o $(SRCDIR)/stats.o $(SRCDIR)/sieve_cache.o $(SRCDIR)/gap_scan.o $(SRCDIR)/crt_heap.o $(SRCDIR)/crt_solver.o $(SRCDIR)/crt_gap_scan.o $(SRCDIR)/crt_runtime.o $(SRCDIR)/crt_runtime_worker.o $(SRCDIR)/crt_runtime_cpu.o $(SRCDIR)/crt_runtime_gpu.o $(SRCDIR)/presieve_utils.o $(SRCDIR)/wheel_sieve.o $(SRCDIR)/uint256_utils.o $(SRCDIR)/block_utils.o $(SRCDIR)/primality_utils.o $(SRCDIR)/rgm_check.o $(RPC_OBJS) $(STRATUM_OBJ) $(GPU_OBJ)
-	$(LINKER) -o $@ $(SRCDIR)/main.o $(SRCDIR)/stats.o $(SRCDIR)/sieve_cache.o $(SRCDIR)/gap_scan.o $(SRCDIR)/crt_heap.o $(SRCDIR)/crt_solver.o $(SRCDIR)/crt_gap_scan.o $(SRCDIR)/crt_runtime.o $(SRCDIR)/crt_runtime_worker.o $(SRCDIR)/crt_runtime_cpu.o $(SRCDIR)/crt_runtime_gpu.o $(SRCDIR)/presieve_utils.o $(SRCDIR)/wheel_sieve.o $(SRCDIR)/uint256_utils.o $(SRCDIR)/block_utils.o $(SRCDIR)/primality_utils.o $(SRCDIR)/rgm_check.o $(RPC_OBJS) $(STRATUM_OBJ) $(GPU_OBJ) $(LDFLAGS) $(LIBS)
+$(TARGET): $(BINDIR) $(SRCDIR)/main.o $(SRCDIR)/stats.o $(SRCDIR)/sieve_cache.o $(SRCDIR)/gap_scan.o $(SRCDIR)/crt_heap.o $(SRCDIR)/crt_solver.o $(SRCDIR)/crt_gap_scan.o $(SRCDIR)/crt_runtime.o $(SRCDIR)/crt_runtime_worker.o $(SRCDIR)/crt_runtime_cpu.o $(SRCDIR)/crt_runtime_gpu.o $(SRCDIR)/presieve_utils.o $(SRCDIR)/wheel_sieve.o $(SRCDIR)/sievegap.o $(SRCDIR)/uint256_utils.o $(SRCDIR)/block_utils.o $(SRCDIR)/primality_utils.o $(SRCDIR)/rgm_check.o $(RPC_OBJS) $(STRATUM_OBJ) $(GPU_OBJ)
+	$(LINKER) -o $@ $(SRCDIR)/main.o $(SRCDIR)/stats.o $(SRCDIR)/sieve_cache.o $(SRCDIR)/gap_scan.o $(SRCDIR)/crt_heap.o $(SRCDIR)/crt_solver.o $(SRCDIR)/crt_gap_scan.o $(SRCDIR)/crt_runtime.o $(SRCDIR)/crt_runtime_worker.o $(SRCDIR)/crt_runtime_cpu.o $(SRCDIR)/crt_runtime_gpu.o $(SRCDIR)/presieve_utils.o $(SRCDIR)/wheel_sieve.o $(SRCDIR)/sievegap.o $(SRCDIR)/uint256_utils.o $(SRCDIR)/block_utils.o $(SRCDIR)/primality_utils.o $(SRCDIR)/rgm_check.o $(RPC_OBJS) $(STRATUM_OBJ) $(GPU_OBJ) $(LDFLAGS) $(LIBS)
 
 clean:
-	rm -rf $(BINDIR) $(SRCDIR)/*.o
+	rm -rf $(BINDIR) $(SRCDIR)/*.o $(BUILD_CFG_FILE)
 
 gen_crt: $(BINDIR) tools/gen_crt.c
 	$(CC) -O2 -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -o $(BINDIR)/gen_crt tools/gen_crt.c -lm -lpthread

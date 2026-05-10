@@ -1690,6 +1690,7 @@ presieve tile period, making it cache-neutral. All other P values
 | `--fast-euler`        | off           | Fast Euler-Plumb base-2 primality path (CPU).  Mutually exclusive with `--fast-fermat`. |
 | `--mr-rounds N`       | 2             | Miller-Rabin rounds for `mpz_probab_prime_p` (default path, not `--fast-fermat`).  Old default was 10; 2 rounds gives false-positive rate < 2^-128 for sieve-filtered candidates. |
 | `--sample-stride K`   | 8             | Controls gap scanning strategy.  K > 1 enables backward-scan (CPU) or two-phase smart-scan (GPU).  Set to 1 for full-test (all survivors tested). |
+| `--sievegap`          | off           | Enable standalone non-CRT sieve path (`src/sievegap.c`).  Bypasses legacy non-CRT presieve/wheel/adaptive path in `sieve_range()`.  Ignored when CRT mode is active (`--crt-file`). |
 | `--partial-sieve-auto` / `--partial-sieve` | off | Adaptive non-CRT sieve-prime limiting.  Adjusts sieve depth periodically based on runtime behavior. |
 | `--adaptive-presieve` | off           | Adaptive non-CRT presieve window skipping for dense windows after presieve. |
 | `--adaptive-presieve-ratio R` | 1.08 | Dense-window trigger ratio vs survivor EMA (non-CRT).  A window is considered dense when `survivors > EMA * R`.  Lower values trigger more often. |
@@ -1723,6 +1724,32 @@ presieve tile period, making it cache-neutral. All other P values
 | `--keep-going`        | on            | Continue after a found block (default) |
 | `--stop-after-block`  | off           | Exit after submitting a valid block |
 | `--selftest`          | off           | Run internal prime checks and exit |
+
+### Using `--sievegap`
+
+`--sievegap` enables the standalone segmented odd-only sieve module
+(`src/sievegap.c`) for non-CRT mining.
+
+Behavior when enabled:
+
+1. The non-CRT sieve branch uses `sievegap_run_range()`.
+2. Legacy non-CRT tuning flags are disabled for that run:
+   `--partial-sieve-auto`, `--adaptive-presieve`, `--wheel-sieve`.
+3. In CRT mode (`--crt-file ...`), `--sievegap` is ignored and CRT paths
+   remain unchanged.
+4. In non-CRT mode, `--sievegap` implies `--no-gpu-sieve` (GPU Phase-2 sieve
+  is auto-disabled for this path). CUDA/OpenCL Fermat testing remains usable.
+
+Examples:
+
+- CPU non-CRT standalone sieve:
+  `./bin/gap_miner --shift 20 --threads 4 --sieve-size 33554432 --sieve-primes 900000 --sievegap --rpc-url http://127.0.0.1:31397 --rpc-user u --rpc-pass p`
+
+- CUDA non-CRT standalone sieve:
+  `./bin/gap_miner --shift 20 --threads 4 --cuda 0 --sieve-size 33554432 --sieve-primes 1500000 --sievegap --rpc-url http://127.0.0.1:31397 --rpc-user u --rpc-pass p`
+
+- CRT run (flag is ignored by design):
+  `./bin/gap_miner --shift 20 --threads 4 --crt-file crt/crt_s256_m22.txt --sievegap --rpc-url http://127.0.0.1:31397 --rpc-user u --rpc-pass p`
 | `--p P --q Q`         | --            | Force primes for `--build-only` runs |
 | `--cuda [DEV,...]`    | off           | Enable CUDA GPU Fermat testing (requires `WITH_CUDA=1` build).  Optional comma-separated `DEV` list selects GPU devices (e.g. `--cuda 0,1`).  Up to 8 GPUs, round-robin dispatch. |
 | `--opencl [DEV,...]`  | off           | Enable OpenCL GPU Fermat path (requires `WITH_OPENCL=1` build).  Optional device list selects GPU devices (e.g. `--opencl 0,1`).  Do not combine with `--cuda` in one run. |

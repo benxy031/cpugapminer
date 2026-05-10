@@ -93,6 +93,8 @@ endif
 
 all: $(TARGET)
 
+TEST_CFLAGS=$(filter-out -DWITH_CUDA -DWITH_OPENCL,$(CFLAGS))
+
 $(BINDIR):
 	mkdir -p $(BINDIR)
 
@@ -112,7 +114,7 @@ C_OBJS=$(SRCDIR)/stats.o $(SRCDIR)/sieve_cache.o $(SRCDIR)/gap_scan.o \
 	$(SRCDIR)/crt_heap.o $(SRCDIR)/crt_solver.o $(SRCDIR)/crt_gap_scan.o \
 	$(SRCDIR)/crt_runtime.o $(SRCDIR)/crt_runtime_worker.o \
 	$(SRCDIR)/crt_runtime_cpu.o $(SRCDIR)/crt_runtime_gpu.o \
-	$(SRCDIR)/presieve_utils.o $(SRCDIR)/wheel_sieve.o \
+	$(SRCDIR)/presieve_utils.o $(SRCDIR)/wheel_sieve.o $(SRCDIR)/sievegap.o \
 	$(SRCDIR)/uint256_utils.o $(SRCDIR)/block_utils.o $(SRCDIR)/primality_utils.o \
 	$(SRCDIR)/rgm_check.o
 
@@ -124,5 +126,8 @@ clean:
 
 gen_crt: $(BINDIR) tools/gen_crt.c
 	$(CC) -O2 -std=c11 -Wall -Wextra -o $(BINDIR)/gen_crt.exe tools/gen_crt.c -lm -lpthread
+
+tests/test_sievegap.exe: $(SRCDIR)/sievegap.c $(SRCDIR)/uint256_utils.c tests/test_sievegap.c
+	$(CC) $(TEST_CFLAGS) -I$(SRCDIR) -o $@ $(SRCDIR)/sievegap.c $(SRCDIR)/uint256_utils.c tests/test_sievegap.c -lcrypto -lm
 
 .PHONY: all clean gen_crt
