@@ -46,15 +46,22 @@ jobs:
 
       - name: Build CPU portable variant
         run: |
+          mkdir -p out/win-cpu
           make -f Makefile.mingw clean
           make -f Makefile.mingw WITH_RPC=1 ARCH_FLAGS='-march=x86-64 -mtune=generic -msse2'
-          cp bin/gap_miner.exe bin/gap_miner_portable.exe
+          cp bin/gap_miner.exe out/win-cpu/gap_miner_portable.exe
 
       - name: Build CPU ADX variant
         run: |
+          mkdir -p out/win-cpu
           make -f Makefile.mingw clean
           make -f Makefile.mingw WITH_RPC=1 ARCH_FLAGS='-march=x86-64 -mtune=generic -msse2 -mbmi2 -madx'
-          cp bin/gap_miner.exe bin/gap_miner_adx.exe
+          cp bin/gap_miner.exe out/win-cpu/gap_miner_adx.exe
+
+      - name: Stage CPU variants for smoke test
+        run: |
+          cp out/win-cpu/gap_miner_portable.exe bin/
+          cp out/win-cpu/gap_miner_adx.exe bin/
 
       - name: Wheel sieve smoke test
         run: |
@@ -72,9 +79,9 @@ jobs:
       - name: Collect DLLs
         run: |
           mkdir -p dist
-          cp bin/gap_miner_portable.exe dist/gap_miner.exe
-          cp bin/gap_miner_portable.exe dist/gap_miner_portable.exe
-          cp bin/gap_miner_adx.exe dist/gap_miner_adx.exe
+          cp out/win-cpu/gap_miner_portable.exe dist/gap_miner.exe
+          cp out/win-cpu/gap_miner_portable.exe dist/gap_miner_portable.exe
+          cp out/win-cpu/gap_miner_adx.exe dist/gap_miner_adx.exe
           cp bin/gen_crt.exe dist/
           # Copy CRT sieve files
           cp -r crt dist/ 2>/dev/null || true
@@ -187,22 +194,26 @@ jobs:
       - name: Build CUDA portable variant
         shell: msys2 {0}
         run: |
+          mkdir -p out/win-cuda
           make -f Makefile.mingw clean
           make -f Makefile.mingw WITH_RPC=1 WITH_CUDA=1 CUDA_DLL=1 GPU_BITS=1024 ARCH_FLAGS='-march=x86-64 -mtune=generic -msse2'
-          cp bin/gap_miner.exe bin/gap_miner_cuda_portable.exe
+          cp bin/gap_miner.exe out/win-cuda/gap_miner_cuda_portable.exe
 
       - name: Build CUDA ADX variant
         shell: msys2 {0}
         run: |
+          mkdir -p out/win-cuda
           make -f Makefile.mingw clean
           make -f Makefile.mingw WITH_RPC=1 WITH_CUDA=1 CUDA_DLL=1 GPU_BITS=1024 ARCH_FLAGS='-march=x86-64 -mtune=generic -msse2 -mbmi2 -madx'
-          cp bin/gap_miner.exe bin/gap_miner_cuda_adx.exe
+          cp bin/gap_miner.exe out/win-cuda/gap_miner_cuda_adx.exe
 
       - name: Stage CUDA DLLs for smoke test
         shell: msys2 {0}
         run: |
           cp src/gpu_fermat.dll bin/
           cp src/gpu_sieve.dll bin/
+          cp out/win-cuda/gap_miner_cuda_portable.exe bin/
+          cp out/win-cuda/gap_miner_cuda_adx.exe bin/
 
       - name: Wheel sieve smoke test
         shell: msys2 {0}
@@ -224,9 +235,9 @@ jobs:
         shell: msys2 {0}
         run: |
           mkdir -p dist-cuda
-          cp bin/gap_miner_cuda_portable.exe dist-cuda/gap_miner.exe
-          cp bin/gap_miner_cuda_portable.exe dist-cuda/gap_miner_portable.exe
-          cp bin/gap_miner_cuda_adx.exe dist-cuda/gap_miner_adx.exe
+          cp out/win-cuda/gap_miner_cuda_portable.exe dist-cuda/gap_miner.exe
+          cp out/win-cuda/gap_miner_cuda_portable.exe dist-cuda/gap_miner_portable.exe
+          cp out/win-cuda/gap_miner_cuda_adx.exe dist-cuda/gap_miner_adx.exe
           cp bin/gen_crt.exe   dist-cuda/
           cp src/gpu_fermat.dll dist-cuda/
           cp src/gpu_sieve.dll  dist-cuda/
