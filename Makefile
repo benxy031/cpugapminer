@@ -103,6 +103,10 @@ $(BUILD_CFG_FILE): | $(BINDIR)
 		rm -f "$$tmp_file"; \
 	fi
 
+# Explicit header deps for runtime SIMD dispatch helper.
+$(SRCDIR)/main.o: $(SRCDIR)/cpu_features.h
+$(SRCDIR)/wheel_sieve.o: $(SRCDIR)/cpu_features.h
+
 $(SRCDIR)/%.o: $(SRCDIR)/%.c $(BUILD_CFG_FILE)
 	$(CC) $(CFLAGS) -c $< -o $@
 

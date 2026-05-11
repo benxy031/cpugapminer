@@ -47,8 +47,8 @@ jobs:
       - name: Build CPU binary (single runtime-dispatch variant)
         run: |
           make -f Makefile.mingw clean
-          # Single binary for maximum compatibility.
-          # ADX/BMI2 path is enabled at runtime when CPU supports it.
+          # Build a universal baseline binary; AVX2/SSE2 paths are selected
+          # at runtime by CPU feature dispatch.
           make -f Makefile.mingw WITH_RPC=1 ARCH_FLAGS='-march=x86-64 -mtune=generic -msse2'
 
       - name: Wheel sieve smoke test

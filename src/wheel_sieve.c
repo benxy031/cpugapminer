@@ -1,11 +1,10 @@
 #include "wheel_sieve.h"
+#include "cpu_features.h"
 
 #include <stdlib.h>
 #include <string.h>
-#ifdef __AVX2__
+#if CPU_FEATURES_X86
 #include <immintrin.h>
-#elif defined(__SSE2__)
-#include <emmintrin.h>
 #endif
 
 static unsigned int g_wheel_size = 0;
@@ -94,14 +93,128 @@ size_t wheel_sieve_period_bytes(void) {
 }
 
 const char *wheel_sieve_backend_name(void) {
-#ifdef __AVX2__
-    return "AVX2";
-#elif defined(__SSE2__)
+    if (cpu_features_has_avx2())
+        return "AVX2";
+    if (cpu_features_has_sse2())
     return "SSE2";
-#else
     return "scalar";
-#endif
 }
+
+static inline void wheel_tile_shifted_scalar_u8(uint8_t *sieve, size_t sieve_bytes,
+                                                const uint8_t *tmpl,
+                                                size_t period_bytes,
+                                                size_t src_byte,
+                                                unsigned shift)
+{
+    unsigned inv = 8u - shift;
+    for (size_t i = 0; i < sieve_bytes; i++) {
+        uint8_t lo = tmpl[src_byte];
+        size_t nx = src_byte + 1;
+        if (nx >= period_bytes)
+            nx = 0;
+        uint8_t hi = tmpl[nx];
+        sieve[i] = (uint8_t)((lo >> shift) | (hi << inv));
+        src_byte = nx;
+    }
+}
+
+#if defined(__SSE2__)
+static inline void wheel_tile_shifted_sse2_u8(uint8_t *sieve, size_t sieve_bytes,
+                                              const uint8_t *tmpl,
+                                              size_t period_bytes,
+                                              size_t src_byte,
+                                              unsigned shift)
+{
+    unsigned inv = 8u - shift;
+    const __m128i zero16 = _mm_setzero_si128();
+    const __m128i mask8  = _mm_set1_epi16(0x00FF);
+    for (size_t i = 0; i < sieve_bytes; ) {
+        size_t avail = period_bytes - src_byte;
+
+        if (avail >= 17 && sieve_bytes - i >= 16) {
+            __m128i lo8a = _mm_loadl_epi64((const __m128i *)(tmpl + src_byte));
+            __m128i hi8a = _mm_loadl_epi64((const __m128i *)(tmpl + src_byte + 1));
+            __m128i c16a = _mm_or_si128(
+                _mm_unpacklo_epi8(lo8a, zero16),
+                _mm_slli_epi16(_mm_unpacklo_epi8(hi8a, zero16), 8));
+            __m128i s16a = _mm_and_si128(_mm_srli_epi16(c16a, shift), mask8);
+
+            __m128i lo8b = _mm_loadl_epi64((const __m128i *)(tmpl + src_byte + 8));
+            __m128i hi8b = _mm_loadl_epi64((const __m128i *)(tmpl + src_byte + 9));
+            __m128i c16b = _mm_or_si128(
+                _mm_unpacklo_epi8(lo8b, zero16),
+                _mm_slli_epi16(_mm_unpacklo_epi8(hi8b, zero16), 8));
+            __m128i s16b = _mm_and_si128(_mm_srli_epi16(c16b, shift), mask8);
+
+            _mm_storeu_si128((__m128i *)(sieve + i), _mm_packus_epi16(s16a, s16b));
+
+            i += 16;
+            src_byte += 16;
+            if (src_byte >= period_bytes)
+                src_byte -= period_bytes;
+        } else {
+            size_t nx = src_byte + 1;
+            if (nx >= period_bytes)
+                nx = 0;
+            sieve[i++] = (uint8_t)((tmpl[src_byte] >> shift) | (tmpl[nx] << inv));
+            src_byte = nx;
+        }
+    }
+}
+#endif
+
+#if CPU_FEATURES_X86 && (defined(__GNUC__) || defined(__clang__))
+CPU_TARGET_AVX2
+static void wheel_tile_shifted_avx2_u8(uint8_t *sieve, size_t sieve_bytes,
+                                       const uint8_t *tmpl,
+                                       size_t period_bytes,
+                                       size_t src_byte,
+                                       unsigned shift)
+{
+    unsigned inv = 8u - shift;
+    const __m256i byte_mask = _mm256_set1_epi16(0x00FF);
+    for (size_t i = 0; i < sieve_bytes; ) {
+        size_t avail = period_bytes - src_byte;
+
+        if (avail >= 34 && sieve_bytes - i >= 32) {
+            __m256i lo_a = _mm256_cvtepu8_epi16(
+                _mm_loadu_si128((const __m128i *)(tmpl + src_byte)));
+            __m256i hi_a = _mm256_cvtepu8_epi16(
+                _mm_loadu_si128((const __m128i *)(tmpl + src_byte + 1)));
+            __m256i out_a = _mm256_and_si256(
+                _mm256_srli_epi16(
+                    _mm256_or_si256(lo_a, _mm256_slli_epi16(hi_a, 8)), shift),
+                byte_mask);
+            __m256i pk_a = _mm256_packus_epi16(out_a, _mm256_setzero_si256());
+            _mm_storeu_si128((__m128i *)(sieve + i),
+                _mm256_castsi256_si128(_mm256_permute4x64_epi64(pk_a, 0xD8)));
+
+            __m256i lo_b = _mm256_cvtepu8_epi16(
+                _mm_loadu_si128((const __m128i *)(tmpl + src_byte + 16)));
+            __m256i hi_b = _mm256_cvtepu8_epi16(
+                _mm_loadu_si128((const __m128i *)(tmpl + src_byte + 17)));
+            __m256i out_b = _mm256_and_si256(
+                _mm256_srli_epi16(
+                    _mm256_or_si256(lo_b, _mm256_slli_epi16(hi_b, 8)), shift),
+                byte_mask);
+            __m256i pk_b = _mm256_packus_epi16(out_b, _mm256_setzero_si256());
+            _mm_storeu_si128((__m128i *)(sieve + i + 16),
+                _mm256_castsi256_si128(_mm256_permute4x64_epi64(pk_b, 0xD8)));
+
+            i += 32;
+            src_byte += 32;
+            if (src_byte >= period_bytes)
+                src_byte -= period_bytes;
+        } else {
+            size_t nx = src_byte + 1;
+            if (nx >= period_bytes)
+                nx = 0;
+            sieve[i++] = (uint8_t)((tmpl[src_byte] >> shift) | (tmpl[nx] << inv));
+            src_byte = nx;
+        }
+    }
+}
+#endif
 
 size_t wheel_sieve_start_bit(uint64_t base_mod, uint64_t L) {
     if (!g_wheel_size)
@@ -132,104 +245,21 @@ void wheel_sieve_tile(uint8_t *sieve, size_t sieve_bytes, size_t start_bit) {
             src_byte = 0;
         }
     } else {
-        /* Bit-shifted: out[i] = (src[s+i] >> shift) | (src[s+i+1] << inv)
-           AVX2: same strategy as tile_presieve — two 16-byte passes per step
-           to produce 32 output bytes.  Scalar fallback at period wrap edges. */
-        unsigned inv = 8U - shift;
-#ifdef __AVX2__
-        const __m256i byte_mask = _mm256_set1_epi16(0x00FF);
-        for (size_t i = 0; i < sieve_bytes; ) {
-            size_t avail = period_bytes - src_byte;
-
-            if (avail >= 34 && sieve_bytes - i >= 32) {
-                /* ── AVX2 fast path: 32 output bytes from 33 source bytes ── */
-                __m256i lo_a = _mm256_cvtepu8_epi16(
-                    _mm_loadu_si128((const __m128i *)(g_wheel_tmpl + src_byte)));
-                __m256i hi_a = _mm256_cvtepu8_epi16(
-                    _mm_loadu_si128((const __m128i *)(g_wheel_tmpl + src_byte + 1)));
-                __m256i out_a = _mm256_and_si256(
-                    _mm256_srli_epi16(
-                        _mm256_or_si256(lo_a, _mm256_slli_epi16(hi_a, 8)), shift),
-                    byte_mask);
-                __m256i pk_a = _mm256_packus_epi16(out_a, _mm256_setzero_si256());
-                _mm_storeu_si128((__m128i *)(sieve + i),
-                    _mm256_castsi256_si128(_mm256_permute4x64_epi64(pk_a, 0xD8)));
-
-                __m256i lo_b = _mm256_cvtepu8_epi16(
-                    _mm_loadu_si128((const __m128i *)(g_wheel_tmpl + src_byte + 16)));
-                __m256i hi_b = _mm256_cvtepu8_epi16(
-                    _mm_loadu_si128((const __m128i *)(g_wheel_tmpl + src_byte + 17)));
-                __m256i out_b = _mm256_and_si256(
-                    _mm256_srli_epi16(
-                        _mm256_or_si256(lo_b, _mm256_slli_epi16(hi_b, 8)), shift),
-                    byte_mask);
-                __m256i pk_b  = _mm256_packus_epi16(out_b, _mm256_setzero_si256());
-                _mm_storeu_si128((__m128i *)(sieve + i + 16),
-                    _mm256_castsi256_si128(_mm256_permute4x64_epi64(pk_b, 0xD8)));
-
-                i        += 32;
-                src_byte += 32;
-                if (src_byte >= period_bytes) src_byte -= period_bytes;
-            } else {
-                /* Scalar: period wrap or < 32 bytes remaining */
-                size_t nx = src_byte + 1;
-                if (nx >= period_bytes) nx = 0;
-                sieve[i++] = (uint8_t)((g_wheel_tmpl[src_byte] >> shift)
-                             | (g_wheel_tmpl[nx] << inv));
-                src_byte = nx;
-            }
+        if (cpu_features_has_avx2()) {
+#if CPU_FEATURES_X86 && (defined(__GNUC__) || defined(__clang__))
+            wheel_tile_shifted_avx2_u8(sieve, sieve_bytes, g_wheel_tmpl,
+                                       period_bytes, src_byte, shift);
+            return;
+#endif
         }
-#elif defined(__SSE2__)
-        const __m128i zero16 = _mm_setzero_si128();
-        const __m128i mask8  = _mm_set1_epi16(0x00FF);
-        for (size_t i = 0; i < sieve_bytes; ) {
-            size_t avail = period_bytes - src_byte;
-
-            if (avail >= 17 && sieve_bytes - i >= 16) {
-                /* SSE2 fast path: 16 output bytes from 17 source bytes. */
-                __m128i lo8a = _mm_loadl_epi64(
-                    (const __m128i *)(g_wheel_tmpl + src_byte));
-                __m128i hi8a = _mm_loadl_epi64(
-                    (const __m128i *)(g_wheel_tmpl + src_byte + 1));
-                __m128i c16a = _mm_or_si128(
-                    _mm_unpacklo_epi8(lo8a, zero16),
-                    _mm_slli_epi16(_mm_unpacklo_epi8(hi8a, zero16), 8));
-                __m128i s16a = _mm_and_si128(_mm_srli_epi16(c16a, shift), mask8);
-
-                __m128i lo8b = _mm_loadl_epi64(
-                    (const __m128i *)(g_wheel_tmpl + src_byte + 8));
-                __m128i hi8b = _mm_loadl_epi64(
-                    (const __m128i *)(g_wheel_tmpl + src_byte + 9));
-                __m128i c16b = _mm_or_si128(
-                    _mm_unpacklo_epi8(lo8b, zero16),
-                    _mm_slli_epi16(_mm_unpacklo_epi8(hi8b, zero16), 8));
-                __m128i s16b = _mm_and_si128(_mm_srli_epi16(c16b, shift), mask8);
-
-                _mm_storeu_si128((__m128i *)(sieve + i),
-                    _mm_packus_epi16(s16a, s16b));
-
-                i += 16;
-                src_byte += 16;
-                if (src_byte >= period_bytes)
-                    src_byte -= period_bytes;
-            } else {
-                /* Scalar: period wrap or < 16 bytes remaining */
-                size_t nx = src_byte + 1;
-                if (nx >= period_bytes) nx = 0;
-                sieve[i++] = (uint8_t)((g_wheel_tmpl[src_byte] >> shift)
-                             | (g_wheel_tmpl[nx] << inv));
-                src_byte = nx;
-            }
-        }
-#else
-        for (size_t i = 0; i < sieve_bytes; i++) {
-            uint8_t lo = g_wheel_tmpl[src_byte];
-            size_t nx = src_byte + 1;
-            if (nx >= period_bytes) nx = 0;
-            uint8_t hi = g_wheel_tmpl[nx];
-            sieve[i] = (uint8_t)((lo >> shift) | (hi << inv));
-            src_byte = nx;
+#if defined(__SSE2__)
+        if (cpu_features_has_sse2()) {
+            wheel_tile_shifted_sse2_u8(sieve, sieve_bytes, g_wheel_tmpl,
+                                       period_bytes, src_byte, shift);
+            return;
         }
 #endif
+        wheel_tile_shifted_scalar_u8(sieve, sieve_bytes, g_wheel_tmpl,
+                                     period_bytes, src_byte, shift);
     }
 }
