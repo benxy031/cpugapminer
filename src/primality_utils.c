@@ -6,6 +6,33 @@
 #include <x86intrin.h>
 #endif
 
+#if defined(__x86_64__) && defined(__BMI2__) && defined(__ADX__)
+static int g_primality_runtime_adx_checked = 0;
+static int g_primality_runtime_adx_enabled = 1;
+
+static inline int primality_detect_adx_bmi2_runtime(void)
+{
+#if defined(__GNUC__)
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("adx") && __builtin_cpu_supports("bmi2");
+#else
+    return 1;
+#endif
+}
+
+static inline void primality_runtime_init_adx_once(void)
+{
+    if (!g_primality_runtime_adx_checked) {
+        g_primality_runtime_adx_enabled = primality_detect_adx_bmi2_runtime();
+        g_primality_runtime_adx_checked = 1;
+    }
+}
+#else
+static inline void primality_runtime_init_adx_once(void)
+{
+}
+#endif
+
 /* n_prime = -(n^{-1}) mod 2^64 for odd n. */
 static inline uint64_t mont_ninv(uint64_t n) {
     uint64_t x = 1;
@@ -589,26 +616,31 @@ DECL_MONTMUL_EXACT_ADX(cpu_montmul_n20, 20, adx_addmul_20)
 /* Dispatch to exact-NL montmul — no runtime switch in the inner loop. */
 #define MONTMUL_EXACT_DISPATCH(r, a, b, n, ninv, nlimbs) \
     do { \
-        switch (nlimbs) { \
-        case  2: cpu_montmul_n2 (r,a,b,n,ninv); break; \
-        case  3: cpu_montmul_n3 (r,a,b,n,ninv); break; \
-        case  4: cpu_montmul_n4 (r,a,b,n,ninv); break; \
-        case  5: cpu_montmul_n5 (r,a,b,n,ninv); break; \
-        case  6: cpu_montmul_n6 (r,a,b,n,ninv); break; \
-        case  7: cpu_montmul_n7 (r,a,b,n,ninv); break; \
-        case  8: cpu_montmul_n8 (r,a,b,n,ninv); break; \
-        case  9: cpu_montmul_n9 (r,a,b,n,ninv); break; \
-        case 10: cpu_montmul_n10(r,a,b,n,ninv); break; \
-        case 11: cpu_montmul_n11(r,a,b,n,ninv); break; \
-        case 12: cpu_montmul_n12(r,a,b,n,ninv); break; \
-        case 13: cpu_montmul_n13(r,a,b,n,ninv); break; \
-        case 14: cpu_montmul_n14(r,a,b,n,ninv); break; \
-        case 15: cpu_montmul_n15(r,a,b,n,ninv); break; \
-        case 16: cpu_montmul_n16(r,a,b,n,ninv); break; \
-        case 17: cpu_montmul_n17(r,a,b,n,ninv); break; \
-        case 18: cpu_montmul_n18(r,a,b,n,ninv); break; \
-        case 19: cpu_montmul_n19(r,a,b,n,ninv); break; \
-        default: cpu_montmul_n20(r,a,b,n,ninv); break; \
+        primality_runtime_init_adx_once(); \
+        if (!g_primality_runtime_adx_enabled) { \
+            cpu_montmul_n((r), (a), (b), (n), (ninv), (nlimbs)); \
+        } else { \
+            switch (nlimbs) { \
+            case  2: cpu_montmul_n2 (r,a,b,n,ninv); break; \
+            case  3: cpu_montmul_n3 (r,a,b,n,ninv); break; \
+            case  4: cpu_montmul_n4 (r,a,b,n,ninv); break; \
+            case  5: cpu_montmul_n5 (r,a,b,n,ninv); break; \
+            case  6: cpu_montmul_n6 (r,a,b,n,ninv); break; \
+            case  7: cpu_montmul_n7 (r,a,b,n,ninv); break; \
+            case  8: cpu_montmul_n8 (r,a,b,n,ninv); break; \
+            case  9: cpu_montmul_n9 (r,a,b,n,ninv); break; \
+            case 10: cpu_montmul_n10(r,a,b,n,ninv); break; \
+            case 11: cpu_montmul_n11(r,a,b,n,ninv); break; \
+            case 12: cpu_montmul_n12(r,a,b,n,ninv); break; \
+            case 13: cpu_montmul_n13(r,a,b,n,ninv); break; \
+            case 14: cpu_montmul_n14(r,a,b,n,ninv); break; \
+            case 15: cpu_montmul_n15(r,a,b,n,ninv); break; \
+            case 16: cpu_montmul_n16(r,a,b,n,ninv); break; \
+            case 17: cpu_montmul_n17(r,a,b,n,ninv); break; \
+            case 18: cpu_montmul_n18(r,a,b,n,ninv); break; \
+            case 19: cpu_montmul_n19(r,a,b,n,ninv); break; \
+            default: cpu_montmul_n20(r,a,b,n,ninv); break; \
+            } \
         } \
     } while (0)
 
@@ -1416,4 +1448,23 @@ int euler_test_cpu_nlimbs(const uint64_t *n, int nlimbs)
     case 20: return euler_test_cpu_nlimbs_20(n);
     default: return 0;
     }
+}
+
+int primality_cpu_adx_compiled(void)
+{
+#if defined(__x86_64__) && defined(__BMI2__) && defined(__ADX__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int primality_cpu_adx_enabled(void)
+{
+#if defined(__x86_64__) && defined(__BMI2__) && defined(__ADX__)
+    primality_runtime_init_adx_once();
+    return g_primality_runtime_adx_enabled;
+#else
+    return 0;
+#endif
 }

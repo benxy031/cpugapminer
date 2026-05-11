@@ -7667,6 +7667,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     const char *header = NULL;
+    int header_owned = 0;
     int is_hex = 0;
     int shift = 20;
     /* adder_max is the exclusive upper bound on adder values.  if the user
@@ -8498,6 +8499,7 @@ int main(int argc, char **argv) {
                             header = malloc(len+1);
                             memcpy((char*)header, start, len);
                             ((char*)header)[len] = '\0';
+                            header_owned = 1;
                             if (header[0]) {
                                 is_hex = 1; /* GBT prevhash is always a 64-char hex string */
                                 log_msg("auto-header from GBT = %s\n", header);
@@ -8548,6 +8550,10 @@ int main(int argc, char **argv) {
             }
         } else {
             got_work = build_mining_pass(rpc_url, rpc_user, rpc_pass, shift);
+        }
+        if (g_stratum && !got_work) {
+            log_msg("stratum: connected but failed to receive initial work; exiting\n");
+            return 3;
         }
         if (got_work) {
             struct pass_state pass_snap;
@@ -8759,9 +8765,21 @@ int main(int argc, char **argv) {
                 use_mr_verify ? " + MR base-3 verify (--mr-verify)" : "");
     else
         log_msg("Miller-Rabin rounds: %d (--no-fast-euler; --mr-rounds to change)\n", cli_mr_rounds);
-    if (use_cpu_fermat)
-        log_msg("CPU Montgomery multiply: custom ADX path active (--cpu-fermat); %s\n",
-                use_fast_euler ? "using euler_test_cpu_nlimbs" : "using fermat_test_cpu_nlimbs");
+    if (use_cpu_fermat) {
+        const char *cpu_test_name = use_fast_euler ? "using euler_test_cpu_nlimbs"
+                                                   : "using fermat_test_cpu_nlimbs";
+        if (primality_cpu_adx_compiled()) {
+            if (primality_cpu_adx_enabled())
+                log_msg("CPU Montgomery multiply: custom ADX path active (--cpu-fermat); %s\n",
+                        cpu_test_name);
+            else
+                log_msg("CPU Montgomery multiply: ADX/BMI2 compiled but unsupported on this CPU; using portable CIOS fallback (--cpu-fermat); %s\n",
+                        cpu_test_name);
+        } else {
+            log_msg("CPU Montgomery multiply: portable CIOS path active (--cpu-fermat); %s\n",
+                    cpu_test_name);
+        }
+    }
     if (use_sievegap) {
         log_msg("sievegap: standalone non-CRT mode enabled (legacy presieve/wheel path bypassed)\n");
         fprintf(stderr, "sievegap: SIMD mark path active: ");
@@ -9204,8 +9222,17 @@ int main(int argc, char **argv) {
                         &scan_target_cfg,
                         pass_snap.ndiff);
                     memcpy(h256, pass_snap.h256, 32);
-                    free((char*)header);
-                    header = strdup(pass_snap.prevhex);
+                    {
+                        char *new_header = strdup(pass_snap.prevhex);
+                        if (!new_header) {
+                            log_msg("stratum: strdup failed while updating header\n");
+                        } else {
+                            if (header_owned && header)
+                                free((char*)header);
+                            header = new_header;
+                            header_owned = 1;
+                        }
+                    }
                     if (!g_abort_pass)
                         log_msg("\n*** STRATUM NEW BLOCK ***\n\n");
                     g_abort_pass = 1;
@@ -9223,8 +9250,15 @@ int main(int argc, char **argv) {
                         pass_snap.ndiff);
                     memcpy(h256, pass_snap.h256, 32);
                     if (pass_snap.prevhex[0] && strcmp(pass_snap.prevhex, header ? header : "") != 0) {
-                        free((char*)header);
-                        header = strdup(pass_snap.prevhex);
+                        char *new_header = strdup(pass_snap.prevhex);
+                        if (!new_header) {
+                            log_msg("rpc: strdup failed while updating header\n");
+                        } else {
+                            if (header_owned && header)
+                                free((char*)header);
+                            header = new_header;
+                            header_owned = 1;
+                        }
                         if (!g_abort_pass)
                             log_msg("\n*** NEW BLOCK  prevhash=%.16s...  mining on top ***\n\n", pass_snap.prevhex);
                         pthread_mutex_lock(&g_work_lock);
@@ -9401,8 +9435,17 @@ int main(int argc, char **argv) {
                         &scan_target_cfg,
                         pass_snap.ndiff);
                     memcpy(h256, pass_snap.h256, 32);
-                    free((char*)header);
-                    header = strdup(pass_snap.prevhex);
+                    {
+                        char *new_header = strdup(pass_snap.prevhex);
+                        if (!new_header) {
+                            log_msg("stratum: strdup failed while updating header\n");
+                        } else {
+                            if (header_owned && header)
+                                free((char*)header);
+                            header = new_header;
+                            header_owned = 1;
+                        }
+                    }
                     if (!g_abort_pass)
                         log_msg("\n*** STRATUM NEW BLOCK ***\n\n");
                 }
@@ -9431,8 +9474,15 @@ int main(int argc, char **argv) {
                         pass_snap.ndiff);
                     memcpy(h256, pass_snap.h256, 32);
                     if (pass_snap.prevhex[0] && strcmp(pass_snap.prevhex, header ? header : "") != 0) {
-                        free((char*)header);
-                        header = strdup(pass_snap.prevhex);
+                        char *new_header = strdup(pass_snap.prevhex);
+                        if (!new_header) {
+                            log_msg("rpc: strdup failed while updating header\n");
+                        } else {
+                            if (header_owned && header)
+                                free((char*)header);
+                            header = new_header;
+                            header_owned = 1;
+                        }
                         if (!g_abort_pass)
                             log_msg("\n*** NEW BLOCK  prevhash=%.16s...  mining on top ***\n\n", pass_snap.prevhex);
                         pthread_mutex_lock(&g_work_lock);
@@ -9454,6 +9504,11 @@ int main(int argc, char **argv) {
         gpu_fermat_destroy(g_gpu_ctx[gi]);
 #endif
     stop_stats_thread();
+    if (header_owned && header) {
+        free((char*)header);
+        header = NULL;
+        header_owned = 0;
+    }
     if (!keep_going) {
         printf("Done, no qualifying gaps found in tried adders.\n");
         return 0;

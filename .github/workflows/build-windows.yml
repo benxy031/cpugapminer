@@ -44,11 +44,22 @@ jobs:
             make
             bc
 
-      - name: Build (CPU-only, WITH_RPC)
-        run: make -f Makefile.mingw clean && make -f Makefile.mingw WITH_RPC=1 ARCH_FLAGS='-march=native'
+      - name: Build CPU portable variant
+        run: |
+          make -f Makefile.mingw clean
+          make -f Makefile.mingw WITH_RPC=1 ARCH_FLAGS='-march=x86-64 -mtune=generic -msse2'
+          cp bin/gap_miner.exe bin/gap_miner_portable.exe
+
+      - name: Build CPU ADX variant
+        run: |
+          make -f Makefile.mingw clean
+          make -f Makefile.mingw WITH_RPC=1 ARCH_FLAGS='-march=x86-64 -mtune=generic -msse2 -mbmi2 -madx'
+          cp bin/gap_miner.exe bin/gap_miner_adx.exe
 
       - name: Wheel sieve smoke test
-        run: ./bin/gap_miner.exe --wheel-sieve 210 --selftest
+        run: |
+          ./bin/gap_miner_portable.exe --wheel-sieve 210 --selftest
+          ./bin/gap_miner_adx.exe --wheel-sieve 210 --selftest
 
       - name: Build and run sievegap unit test
         run: |
@@ -61,7 +72,9 @@ jobs:
       - name: Collect DLLs
         run: |
           mkdir -p dist
-          cp bin/gap_miner.exe dist/
+          cp bin/gap_miner_portable.exe dist/gap_miner.exe
+          cp bin/gap_miner_portable.exe dist/gap_miner_portable.exe
+          cp bin/gap_miner_adx.exe dist/gap_miner_adx.exe
           cp bin/gen_crt.exe dist/
           # Copy CRT sieve files
           cp -r crt dist/ 2>/dev/null || true
@@ -97,7 +110,7 @@ jobs:
             done
           }
 
-          resolve_and_copy_deps dist/gap_miner.exe dist/gen_crt.exe
+          resolve_and_copy_deps dist/gap_miner.exe dist/gap_miner_portable.exe dist/gap_miner_adx.exe dist/gen_crt.exe
 
       - name: Upload artefact
         uses: actions/upload-artifact@v4
@@ -164,16 +177,26 @@ jobs:
             -gencode arch=compute_61,code=sm_61 `
             -gencode arch=compute_75,code=sm_75 `
             -gencode arch=compute_86,code=sm_86 `
-            -gencode arch=compute_61,code=compute_61 `
+            -gencode arch=compute_61,code=sm_61 `
             --shared `
             -Xlinker "/DEF:src\gpu_sieve.def" `
             -o src/gpu_sieve.dll `
             src/gpu_sieve.cu
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
-      - name: Build gap_miner (WITH_RPC + CUDA DLL mode)
+      - name: Build CUDA portable variant
         shell: msys2 {0}
-        run: make -f Makefile.mingw clean && make -f Makefile.mingw WITH_RPC=1 WITH_CUDA=1 CUDA_DLL=1 GPU_BITS=1024 ARCH_FLAGS='-march=native'
+        run: |
+          make -f Makefile.mingw clean
+          make -f Makefile.mingw WITH_RPC=1 WITH_CUDA=1 CUDA_DLL=1 GPU_BITS=1024 ARCH_FLAGS='-march=x86-64 -mtune=generic -msse2'
+          cp bin/gap_miner.exe bin/gap_miner_cuda_portable.exe
+
+      - name: Build CUDA ADX variant
+        shell: msys2 {0}
+        run: |
+          make -f Makefile.mingw clean
+          make -f Makefile.mingw WITH_RPC=1 WITH_CUDA=1 CUDA_DLL=1 GPU_BITS=1024 ARCH_FLAGS='-march=x86-64 -mtune=generic -msse2 -mbmi2 -madx'
+          cp bin/gap_miner.exe bin/gap_miner_cuda_adx.exe
 
       - name: Stage CUDA DLLs for smoke test
         shell: msys2 {0}
@@ -183,7 +206,9 @@ jobs:
 
       - name: Wheel sieve smoke test
         shell: msys2 {0}
-        run: ./bin/gap_miner.exe --wheel-sieve 210 --selftest
+        run: |
+          ./bin/gap_miner_cuda_portable.exe --wheel-sieve 210 --selftest
+          ./bin/gap_miner_cuda_adx.exe --wheel-sieve 210 --selftest
 
       - name: Build and run sievegap unit test
         shell: msys2 {0}
@@ -199,7 +224,9 @@ jobs:
         shell: msys2 {0}
         run: |
           mkdir -p dist-cuda
-          cp bin/gap_miner.exe dist-cuda/
+          cp bin/gap_miner_cuda_portable.exe dist-cuda/gap_miner.exe
+          cp bin/gap_miner_cuda_portable.exe dist-cuda/gap_miner_portable.exe
+          cp bin/gap_miner_cuda_adx.exe dist-cuda/gap_miner_adx.exe
           cp bin/gen_crt.exe   dist-cuda/
           cp src/gpu_fermat.dll dist-cuda/
           cp src/gpu_sieve.dll  dist-cuda/
@@ -240,7 +267,7 @@ jobs:
             done
           }
 
-          resolve_and_copy_deps dist-cuda/gap_miner.exe dist-cuda/gen_crt.exe
+          resolve_and_copy_deps dist-cuda/gap_miner.exe dist-cuda/gap_miner_portable.exe dist-cuda/gap_miner_adx.exe dist-cuda/gen_crt.exe
 
       - name: Upload CUDA artefact
         uses: actions/upload-artifact@v4

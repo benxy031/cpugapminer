@@ -23,4 +23,10 @@ int fermat_test_cpu_nlimbs(const uint64_t *n, int nlimbs);
  * Returns 1 (probably prime) or 0 (composite). */
 int euler_test_cpu_nlimbs(const uint64_t *n, int nlimbs);
 
+/* CPU Montgomery backend feature status.
+ * On ADX/BMI2 builds, runtime detection may disable ADX path and use
+ * portable CIOS fallback when the host CPU lacks required instructions. */
+int primality_cpu_adx_compiled(void);
+int primality_cpu_adx_enabled(void);
+
 #endif
