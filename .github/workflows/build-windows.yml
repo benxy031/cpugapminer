@@ -66,7 +66,11 @@ jobs:
       - name: Wheel sieve smoke test
         run: |
           ./bin/gap_miner_portable.exe --wheel-sieve 210 --selftest
-          ./bin/gap_miner_adx.exe --wheel-sieve 210 --selftest
+          if grep -qi adx /proc/cpuinfo && grep -qi bmi2 /proc/cpuinfo; then
+            ./bin/gap_miner_adx.exe --wheel-sieve 210 --selftest
+          else
+            echo "Skipping ADX smoke test: runner CPU lacks ADX/BMI2"
+          fi
 
       - name: Build and run sievegap unit test
         run: |
@@ -219,7 +223,11 @@ jobs:
         shell: msys2 {0}
         run: |
           ./bin/gap_miner_cuda_portable.exe --wheel-sieve 210 --selftest
-          ./bin/gap_miner_cuda_adx.exe --wheel-sieve 210 --selftest
+          if grep -qi adx /proc/cpuinfo && grep -qi bmi2 /proc/cpuinfo; then
+            ./bin/gap_miner_cuda_adx.exe --wheel-sieve 210 --selftest
+          else
+            echo "Skipping ADX smoke test: runner CPU lacks ADX/BMI2"
+          fi
 
       - name: Build and run sievegap unit test
         shell: msys2 {0}

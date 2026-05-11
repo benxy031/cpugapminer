@@ -4,20 +4,24 @@
 #include <string.h>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <x86intrin.h>
+#include <cpuid.h>
 #endif
 
-#if defined(__x86_64__) && defined(__BMI2__) && defined(__ADX__)
+#if defined(__x86_64__) || defined(_M_X64)
 static int g_primality_runtime_adx_checked = 0;
 static int g_primality_runtime_adx_enabled = 1;
 
 static inline int primality_detect_adx_bmi2_runtime(void)
 {
-#if defined(__GNUC__)
-    __builtin_cpu_init();
-    return __builtin_cpu_supports("adx") && __builtin_cpu_supports("bmi2");
-#else
-    return 1;
-#endif
+    unsigned int eax, ebx, ecx, edx;
+    const unsigned int bit_bmi2 = 1u << 8;
+    const unsigned int bit_adx = 1u << 19;
+
+    if (!__get_cpuid_max(0, NULL))
+        return 0;
+    if (!__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx))
+        return 0;
+    return ((ebx & bit_bmi2) != 0) && ((ebx & bit_adx) != 0);
 }
 
 static inline void primality_runtime_init_adx_once(void)
@@ -321,7 +325,7 @@ static inline void FN(uint64_t *r, \
         for (int i = 0; i < nlimbs; i++) r[i] = t[i]; \
 }
 
-#if defined(__x86_64__) && defined(__BMI2__) && defined(__ADX__)
+#if defined(__x86_64__) || defined(_M_X64)
 /*
  * ADX CIOS Montgomery inner loop: t[0..nl] += ai * b[0..nl-1]
  *
@@ -939,7 +943,7 @@ DECL_MONTSQR_EXACT(20)
         } \
     } while (0)
 
-#endif /* __x86_64__ && __BMI2__ && __ADX__ */
+#endif /* __x86_64__ */
 
 /* Fallback for CPUs without ADX/BMI2: use the generic CIOS montmul.
    MONTMUL_EXACT_DISPATCH is only defined in the ADX block above;
@@ -1452,7 +1456,7 @@ int euler_test_cpu_nlimbs(const uint64_t *n, int nlimbs)
 
 int primality_cpu_adx_compiled(void)
 {
-#if defined(__x86_64__) && defined(__BMI2__) && defined(__ADX__)
+#if defined(__x86_64__) || defined(_M_X64)
     return 1;
 #else
     return 0;
@@ -1461,7 +1465,7 @@ int primality_cpu_adx_compiled(void)
 
 int primality_cpu_adx_enabled(void)
 {
-#if defined(__x86_64__) && defined(__BMI2__) && defined(__ADX__)
+#if defined(__x86_64__) || defined(_M_X64)
     primality_runtime_init_adx_once();
     return g_primality_runtime_adx_enabled;
 #else
