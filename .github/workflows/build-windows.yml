@@ -44,33 +44,16 @@ jobs:
             make
             bc
 
-      - name: Build CPU portable variant
+      - name: Build CPU binary (single runtime-dispatch variant)
         run: |
-          mkdir -p out/win-cpu
           make -f Makefile.mingw clean
+          # Single binary for maximum compatibility.
+          # ADX/BMI2 path is enabled at runtime when CPU supports it.
           make -f Makefile.mingw WITH_RPC=1 ARCH_FLAGS='-march=x86-64 -mtune=generic -msse2'
-          cp bin/gap_miner.exe out/win-cpu/gap_miner_portable.exe
-
-      - name: Build CPU ADX variant
-        run: |
-          mkdir -p out/win-cpu
-          make -f Makefile.mingw clean
-          make -f Makefile.mingw WITH_RPC=1 ARCH_FLAGS='-march=x86-64 -mtune=generic -msse2 -mbmi2 -madx'
-          cp bin/gap_miner.exe out/win-cpu/gap_miner_adx.exe
-
-      - name: Stage CPU variants for smoke test
-        run: |
-          cp out/win-cpu/gap_miner_portable.exe bin/
-          cp out/win-cpu/gap_miner_adx.exe bin/
 
       - name: Wheel sieve smoke test
         run: |
-          ./bin/gap_miner_portable.exe --wheel-sieve 210 --selftest
-          if grep -qi adx /proc/cpuinfo && grep -qi bmi2 /proc/cpuinfo; then
-            ./bin/gap_miner_adx.exe --wheel-sieve 210 --selftest
-          else
-            echo "Skipping ADX smoke test: runner CPU lacks ADX/BMI2"
-          fi
+          ./bin/gap_miner.exe --wheel-sieve 210 --selftest
 
       - name: Build and run sievegap unit test
         run: |
@@ -83,9 +66,7 @@ jobs:
       - name: Collect DLLs
         run: |
           mkdir -p dist
-          cp out/win-cpu/gap_miner_portable.exe dist/gap_miner.exe
-          cp out/win-cpu/gap_miner_portable.exe dist/gap_miner_portable.exe
-          cp out/win-cpu/gap_miner_adx.exe dist/gap_miner_adx.exe
+          cp bin/gap_miner.exe dist/gap_miner.exe
           cp bin/gen_crt.exe dist/
           # Copy CRT sieve files
           cp -r crt dist/ 2>/dev/null || true
@@ -121,7 +102,7 @@ jobs:
             done
           }
 
-          resolve_and_copy_deps dist/gap_miner.exe dist/gap_miner_portable.exe dist/gap_miner_adx.exe dist/gen_crt.exe
+          resolve_and_copy_deps dist/gap_miner.exe dist/gen_crt.exe
 
       - name: Upload artefact
         uses: actions/upload-artifact@v4
@@ -195,39 +176,22 @@ jobs:
             src/gpu_sieve.cu
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
-      - name: Build CUDA portable variant
+      - name: Build CUDA binary (single runtime-dispatch variant)
         shell: msys2 {0}
         run: |
-          mkdir -p out/win-cuda
           make -f Makefile.mingw clean
           make -f Makefile.mingw WITH_RPC=1 WITH_CUDA=1 CUDA_DLL=1 GPU_BITS=1024 ARCH_FLAGS='-march=x86-64 -mtune=generic -msse2'
-          cp bin/gap_miner.exe out/win-cuda/gap_miner_cuda_portable.exe
-
-      - name: Build CUDA ADX variant
-        shell: msys2 {0}
-        run: |
-          mkdir -p out/win-cuda
-          make -f Makefile.mingw clean
-          make -f Makefile.mingw WITH_RPC=1 WITH_CUDA=1 CUDA_DLL=1 GPU_BITS=1024 ARCH_FLAGS='-march=x86-64 -mtune=generic -msse2 -mbmi2 -madx'
-          cp bin/gap_miner.exe out/win-cuda/gap_miner_cuda_adx.exe
 
       - name: Stage CUDA DLLs for smoke test
         shell: msys2 {0}
         run: |
           cp src/gpu_fermat.dll bin/
           cp src/gpu_sieve.dll bin/
-          cp out/win-cuda/gap_miner_cuda_portable.exe bin/
-          cp out/win-cuda/gap_miner_cuda_adx.exe bin/
 
       - name: Wheel sieve smoke test
         shell: msys2 {0}
         run: |
-          ./bin/gap_miner_cuda_portable.exe --wheel-sieve 210 --selftest
-          if grep -qi adx /proc/cpuinfo && grep -qi bmi2 /proc/cpuinfo; then
-            ./bin/gap_miner_cuda_adx.exe --wheel-sieve 210 --selftest
-          else
-            echo "Skipping ADX smoke test: runner CPU lacks ADX/BMI2"
-          fi
+          ./bin/gap_miner.exe --wheel-sieve 210 --selftest
 
       - name: Build and run sievegap unit test
         shell: msys2 {0}
@@ -243,9 +207,7 @@ jobs:
         shell: msys2 {0}
         run: |
           mkdir -p dist-cuda
-          cp out/win-cuda/gap_miner_cuda_portable.exe dist-cuda/gap_miner.exe
-          cp out/win-cuda/gap_miner_cuda_portable.exe dist-cuda/gap_miner_portable.exe
-          cp out/win-cuda/gap_miner_cuda_adx.exe dist-cuda/gap_miner_adx.exe
+          cp bin/gap_miner.exe dist-cuda/gap_miner.exe
           cp bin/gen_crt.exe   dist-cuda/
           cp src/gpu_fermat.dll dist-cuda/
           cp src/gpu_sieve.dll  dist-cuda/
@@ -286,7 +248,7 @@ jobs:
             done
           }
 
-          resolve_and_copy_deps dist-cuda/gap_miner.exe dist-cuda/gap_miner_portable.exe dist-cuda/gap_miner_adx.exe dist-cuda/gen_crt.exe
+          resolve_and_copy_deps dist-cuda/gap_miner.exe dist-cuda/gen_crt.exe
 
       - name: Upload CUDA artefact
         uses: actions/upload-artifact@v4
