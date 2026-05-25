@@ -3111,7 +3111,7 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
                     const uint64_t *ph2_primes    = small_primes_cache + split_idx;
                     const uint64_t *ph2_base_mod_p = tls_base_mod_p + split_idx;
                     int ret = gpu_sieve_mark_segment_batch(
-                        tls_gpu_seg, bit_size, seg_size,
+                        tls_gpu_seg, bit_size, (seg_size + 1) >> 1,
                         bits,
                         ph2_primes, ph2_base_mod_p,
                         tls_gpu_base_mod_p_gen, L, R, n_ph2);
@@ -8307,8 +8307,11 @@ int main(int argc, char **argv) {
             {
                 extern int g_gpu_sieve_enable;
                 if (g_gpu_sieve_enable) {
-                    log_msg("sievegap: disabling GPU Phase-2 sieve (--no-gpu-sieve implied)\n");
-                    g_gpu_sieve_enable = 0;
+                    /* GPU Phase-2 sieve co-enabled with sievegap: large-prime
+                       marking runs in the presieve helper thread's GPU sieve
+                       stream while the main thread runs GPU Fermat — giving
+                       true GPU-only pipeline overlap on the same device. */
+                    log_msg("sievegap: GPU Phase-2 sieve enabled (pipeline overlap with GPU Fermat)\n");
                 }
             }
 #endif
@@ -8884,6 +8887,15 @@ int main(int argc, char **argv) {
            primes_cap = small_primes_count + 64  (Phase-2 primes after split) */
         size_t gpu_seg_cap    = (size_t)(sieve_size / 2 + 1) + 64;
         size_t gpu_primes_cap = (small_primes_count > 0 ? small_primes_count : 1200000) + 64;
+        /* CRT windows are tiny (sieve_size <= gap_scan, typically ~16k).
+         * GPU sieve dispatch overhead (~0.5ms/call) completely dominates
+         * over the negligible kernel work, making it 40-45x slower than
+         * CPU-only sieve.  Auto-disable regardless of --gpu-sieve flag. */
+        if (g_gpu_sieve_enable && g_crt_mode != CRT_MODE_NONE) {
+            log_msg("GPU sieve: auto-disabled in CRT mode (window=%d too small for GPU dispatch)\n",
+                    sieve_size);
+            g_gpu_sieve_enable = 0;
+        }
         if (g_gpu_sieve_enable) {
             if (gpu_sieve_init(gpu_seg_cap, gpu_primes_cap) == 0) {
                 int sieve_ids[32];

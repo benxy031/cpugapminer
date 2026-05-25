@@ -26,6 +26,24 @@ static __thread uint8_t *tls_gpu_bits = NULL;
 static __thread size_t tls_gpu_bits_cap = 0;
 #endif
 
+/* Scratch buffer for precomputed base_mod_p values when not available from
+ * the caller — avoids recomputing uint256_mod_small per prime per L1 block. */
+static __thread uint64_t *tls_base_scratch = NULL;
+static __thread size_t tls_base_scratch_cap = 0;
+
+static int ensure_base_scratch_capacity(size_t count) {
+    if (tls_base_scratch_cap >= count)
+        return 0;
+    free(tls_base_scratch);
+    tls_base_scratch = (uint64_t *)malloc(count * sizeof(uint64_t));
+    if (!tls_base_scratch) {
+        tls_base_scratch_cap = 0;
+        return -1;
+    }
+    tls_base_scratch_cap = count;
+    return 0;
+}
+
 static int ensure_bits_capacity(size_t bytes) {
     if (tls_bits_cap >= bytes)
         return 0;
@@ -276,14 +294,37 @@ uint64_t *sievegap_run_range(uint64_t L,
         }
     }
 
-    for (size_t i = sieve_start; i < gpu_split; i++) {
-        uint64_t p = small_primes[i];
-        uint64_t base = 0;
-        if (base_mod_p_ready && base_mod_p)
-            base = base_mod_p[i];
-        else if (h256)
-            base = uint256_mod_small(h256, shift, p);
-        mark_prime_cpu(bits, L, R, p, base, bit_bytes);
+    /* Phase 1: small primes, L1-blocked.
+     * Precompute base (= h256 mod p) once per prime before the block loop;
+     * reuse across blocks so uint256_mod_small is not called repeatedly. */
+    const uint64_t *eff_base = NULL;
+    if (base_mod_p_ready && base_mod_p) {
+        eff_base = base_mod_p;
+    } else if (h256 && gpu_split > 0) {
+        if (ensure_base_scratch_capacity(gpu_split) == 0) {
+            for (size_t i = sieve_start; i < gpu_split; i++)
+                tls_base_scratch[i] = uint256_mod_small(h256, shift, small_primes[i]);
+            eff_base = tls_base_scratch;
+        }
+    }
+
+    /* Block size matches L1D cache (32 KB = SIEVEGAP_GPU_SPLIT_BITS bits).
+     * Inner prime loop touches only blk_bit_bytes bytes of bitmap per pass,
+     * keeping the working set hot across all primes in the block. */
+    uint64_t seg_bits = (seg_size + 1ULL) >> 1;
+    for (uint64_t blk_bit = 0; blk_bit < seg_bits; blk_bit += SIEVEGAP_GPU_SPLIT_BITS) {
+        uint64_t blk_end_bit = blk_bit + SIEVEGAP_GPU_SPLIT_BITS;
+        if (blk_end_bit > seg_bits)
+            blk_end_bit = seg_bits;
+        uint64_t blk_L = L + (blk_bit << 1);
+        uint64_t blk_R = L + (blk_end_bit << 1);
+        uint8_t *blk_bits = bits + (blk_bit >> 3);
+        size_t blk_bit_bytes = (size_t)((blk_end_bit - blk_bit + 7) >> 3);
+
+        for (size_t i = sieve_start; i < gpu_split; i++) {
+            uint64_t base = eff_base ? eff_base[i] : 0;
+            mark_prime_cpu(blk_bits, blk_L, blk_R, small_primes[i], base, blk_bit_bytes);
+        }
     }
 
 #ifdef WITH_CUDA
@@ -294,9 +335,11 @@ uint64_t *sievegap_run_range(uint64_t L,
         if (n_phase2 > 0 && ensure_gpu_bits_capacity(bit_bytes) == 0) {
             uint8_t *phase2_bits_buf = tls_gpu_bits;
             memset(phase2_bits_buf, 0, bit_bytes);
+            /* segment_len must be the ODD candidate count (d_segment is
+             * indexed by odd-position: segment[i] corresponds to L+2*i). */
             int mode = gpu_sieve_mark_segment_batch(phase2_bits_buf,
                                                     bit_bytes,
-                                                    seg_size,
+                                                    (seg_size + 1) >> 1,
                                                     bits,
                                                     small_primes + gpu_split,
                                                     base_mod_p + gpu_split,
@@ -374,6 +417,7 @@ uint64_t *sievegap_run_range(uint64_t L,
 void sievegap_free_tls_buffers(void) {
     free(tls_bits);
     free(tls_survivors);
+    free(tls_base_scratch);
 #ifdef WITH_CUDA
     free(tls_gpu_bits);
     tls_gpu_bits = NULL;
@@ -383,4 +427,6 @@ void sievegap_free_tls_buffers(void) {
     tls_survivors = NULL;
     tls_bits_cap = 0;
     tls_survivors_cap = 0;
+    tls_base_scratch = NULL;
+    tls_base_scratch_cap = 0;
 }
