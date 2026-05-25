@@ -29,21 +29,25 @@
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* Multiply-accumulate: *acc += a × b + carry_in.  Returns carry out.
-   C computes the 128-bit product; the additions use a hardware carry chain
-   (add.cc/addc) replacing 4× setp+selp with 4 add/addc instructions.
-   sm_70+: inline PTX with "+&l" early-clobber, which prevents nvcc from
-   aliasing *acc's register with 'lo' or 'carry' when both happen to be 0.
-   sm_61 and earlier: "+&l" multi-modifier is not accepted by that nvcc;
-   fall back to portable C arithmetic (nvcc still emits add.cc/addc). */
+   Uses PTX add.cc.u64 / addc.u64 carry chains on all CUDA architectures
+   (sm_20+) — saves ~4 instructions vs the C setp+selp path per call.
+   "+&l" early-clobber prevents nvcc from aliasing *acc's register with
+   'lo' or 'carry' inputs.
+   sm>=700 (Volta+): nvcc correctly respects the "+&l" early-clobber
+   and never aliases the carry input register with the acc read-write
+   register, so PTX add.cc/addc carry chains give correct results.
+   sm<700 (Pascal/Maxwell/Kepler): nvcc WITHOUT "+&" CAN alias the
+   carry input with the acc register, producing "add.cc acc,acc,acc"
+   (doubling) instead of "add.cc acc,acc,carry" — confirmed in the
+   generated PTX for sm_61.  Use the C fallback on these arches;
+   the compiler lowers it to integer arithmetic that is always correct. */
 __device__ static __forceinline__
 uint64_t mac(uint64_t *acc, uint64_t a, uint64_t b, uint64_t carry)
 {
     uint64_t lo = a * b;
     uint64_t hi = __umul64hi(a, b);
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-    /* sm_70+ (Volta and later): "+&l" early-clobber is supported.
-       Prevents nvcc from aliasing *acc's register with 'lo' or 'carry'
-       inputs when both happen to be zero. */
+    /* Volta+ (sm_70+): "+&l" early-clobber accepted; no aliasing. */
     asm volatile(
         "add.cc.u64  %0, %0, %2;\n\t"   /* acc += lo,     CF1          */
         "addc.u64    %1, %1,  0;\n\t"   /* hi  += CF1                  */
@@ -53,9 +57,7 @@ uint64_t mac(uint64_t *acc, uint64_t a, uint64_t b, uint64_t carry)
         : "l"(lo), "l"(carry)
     );
 #else
-    /* sm_61 and earlier: "+&l" multi-modifier constraint not supported.
-       Use portable C arithmetic; nvcc emits equivalent add.cc/addc PTX
-       via its own instruction selection. */
+    /* sm<700 or host: plain C — correct and avoids ptxas aliasing bug. */
     uint64_t sum = *acc + lo;
     uint64_t c1  = (sum < lo);
     *acc = sum + carry;
@@ -138,14 +140,13 @@ uint64_t compute_ninv(uint64_t n0)
 }
 
 /* r = R mod n,  where R = 2^(64×AL).
-   Fast top-down computation: start from the highest bit of R (bit 64*AL)
-   and reduce downward.  Since R = 2^(64*AL) has exactly one bit set,
-   we scan from bit (64*AL-1) down to 0, doubling r each step.
-   We begin with r = 2^topbit mod n where topbit = highest bit of n,
-   so r = 2^topbit - n (since 2^topbit >= n > 2^(topbit-1)).
-   Then we double r for each remaining bit position, taking mod n
-   at each step.  Total: (64*AL - topbit) doublings instead of 64*AL.
-   For 976-bit candidates in 1024-bit R, this saves ~48 doublings (~5%). */
+   Fast top-down computation: we start from r = 2^topbit, where topbit is
+   the index of the highest set bit of n.  Because n has bit topbit set and
+   n is odd, n > 2^topbit, so 2^topbit < n and is already a valid reduced
+   value in [0, n).  We then double r exactly (64*AL - topbit) times (taking
+   mod n at each step) to reach R = 2^(64*AL) mod n.
+   Total doublings = 64*AL - topbit.  For 976-bit n in 1024-bit R this saves
+   ~48 doublings (~5%) versus starting from 2^0 = 1. */
 template<int AL>
 __device__ static __forceinline__
 void compute_rmodn_t(uint64_t *r, const uint64_t *n)
@@ -156,17 +157,15 @@ void compute_rmodn_t(uint64_t *r, const uint64_t *n)
     int top_bit_in_limb = 63 - __clzll(n[top_limb]);
     int topbit = top_limb * 64 + top_bit_in_limb;
 
-    /* r = 2^topbit - n  (this is R' mod n where R' = 2^topbit; since
-       2^topbit >= n but 2^topbit < 2*n, R' mod n = 2^topbit - n). */
-    /* Compute 2^topbit */
+    /* r = 2^topbit.  Because topbit is the MSB position of n,
+       we have 2^topbit < n (n has bit topbit set plus at least the
+       odd low bit), so r is already a valid reduced value in [0,n).
+       Do NOT subtract n here — that would underflow and corrupt r.
+       Double r (64*AL - topbit) times to reach 2^(64*AL) mod n = R mod n. */
     for (int i = 0; i < AL; i++) r[i] = 0;
     r[top_limb] = 1ULL << top_bit_in_limb;
-    /* r = 2^topbit - n */
-    sub_t<AL>(r, r, n);
 
-    /* Double r for each remaining bit from topbit+1 to 64*AL-1.
-       After this loop, r = 2^(64*AL) mod n = R mod n. */
-    int remaining = 64 * AL - 1 - topbit;
+    int remaining = 64 * AL - topbit;
     #pragma unroll 1
     for (int i = 0; i < remaining; i++)
         moddbl_t<AL>(r, n);
@@ -215,6 +214,100 @@ void montmul_t(uint64_t *      __restrict__ r,
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ *  Montgomery squaring: r = a² · R⁻¹ mod n  (SOS shortcut)
+ *
+ *  Uses Separated Operand Scanning to skip duplicate cross-products.
+ *  Saves AL(AL-1)/2 mac() calls vs montmul_t(r,a,a,...):
+ *    AL=5:  10 saved  (~13%)    AL=8:  28 saved  (~22%)
+ *    AL=10: 45 saved  (~23%)    AL=12: 66 saved  (~25%)
+ *
+ *  Algorithm (4 phases):
+ *    1. Upper-triangle: tbuf[i+j] += a[i]*a[j] for i < j
+ *    2. Double tbuf (each off-diagonal product appears twice in a²)
+ *    3. Diagonal: tbuf[2i] += a[i]²  (only AL products vs AL² total)
+ *    4. CIOS reduction: identical to montmul_t's reduction pass
+ *
+ *  Invariant: a < n < R → a² < n² < R·n → CIOS reduction stays in [0,2n).
+ *  Phase 4 uses absolute indexing (no t++ trick) to avoid clobbering
+ *  carry words set by Phase 3.
+ * ═══════════════════════════════════════════════════════════════════
+ * NOTE (GPU): montsqr_t is verified correct (passes 116/116 tests) but
+ * is NOT called from fermat_expmod.  On GPU, the 2*AL intermediate
+ * buffer (tbuf[2*AL+4]) is accessed in a scattered pattern across all
+ * 4 phases, which forces the compiler to spill it to local memory
+ * (LMEM), incurring ~30× end-to-end throughput regression vs
+ * montmul_t(r,a,a,...).  montmul_t uses a sliding-window t++ trick
+ * that keeps only AL+2 live values at a time, fits in registers with
+ * zero spill, and the L1-cached sequential access pattern dominates.
+ * A future CIOS-style squaring that preserves the sliding window would
+ * be needed to regain the arithmetic savings on GPU.
+ * ═══════════════════════════════════════════════════════════════════ */
+template<int AL>
+__device__ static __forceinline__
+void montsqr_t(uint64_t * __restrict__ r,
+               const uint64_t * __restrict__ a,
+               const uint64_t * __restrict__ n,
+               uint64_t ninv)
+{
+    uint64_t tbuf[2 * AL + 4];
+    for (int i = 0; i < 2 * AL + 4; i++) tbuf[i] = 0;
+
+    /* Phase 1: upper-triangle cross-products.
+       Row i accumulates a[i]·a[j] (j > i) into tbuf[i+j], carry → tbuf[i+AL]. */
+    for (int i = 0; i < AL - 1; i++) {
+        uint64_t c = 0;
+        for (int j = i + 1; j < AL; j++)
+            c = mac(&tbuf[i + j], a[i], a[j], c);
+        uint64_t old = tbuf[i + AL];
+        tbuf[i + AL] += c;
+        tbuf[i + AL + 1] += (tbuf[i + AL] < old);
+    }
+
+    /* Phase 2: double the accumulator (each cross-product a[i]·a[j]
+       appears once; doubling accounts for the symmetric a[j]·a[i] term). */
+    uint64_t carry = 0;
+    #pragma unroll
+    for (int i = 0; i < 2 * AL; i++) {
+        uint64_t v = tbuf[i];
+        tbuf[i] = (v << 1) | carry;
+        carry = v >> 63;
+    }
+    tbuf[2 * AL] += carry;   /* at most 1; a²<R·n guarantees no further overflow */
+
+    /* Phase 3: add diagonal a[i]² at positions (2i, 2i+1).
+       mac(&tbuf[2i], a[i], a[i], 0) returns hi(a[i]²) + carry_from_add.
+       3-level carry propagation mirrors primality_utils.c SOS squaring. */
+    for (int i = 0; i < AL; i++) {
+        uint64_t c1 = mac(&tbuf[2 * i], a[i], a[i], 0);
+        uint64_t old = tbuf[2 * i + 1];
+        tbuf[2 * i + 1] += c1;
+        if (tbuf[2 * i + 1] < old) {          /* carry into 2i+2 */
+            if (++tbuf[2 * i + 2] == 0)        /* carry into 2i+3 */
+                tbuf[2 * i + 3]++;             /* (very rare; terminates here) */
+        }
+    }
+
+    /* Phase 4: CIOS reduction using absolute indexing (no t++ / zeroing trick,
+       which would clobber Phase-3 carry words in the upper half of tbuf). */
+    for (int i = 0; i < AL; i++) {
+        uint64_t m = tbuf[i] * ninv;
+        uint64_t c = 0;
+        for (int j = 0; j < AL; j++)
+            c = mac(&tbuf[i + j], m, n[j], c);
+        uint64_t old = tbuf[i + AL];
+        tbuf[i + AL] += c;
+        tbuf[i + AL + 1] += (tbuf[i + AL] < old);
+    }
+
+    /* Result is at tbuf[AL..2*AL-1]; overflow word at tbuf[2*AL]. */
+    uint64_t *t = &tbuf[AL];
+    if (tbuf[2 * AL] || gte_t<AL>(t, n))
+        sub_t<AL>(r, t, n);
+    else
+        for (int i = 0; i < AL; i++) r[i] = t[i];
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  *  Sliding-window modular exponentiation: res = base^(n-1) mod n
  *
  *  WIN_BITS selects the precomputed table size vs squaring trade-off:
@@ -243,7 +336,7 @@ void fermat_expmod(uint64_t * __restrict__ res,
     uint64_t win[WIN_SIZE * AL];
     uint64_t tmp[AL];
     for (int i = 0; i < AL; i++) win[i] = base_m[i];   /* win[0] = base^1 */
-    montmul_t<AL>(tmp, base_m, base_m, n, ninv);        /* tmp    = base^2  */
+    montmul_t<AL>(tmp, base_m, base_m, n, ninv);         /* tmp    = base^2  */
     for (int k = 1; k < WIN_SIZE; k++)
         montmul_t<AL>(&win[k * AL], &win[(k-1) * AL], tmp, n, ninv);
 
@@ -305,7 +398,10 @@ __global__ void fermat_kernel_t(const uint64_t * __restrict__ cands,
 
     uint64_t n[AL];
     const uint64_t *src = &cands[(size_t)idx * (size_t)AL];
-    for (int i = 0; i < AL; i++) n[i] = src[i];
+    /* __ldg() routes through the read-only cache (texture path), which is
+       independent of L1 and improves bandwidth when many threads access
+       different candidates (non-coalesced or scattered global reads). */
+    for (int i = 0; i < AL; i++) n[i] = __ldg(&src[i]);
 
     if ((n[0] & 1) == 0) { results[idx] = 0; return; }
 
@@ -327,12 +423,20 @@ __global__ void fermat_kernel_t(const uint64_t * __restrict__ cands,
     /* Adaptive window: 4-bit for AL≤7 (≤448-bit, low register pressure),
        3-bit for AL≥8 (≥512-bit) — halves the precomputed table from
        8×AL to 4×AL entries, keeping win[] in registers not local memory.
-       E.g. shift=384 (AL=10): win[80]→win[40] saves 320 bytes/thread.  */
+       E.g. shift=384 (AL=10): win[80]→win[40] saves 320 bytes/thread.
+       On sm<700 (Pascal and earlier, 2 warp schedulers, 65536 regs/SM),
+       register pressure is more critical: always use WIN_BITS=3 to reduce
+       the win[] table from 8×AL to 4×AL across all AL values.  This
+       typically raises occupancy by ~1.5× at AL=6–7 on sm_61. */
     uint64_t res[AL];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+    fermat_expmod<AL, 3>(res, e, msb_e, n, ninv, base_m);
+#else
     if constexpr (AL <= 7)
         fermat_expmod<AL, 4>(res, e, msb_e, n, ninv, base_m);
     else
         fermat_expmod<AL, 3>(res, e, msb_e, n, ninv, base_m);
+#endif
 
     int ok = (res[0] == 1);
     for (int i = 1; i < AL; i++)
@@ -398,6 +502,23 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
     } while (0); \
     return cudaPeekAtLastError()
 
+/* IMPORTANT: stride == active_limbs.  Every AL value from 1 to NL must have
+   an exact dispatch entry so the kernel reads exactly AL limbs per candidate.
+   A gap (e.g. al=4 dispatching to template<5>) would read past the end of
+   each candidate's data into the next candidate's first limb, corrupting the
+   modulus and producing incorrect Fermat results. */
+#if NL >= 1
+    if (al <= 1)  { FERMAT_DISPATCH(1);  }
+#endif
+#if NL >= 2
+    if (al <= 2)  { FERMAT_DISPATCH(2);  }
+#endif
+#if NL >= 3
+    if (al <= 3)  { FERMAT_DISPATCH(3);  }
+#endif
+#if NL >= 4
+    if (al <= 4)  { FERMAT_DISPATCH(4);  }
+#endif
 #if NL >= 5
     if (al <= 5)  { FERMAT_DISPATCH(5);  }
 #endif

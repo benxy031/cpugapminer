@@ -119,7 +119,7 @@ struct crt_runtime_worker_ctx {
     void (*crt_score_roll_observe)(double score,
                                    uint64_t surv_cnt,
                                    uint64_t primes_found,
-                                   uint64_t qual_pairs);
+                                   double gap_ratio);
 
 #ifdef WITH_GPU_FERMAT
     size_t (*gpu_batch_filter)(uint64_t *offsets, size_t cnt);

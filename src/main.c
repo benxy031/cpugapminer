@@ -17,6 +17,7 @@
 #include "cpu_features.h"
 #include "compat_win32.h"
 #include "rgm_check.h"
+#include "gap_dist.h"
 #include <openssl/sha.h>
 #include <openssl/bn.h>
 #include <gmp.h>
@@ -255,7 +256,11 @@ static double compute_cramer_score(const uint64_t *surv, size_t n,
     }
 
     free(qpow);
-    return p * p * score;
+    /* Multiply by the Hardy-Littlewood correction factor C_{needed_gap}/C_2.
+     * For gaps divisible by small odd primes, this boosts the score by the
+     * factor by which such gaps occur more often than gaps of size 2 would,
+     * making the Cramér score reflect the true gap-type probability under HL. */
+    return p * p * score * gap_dist_hl_ratio_large(needed_gap);
 }
 
 /* Phase 1 defaults by shift band for CRT solver mode. */
@@ -317,9 +322,11 @@ static void __attribute__((unused))
 crt_score_roll_observe(double score,
                                    uint64_t surv_cnt,
                                    uint64_t primes_found,
-                                   uint64_t qual_pairs) {
+                                   double gap_ratio) {
     if (score < 0.0)
         score = 0.0;
+    if (gap_ratio < 0.0)
+        gap_ratio = 0.0;
 
     pthread_mutex_lock(&g_crt_score_roll.mu);
 
@@ -336,12 +343,15 @@ crt_score_roll_observe(double score,
         g_crt_score_roll.n++;
     }
 
+    /* y = max_gap_in_window / needed_gap: non-zero for every window with
+     * >= 2 GPU primes, giving a dense signal for Pearson correlation
+     * without waiting for a qualifying gap (which occurs ~once per hour). */
     g_crt_score_roll.x[slot] = score;
-    g_crt_score_roll.y[slot] = (double)qual_pairs;
+    g_crt_score_roll.y[slot] = gap_ratio;
 
     {
         long double x = (long double)score;
-        long double y = (long double)qual_pairs;
+        long double y = (long double)gap_ratio;
         g_crt_score_roll.sx  += x;
         g_crt_score_roll.sy  += y;
         g_crt_score_roll.sxx += x * x;
@@ -353,7 +363,8 @@ crt_score_roll_observe(double score,
     g_crt_score_roll.total_obs++;
     g_crt_score_roll.total_surv   += surv_cnt;
     g_crt_score_roll.total_primes += primes_found;
-    g_crt_score_roll.total_qual   += qual_pairs;
+    /* total_qual stores sum of gap_ratio * 1000 (milli-units) for display. */
+    g_crt_score_roll.total_qual   += (uint64_t)(gap_ratio * 1000.0);
 
     pthread_mutex_unlock(&g_crt_score_roll.mu);
 }
@@ -2106,14 +2117,15 @@ static void print_stats(void) {
                     (double)score_snap.total_obs;
                 double avg_primes = (double)score_snap.total_primes /
                     (double)score_snap.total_obs;
-                double avg_qual = (double)score_snap.total_qual /
-                    (double)score_snap.total_obs;
-                log_msg("  phase1: score_calib obs=%llu roll=%zu corr(score,qual)=%.3f avg_score=%.3e avg_qual_win=%.3f avg_surv=%.1f avg_primes=%.1f",
+                /* total_qual stores sum of gap_ratio*1000; divide back for display. */
+                double avg_gap_ratio = (double)score_snap.total_qual /
+                    (1000.0 * (double)score_snap.total_obs);
+                log_msg("  phase1: score_calib obs=%llu roll=%zu corr(score,gap_ratio)=%.3f avg_score=%.3e avg_gap_ratio=%.3f avg_surv=%.1f avg_primes=%.1f",
                     (unsigned long long)score_snap.total_obs,
                     score_snap.n,
                     score_snap.corr,
                     score_snap.avg_score,
-                    avg_qual,
+                    avg_gap_ratio,
                     avg_surv,
                     avg_primes);
             }
@@ -2261,6 +2273,87 @@ static void print_stats(void) {
                         " — primality pipeline may be incorrect!\n",
                         mg_mean, mg_logbase, dev_pct,
                         (unsigned long long)mg_cnt);
+        }
+    }
+
+    /* ── Gap distribution check (Hardy-Littlewood model, log file only) ────
+       Compares the observed frequency of each small even gap against the
+       theoretical relative frequency:
+         E[count(g)] / E[count(2)] = (C_g/C_2) × exp(-(g-2)/logbase)
+       where C_g/C_2 = ∏_{p odd prime | g} (p-1)/(p-2)  (Holt w_{g,1}(∞)).
+       A persistent deviation > 20% for g ≤ 12 after 50 000+ gaps is unusual
+       and may indicate a primality-pipeline issue.                          */
+    {
+        uint64_t gd_counts[GAP_DIST_NBUCKETS];
+        uint64_t gd_total = 0;
+        if (gap_dist_snapshot(gd_counts, &gd_total) && gd_counts[0] >= 100) {
+            /* Use the logbase from the mean-gap accumulator (weighted average
+             * over all observed windows).  Fall back to a safe default if not
+             * yet available.                                                 */
+            double gd_logbase = 200.0;
+            {
+                double mg_mean_tmp, mg_lb_tmp;
+                uint64_t mg_cnt_tmp;
+                if (rgm_mean_gap_snapshot(&mg_mean_tmp, &mg_lb_tmp, &mg_cnt_tmp)
+                        && mg_lb_tmp > 1.0)
+                    gd_logbase = mg_lb_tmp;
+            }
+            double inv_lb = (gd_logbase > 1.0) ? 1.0 / gd_logbase : 0.0;
+            log_file_only("  gap_dist: total=%llu  ref(g=2)=%llu  logbase=%.1f"
+                          "  [HL asymptotic model]\n",
+                          (unsigned long long)gd_total,
+                          (unsigned long long)gd_counts[0],
+                          gd_logbase);
+            log_file_only("  gap_dist:  gap  observed   expected   ratio  dev%%\n");
+            int gd_warn = 0;
+            for (int gi = 0; gi < GAP_DIST_NBUCKETS - 1; gi++) {
+                int g = 2 * (gi + 1);
+                double hl   = gap_dist_hl_ratio(g);
+                double exp_cnt = (double)gd_counts[0] * hl
+                                 * exp(-(g - 2) * inv_lb);
+                double ratio   = (exp_cnt > 0.0)
+                                 ? (double)gd_counts[gi] / exp_cnt : 0.0;
+                double dev_pct = 100.0 * (ratio - 1.0);
+                log_file_only(
+                    "  gap_dist:  g=%2d  obs=%7llu  exp=%7.1f"
+                    "  ratio=%.3f  dev=%+.1f%%\n",
+                    g, (unsigned long long)gd_counts[gi], exp_cnt,
+                    ratio, dev_pct);
+                if (g <= 12 && gd_total >= 50000ULL && fabs(dev_pct) > 20.0)
+                    gd_warn = 1;
+            }
+            log_file_only("  gap_dist:  g>%d  obs=%llu\n",
+                          GAP_DIST_MAX_GAP,
+                          (unsigned long long)gd_counts[GAP_DIST_NBUCKETS - 1]);
+            if (gd_warn)
+                log_msg("  GAP-DIST WARNING: gap distribution deviates >20%%"
+                        " from HL theory for small gaps (g≤12) —"
+                        " check primality pipeline\n");
+
+            /* ── Adaptive MR rounds ──────────────────────────────────────
+               If gap_dist_mr_recommendation() reports that small gaps are
+               consistently over-represented (composites leaking through the
+               primality test), tighten it by adding one MR round.  The
+               function uses a 2-interval hysteresis so single-interval noise
+               never triggers an adjustment.  We cap at 6 rounds to bound the
+               throughput cost.                                             */
+            {
+                int mr_rec = gap_dist_mr_recommendation(gd_logbase);
+                if (mr_rec > 0) {
+                    if (cli_mr_rounds < 6) {
+                        cli_mr_rounds++;
+                        log_msg("  GAP-DIST: auto-increasing MR rounds to %d"
+                                " (g≤12 over-represented ≥2 intervals:"
+                                " composites may be passing primality test)\n",
+                                cli_mr_rounds);
+                    } else {
+                        log_msg("  GAP-DIST WARNING: g≤12 still over-represented"
+                                " but MR rounds already at cap (%d);"
+                                " check Fermat / sieve logic\n",
+                                cli_mr_rounds);
+                    }
+                }
+            }
         }
     }
 
@@ -5515,8 +5608,10 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
                              const char *rpc_url, const char *rpc_user,
                              const char *rpc_pass,
                              size_t *out_primes_found,
-                             size_t *out_qual_pairs) {
+                             size_t *out_qual_pairs,
+                             uint64_t *out_max_gap) {
     size_t qual_pairs = 0;
+    uint64_t max_gap = 0;
     __sync_fetch_and_add(&stats_crt_windows, 1);
 
     /* GPU batches should preserve ascending offsets, but guard anyway.
@@ -5556,6 +5651,7 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
     __sync_fetch_and_add(&stats_pairs, (uint64_t)(prime_cnt - 1));
     for (size_t i = 0; i + 1 < prime_cnt; i++) {
         uint64_t gap = primes[i + 1] - primes[i];
+        if (gap > max_gap) max_gap = gap;
         double merit = (double)gap / logbase;
         int best_needs_validation = (merit >= target) &&
             (use_crt_precision || use_mr_verify);
@@ -5681,6 +5777,8 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
         *out_primes_found = prime_cnt;
     if (out_qual_pairs)
         *out_qual_pairs = qual_pairs;
+    if (out_max_gap)
+        *out_max_gap = max_gap;
 }
 
 /* ── GPU batch accumulator (double-buffered async pipeline) ──
@@ -6041,15 +6139,19 @@ static void gpu_accum_collect(struct gpu_accum *a) {
                 w->surv[pf++] = w->surv[j];
         }
         size_t w_primes = 0, w_qual = 0;
+        uint64_t w_max_gap = 0;
         scan_gap_results(w->surv, pf, w->logbase, w->nonce, w->cand_odd,
                          w->nAdd, w->shift, w->target,
                          w->rpc_url, w->rpc_user, w->rpc_pass,
-                         &w_primes, &w_qual);
+                         &w_primes, &w_qual, &w_max_gap);
         if (w->cramer_score > 0.0) {
+            double needed_gap = w->logbase * w->target;
+            double gap_ratio = (needed_gap > 0.0 && w_max_gap > 0)
+                ? (double)w_max_gap / needed_gap : 0.0;
             crt_score_roll_observe(w->cramer_score,
                                    (uint64_t)w->surv_cnt,
                                    (uint64_t)w_primes,
-                                   (uint64_t)w_qual);
+                                   gap_ratio);
         }
         free(w->surv); w->surv = NULL;
         mpz_clear(w->base);
@@ -7544,6 +7646,7 @@ static void *worker_fn(void *arg) {
                     rgm_accumulate_window(pr, cnt, 10);
                     rgm_accumulate_window(pr, cnt, 20);
                     rgm_accumulate_mean_gap(pr, cnt, logbase);
+                    gap_dist_accumulate(pr, cnt);
                 }
                 {
                     int sc_ret = scan_candidates(pr, cnt, target_local, logbase,
@@ -9273,6 +9376,7 @@ int main(int argc, char **argv) {
                         rgm_accumulate_window(pr, cnt, 10);
                         rgm_accumulate_window(pr, cnt, 20);
                         rgm_accumulate_mean_gap(pr, cnt, logbase);
+                        gap_dist_accumulate(pr, cnt);
                     }
                     if (scan_candidates(pr, cnt, target, logbase,
                                        shift, header,
