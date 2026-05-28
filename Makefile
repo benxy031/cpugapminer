@@ -54,6 +54,16 @@ ifdef WITH_CUDA
 	CFLAGS+=-DWITH_CUDA -DGPU_NLIMBS=$(GPU_NLIMBS) -I$(CUDA_PATH)/include
 	NVCC_FLAGS=-DGPU_NLIMBS=$(GPU_NLIMBS) -std=c++17
 	LIBS+=-lcudart -L$(CUDA_PATH)/lib64
+
+	# Optional CGBN-based Fermat kernel (~1.9× faster for full-width candidates).
+	# Enable with: make WITH_CGBN_FERMAT=1 ...
+	# Requires internet on first build (auto-clones NVlabs/CGBN header-only library).
+	CGBN_DIR  := tools/bench_cgbn/cgbn
+	CGBN_HDR  := $(CGBN_DIR)/include/cgbn/cgbn.h
+	ifdef WITH_CGBN_FERMAT
+		NVCC_FLAGS += -DWITH_CGBN_FERMAT -I$(CGBN_DIR)/include
+		CFLAGS     += -DWITH_CGBN_FERMAT
+	endif
 endif
 
 ifdef WITH_OPENCL
@@ -114,6 +124,12 @@ $(SRCDIR)/%.o: $(SRCDIR)/%.cpp $(BUILD_CFG_FILE)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(SRCDIR)/gpu_fermat.o: $(SRCDIR)/gpu_fermat.cu $(SRCDIR)/gpu_fermat.h
+ifdef WITH_CGBN_FERMAT
+	@if [ ! -f "$(CGBN_HDR)" ]; then \
+		echo "[cgbn] Cloning NVlabs/CGBN (header-only)..."; \
+		git clone --depth=1 https://github.com/NVlabs/CGBN.git $(CGBN_DIR); \
+	fi
+endif
 	$(NVCC) -O3 $(CUDA_ARCH) $(NVCC_FLAGS) -c $< -o $@
 
 $(SRCDIR)/gpu_sieve.o: $(SRCDIR)/gpu_sieve.cu $(SRCDIR)/gpu_sieve.h

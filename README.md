@@ -413,6 +413,108 @@ bin/gap_miner \
 
 ## Recent changes (May 2026)
 
+### CGBN cooperative Fermat kernel (May 2026)
+
+The CUDA Fermat backend (`src/gpu_fermat.cu`) gained an optional second kernel
+path based on NVlabs' **CGBN** (Cooperative GBN) header-only library (Apache
+2.0, auto-cloned on first build).  Instead of one GPU thread per candidate,
+CGBN assigns TPI cooperating threads per candidate, which trades arithmetic
+width (limbs/thread) for register count and occupancy.
+
+#### Measured speedup (RTX 3060, 768-bit / NL=12)
+
+| Kernel | regs/thread | warps/SM | occupancy | throughput |
+|--------|-------------|----------|-----------|------------|
+| Scalar (existing) | 255 | 8 | ~17% | baseline |
+| CGBN TPI=8 | 50 | 40 | ~83% | **~1.9×** |
+
+#### Build
+
+```sh
+make WITH_RPC=1 WITH_CUDA=1 WITH_CGBN_FERMAT=1 CUDA_ARCH="-arch=sm_86" GPU_BITS=768
+```
+
+The Makefile auto-clones `tools/bench_cgbn/cgbn/` from GitHub the first time if
+the directory is absent.  No extra dependencies — CGBN is header-only.
+
+#### Supported AL values and TPI selection
+
+CGBN requires that `LIMBS = 2×AL / TPI` is both an integer and ≤ TPI (the
+`dlimbs_algs_multi` specialization does not exist in this release of CGBN).
+This restricts which (AL, TPI) pairs compile.  The dispatch selects the largest
+valid power-of-2 TPI ≤ 8:
+
+| AL | Bits  | TPI | LIMBS | Notes |
+|----|-------|-----|-------|-------|
+| 2  | 128   | 4   | 1     | |
+| 4  | 256   | 8   | 1     | |
+| 6  | 384   | 4   | 3     | |
+| 8  | 512   | 8   | 2     | |
+| 12 | 768   | 8   | 3     | default GPU_BITS=768 full width |
+| 16 | 1024  | 8   | 4     | |
+| 20 | 1280  | 8   | 5     | |
+
+AL values 1, 3, 5, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19 and all other AL
+values without a valid (integer LIMBS ≤ TPI) pair fall back to the existing
+scalar `fermat_kernel_t`.
+
+The CGBN kernel is chosen automatically at runtime when `al` matches a
+supported entry in the dispatch table; no runtime flag is required.
+
+#### Startup log messages
+
+At miner startup (when `WITH_CGBN_FERMAT=1` was used at build time):
+
+```
+CUDA: CGBN Fermat kernel active for 768-bit candidates (TPI=8)
+```
+
+On the first batch dispatched through the CGBN path:
+
+```
+GPU Fermat: CGBN kernel active (AL=12, 768-bit, TPI=8)
+```
+
+If the active AL is odd (no CGBN support), the startup message instead says:
+
+```
+CUDA: CGBN Fermat kernel inactive (AL=9 is odd; even AL required)
+```
+
+#### Correctness fix baked in
+
+CGBN's `fwmont_mul` uses lazy Montgomery reduction: `mont_sqr` can return
+`r ∈ [N, 2N)` instead of `[0, N)`.  The add+cond-sub doubling step
+(`carry || compare(t,N)≥0 → sub(r,t,N)`) is only correct when `r < N`.  An
+explicit reduce is applied after every `mont_sqr`:
+
+```cpp
+cgbn_mont_sqr(env, r, r, N, np0);
+if (cgbn_compare(env, r, N) >= 0)
+    cgbn_sub(env, r, r, N);
+```
+
+Without this fix, approximately 742/749 (99%) of candidates are incorrectly
+classified, confirmed by comparison against GMP `mpz_powm`.
+
+#### Implementation notes
+
+- `cgbn.h` uses `__CUDA_ARCH__` (not `__CUDACC__`) to select its device path.
+  The host-compilation phase of `nvcc` therefore falls through to
+  `cgbn_cpu.h`, which contains `#error You must use GMP for now`.  The fix:
+  `#include <gmp.h>` immediately before `#include "cgbn/cgbn.h"` — this
+  defines `__GMP_H__` and routes the host pass through `cgbn_mpz.h` instead.
+- `cgbn_context_t<TPI, Params>` takes exactly two template parameters; the
+  monitor mode (`cgbn_no_checks`) is passed to the constructor, not as a
+  template argument.
+- `cgbn_load` takes a non-const `cgbn_mem_t *`; `const_cast` is used at the
+  call site in `launch_fermat`.
+- `uint64_t[AL]` and `cgbn_mem_t<AL*64>` share the same little-endian
+  `uint32_t` layout, so `reinterpret_cast` between them is safe — no copy or
+  conversion is needed.
+- The benchmark infrastructure that led to this integration lives in
+  `tools/bench_cgbn/` (standalone `.cu` files, separate Makefile).
+
 ### GPU sieve Phase 2 integration (May 2026)
 
 The sieve is still a mixed CPU/GPU pipeline. Only Phase 2, the large-prime

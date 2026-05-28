@@ -8571,6 +8571,16 @@ int main(int argc, char **argv) {
             log_msg("CUDA: active_limbs=%d (%d-bit candidates, compiled NL=%d)\n",
                     active_limbs < GPU_NLIMBS ? active_limbs : GPU_NLIMBS,
                     candidate_bits, GPU_NLIMBS);
+#ifdef WITH_CGBN_FERMAT
+            {
+                int al = active_limbs < GPU_NLIMBS ? active_limbs : GPU_NLIMBS;
+                if (al % 2 == 0)
+                    log_msg("CUDA: CGBN Fermat kernel active for %d-bit candidates (TPI=%d)\n",
+                            al * 64, (al % 4 == 0) ? 8 : 4);
+                else
+                    log_msg("CUDA: CGBN Fermat kernel inactive (AL=%d is odd; even AL required)\n", al);
+            }
+#endif
         }
     }
 #else

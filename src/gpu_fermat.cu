@@ -445,6 +445,87 @@ __global__ void fermat_kernel_t(const uint64_t * __restrict__ cands,
     results[idx] = ok ? 1 : 0;
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ *  CGBN-based Fermat kernel: template<BITS, TPI> covers all even AL.
+ *
+ *  Enabled with: make WITH_CGBN_FERMAT=1 ...
+ *
+ *  TPI selection per AL (largest power-of-2 dividing 2×AL, capped at 8):
+ *    AL%4==0  →  TPI=8  (256/512/768/1024/… bit)
+ *    AL%2==0  →  TPI=4  (384/640/896/… bit)
+ *    AL odd   →  no CGBN, scalar fermat_kernel_t fallback.
+ *
+ *  Correctness fix baked in: CGBN fwmont_mul uses lazy reduction —
+ *  mont_sqr can return r ∈ [N, 2N).  Explicit reduce after every
+ *  squaring brings r into [0, N) before the add+cond-sub double.
+ * ═══════════════════════════════════════════════════════════════════ */
+#if defined(WITH_CGBN_FERMAT)
+/* cgbn.h checks __CUDA_ARCH__ (not __CUDACC__) for its device path;
+   the host-compilation phase of nvcc falls through to cgbn_cpu.h (#error)
+   unless __GMP_H__ is defined first.  Including gmp.h routes it to
+   cgbn_mpz.h instead, which provides cgbn_mem_t<BITS> for host code. */
+#include <gmp.h>
+#include "cgbn/cgbn.h"
+
+/* Params struct parameterised on TPI; everything else fixed. */
+template<uint32_t TPI_VAL>
+struct CgbnFermatParams {
+    static const uint32_t TPB           = 128;   /* threads/block       */
+    static const uint32_t MAX_ROTATION  = 4;
+    static const uint32_t SHM_LIMIT     = 0;
+    static const bool     CONSTANT_TIME = false;
+    static const uint32_t TPI           = TPI_VAL;
+};
+
+/* Single kernel template: instantiated for each (BITS, TPI) pair.
+   uint64_t[BITS/64] and cgbn_mem_t<BITS> share the same little-endian
+   uint32_t layout, so reinterpret_cast between them is safe.           */
+template<uint32_t BITS, uint32_t TPI_VAL>
+__global__ static
+void cgbn_fermat_kernel_t(cgbn_mem_t<BITS> *cands,
+                          uint8_t * __restrict__ results,
+                          uint32_t n)
+{
+    int32_t id = (int32_t)((blockIdx.x * blockDim.x + threadIdx.x) / TPI_VAL);
+    if ((uint32_t)id >= n) return;
+
+    typedef cgbn_context_t<TPI_VAL, CgbnFermatParams<TPI_VAL>> ctx_t;
+    typedef cgbn_env_t<ctx_t, BITS>                             env_t;
+    typedef typename env_t::cgbn_t                              bn_t;
+
+    ctx_t    ctx(cgbn_no_checks);
+    env_t    env(ctx);
+    bn_t     N, e, r, t, base;
+    uint32_t np0;
+    int32_t  pos;
+
+    cgbn_load    (env, N,    cands + id);
+    cgbn_sub_ui32(env, e,    N, 1);
+    cgbn_set_ui32(env, base, 2);
+    np0 = cgbn_bn2mont(env, r, base, N);
+    pos = (int32_t)(BITS - 1) - (int32_t)cgbn_clz(env, e) - 1;
+
+    while (pos >= 0) {
+        cgbn_mont_sqr(env, r, r, N, np0);
+        /* fwmont_mul lazy-reduces to [0,2N); add+cond_sub requires [0,N). */
+        if (cgbn_compare(env, r, N) >= 0)
+            cgbn_sub(env, r, r, N);
+        if (cgbn_extract_bits_ui32(env, e, (uint32_t)pos, 1)) {
+            uint32_t carry = cgbn_add(env, t, r, r);
+            if (carry || cgbn_compare(env, t, N) >= 0)
+                cgbn_sub(env, r, t, N);
+            else
+                cgbn_set(env, r, t);
+        }
+        pos--;
+    }
+    cgbn_mont2bn(env, r, r, N, np0);
+    results[id] = (uint8_t)cgbn_equals_ui32(env, r, 1);
+}
+
+#define CGBN_FERMAT_AVAILABLE 1
+#endif /* WITH_CGBN_FERMAT */
+
 /* ── Kernel dispatch: launch the narrowest specialization that fits ──
    Candidates are stored at active_limbs stride, and the kernel
    operates on AL limbs.  Speedup ≈ (NL/AL)² from Montgomery mul.
@@ -494,6 +575,64 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
                                  const uint64_t *d_cands, uint8_t *d_results,
                                  uint32_t count)
 {
+#if defined(CGBN_FERMAT_AVAILABLE)
+    /* CGBN dispatch for even AL values.
+       TPI=8 for AL%4==0, TPI=4 for AL%2==0 (largest power-of-2 ≤ 8 dividing 2×AL).
+       Odd AL falls through to the scalar FERMAT_DISPATCH macros below.
+       All template instantiations share the same kernel body; nvcc compiles
+       only those actually referenced in the switch cases guarded by #if NL>=. */
+    {
+        static int cgbn_logged = 0;
+        #define CGBN_DISP(AL_VAL, TPI_VAL) \
+            case AL_VAL: { \
+                const int tpb  = (int)CgbnFermatParams<TPI_VAL>::TPB; \
+                const int ipb  = tpb / (int)(TPI_VAL); \
+                int grid = (int)((count + (uint32_t)ipb - 1u) / (uint32_t)ipb); \
+                if (!__atomic_exchange_n(&cgbn_logged, 1, __ATOMIC_RELAXED)) \
+                    fprintf(stderr, "GPU Fermat: CGBN kernel active " \
+                            "(AL=%d, %d-bit, TPI=%d)\n", \
+                            (AL_VAL), (AL_VAL) * 64, (TPI_VAL)); \
+                cgbn_fermat_kernel_t<(AL_VAL)*64u, (TPI_VAL)><<<grid, tpb, 0, stream>>>( \
+                    reinterpret_cast<cgbn_mem_t<(AL_VAL)*64u>*>( \
+                        const_cast<uint64_t*>(d_cands)), \
+                    d_results, count); \
+                return cudaPeekAtLastError(); \
+            }
+        switch (al) {
+            /* Valid (AL, TPI) pairs satisfy two constraints:
+               1. TPI divides 2×AL  (BITS = AL×64 divisible by TPI×32)
+               2. LIMBS = 2×AL/TPI ≤ TPI  (dlimbs_algs_multi has no specialisation)
+               → TPI ≥ sqrt(2×AL), TPI = largest valid power-of-2 ≤ 8.
+               AL values where no power-of-2 satisfies both (e.g. AL=10,14,18)
+               fall through to the scalar fermat_kernel_t below.               */
+            #if NL >= 2
+            CGBN_DISP( 2, 4)   /* 128-bit,  LIMBS=1 */
+            #endif
+            #if NL >= 4
+            CGBN_DISP( 4, 8)   /* 256-bit,  LIMBS=1 */
+            #endif
+            #if NL >= 6
+            CGBN_DISP( 6, 4)   /* 384-bit,  LIMBS=3 */
+            #endif
+            #if NL >= 8
+            CGBN_DISP( 8, 8)   /* 512-bit,  LIMBS=2 */
+            #endif
+            #if NL >= 12
+            CGBN_DISP(12, 8)   /* 768-bit,  LIMBS=3 */
+            #endif
+            #if NL >= 16
+            CGBN_DISP(16, 8)   /* 1024-bit, LIMBS=4 */
+            #endif
+            #if NL >= 20
+            CGBN_DISP(20, 8)   /* 1280-bit, LIMBS=5 */
+            #endif
+            /* AL=10,14,18: no valid TPI (LIMBS > TPI for all divisors) → scalar */
+            default: break;
+        }
+        #undef CGBN_DISP
+    }
+#endif
+
 #define FERMAT_DISPATCH(W) \
     do { \
         int block = fermat_block_size_for_kernel<W>(); \
