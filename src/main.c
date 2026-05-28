@@ -10,6 +10,7 @@
 #include <math.h>
 #include <time.h>
 #include <limits.h>
+#include <signal.h>
 #include <pthread.h>
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 #include <immintrin.h>
@@ -663,6 +664,11 @@ static int stratum_dedup(const char *blockhex) {
    submitted.  Historically `--keep-going` enabled this behavior, but it is now
    the default; use --stop-after-block to request the old behaviour. */
 static _Atomic int keep_going = 1;    /* default == continue mining */
+
+static void sigint_handler(int sig) {
+    (void)sig;
+    keep_going = 0;
+}
 static volatile int debug_force = 0;    /* if nonzero, pretend any header meets target */
 /* if nonzero the miner uses a lightweight Fermat test (bases 2 & 3) instead of
    the full deterministic Miller‑Rabin.  This is faster but may misclassify a
@@ -841,6 +847,13 @@ static int cli_sample_stride = DEFAULT_SAMPLE_STRIDE;
 static int cli_mr_rounds = 2;
 /* Additional probable-prime rounds used by --crt-precision. */
 static int cli_crt_precision_rounds = 8;
+
+/* RGM baseline options:
+   cli_rgm_cal_min  : minimum accumulated samples before region scoring activates
+                      (lower = faster warmup, slightly noisier early baseline).
+   cli_rgm_state_file: optional path; loaded on startup and written on clean exit. */
+static uint64_t    cli_rgm_cal_min        = 50000ULL;
+static const char *cli_rgm_state_file     = NULL;
 
 static inline int crt_precision_rounds_effective(void) {
     return (cli_crt_precision_rounds > cli_mr_rounds)
@@ -2366,12 +2379,26 @@ static void print_stats(void) {
         if (rgm_qual_prob_snapshot(&p_emp, &ep, &eq, &etgt) && ep >= 1000ULL) {
             double p_theory = exp(-etgt);
             double ratio = (p_theory > 0.0) ? p_emp / p_theory : 0.0;
+            double lambda = p_theory * (double)ep;  /* expected qualifying gaps */
+            double p_zero = exp(-lambda);           /* P(0 found | Poisson λ)  */
             log_file_only("  qual_prob: empirical=%.4e  theory(e^-merit)=%.4e"
                           "  ratio=%.3f  pairs=%llu  quals=%llu  target=%.4f\n",
                           p_emp, p_theory, ratio,
                           (unsigned long long)ep,
                           (unsigned long long)eq,
                           etgt);
+            /* Human-readable Poisson summary:
+               λ = expected qualifying gaps in pairs tested so far.
+               P(0) = chance of zero finds at this sample size (normal if > 5%). */
+            log_file_only("  qual_prob: expected_gaps=%.3f  P(zero_finds)=%.1f%%"
+                          "%s\n",
+                          lambda, p_zero * 100.0,
+                          (p_zero > 0.95) ? "  (early — keep going)" :
+                          (p_zero > 0.50) ? "  (normal — below median luck)" :
+                          (p_zero > 0.20) ? "  (below median — normal range)" :
+                          (p_zero > 0.05) ? "  (unlucky — well above expected)" :
+                          (p_zero > 0.01) ? "  (very unlucky)" :
+                                            "  (extremely unlucky — check pipeline)");
         }
     }
 
@@ -7286,7 +7313,8 @@ static void *worker_fn(void *arg) {
                        Regions whose interior spread is far below the calibrated
                        RGM baseline are uniformly dense — no qualifying gap inside.
                        skip_thresh=0.7: conservative (≈30% below baseline to skip).
-                       Requires 500k calibration samples before activating.
+                       Requires cli_rgm_cal_min calibration samples (default 50k,
+                       configurable via --rgm-cal-min) before activating.
                        Only effective when --sample-stride 1 has been run at least
                        briefly to build the baseline; safe to call always. */
                     if (gpu_reg_alive && sp_cnt >= 3) {
@@ -7294,10 +7322,10 @@ static void *worker_fn(void *arg) {
                             sampled_primes, sp_cnt,
                             gap_reg_lo, gap_reg_hi,
                             gpu_reg_alive, n_gap_regions,
-                            gpu_rth,   /* target_gap = target_local * logbase */
-                            10,        /* chunk_n bucket used as baseline      */
-                            0.7,       /* skip_thresh in sigma units           */
-                            500000ULL  /* cal_min_samples                      */
+                            gpu_rth,          /* target_gap = target_local * logbase */
+                            10,               /* chunk_n bucket used as baseline      */
+                            0.7,              /* skip_thresh in sigma units           */
+                            cli_rgm_cal_min   /* cal_min_samples                      */
                         );
                     }
                     /* Collect verification candidates from surviving regions */
@@ -7820,6 +7848,10 @@ int main(int argc, char **argv) {
         printf("  -e, --extra-verbose  write live merit events + partial-sieve-auto details to log file\n");
         printf("      --stats-verbose  include detailed CRT phase telemetry in STATS output\n");
         printf("      --sample-stride K smart scan: test every Kth survivor (default: 8, 1=off)\n");
+        printf("      --rgm-cal-min N   RGM region-scoring: minimum baseline samples before activating\n");
+        printf("                        (default: 50000; lower = faster warmup, noisier early baseline)\n");
+        printf("      --rgm-state-file F  persist RGM baseline across restarts: load on startup,\n");
+        printf("                        save on clean exit.  Run once with --sample-stride 1 to build.\n");
         printf("      --mr-rounds N     Miller-Rabin rounds for primality  (default: 2)\n");
         printf("      --mr-verify       MR base-3 verify Fermat/GPU survivors (catches pseudoprimes)\n");
         printf("      --crt-file FILE   load CRT sieve file (binary template or text gap-solver)\n");
@@ -8091,6 +8123,12 @@ int main(int argc, char **argv) {
             cli_sample_stride = atoi(argv[++i]);
             if (cli_sample_stride < 1) cli_sample_stride = 1;
         }
+        else if (!strcmp(argv[i],"--rgm-cal-min") && i+1<argc) {
+            long long v = atoll(argv[++i]);
+            cli_rgm_cal_min = (v > 0) ? (uint64_t)v : 1ULL;
+        }
+        else if (!strcmp(argv[i],"--rgm-state-file") && i+1<argc)
+            cli_rgm_state_file = argv[++i];
         else if (!strcmp(argv[i],"--mr-rounds") && i+1<argc) {
             cli_mr_rounds = atoi(argv[++i]);
             if (cli_mr_rounds < 1) cli_mr_rounds = 1;
@@ -8825,6 +8863,11 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* Install SIGINT/SIGTERM handler so Ctrl+C triggers a clean exit
+       (saves --rgm-state-file and other cleanup) instead of killing us. */
+    signal(SIGINT,  sigint_handler);
+    signal(SIGTERM, sigint_handler);
+
     stats_start_ms = now_ms();
     start_stats_thread(print_stats);
     /* Trigger sieve cache population so we can log its stats. */
@@ -9014,6 +9057,21 @@ int main(int argc, char **argv) {
         log_msg("stats verbosity: detailed (--stats-verbose)\n");
     if (use_crt_auto_split)
         log_msg("CRT auto split: enabled (--crt-auto-split)\n");
+
+    /* RGM state persistence: load from previous run if requested */
+    if (cli_rgm_state_file) {
+        int merged = rgm_load_state(cli_rgm_state_file);
+        if (merged < 0)
+            log_msg("RGM state: no prior state at %s (will create on exit)\n",
+                    cli_rgm_state_file);
+        else
+            log_msg("RGM state: loaded %d record(s) from %s (baseline pre-warmed; cal-min=%llu)\n",
+                    merged, cli_rgm_state_file,
+                    (unsigned long long)cli_rgm_cal_min);
+    } else if (cli_rgm_cal_min != 50000ULL) {
+        log_msg("RGM cal-min: %llu (--rgm-cal-min)\n",
+                (unsigned long long)cli_rgm_cal_min);
+    }
 
 #ifndef WITH_RPC
     /* suppress unused-but-set warnings when built without RPC */
@@ -9709,6 +9767,14 @@ int main(int argc, char **argv) {
         gpu_fermat_destroy(g_gpu_ctx[gi]);
 #endif
     stop_stats_thread();
+    if (cli_rgm_state_file) {
+        int rc = rgm_save_state(cli_rgm_state_file);
+        if (rc != 0)
+            fprintf(stderr, "Warning: failed to save RGM state to %s\n",
+                    cli_rgm_state_file);
+        else
+            fprintf(stderr, "RGM state saved to %s\n", cli_rgm_state_file);
+    }
     if (header_owned && header) {
         free((char*)header);
         header = NULL;

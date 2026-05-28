@@ -333,3 +333,83 @@ int rgm_qual_prob_snapshot(double *p_out, uint64_t *pairs_out,
     if (p_out) *p_out = (double)qf / (double)ps;
     return 1;
 }
+
+/* ── RGM state persistence ──────────────────────────────────────────────── */
+
+int rgm_save_state(const char *path) {
+    if (!path || !*path) return -1;
+    pthread_once(&g_rgm_once, rgm_init_once);
+
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+
+    fprintf(f, "# cpugapminer rgm_state v1\n");
+    fprintf(f, "# bucket <n> <count> <sum_log_ratio>\n");
+    fprintf(f, "# meangap <count> <sum_span> <sum_logbase>\n");
+
+    /* Save only the two buckets used by rgm_score_regions */
+    for (int n = 10; n <= 20; n += 10) {
+        struct rgm_bucket *b = &g_rgm[n];
+        pthread_mutex_lock(&b->mu);
+        uint64_t cnt = b->count;
+        double   sum = b->sum_log_ratio;
+        pthread_mutex_unlock(&b->mu);
+        if (cnt > 0)
+            fprintf(f, "bucket %d %llu %.17g\n", n,
+                    (unsigned long long)cnt, sum);
+    }
+
+    pthread_mutex_lock(&g_mean_gap.mu);
+    uint64_t mg_cnt = g_mean_gap.count;
+    double   mg_sp  = g_mean_gap.sum_span;
+    double   mg_lb  = g_mean_gap.sum_logbase;
+    pthread_mutex_unlock(&g_mean_gap.mu);
+
+    if (mg_cnt > 0)
+        fprintf(f, "meangap %llu %.17g %.17g\n",
+                (unsigned long long)mg_cnt, mg_sp, mg_lb);
+
+    return fclose(f);
+}
+
+int rgm_load_state(const char *path) {
+    if (!path || !*path) return -1;
+    pthread_once(&g_rgm_once, rgm_init_once);
+
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+
+    int merged = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n') continue;
+
+        if (strncmp(line, "bucket ", 7) == 0) {
+            int n; unsigned long long cnt; double sum;
+            if (sscanf(line + 7, "%d %llu %lf", &n, &cnt, &sum) == 3) {
+                if (n >= 2 && n <= RGM_MAX_N && cnt > 0) {
+                    struct rgm_bucket *b = &g_rgm[n];
+                    pthread_mutex_lock(&b->mu);
+                    b->count         += (uint64_t)cnt;
+                    b->sum_log_ratio += sum;
+                    pthread_mutex_unlock(&b->mu);
+                    merged++;
+                }
+            }
+        } else if (strncmp(line, "meangap ", 8) == 0) {
+            unsigned long long cnt; double sp, lb;
+            if (sscanf(line + 8, "%llu %lf %lf", &cnt, &sp, &lb) == 3) {
+                if (cnt > 0) {
+                    pthread_mutex_lock(&g_mean_gap.mu);
+                    g_mean_gap.count       += (uint64_t)cnt;
+                    g_mean_gap.sum_span    += sp;
+                    g_mean_gap.sum_logbase += lb;
+                    pthread_mutex_unlock(&g_mean_gap.mu);
+                    merged++;
+                }
+            }
+        }
+    }
+    fclose(f);
+    return merged;
+}

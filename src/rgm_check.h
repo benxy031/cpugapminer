@@ -115,3 +115,23 @@ void rgm_accum_qual(uint64_t pairs_scanned, uint64_t quals_found,
                     double target_merit);
 int  rgm_qual_prob_snapshot(double *p_out, uint64_t *pairs_out,
                             uint64_t *quals_out, double *target_out);
+
+/* ── RGM state persistence ───────────────────────────────────────────────────
+ *
+ * rgm_save_state: write RGM baseline accumulators to a text file so they can
+ *   be restored on the next run, avoiding the warmup period.  Only buckets
+ *   n=10 and n=20 (used by rgm_score_regions) and the mean-gap accumulator
+ *   are saved.  Returns 0 on success, -1 on error.
+ *
+ * rgm_load_state: read a file previously written by rgm_save_state and ADD
+ *   its data to the current in-memory accumulators (merge, not replace).
+ *   Unknown lines and version mismatches are silently ignored.
+ *   Returns the number of bucket/meangap lines successfully merged, -1 on
+ *   file-open error.
+ *
+ * Typical usage:
+ *   startup : rgm_load_state(path)  — warms up baseline from prior run
+ *   shutdown: rgm_save_state(path)  — persists current accumulators
+ */
+int rgm_save_state(const char *path);
+int rgm_load_state(const char *path);

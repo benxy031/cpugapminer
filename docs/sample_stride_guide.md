@@ -1,17 +1,52 @@
-# `--sample-stride` Reference Guide
+# Gap-Finding Tuning Guide
 
-## What is sample-stride?
+## Overview: two completely different scan algorithms
+
+The miner has **two scan algorithms**, selected automatically based on whether
+`--cuda`/`--opencl` is active and whether a `--crt-file` is loaded.
+
+| Mode | Algorithm | Fermat tests per window | False-gap risk |
+|------|-----------|------------------------|----------------|
+| **GPU non-CRT** | Two-phase smart-scan | ~1/K of full | Yes — verified post-hoc |
+| **CPU non-CRT** | Backward-scan (bkscan) | ~1/8 of full | None |
+| **CRT (any)** | Full Fermat on all CRT candidates | 100% of filtered set | None |
+
+`--sample-stride` means something **different** in each mode — do not apply GPU
+rules to CPU runs or vice-versa.
+
+---
+
+## GPU non-CRT: two-phase smart-scan
+
+### What it does
+
+1. **Phase 1** — the GPU tests every K-th sieve survivor (K = `--sample-stride`).
+   This produces a sparse set of confirmed primes.
+2. **Gap analysis** — consecutive Phase-1 primes separated by ≥ `target × ln(N)`
+   become **candidate gap regions**.  The gap-detection threshold is always the
+   network `--target` merit, not `--scan-merit`.
+3. **RGM filtering** *(after ≥50 k calibration samples, default)* — regions whose interior
+   density is ≥30% below the RGM baseline are skipped as uniformly-dense.
+4. **Phase 2** — the GPU tests all non-sampled sieve survivors inside surviving
+   regions.  The surviving Phase-1 + Phase-2 primes are merged and sorted.
+5. **False-gap verification** — every gap that passes the merit threshold is
+   scanned for interior primes by `bn_candidate_is_prime()`.  This catches any
+   prime that was on a sampled index and still happened to be missed.
+
+### Key insight: `--scan-merit` is IGNORED by the GPU path
+
+The code sets `gpu_rth = (size_t)(target_local * logbase)` (network merit) for
+gap-region detection, not the `--scan-merit` value.  Setting `--scan-merit` does
+nothing useful in GPU mode; omit it.
+
+### What is sample-stride?
 
 In **GPU smart-scan mode** (`--cuda`), the sieve produces a sorted array of survivors.
 Instead of testing every survivor in phase-1, the GPU tests only every K-th element
-(`--sample-stride K`). Survivors clumped too densely in a region will all be sampled
-exactly once per stride, and if an entire stride-width gap is empty of sampled primes
-it is flagged as a **candidate gap region** and filled in during phase-2.
+(`--sample-stride K`). At least 2 sampled candidates must fall inside every
+qualifying gap, or the gap will be missed entirely.
 
-The stride must be ≤ `gap_survivors / 2` — i.e., at least 2 sampled candidates must
-fall inside every qualifying gap, or the gap will be missed entirely.
-
-## Formula
+### Formula
 
 ```
 ln_N          = (256 + shift) × ln(2)          # log of the number being tested
@@ -44,6 +79,21 @@ Derived from first principles:
 >
 > **Key insight 3**: Sieve-size affects GPU batch size (candidates per window) but
 > not stride.  See the [sieve-primes section](#effect-of-sieve-primes) below.
+>
+> **Key insight 4 (NEW)**: `--scan-merit` is **ignored** by the GPU smart-scan path.
+> Gap regions are detected at the network `--target` threshold.  Only CPU backward-scan
+> uses `--scan-merit` to set the backward-jump distance.
+>
+> **Key insight 5 (NEW)**: `--fast-euler` is **enabled by default**.  You do not need
+> to pass it explicitly.  It halves the cost of CPU boundary probes (left/right edge
+> of each gap region) even in GPU mode.  Passing `--fast-fermat` overrides it and
+> costs ~29% more pps.
+>
+> **Key insight 6 (NEW)**: With `WITH_CGBN_FERMAT=1` at build time, the GPU Fermat
+> kernel runs at ~1.9× the throughput for 768-bit candidates (AL=12, TPI=8).  This
+> raises effective GPU Fermat capacity from ~6.5 M to ~12 M tests/s, shifting the
+> pipeline bottleneck back to the sieve.  When CGBN is active, more sieve-primes
+> (deeper sieving) pays off more than before because GPU becomes less of a bottleneck.
 
 ---
 
@@ -80,8 +130,6 @@ Target merit = 20.7 (safe floor for current network).
 **Optimal throughput** in practice: `floor(target_merit / 4)` to `floor(target_merit / 3)`.  
 For target 20.7–21.5 the safe maximum is **10** but benchmark optimum is **5–7**.
 For target 22.0+ safe max is **11**, optimum **6–8**.
-
----
 
 ---
 
@@ -141,6 +189,8 @@ What **does** change with sieve-primes (for shift=68, sieve-size=25.5 M):
 - For shift=68 the optimum is typically 2–4 M primes; beyond that sieve overhead grows
   faster than Fermat savings.
 - `false_gaps` are already 0 at 3.3 M primes for this shift; deeper sieving adds no benefit.
+- **With CGBN build**: GPU Fermat is ~1.9× faster, so optimal sieve depth shifts up.
+  At shift=68 with CGBN, 4–6 M primes (vs 2–4 M scalar) keeps the GPU fully occupied.
 
 ## Window Survivors by Sieve-Size
 
@@ -181,64 +231,292 @@ Both columns are independent of shift and sieve-primes.
 
 ---
 
-## Example Commands
+## GPU non-CRT: example commands
 
-### Shift 64 — GPU, sieve-size 22M
+Notes on these examples:
+- `--fast-euler` is the default and is **not** shown; omit `--fast-fermat`.
+- `--sieve-primes` is **optional for GPU non-CRT** — the miner auto-scales it
+  as `900000 × (shift/64)^1.5` (capped at 10 M).  Set it explicitly only if
+  you want to override the auto value.
+- With `WITH_CGBN_FERMAT=1` build: increase sieve-primes by ~1.5–2× vs the
+  values below because the GPU Fermat bottleneck is reduced by ~1.9×.
+
+### Shift 64 — GPU non-CRT
+
 ```bash
 ./gap_miner -o HOST -p PORT -u USER --pass PASS \
-  -s 64 --threads 12 --fast-fermat \
-  --sieve-size 22000000 --sieve-primes 4000000 \
+  -s 64 --threads 12 \
+  --sieve-size 22000000 \
+  --sample-stride 5 --cuda
+# sieve-primes auto-scales to ~900K (shift=64, scale=1.0)
+```
+
+With CGBN build (deeper sieve pays off):
+
+```bash
+./gap_miner -o HOST -p PORT -u USER --pass PASS \
+  -s 64 --threads 12 \
+  --sieve-size 22000000 --sieve-primes 2000000 \
   --sample-stride 5 --cuda
 ```
 
-### Shift 128 — GPU, sieve-size 33.5M
+### Shift 128 — GPU non-CRT
+
 ```bash
 ./gap_miner -o HOST -p PORT -u USER --pass PASS \
-  -s 128 --threads 10 --fast-fermat \
-  --sieve-size 33500000 --sieve-primes 4000000 \
+  -s 128 --threads 8 \
+  --sieve-size 33500000 \
+  --sample-stride 5 --cuda
+# sieve-primes auto-scales to ~2.55M (shift=128, scale=2.83)
+```
+
+### Shift 384 — GPU non-CRT
+
+```bash
+./gap_miner -o HOST -p PORT -u USER --pass PASS \
+  -s 384 --threads 6 \
+  --sieve-size 22000000 \
+  --sample-stride 5 --cuda
+# sieve-primes auto-scales to ~8.2M (shift=384, scale=9.19, capped at 10M)
+```
+
+### Shift 512 — GPU non-CRT (CGBN build, GPU_BITS=768)
+
+```bash
+./gap_miner -o HOST -p PORT -u USER --pass PASS \
+  -s 512 --threads 6 \
+  --sieve-size 22000000 \
+  --sample-stride 5 --cuda
+# sieve-primes auto-scales to 10M (capped)
+```
+
+### Shift 768 — GPU (max, AL=12, GPU_BITS=768)
+
+```bash
+./gap_miner -o HOST -p PORT -u USER --pass PASS \
+  -s 768 --threads 6 \
+  --sieve-size 12000000 \
   --sample-stride 5 --cuda
 ```
 
-### Shift 384 — GPU, sieve-size 22M
-```bash
-./gap_miner -o HOST -p PORT -u USER --pass PASS \
-  -s 384 --threads 8 --fast-fermat \
-  --sieve-size 22000000 --sieve-primes 4000000 \
-  --sample-stride 5 --cuda
-```
+### Shift >768 — CPU only (exceeds GPU capacity at GPU_BITS=768)
 
-### Shift 768 — GPU (max supported), sieve-size 12M
 ```bash
 ./gap_miner -o HOST -p PORT -u USER --pass PASS \
-  -s 768 --threads 6 --fast-fermat \
-  --sieve-size 12000000 --sieve-primes 4000000 \
-  --sample-stride 5 --cuda
-```
-
-### Shift 1024 — CPU only (exceeds GPU NL=16)
-```bash
-./gap_miner -o HOST -p PORT -u USER --pass PASS \
-  -s 1024 --threads 14 --fast-fermat \
+  -s 1024 --threads 14 \
   --sieve-size 12000000 --sieve-primes 4000000
+# stride=8 (default) enables backward-scan automatically
 ```
 
 ---
 
-## Notes
+## CPU non-CRT: backward-scan algorithm
 
-- **`--sample-stride` has different meaning in non-GPU mode.**  In CPU mode the
-  specific numeric value does not matter — only whether it is `> 1` (default 8).
-  `stride > 1` enables the **backward-scan** algorithm; `stride = 1` disables it
-  and falls back to cooperative full-test (useful only for benchmarking).
-  The CPU backward-scan uses a hardcoded `BKSCAN_SAMPLE = 200` seed internally
-  and is not sensitive to the stride value.
-- At **shift ≤ 68**, CPU backward-scan typically outperforms GPU smart-scan
-  because the per-test cost (300-bit modular exponentiation) is low enough that
-  the algorithm efficiency advantage of backward-scan beats GPU raw throughput.
-- At **shift ≥ 128**, GPU starts to win as individual Fermat cost dominates.
-- The **default stride = 8** in the source is well-tuned for shifts up to ~96 with
-  target ≈20.7 (`floor(20.7/2)=10`; 8 is safe and slightly conservative).
-  For any shift or sieve depth, the safe upper bound is `floor(target_merit/2)`.
-- **`--sample-stride 1`** disables smart-scan entirely (full test of every sieve
-  survivor); use this as the correctness baseline or when Option C
-  `qual_prob` calibration is needed.
+### How it works (actual code, not summary)
+
+The backward-scan algorithm (`gap_scan.c: backward_scan_segment`) works as follows:
+
+1. Find the **first prime** in the window (forward scan from start).
+2. Compute `target_pos = current_prime + needed_gap` where  
+   `needed_gap = scan_target × ln(N)`.
+3. Binary-search for the first candidate > `target_pos`, then **scan backward**
+   from that point looking for the next prime.
+4. If a prime is found → new `current_prime`, jump to step 2.
+5. If **no prime** is found between `current_prime` and `target_pos` → qualifying
+   gap found.  Record it, then forward-scan for the next prime after `target_pos`.
+6. Repeat until end of window.
+
+This algorithm tests only ~8 candidates per confirmed prime (prime density in
+sieve survivors ≈ 12–15%), for an ~8× reduction in Fermat tests vs. full scan.
+**No false gaps are possible** — every candidate in a gap region IS tested.
+
+### `--sample-stride` meaning in CPU mode
+
+`stride > 1` enables backward-scan.  `stride = 1` disables it (full cooperative
+test, ~8× slower — benchmarking baseline only).
+
+The **numeric value of stride** affects the adaptive best-merit sampling pass
+only (a leading sample of `max(cnt/32, stride×8, 64)` capped at 320 candidates
+is tested before the backward scan).  A higher stride slightly enlarges this
+sample.  **Gap-finding quality and speed are not affected by the stride number**
+as long as `stride > 1`.
+
+### `--scan-merit` in CPU mode
+
+`--scan-merit M` sets `scan_target = M` for the backward-scan jump distance:
+```
+needed_gap = scan_target × ln(N)
+```
+If `M < submit_target`, the backward scan catches gaps slightly below the
+submit threshold (useful for merit tracking / stats display).  If `M > submit_target`,
+the code silently clamps it to `submit_target` and warns once.
+
+**Recommendation**: omit `--scan-merit`; the default (`submit_target`) is correct.
+
+### CPU vs GPU crossover
+
+| Shift | Recommended mode | Why |
+|------:|:----------------:|-----|
+| ≤ 64  | **CPU bkscan** | Per-test cost (300-bit Fermat) is low; bkscan algorithm overhead is zero; GPU launch overhead dominates |
+| 64–128 | Depends on GPU | Benchmark both; GPU wins when CGBN is active |
+| ≥ 128 | **GPU smart-scan** | Individual Fermat cost (768-bit+) dominates; GPU parallelism wins |
+
+### CPU threading
+
+The window is split into overlapping LEFT and RIGHT halves.  The worker thread
+processes the backward scan on LEFT; the helper thread sieves the next window
+**and** backward-scans RIGHT concurrently.  Overlap requires `--threads ≥ 2`.
+This gives ~1.5× speedup on hyperthreaded CPUs.  At shift ≤ 64 sieve time ≈
+scan time, so the overlap is near-perfect.
+
+---
+
+## CRT mode: full Fermat on filtered candidates
+
+CRT modes (`--crt-file`) do **not** use backward-scan or GPU smart-scan.  Every
+CRT-filtered candidate is Fermat-tested.  The sieve-primes and GPU batch size
+are set automatically per shift band:
+
+| Shift range | sieve-primes (CPU) | sieve-primes (GPU) | gpu-batch |
+|------------:|-------------------:|-------------------:|----------:|
+| ≥ 768       | 5 000 000          | 300 000            | 16 384    |
+| ≥ 384       | 3 000 000          | 300 000            | 8 192     |
+| ≥ 128       | 2 000 000          | 500 000            | 4 096     |
+| < 128       | 900 000            | 900 000            | 2 048     |
+
+Note: **GPU CRT uses far fewer sieve-primes than CPU CRT**.  In GPU CRT mode,
+the GPU Fermat test is the bottleneck, not candidate density; deeper sieving
+reduces candidates but the GPU can handle them anyway.  Shallow sieving lets
+the sieve run faster and keeps the GPU fed.
+
+With `WITH_CGBN_FERMAT=1` you may benefit from slightly deeper sieving in GPU
+CRT mode at shift 128–384 (the GPU bottleneck is reduced ~1.9×).
+
+### CRT recommended command (shift 512, GPU monolithic)
+
+```bash
+bin/gap_miner -o HOST -p PORT -u USER --pass PASS \
+  --shift 512 --threads 8 \
+  --cuda 0 \
+  --crt-file crt/crt_s512_m22.txt
+# sieve-primes auto: 300K (GPU CRT profile)
+# gpu-batch auto: 8192
+```
+
+---
+
+## Sieve auto-scaling reference (GPU non-CRT)
+
+The miner automatically scales `--sieve-primes` based on shift when `--cuda`
+is active and no explicit `--sieve-primes` is given:
+
+```
+scale      = (shift / 64) ^ 1.5
+auto_count = min(900000 × scale, 10000000)
+```
+
+| Shift | scale | auto sieve-primes | P_max (approx) |
+|------:|------:|------------------:|---------------:|
+|    64 |  1.00 |           900 000 |       14 M     |
+|   128 |  2.83 |         2 547 000 |       42 M     |
+|   192 |  5.20 |         4 682 000 |       82 M     |
+|   256 |  8.00 |         7 200 000 |      130 M     |
+|   320 | 11.31 |        10 000 000 |      186 M     |
+|   384 | 15.59 |        10 000 000 | (capped)       |
+|   512 | 22.63 |        10 000 000 | (capped)       |
+|   768 | 42.43 |        10 000 000 | (capped)       |
+
+**With CGBN build**: the GPU can handle more candidates per second, so the
+optimal sieve depth shifts toward denser sieving.  Consider adding
+`--sieve-primes 10000000` explicitly at shifts ≥ 256 even without auto-cap.
+
+---
+
+## Effect of sieve-primes on GPU non-CRT throughput
+
+From measurements at shift=68, sieve-size=25.5 M.  `Primes/window` (confirmed
+primes from PNT) is nearly constant; candidate count falls with more sieving.
+
+| sieve-primes | keep% | Cands / window | Primes / window | Safe stride |
+|-------------:|------:|---------------:|----------------:|:-----------:|
+|      500 000 |  3.54 |        ~903 K  |         ~114 K  | **10**      |
+|    1 000 000 |  3.38 |        ~862 K  |         ~114 K  | **10**      |
+|    2 000 000 |  3.23 |        ~824 K  |         ~114 K  | **10**      |
+|    3 300 000 |  3.10 |        ~790 K  |         ~112 K  | **10**      |
+|    5 000 000 |  3.03 |        ~773 K  |         ~114 K  | **10**      |
+|    8 000 000 |  2.97 |        ~757 K  |         ~114 K  | **10**      |
+|   16 000 000 |  2.86 |        ~730 K  |         ~114 K  | **10**      |
+
+Primes/window ≈ `sieve_size / ln_N` — constant.  Safe stride is always determined
+by confirmed-prime density (≈ target_merit), not by candidate density.
+
+---
+
+## RGM calibration and region scoring
+
+After accumulating enough calibration samples (default: **50 000**, configurable via
+`--rgm-cal-min N`), the GPU smart-scan path uses RGM scoring to **skip
+uniformly-dense regions** (threshold: ≥30% below RGM baseline, sigma=0.7). This
+reduces Phase-2 work in windows too dense to contain a qualifying gap.
+
+**Important:** RGM accumulation only happens with `--sample-stride 1` (full scan).
+In smart-scan mode the confirmed-prime array is biased, so accumulation is
+skipped there. You must run briefly with stride 1 to build the baseline.
+
+### Warm-up estimate (shift≈68, ~114 k primes/window)
+
+| cal-min | Windows needed | Wall time |
+|---------|---------------|----------|
+| 50 000 (default) | ~5 windows | ~2–3 s |
+| 100 000 | ~10 windows | ~5 s |
+| 500 000 (old hardcoded) | ~48 windows | ~24 s |
+
+### Persisting the baseline across restarts
+
+Use `--rgm-state-file PATH` to load the prior baseline on startup and save
+it on clean exit. This eliminates the warm-up wait entirely on subsequent runs.
+
+```bash
+# First run: stride 1 for a few seconds to build baseline, then exit.
+./gap_miner --cuda --shift 68 --target 21 --sample-stride 1 \
+            --rgm-state-file rgm_baseline.txt
+
+# Production run: loads pre-warmed baseline instantly, mines at stride 5.
+./gap_miner --cuda --shift 68 --target 21 --sample-stride 5 \
+            --rgm-state-file rgm_baseline.txt
+```
+
+The state file is a small human-readable text file (~3 lines). It is safe to
+delete at any time; the miner will recreate it on the next clean exit.
+
+Key options:
+- `--rgm-cal-min N` — minimum samples before scoring activates (default: 50 000).
+  Lower = faster warmup but noisier early baseline; below 10 000 not recommended.
+- `--rgm-state-file FILE` — persist baseline across restarts (load + save on exit).
+
+---
+
+## Quick decision guide
+
+| Goal | Mode | Key flags | Stride |
+|------|------|-----------|--------|
+| Record hunting, GPU, shift 64–128 | GPU non-CRT | `--cuda --sample-stride 5` | 5 |
+| Record hunting, GPU, shift 128–512 | GPU non-CRT (CGBN build recommended) | `--cuda --sample-stride 5` | 5 |
+| Record hunting, GPU, shift 512–768 | GPU non-CRT, GPU_BITS=768 build | `--cuda --sample-stride 5` | 5 |
+| Record hunting, CPU only, shift ≤ 64 | CPU bkscan | *(default, no --cuda)* | 8 (default) |
+| Record hunting, CPU only, shift > 768 | CPU bkscan | *(no --cuda)* | 8 (default) |
+| CRT gap-solving, GPU | GPU CRT monolithic | `--cuda 0 --crt-file ...` | N/A |
+| CRT gap-solving, CPU | CPU CRT monolithic | `--crt-file ...` | N/A |
+| Correctness baseline / RGM cal | GPU full scan | `--cuda --sample-stride 1` | 1 |
+
+### Common mistakes
+
+| Mistake | Effect | Fix |
+|---------|--------|-----|
+| Using `--fast-fermat` on GPU runs | Costs ~29% more pps on boundary probes | Remove it; `--fast-euler` is default |
+| Setting `--scan-merit` in GPU mode | No effect on gap detection | Remove it |
+| Manual `--sieve-primes` lower than auto | Leaves GPU under-utilized | Omit or increase it |
+| `--sample-stride > 10` at target≈21 | Gap regions missed → false low merit | Keep stride ≤ 10 |
+| `--sample-stride 1` in production | 8× more Fermat tests, same gap quality | Use stride 5 instead |
+| Not specifying `GPU_BITS=768` at shift 512 | Extra registers, lower occupancy | `make GPU_BITS=768` |
+| `--threads 1` with GPU | No helper sieves next window; GPU stalls | Use `--threads ≥ 2` |
