@@ -814,7 +814,6 @@ static void *ils_worker(void *arg) {
     /* start from a copy of the seed solution, already local-search refined */
     memcpy(work, a->start_offsets, (size_t)np * sizeof(int));
     local_search_sweep(work, np, gs, a->ils_fixed, buf);
-    pair_search_sweep (work, np, gs, a->ils_fixed, buf, buf2);
     double best_w;
     int best_cnt = evaluate(work, np, gs, buf, &best_w);
 
@@ -822,19 +821,28 @@ static void *ils_worker(void *arg) {
     if (!best_offsets) { perror("malloc"); exit(1); }
     memcpy(best_offsets, work, (size_t)np * sizeof(int));
 
+    int nfree = np - a->ils_fixed;
     int stale = 0;
     for (int r = 0; r < a->rounds; r++) {
         memcpy(work, best_offsets, (size_t)np * sizeof(int));
 
-        int weak_idx = kick_weakest_prime(work, np, gs, a->ils_fixed, buf2, &rng);
-        if (weak_idx >= 0) {
-            local_search_one(work, np, gs, weak_idx, buf);
-            if (weak_idx + 1 < np)
-                local_search_pair(work, np, gs, weak_idx, weak_idx + 1,
-                                  buf, buf2);
+        /* Kick: 1-3 random free primes + occasionally kick the weakest.
+           More diverse perturbation escapes narrow local optima faster
+           than always kicking only the single weakest prime. */
+        int n_kicks = 1 + (int)(rand_r(&rng) % 3u);
+        for (int k = 0; k < n_kicks && nfree > 0; k++) {
+            int idx = a->ils_fixed + (int)(rand_r(&rng) % (unsigned)nfree);
+            int p = PRIMES[idx];
+            work[idx] = 1 + (int)(rand_r(&rng) % (unsigned)(p - 1));
         }
+        /* also kick the weakest prime every 4th round for targeted repair */
+        if ((r & 3) == 0) {
+            int weak_idx = kick_weakest_prime(work, np, gs, a->ils_fixed, buf2, &rng);
+            if (weak_idx >= 0)
+                local_search_one(work, np, gs, weak_idx, buf);
+        }
+        /* fast local search only — pair_search_sweep runs once at chain end */
         local_search_sweep(work, np, gs, a->ils_fixed, buf);
-        pair_search_sweep (work, np, gs, a->ils_fixed, buf, buf2);
 
         double w_nc;
         int nc = evaluate(work, np, gs, buf, &w_nc);
@@ -846,8 +854,13 @@ static void *ils_worker(void *arg) {
         } else {
             stale++;
         }
-        if (stale > a->rounds / 5 && stale > 80) break;
+        if (stale > a->rounds / 3 && stale > 60) break;
     }
+
+    /* pair_search_sweep once at chain end: polishes the best found without
+       paying its cost on every round (~100x fewer pair-sweep calls total) */
+    pair_search_sweep(best_offsets, np, gs, a->ils_fixed, buf, buf2);
+    best_cnt = evaluate(best_offsets, np, gs, buf, &best_w);
 
     a->result.offsets      = best_offsets;
     a->result.n_candidates = best_cnt;
@@ -1205,18 +1218,22 @@ int main(int argc, char **argv) {
 
             unsigned ils_base_seed = (unsigned)time(NULL) ^ 0xC0FFEE00u;
             for (int t = 0; t < actual_threads; t++) {
+                /* Each thread starts from a different population member so
+                   chains explore distinct basins. Threads beyond pop_size
+                   wrap around to reuse population slots with a perturbed seed. */
+                int start_idx = (pop_size > 1) ? (t % pop_size) : bi;
                 ils_wargs[t].n_primes      = np;
                 ils_wargs[t].gap_size      = gs;
                 ils_wargs[t].ils_fixed     = ils_fixed;
                 ils_wargs[t].rounds        = rounds_per_thread;
                 ils_wargs[t].seed          = ils_base_seed ^ ((unsigned)t * 1234567891u);
-                ils_wargs[t].start_offsets = pop[bi].offsets;
+                ils_wargs[t].start_offsets = pop[start_idx].offsets;
                 ils_wargs[t].result.offsets = NULL;
                 pthread_create(&ils_tids[t], NULL, ils_worker, &ils_wargs[t]);
             }
 
-            /* progress: just wait (ILS is fast) */
-            fprintf(stderr, "  ILS: %d chains x %d rounds ...",
+            /* progress: just wait */
+            fprintf(stderr, "  ILS: %d chains x %d rounds (pair-sweep at chain end) ...",
                     actual_threads, rounds_per_thread);
             fflush(stderr);
 

@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <time.h>
 
 #include "compat_win32.h"
@@ -237,8 +238,11 @@ static void crt_runtime_process_solver_window(
         __sync_fetch_and_add(&stats_cramer_score_sum_e9,
             (uint64_t)(cs * 1e9));
 
+        /* Compare using the same normalised key the heap uses:
+         * heap_key = cramer_score / sqrt(surv_cnt + 1). */
+        double cs_key = cs / sqrt((double)(surv_cnt + 1));
         double heap_worst_sc = crt_heap_worst_score_advisory();
-        if (heap_worst_sc >= 0.0 && cs <= heap_worst_sc) {
+        if (heap_worst_sc >= 0.0 && cs_key <= heap_worst_sc) {
             __sync_fetch_and_add(&stats_crt_heap_push_drop, 1);
             __sync_fetch_and_add(&stats_cramer_heap_skip, 1);
             struct timespec bt = {0, 200000L}; /* 200 us */

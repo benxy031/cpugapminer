@@ -5,10 +5,19 @@
 #include "crt_heap.h"
 #include "stats.h"
 
+#include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <time.h>
+
+/* Heap priority: normalise Cramér score by sqrt(surv_cnt) so that windows
+ * with fewer survivors (cheaper Fermat cost) are preferred when they have
+ * comparable gap probability.  Consumer always pops the highest-key item. */
+static inline double heap_key(const struct crt_work_item *w) {
+    double d = (double)(w->surv_cnt + 1);
+    return w->cramer_score / sqrt(d);
+}
 
 static struct crt_work_item **crt_heap = NULL;
 static size_t crt_heap_size = 0;
@@ -16,7 +25,7 @@ size_t crt_heap_cap = CRT_HEAP_CAP;
 static pthread_mutex_t crt_heap_mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t crt_heap_cv = PTHREAD_COND_INITIALIZER;
 
-/* Cached worst (minimum) cramer_score among heap leaves.
+/* Cached worst (minimum) heap_key() among heap leaves.
  * Updated under crt_heap_mtx; read lock-free via atomic load.
  * Stays -1.0 when the heap has room or is empty. */
 static _Atomic double g_crt_heap_worst_score_cache;
@@ -35,10 +44,11 @@ static void crt_heap_refresh_worst_cache_locked(void) {
         return;
     }
     size_t first_leaf = crt_heap_size / 2;
-    double min_sc = crt_heap[first_leaf]->cramer_score;
-    for (size_t i = first_leaf + 1; i < crt_heap_size; i++)
-        if (crt_heap[i]->cramer_score < min_sc)
-            min_sc = crt_heap[i]->cramer_score;
+    double min_sc = heap_key(crt_heap[first_leaf]);
+    for (size_t i = first_leaf + 1; i < crt_heap_size; i++) {
+        double k = heap_key(crt_heap[i]);
+        if (k < min_sc) min_sc = k;
+    }
     atomic_store(&g_crt_heap_worst_score_cache, min_sc);
 }
 
@@ -75,12 +85,12 @@ void crt_work_free(struct crt_work_item *w) {
     free(w);
 }
 
-/* Max-heap on cramer_score: root holds the item with the highest score
- * (most promising window — processed first by Fermat consumer). */
+/* Max-heap on heap_key(): root holds the item with the highest priority
+ * (best cramer_score per unit sqrt(surv_cnt) — cheapest+best first). */
 static void crt_heap_sift_up(size_t i) {
     while (i > 0) {
         size_t parent = (i - 1) / 2;
-        if (crt_heap[parent]->cramer_score >= crt_heap[i]->cramer_score) break;
+        if (heap_key(crt_heap[parent]) >= heap_key(crt_heap[i])) break;
         struct crt_work_item *tmp = crt_heap[parent];
         crt_heap[parent] = crt_heap[i];
         crt_heap[i] = tmp;
@@ -92,9 +102,9 @@ static void crt_heap_sift_down(size_t i, size_t n) {
     while (1) {
         size_t largest = i;
         size_t left = 2 * i + 1, right = 2 * i + 2;
-        if (left < n && crt_heap[left]->cramer_score > crt_heap[largest]->cramer_score)
+        if (left < n && heap_key(crt_heap[left]) > heap_key(crt_heap[largest]))
             largest = left;
-        if (right < n && crt_heap[right]->cramer_score > crt_heap[largest]->cramer_score)
+        if (right < n && heap_key(crt_heap[right]) > heap_key(crt_heap[largest]))
             largest = right;
         if (largest == i) break;
         struct crt_work_item *tmp = crt_heap[largest];
@@ -125,14 +135,14 @@ int crt_heap_push(struct crt_work_item *w) {
         return 1;
     }
 
-    /* Max-heap: evict the leaf with the lowest cramer_score (worst window). */
+    /* Max-heap: evict the leaf with the lowest heap_key() (worst window). */
     size_t first_leaf = crt_heap_size / 2;
     size_t min_idx = first_leaf;
     for (size_t i = first_leaf + 1; i < crt_heap_size; i++) {
-        if (crt_heap[i]->cramer_score < crt_heap[min_idx]->cramer_score)
+        if (heap_key(crt_heap[i]) < heap_key(crt_heap[min_idx]))
             min_idx = i;
     }
-    if (w->cramer_score > crt_heap[min_idx]->cramer_score) {
+    if (heap_key(w) > heap_key(crt_heap[min_idx])) {
         crt_work_free(crt_heap[min_idx]);
         crt_heap[min_idx] = w;
         crt_heap_sift_up(min_idx);

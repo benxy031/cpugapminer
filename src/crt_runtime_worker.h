@@ -22,7 +22,7 @@ struct crt_work_item;
 struct worker_args {
     int tid;
     int nthreads;
-    uint8_t  h256[32];  /* 256-bit base hash (big-endian) */
+    uint8_t  h256[32];   /* 256-bit base hash (big-endian) */
     int shift;
     int64_t adder_max;
     uint64_t sieve_size;

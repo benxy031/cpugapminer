@@ -116,6 +116,10 @@ static int rpc_rate_ms = 0;
 static int rpc_default_retries = 3;
 /* Poll getbestblockhash at this interval to detect tip changes quickly. */
 static int rpc_tip_poll_ms = 1000;
+/* Force nonce rotation if no gap block found within this many ms (0 = off).
+ * Prevents the miner from exhausting a barren nonce/adder combination.
+ * Default: 600 s (10 min).  Set with --nonce-rotate-s. */
+static int g_nonce_rotate_ms = 600000;
 #ifdef WITH_RPC
 /* Per-thread tip poll state used to keep long scan loops responsive. */
 static __thread int tls_rpc_tip_poll_enabled = 0;
@@ -3349,26 +3353,34 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
             uint64_t cur = tls_partial_use_limit ? tls_partial_use_limit : use_limit;
             uint64_t next = cur;
 
-            /* GPU can handle much higher survivor densities than CPU Fermat.
-               Use a lower floor (1%) when GPU is active so the controller
-               does not over-sieve and starve the GPU of candidates.        */
+            /* CPU-only non-CRT target band: 1-5% survivors.
+               Fewer candidates → exponentially higher P(gap ≥ target):
+               GapMiner get_speed_factor = exp((1 - n/n̄) * merit).
+               A window 20% below average has exp(0.2*21)=67x better odds.
+               GPU path keeps a wider band (1-20%) so the GPU consumer is
+               not starved of candidates.                                   */
 #ifdef WITH_GPU_FERMAT
-            double surv_lo = (g_gpu_count > 0) ? 0.01 : 0.05;
+            int _has_gpu = (g_gpu_count > 0);
 #else
-            double surv_lo = 0.05;
+            int _has_gpu = 0;
 #endif
+            double surv_lo  = 0.01;
+            double surv_hi1 = _has_gpu ? 0.35 : 0.15; /* far too dense  */
+            double surv_hi2 = _has_gpu ? 0.20 : 0.10; /* still dense    */
+            double surv_hi3 = _has_gpu ? 0.13 : 0.05; /* fine-tune up   */
+
             /* Multi-tier step sizes: large jumps when far from the target
                band, fine-tuning near it.  A direction reversal triggers
                full COOLDOWN_WIN; continuing in the same direction uses a
                short hold (3 windows) to avoid thrashing.                 */
             int dir = 0;
-            if (surv_ratio > 0.40) {
+            if (surv_ratio > surv_hi1) {
                 next = cur + (cur >> 2);              /* +25%: far too dense  */
                 dir = +1;
-            } else if (surv_ratio > 0.25) {
+            } else if (surv_ratio > surv_hi2) {
                 next = cur + (cur >> 3) + (cur >> 4); /* +18.75%: still dense */
                 dir = +1;
-            } else if (surv_ratio > 0.18) {
+            } else if (surv_ratio > surv_hi3) {
                 next = cur + (cur >> 5);              /* +3.125%: fine-tune   */
                 dir = +1;
             } else if (surv_ratio < surv_lo) {
@@ -3399,7 +3411,7 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
                 tls_partial_last_dir = dir;
                 __sync_fetch_and_add(&stats_partial_sieve_auto_adjusts, 1);
                 if (use_extra_verbose)
-                    log_file_only("partial sieve auto: limit %llu -> %llu (surv=%.3f%% dir=%+d windows=%u)\n",
+                    log_file_only("partial sieve auto: limit %llu -> %llu (surv=%.3f%% target=1-5%% dir=%+d windows=%u)\n",
                                   (unsigned long long)cur,
                                   (unsigned long long)next,
                                   100.0 * surv_ratio,
@@ -4659,8 +4671,17 @@ static int advance_nonce(void) {
     if (!pass_state_try_advance_nonce(pass_snap.pass_seq, nonce, h256))
         return 0;
     g_nonce_advanced = 1; /* tell main loop: skip getwork, reuse h256 */
-    log_msg("[nonce] advanced to nonce=%u  h256[0..3]=%02x%02x%02x%02x\n",
-            nonce, h256[0], h256[1], h256[2], h256[3]);
+    /* Throttle: log at most once per 5 s to avoid flooding on small shifts
+     * (shift≤25 has adder_max≈sieve_window → ~1 nonce advance per window). */
+    static _Atomic uint64_t nonce_adv_last_log_ms = 0;
+    uint64_t now_adv = now_ms();
+    uint64_t prev_log = atomic_load(&nonce_adv_last_log_ms);
+    if (now_adv - prev_log >= 5000 &&
+        atomic_compare_exchange_strong(&nonce_adv_last_log_ms,
+                                       &prev_log, now_adv)) {
+        log_msg("[nonce] advanced to nonce=%u  h256[0..3]=%02x%02x%02x%02x\n",
+                nonce, h256[0], h256[1], h256[2], h256[3]);
+    }
     return 1;
 }
 #endif /* WITH_RPC — build_mining_pass / assemble_mining_block */
@@ -6996,6 +7017,49 @@ static void *worker_fn(void *arg) {
     uint64_t gbt_last_ms = now_ms();
 #endif
 
+    /* ── Non-CRT nonce-iteration state ─────────────────────────────────────
+       Each worker thread independently iterates nonces so successive sweeps
+       over the same adder range cover a *different* candidate space.
+       Thread t starts at nonce (initial_nonce + t) and steps by nthreads,
+       mirroring GapMiner's per-thread nonce stride.
+       Active in standalone mode and in RPC non-stratum mode (each thread
+       independently cycles its own nonce slice; thread 0 still polls for
+       new blocks and aborts all threads on tip change).                    */
+    uint8_t  hdr80_local[80];
+    uint32_t nonce_local = 0;
+    int      nonces_owned = 0; /* 1 = this thread manages its own nonces */
+    pass_state_snapshot_nonce_hdr80(NULL, hdr80_local);
+#ifdef WITH_RPC
+    nonces_owned = (g_crt_mode == CRT_MODE_NONE && !rpc_url_local && !g_stratum);
+#else
+    nonces_owned = (g_crt_mode == CRT_MODE_NONE);
+#endif
+    if (nonces_owned) {
+        /* Find the first valid nonce for this thread's slot.
+           Initial pass nonce is already baked into h256_local (set by main
+           thread before spawn).  Pick starting nonce so each thread begins
+           at a different offset and they never overlap. */
+        uint32_t start_nonce = (uint32_t)wa->tid;
+        uint8_t hdr84[84], sha_raw[32];
+        for (;;) {
+            memcpy(hdr84, hdr80_local, 80);
+            memcpy(hdr84 + 80, &start_nonce, 4);
+            double_sha256(hdr84, 84, sha_raw);
+            if (sha_raw[31] >= 0x80) {
+                /* Valid nonce — update h256_local to match this nonce so all
+                   subsequent work uses consistent state. */
+                for (int k = 0; k < 32; k++) h256_local[k] = sha_raw[31 - k];
+                set_base_bn(h256_local, shift_local);
+                logbase = uint256_log_approx(h256_local, shift_local);
+                psc.h256 = h256_local;
+                nonce_local = start_nonce;
+                break;
+            }
+            start_nonce += (uint32_t)wa->nthreads;
+            if (start_nonce < (uint32_t)wa->tid) { nonces_owned = 0; break; } /* wraparound */
+        }
+    }
+
     /* Outer loop: mine continuously (same slice, same header) until either
        - a new block is detected by the RPC poller (g_abort_pass = 1), or
        - SIGINT clears keep_going, or
@@ -7007,6 +7071,10 @@ static void *worker_fn(void *arg) {
            prime of the next window.  Without this, gaps spanning
            window boundaries are missed entirely.                   */
         uint64_t carry_last_prime = 0;  /* 0 = no carry */
+#ifdef WITH_RPC
+        /* Timestamp of this pass start; used for nonce-rotation timeout. */
+        uint64_t pass_start_ms = now_ms();
+#endif
         {
             uint64_t L0, R0;
             if (presieve_window(0, base, sieve_size_local,
@@ -7060,6 +7128,23 @@ static void *worker_fn(void *arg) {
                     }
                     } /* end !g_stratum */
                     gbt_last_ms = now_ms();
+
+                    /* Nonce rotation: if no gap found for > g_nonce_rotate_ms
+                     * in this pass, advance to a fresh nonce and restart.
+                     * Only for non-stratum RPC (stratum pool controls nonces).
+                     * Only rpc_thread_local performs the advance; other threads
+                     * will break out when g_abort_pass becomes 1.            */
+                    if (!g_stratum && g_nonce_rotate_ms > 0 &&
+                        (now_ms() - pass_start_ms) > (uint64_t)g_nonce_rotate_ms &&
+                        (last_submit_ms == 0 ||
+                         (now_ms() - last_submit_ms) > (uint64_t)g_nonce_rotate_ms)) {
+                        log_msg("[nonce-rotate] no gap for %.1f min — rotating nonce\n",
+                                (double)(now_ms() - pass_start_ms) / 60000.0);
+                        if (!advance_nonce())
+                            log_msg("[nonce-rotate] advance_nonce failed (nonce space full)\n");
+                        g_abort_pass = 1;
+                        break;
+                    }
                 }
             }
 #endif
@@ -7700,6 +7785,39 @@ static void *worker_fn(void *arg) {
                 carry_last_prime = pr[cnt - 1];
         } /* end window loop */
 
+        /* ── Non-CRT nonce advance ──────────────────────────────────────────
+           After exhausting all windows for this nonce, advance to the next
+           valid nonce owned by this thread (stride = nthreads).  This ensures
+           successive sweeps cover a different candidate space instead of
+           repeating identical sieve results.
+           Skip nonces where SHA256d[31] < 0x80 (not a valid 256-bit number
+           for Gapcoin proof-of-work).                                        */
+        if (nonces_owned && !g_abort_pass) {
+            uint8_t hdr84[84], sha_raw[32];
+            uint32_t next_nonce = nonce_local + (uint32_t)wa->nthreads;
+            int wrapped = (next_nonce < nonce_local); /* uint32 wraparound */
+            for (;;) {
+                if (!keep_going || g_abort_pass) { wrapped = 1; break; }
+                memcpy(hdr84, hdr80_local, 80);
+                memcpy(hdr84 + 80, &next_nonce, 4);
+                double_sha256(hdr84, 84, sha_raw);
+                if (sha_raw[31] >= 0x80) break; /* valid nonce found */
+                next_nonce += (uint32_t)wa->nthreads;
+                if (next_nonce < nonce_local) { wrapped = 1; break; } /* wraparound */
+            }
+            if (wrapped) {
+                /* Nonce space exhausted for this thread — signal main loop */
+                g_abort_pass = 1;
+            } else {
+                nonce_local = next_nonce;
+                for (int k = 0; k < 32; k++) h256_local[k] = sha_raw[31 - k];
+                set_base_bn(h256_local, shift_local);
+                logbase = uint256_log_approx(h256_local, shift_local);
+                psc.h256 = h256_local;
+                carry_last_prime = 0; /* new nonce = new candidate space */
+            }
+        }
+
 #ifdef WITH_RPC
         /* Adder range exhausted.  In stratum mode, do NOT re-mine the
            same slice (which would rediscover identical gaps → duplicate
@@ -7880,6 +7998,7 @@ int main(int argc, char **argv) {
         printf("      --header TEXT     override prime base (rarely needed)\n");
         printf("      --rpc-rate MS     minimum ms between submissions (default: 0)\n");
         printf("      --rpc-poll-ms MS  tip poll interval ms via getbestblockhash (default: 1000)\n");
+        printf("      --nonce-rotate-s S  force nonce rotation after S seconds without finding a gap block (default: 600; 0=off)\n");
         printf("      --rpc-retries N   submit retries\n");
         printf("      --cuda [DEV,...]  use CUDA GPU(s) for Fermat testing (e.g. --cuda 0,1)\n");
         printf("      --opencl [DEV,...] use OpenCL GPU(s) for Fermat testing scaffold (e.g. --opencl 0)\n");
@@ -7969,6 +8088,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--rpc-method") && i+1<argc) rpc_method = argv[++i];
         else if (!strcmp(argv[i],"--rpc-rate") && i+1<argc) cli_rpc_rate = (unsigned int)atoi(argv[++i]);
         else if (!strcmp(argv[i],"--rpc-poll-ms") && i+1<argc) cli_rpc_poll_ms = (unsigned int)atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--nonce-rotate-s") && i+1<argc) g_nonce_rotate_ms = (int)(atof(argv[++i]) * 1000.0);
         else if (!strcmp(argv[i],"--rpc-retries") && i+1<argc) cli_rpc_retries = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--rpc-sign-key") && i+1<argc) rpc_sign_key = argv[++i];
         else if (!strcmp(argv[i],"--log-file") && i+1<argc) log_file = argv[++i];
