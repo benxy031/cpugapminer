@@ -6825,6 +6825,7 @@ static void crt_runtime_init_worker_ctx(
     ctx->gpu_accum_flush = gpu_accum_flush;
     ctx->gpu_accum_collect = gpu_accum_collect;
     ctx->gpu_accum_reset = gpu_accum_reset;
+    ctx->gpu_accum_destroy = gpu_accum_destroy;
     ctx->gpu_accum_get_stride = gpu_accum_get_stride;
     ctx->gpu_accum_set_owns_ctx = gpu_accum_set_owns_ctx;
 #endif

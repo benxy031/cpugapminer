@@ -212,6 +212,15 @@ void crt_runtime_gpu_drain_tls_accum(
         ctx->gpu_accum_flush(acc);
         ctx->gpu_accum_collect(acc);
     }
+
+    /* Destroy and NULL the TLS pointer so the heap-allocated accumulator is
+     * freed.  Without this, consumer threads leak ~2 MB per block transition
+     * (each new block spawns fresh consumer threads that create a new accum
+     * and then exit via return NULL, bypassing the producer-path cleanup). */
+    if (ctx->gpu_accum_destroy) {
+        ctx->gpu_accum_destroy(acc);
+        *ctx->tls_gpu_accum = NULL;
+    }
 }
 
 #else

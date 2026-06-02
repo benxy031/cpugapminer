@@ -138,6 +138,7 @@ struct crt_runtime_worker_ctx {
     void (*gpu_accum_flush)(struct gpu_accum *a);
     void (*gpu_accum_collect)(struct gpu_accum *a);
     void (*gpu_accum_reset)(struct gpu_accum *a);
+    void (*gpu_accum_destroy)(struct gpu_accum *a);
     int (*gpu_accum_get_stride)(const struct gpu_accum *a);
     void (*gpu_accum_set_owns_ctx)(struct gpu_accum *a, int owns_ctx);
 #endif
