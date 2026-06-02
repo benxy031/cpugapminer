@@ -116,7 +116,7 @@ C_OBJS=$(SRCDIR)/stats.o $(SRCDIR)/sieve_cache.o $(SRCDIR)/gap_scan.o \
 	$(SRCDIR)/crt_runtime_cpu.o $(SRCDIR)/crt_runtime_gpu.o \
 	$(SRCDIR)/presieve_utils.o $(SRCDIR)/wheel_sieve.o $(SRCDIR)/sievegap.o \
 	$(SRCDIR)/uint256_utils.o $(SRCDIR)/block_utils.o $(SRCDIR)/primality_utils.o \
-	$(SRCDIR)/rgm_check.o
+	$(SRCDIR)/rgm_check.o $(SRCDIR)/gap_dist.o
 
 $(TARGET): $(BINDIR) $(SRCDIR)/main.o $(C_OBJS) $(RPC_OBJS) $(STRATUM_OBJ) $(CUDA_OBJS)
 	$(LINKER) -o $@ $(SRCDIR)/main.o $(C_OBJS) $(RPC_OBJS) $(STRATUM_OBJ) $(CUDA_OBJS) $(LDFLAGS) $(LIBS)
