@@ -5464,79 +5464,34 @@ static size_t crt_bkscan_and_submit(
     uint64_t qual_pairs[64][2];
     size_t   qual_cnt = 0;
 
-    uint64_t last_sample_prime = 0;
-    int      have_sample_prime = 0;
     uint64_t best_gap_local = 0;
     double   best_merit_loc = 0.0;
     uint64_t last_gap_local = 0;
-    size_t   first_idx = surv_cnt;
 
     __sync_fetch_and_add(&stats_crt_windows, 1);
 
-    /* Sample prefix for live best/last-gap stats and early qualifying pairs.
-       This keeps UI metrics responsive without forcing a full linear scan. */
-    size_t sample_end = surv_cnt;
-    if (sample_end > 192)
-        sample_end = 192;
-    for (size_t j = 0; j < sample_end; j++) {
-        total_tested++;
-        if (!bn_candidate_is_prime(surv[j])) continue;
-        primes_found++;
-
-        if (have_sample_prime) {
-            uint64_t gap = surv[j] - last_sample_prime;
-            double merit = (double)gap / logbase;
-            last_gap_local = gap;
-            stats_last_gap = gap;
-            log_extra_merit_sample("crt-bkscan-sample", merit, gap, target);
-
-            if (merit > best_merit_loc) {
-                best_merit_loc = merit;
-                best_gap_local = gap;
-            }
-            if (merit >= target && qual_cnt < 64) {
-                qual_pairs[qual_cnt][0] = last_sample_prime;
-                qual_pairs[qual_cnt][1] = surv[j];
-                qual_cnt++;
-            }
-        }
-        last_sample_prime = surv[j];
-        have_sample_prime = 1;
-        first_idx = j; /* Start bounded scan from latest sampled prime. */
-    }
-
-    /* If no prime found in sample (rare), keep searching until first prime. */
-    if (first_idx == surv_cnt) {
-        for (size_t j = sample_end; j < surv_cnt; j++) {
-            total_tested++;
-            if (bn_candidate_is_prime(surv[j])) {
-                primes_found++;
-                first_idx = j;
-                break;
-            }
-        }
-    }
-
-    if (first_idx < surv_cnt) {
+    /* Full backward scan from index 0.  backward_scan_segment internally
+       does a forward scan to locate the first prime (~average 1/ln(N) tests),
+       then jumps ahead by needed_gap and scans backward.  This eliminates
+       the separate 192-test sampling pass that previously ran only for UI
+       stats, reducing per-window Fermat cost substantially.
+       CRT windows are independent (fresh sieve each time) — no cross-window
+       carry is needed here. */
+    {
         size_t needed_gap = (size_t)(target * logbase);
         if (needed_gap < 2)
             needed_gap = 2;
 
         struct bkscan_result res;
-        backward_scan_segment(surv, first_idx, surv_cnt,
+        backward_scan_segment(surv, 0, surv_cnt,
                               needed_gap, logbase, target,
                               bn_candidate_is_prime, &res);
 
-        /* backward_scan_segment re-tests the first prime at first_idx. */
-        if (res.tested > 0)
-            total_tested += (res.tested - 1);
-        if (res.primes_found > 0)
-            primes_found += (res.primes_found - 1);
+        total_tested  = res.tested;
+        primes_found  = res.primes_found;
+        best_merit_loc = res.best_merit;
+        best_gap_local = res.best_gap;
 
-        if (res.best_merit > best_merit_loc) {
-            best_merit_loc = res.best_merit;
-            best_gap_local = res.best_gap;
-        }
         if (res.best_gap > 0) {
             last_gap_local = res.best_gap;
             stats_last_gap = res.best_gap;
@@ -5704,6 +5659,9 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
         int best_needs_validation = (merit >= target) &&
             (use_crt_precision || use_mr_verify);
         stats_last_gap = gap;
+        stats_crt_consumer_last_gap = gap;
+        if (gap > stats_crt_consumer_best_gap)
+            stats_crt_consumer_best_gap = gap;
         log_extra_merit_sample("crt-gpu", merit, gap, target);
         if (!best_needs_validation && merit > stats_best_merit) {
             stats_best_merit = merit;
@@ -7523,132 +7481,86 @@ static void *worker_fn(void *arg) {
                both segments are submitted.  ~1.5× speedup on HT CPUs.
                ==============================================================*/
 
-                size_t primes_found_bk = 0;
-                size_t worker_bk_tests = 0;  /* tests for stats_tested flush */
+                /* --- Full backward scan from start of window ---
+                   backward_scan_segment internally does a forward scan to find
+                   the first prime (lo=0), then jumps ahead by needed_gap and
+                   scans backward.  This eliminates the separate sampling pass
+                   that previously ran 64-320 Fermat tests purely for UI stats,
+                   reducing per-window Fermat cost by ~10x at shift ≥ 39. */
+                struct bkscan_result res_w;
+                backward_scan_segment(pr, 0, cnt,
+                                      needed_gap, logbase, target_local,
+                                      bn_candidate_is_prime,
+                                      &res_w);
 
-                     /* --- Adaptive sampling pass for best-merit tracking -------
-                         Backward-scan skips dense clusters, so without sampling the
-                         UI best-merit can look stale.  Use an adaptive sample size:
-                            - scales with window size,
-                            - has a floor for stability,
-                            - caps overhead on large windows,
-                            - nudges up for larger scan-merit strides. */
-                     size_t bkscan_sample = cnt / 32;           /* ~3.1% of window */
-                     size_t stride_floor  = (size_t)smart_K * 8;
-                     if (bkscan_sample < stride_floor) bkscan_sample = stride_floor;
-                     if (bkscan_sample < 64) bkscan_sample = 64;
-                     {
-                          size_t merit_floor = needed_gap / 96;
-                          if (merit_floor > bkscan_sample)
-                                bkscan_sample = merit_floor;
-                     }
-                     if (bkscan_sample > 320) bkscan_sample = 320;
-                     size_t sample_end = cnt < bkscan_sample ? cnt : bkscan_sample;
-                size_t first_idx = cnt;  /* sentinel: not found */
-                uint64_t last_sample_prime = 0;
-                for (size_t j = 0; j < sample_end; j++) {
-                    worker_bk_tests++;
-                    if (bn_candidate_is_prime(pr[j])) {
-                        if (last_sample_prime) {
-                            uint64_t gap_s = pr[j] - last_sample_prime;
-                            double merit_s = (double)gap_s / logbase;
-                            stats_crt_consumer_last_gap = gap_s;
-                            stats_last_gap = gap_s;
-                            log_extra_merit_sample("bkscan-sample", merit_s,
-                                                   gap_s, target_local);
-                            if (merit_s > stats_best_merit) {
-                                stats_best_merit = merit_s;
-                                stats_best_gap   = gap_s;
-                                log_extra_merit_event("best", "bkscan-sample",
-                                                      merit_s, gap_s,
-                                                      target_local);
-                            }
-
-                            /* Do not drop qualifying pairs that appear in
-                               the sampled prefix before backward scan starts. */
-                            if (merit_s >= target_local) {
-                                uint64_t pair_s[2] = {
-                                    last_sample_prime,
-                                    pr[j]
-                                };
-                                stats_crt_consumer_last_qual_gap = gap_s;
-                                stats_last_qual_gap = gap_s;
-                                if (scan_candidates(pair_s, 2,
-                                        target_local, logbase,
-                                        shift_local, header_local,
-                                        rpc_url_local, rpc_user_local,
-                                        rpc_pass_local, rpc_method_local,
-                                        rpc_sign_key_local))
-                                    goto worker_done;
-                            }
-                        }
-                        last_sample_prime = pr[j];
-                        first_idx = j;  /* updates to last prime in sample */
-                        primes_found_bk++;
-                    }
-                }
-                /* If no prime in sample (extremely unlikely), keep searching */
-                if (first_idx == cnt) {
-                    for (size_t j = sample_end; j < cnt; j++) {
-                        worker_bk_tests++;
-                        if (bn_candidate_is_prime(pr[j])) {
-                            first_idx = j;
-                            primes_found_bk++;
-                            break;
-                        }
-                    }
-                }
-
-                if (first_idx < cnt) {
-                    /* --- Full-window backward scan --- */
-                    struct bkscan_result res_w;
-                    backward_scan_segment(pr, first_idx, cnt,
-                                          needed_gap, logbase, target_local,
-                                          bn_candidate_is_prime,
-                                          &res_w);
-                    primes_found_bk += res_w.primes_found;
-                    worker_bk_tests += res_w.tested;
-
-                    /* Update best merit from worker result */
-                    if (res_w.best_merit > stats_best_merit) {
-                        stats_best_merit = res_w.best_merit;
-                        stats_best_gap   = res_w.best_gap;
-                        log_extra_merit_event("best", "bkscan-worker",
-                                              res_w.best_merit,
-                                              res_w.best_gap,
-                                              target_local);
-                    }
-
-                    /* Submit qualifying gaps */
-                    for (size_t qi = 0; qi < res_w.qual_cnt; qi++) {
-                        uint64_t pair[2] = { res_w.qual_pairs[qi][0],
-                                             res_w.qual_pairs[qi][1] };
-                        stats_crt_consumer_last_gap = pair[1] - pair[0];
-                        stats_crt_consumer_last_qual_gap = pair[1] - pair[0];
-                        stats_last_qual_gap = pair[1] - pair[0];
-                        stats_last_gap = pair[1] - pair[0];
-                        if (scan_candidates(pair, 2,
-                                target_local, logbase,
-                                shift_local, header_local,
-                                rpc_url_local, rpc_user_local,
-                                rpc_pass_local, rpc_method_local,
-                                rpc_sign_key_local))
+                /* Cross-window carry: gap from previous window's last confirmed
+                   prime to the first confirmed prime in this window.
+                   res_w.first_prime is set by the internal forward scan in
+                   backward_scan_segment — it is the first Fermat-prime in
+                   [0, cnt), guaranteed to be the true first prime (all elements
+                   before it are tested and non-prime). */
+                if (carry_last_prime && res_w.first_prime
+                    && res_w.first_prime > carry_last_prime) {
+                    uint64_t xw_gap   = res_w.first_prime - carry_last_prime;
+                    double   xw_merit = (double)xw_gap / logbase;
+                    if (xw_merit >= target_local) {
+                        uint64_t xw_pair[2] = { carry_last_prime,
+                                                res_w.first_prime };
+                        if (scan_candidates(xw_pair, 2, target_local, logbase,
+                                            shift_local, header_local,
+                                            rpc_url_local, rpc_user_local,
+                                            rpc_pass_local, rpc_method_local,
+                                            rpc_sign_key_local))
                             goto worker_done;
                     }
-                } /* end first_idx < cnt */
+                }
 
-                /* Flush worker's tested count to stats_tested. */
-                __sync_fetch_and_add(&stats_tested, (uint64_t)worker_bk_tests);
+                /* Update best merit */
+                if (res_w.best_merit > stats_best_merit) {
+                    stats_best_merit = res_w.best_merit;
+                    stats_best_gap   = res_w.best_gap;
+                    log_extra_merit_event("best", "bkscan-worker",
+                                          res_w.best_merit,
+                                          res_w.best_gap,
+                                          target_local);
+                }
+                if (res_w.best_merit > 0.0)
+                    log_extra_merit_sample("bkscan-worker",
+                                           res_w.best_merit,
+                                           res_w.best_gap,
+                                           target_local);
+
+                /* Submit qualifying gaps found within this window */
+                for (size_t qi = 0; qi < res_w.qual_cnt; qi++) {
+                    uint64_t pair[2] = { res_w.qual_pairs[qi][0],
+                                         res_w.qual_pairs[qi][1] };
+                    stats_crt_consumer_last_gap = pair[1] - pair[0];
+                    stats_crt_consumer_last_qual_gap = pair[1] - pair[0];
+                    stats_last_qual_gap = pair[1] - pair[0];
+                    stats_last_gap = pair[1] - pair[0];
+                    if (scan_candidates(pair, 2,
+                            target_local, logbase,
+                            shift_local, header_local,
+                            rpc_url_local, rpc_user_local,
+                            rpc_pass_local, rpc_method_local,
+                            rpc_sign_key_local))
+                        goto worker_done;
+                }
+
+                /* Update carry for next window.  last_prime is the last
+                   confirmed prime in [0, cnt); all elements after it are
+                   tested and non-prime.  0 when no prime found at all. */
+                carry_last_prime = res_w.last_prime;
+
+                /* Flush tested count and update prime/pair stats. */
+                __sync_fetch_and_add(&stats_tested, (uint64_t)res_w.tested);
 
                 /* Stats: estimate full-window consecutive prime pairs for
-                   accurate est calculation.  Backward scan only tests ~5%
-                   of survivors, but e^(-target) applies to ALL consecutive
-                   prime pairs in the window, not just backward-scan jumps.
-                   Use the Fermat pass rate to estimate total primes, then
-                   derive the pair count the full window would have yielded.
-                   This gives est matching the actual qualifying-gap rate. */
-                { double prime_rate = worker_bk_tests > 0
-                      ? (double)primes_found_bk / (double)worker_bk_tests
+                   accurate est calculation.  Backward scan only tests ~8
+                   survivors per jump on average; use the Fermat pass rate
+                   from res_w to extrapolate total primes in the window. */
+                { double prime_rate = res_w.tested > 0
+                      ? (double)res_w.primes_found / (double)res_w.tested
                       : 0.0;
                   size_t est_window_primes =
                       (size_t)((double)orig_cnt * prime_rate);
@@ -7657,7 +7569,7 @@ static void *worker_fn(void *arg) {
                                            (uint64_t)(est_window_primes - 1));
                 }
                 __sync_fetch_and_add(&stats_primes_found,
-                                     (uint64_t)primes_found_bk);
+                                     (uint64_t)res_w.primes_found);
 
                 free(p1_cands); p1_cands = NULL;
                 free(p1_wbuf);  p1_wbuf  = NULL;
@@ -7780,8 +7692,10 @@ static void *worker_fn(void *arg) {
                     if (sc_ret) goto worker_done;
                 }
             }
-            /* Update carry for next window */
-            if (cnt >= 1)
+            /* Update carry for next window.  Only valid where pr[] has been
+               compacted to confirmed primes (full-test and GPU-full paths).
+               The backward-scan path manages carry_last_prime internally. */
+            if (!use_smart && cnt >= 1)
                 carry_last_prime = pr[cnt - 1];
         } /* end window loop */
 
@@ -8732,11 +8646,19 @@ int main(int argc, char **argv) {
 #ifdef WITH_CGBN_FERMAT
             {
                 int al = active_limbs < GPU_NLIMBS ? active_limbs : GPU_NLIMBS;
-                if (al % 2 == 0)
+                /* CGBN dispatch covers AL where LIMBS=2×AL/TPI is an integer
+                   and LIMBS≤TPI (largest power-of-2 TPI≤8):
+                     AL%4==0        → TPI=8  (AL=4,8,12,16,20,…)
+                     AL%2==0, AL≤8  → TPI=4  (AL=2,6)
+                   All other AL (odd, or AL=10,14,18,…) use scalar kernel. */
+                int cgbn_tpi = 0;
+                if      (al % 4 == 0)             cgbn_tpi = 8;
+                else if (al % 2 == 0 && al <= 8)  cgbn_tpi = 4;
+                if (cgbn_tpi)
                     log_msg("CUDA: CGBN Fermat kernel active for %d-bit candidates (TPI=%d)\n",
-                            al * 64, (al % 4 == 0) ? 8 : 4);
+                            al * 64, cgbn_tpi);
                 else
-                    log_msg("CUDA: CGBN Fermat kernel inactive (AL=%d is odd; even AL required)\n", al);
+                    log_msg("CUDA: CGBN Fermat kernel inactive (AL=%d → no valid TPI; using scalar)\n", al);
             }
 #endif
         }

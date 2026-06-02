@@ -599,12 +599,21 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
                 return cudaPeekAtLastError(); \
             }
         switch (al) {
-            /* Valid (AL, TPI) pairs satisfy two constraints:
-               1. TPI divides 2×AL  (BITS = AL×64 divisible by TPI×32)
-               2. LIMBS = 2×AL/TPI ≤ TPI  (dlimbs_algs_multi has no specialisation)
-               → TPI ≥ sqrt(2×AL), TPI = largest valid power-of-2 ≤ 8.
-               AL values where no power-of-2 satisfies both (e.g. AL=10,14,18)
-               fall through to the scalar fermat_kernel_t below.               */
+            /* Supported (AL, TPI) pairs — largest valid power-of-2 TPI ≤ 8
+               where LIMBS = 2×AL/TPI is an integer AND LIMBS ≤ TPI
+               (CGBN dlimbs_algs_multi requires LIMBS ≤ TPI):
+
+                 AL   Bits   TPI  LIMBS
+                  2    128    4    1
+                  4    256    8    1
+                  6    384    4    3
+                  8    512    8    2
+                 12    768    8    3    (default GPU_BITS=768 full width)
+                 16   1024    8    4
+                 20   1280    8    5
+
+               All other AL values (1,3,5,7,9,10,11,13,14,15,17,18,19,…)
+               fall through to the scalar fermat_kernel_t below.              */
             #if NL >= 2
             CGBN_DISP( 2, 4)   /* 128-bit,  LIMBS=1 */
             #endif
@@ -626,7 +635,7 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
             #if NL >= 20
             CGBN_DISP(20, 8)   /* 1280-bit, LIMBS=5 */
             #endif
-            /* AL=10,14,18: no valid TPI (LIMBS > TPI for all divisors) → scalar */
+            /* All other AL: no valid TPI → scalar fermat_kernel_t */
             default: break;
         }
         #undef CGBN_DISP
