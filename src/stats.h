@@ -48,6 +48,19 @@ extern volatile uint64_t stats_partial_sieve_auto_limit_sum;   /* sum of effecti
 extern volatile uint64_t stats_partial_sieve_auto_limit_samples;/* sampled windows for effective limit */
 extern volatile uint64_t stats_adaptive_presieve_windows;      /* windows observed by adaptive-presieve */
 extern volatile uint64_t stats_adaptive_presieve_skipped;      /* dense windows skipped by adaptive-presieve */
+extern volatile uint64_t stats_noncrt_lane_pairs_total;        /* all adjacent non-CRT prime pairs observed */
+extern volatile uint64_t stats_noncrt_lane_pairs_same;         /* p->q stays on same 6k lane (gap mod 6 == 0) */
+extern volatile uint64_t stats_noncrt_lane_pairs_alt2;         /* lane alternation with +2 delta (5->1 lane) */
+extern volatile uint64_t stats_noncrt_lane_pairs_alt4;         /* lane alternation with +4 delta (1->5 lane) */
+extern volatile uint64_t stats_noncrt_lane_pairs_unexpected;   /* unexpected mod-6 transitions */
+extern volatile uint64_t stats_noncrt_lane_qual_total;         /* qualifying non-CRT pairs (merit >= target) */
+extern volatile uint64_t stats_noncrt_lane_qual_same;
+extern volatile uint64_t stats_noncrt_lane_qual_alt2;
+extern volatile uint64_t stats_noncrt_lane_qual_alt4;
+extern volatile uint64_t stats_noncrt_lane_qual_unexpected;
+extern volatile uint64_t stats_noncrt_onesided_intervals;      /* one-sided gate decisions in non-CRT bkscan */
+extern volatile uint64_t stats_noncrt_onesided_skipped;        /* intervals skipped by give-up/go-next */
+extern volatile uint64_t stats_noncrt_onesided_fullcheck;      /* intervals kept for full two-sided check */
 extern volatile uint64_t stats_crt_heap_push_ok;
 extern volatile uint64_t stats_crt_heap_push_replace;
 extern volatile uint64_t stats_crt_heap_push_drop;

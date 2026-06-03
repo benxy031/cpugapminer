@@ -872,6 +872,32 @@ static volatile double g_scan_target_runtime = 20.0;
 /* One-time warning guard for CPU smart-scan stride clamping. */
 static volatile int g_warn_scan_merit_cpu_clamped = 0;
 
+#define ONE_SIDED_SKIP_MERIT_DEFAULT 4.0
+/* One-sided skip (give-up/go-next): in non-CRT CPU backward-scan mode,
+   skip the expensive second-side scan unless first-side gap >= merit*log(N). */
+static volatile int use_one_sided_skip = 0;
+static volatile double one_sided_skip_merit = ONE_SIDED_SKIP_MERIT_DEFAULT;
+static volatile int one_sided_skip_merit_user_set = 0;
+static volatile int g_shift_runtime = 20;
+
+static double auto_one_sided_skip_merit(int shift, double scan_target_runtime) {
+    double base = (scan_target_runtime > 0.0)
+        ? scan_target_runtime
+        : ONE_SIDED_SKIP_MERIT_DEFAULT;
+    double delta;
+
+    if (shift < 64) delta = 0.35;
+    else if (shift < 128) delta = 0.50;
+    else if (shift < 256) delta = 0.70;
+    else if (shift < 512) delta = 0.90;
+    else delta = 1.10;
+
+    double merit = base + delta;
+    if (merit < 4.0) merit = 4.0;
+    if (merit > 96.0) merit = 96.0;
+    return merit;
+}
+
 /* Number of edge-probe candidates per side when eliminating false-positive
    regions in the two-phase smart scan.  Higher values catch more false
    positives but cost more Fermat tests up-front.                            */
@@ -1837,6 +1863,19 @@ static double refresh_runtime_targets(int target_explicit,
     double scan_target = resolve_scan_target(*submit_target, *scan_target_cfg);
     g_mining_target = *submit_target;
     g_scan_target_runtime = scan_target;
+
+    /* Live one-sided auto policy: if user did not set manual merit,
+       keep one-sided gate in sync with runtime scan/ndiff changes. */
+    if (use_one_sided_skip && !one_sided_skip_merit_user_set) {
+        double auto_merit = auto_one_sided_skip_merit((int)g_shift_runtime,
+                                                      scan_target);
+        if (fabs(one_sided_skip_merit - auto_merit) > 1e-9) {
+            one_sided_skip_merit = auto_merit;
+            log_msg("one-sided skip: auto merit updated to %.2f (shift=%d scan=%.4f)\n",
+                    auto_merit, (int)g_shift_runtime, scan_target);
+        }
+    }
+
     return scan_target;
 }
 
@@ -1894,23 +1933,17 @@ static void print_stats(void) {
             prob_pair = p_emp * scale;
         }
     }
-    char est_buf[64] = "n/a";
-    if (stats_gaps > 0 && elapsed > 0.001) {
-        double est_sec = elapsed / (double)stats_gaps;
-        format_est(est_buf, sizeof(est_buf), est_sec);
-    } else {
-        if (pairs_rate > 0 && prob_pair > 0) {
-            double est_sec = 1.0 / (pairs_rate * prob_pair);
-            format_est(est_buf, sizeof(est_buf), est_sec);
-        }
+    char est_model_buf[64] = "n/a";
+    if (pairs_rate > 0 && prob_pair > 0) {
+        double est_model_sec = 1.0 / (pairs_rate * prob_pair);
+        format_est(est_model_buf, sizeof(est_model_buf), est_model_sec);
     }
 
-    /* Observed average gap interval (elapsed / gaps found). Shows actual
-       performance vs the theoretical est= so the user can compare directly. */
-    char avg_gap_buf[64] = "n/a";
+    /* Observed inter-gap interval from this run (elapsed / found gaps). */
+    char est_observed_buf[64] = "n/a";
     if (stats_gaps > 0 && elapsed > 0.001) {
-        double avg_gap_sec = elapsed / (double)stats_gaps;
-        format_est(avg_gap_buf, sizeof(avg_gap_buf), avg_gap_sec);
+        double est_observed_sec = elapsed / (double)stats_gaps;
+        format_est(est_observed_buf, sizeof(est_observed_buf), est_observed_sec);
     }
 
     double prime_rate = (elapsed > 0.001) ? (double)stats_primes_found / elapsed : 0.0;
@@ -1935,12 +1968,13 @@ static void print_stats(void) {
 
     double bm = stats_best_merit;
         log_msg("STATS: elapsed=%.1fs  sieved=%llu (%.0f/s)  tested=%llu (%.0f/s)  "
-            "pps=%.0f  primes=%llu (%.1f%%)  "
+            "pps=%.0f  primes/s=%.0f  primes=%llu (%.1f%%)  "
             "gaps=%llu (%.3f/s)  built=%llu  submitted=%llu  accepted=%llu  "
-            "prob=%.2e/pair  est=%s  avg_gap=%s (submit=%.4f scan=%.4f)  best=%.2f (gap=%llu)  last_gap=%llu  last_qual_gap=%llu",
+            "prob=%.2e/pair  est_model=%s  est_observed=%s (submit=%.4f scan=%.4f)  best=%.2f (gap=%llu)  last_gap=%llu  last_qual_gap=%llu",
             elapsed,
             (unsigned long long)stats_sieved,  sieve_rate,
             (unsigned long long)stats_tested,  test_rate,
+            pairs_rate,
             prime_rate,
             (unsigned long long)stats_primes_found,
             (stats_tested > 0) ? 100.0 * (double)stats_primes_found / (double)stats_tested : 0.0,
@@ -1948,10 +1982,52 @@ static void print_stats(void) {
             (unsigned long long)stats_blocks,
             (unsigned long long)stats_submits,
             (unsigned long long)stats_success,
-            prob_pair, est_buf, avg_gap_buf, target_m, scan_target_m,
+            prob_pair, est_model_buf, est_observed_buf, target_m, scan_target_m,
             bm, (unsigned long long)stats_best_gap,
             (unsigned long long)stats_last_gap,
             (unsigned long long)stats_last_qual_gap);
+
+    if (g_crt_mode == CRT_MODE_NONE && use_stats_verbose) {
+        uint64_t lp = stats_noncrt_lane_pairs_total;
+        uint64_t lq = stats_noncrt_lane_qual_total;
+        if (lp > 0) {
+            double same_pct = 100.0 * (double)stats_noncrt_lane_pairs_same / (double)lp;
+            double a2_pct = 100.0 * (double)stats_noncrt_lane_pairs_alt2 / (double)lp;
+            double a4_pct = 100.0 * (double)stats_noncrt_lane_pairs_alt4 / (double)lp;
+            double unk_pct = 100.0 * (double)stats_noncrt_lane_pairs_unexpected / (double)lp;
+            log_msg("  lane(non-crt): pairs=%llu same=%.1f%% alt+2=%.1f%% alt+4=%.1f%% unexpected=%.2f%%",
+                (unsigned long long)lp,
+                same_pct,
+                a2_pct,
+                a4_pct,
+                unk_pct);
+        }
+        if (lq > 0) {
+            double same_q = 100.0 * (double)stats_noncrt_lane_qual_same / (double)lq;
+            double a2_q = 100.0 * (double)stats_noncrt_lane_qual_alt2 / (double)lq;
+            double a4_q = 100.0 * (double)stats_noncrt_lane_qual_alt4 / (double)lq;
+            double unk_q = 100.0 * (double)stats_noncrt_lane_qual_unexpected / (double)lq;
+            log_msg("  lane(non-crt,qual): pairs=%llu same=%.1f%% alt+2=%.1f%% alt+4=%.1f%% unexpected=%.2f%%",
+                (unsigned long long)lq,
+                same_q,
+                a2_q,
+                a4_q,
+                unk_q);
+        }
+        if (stats_noncrt_onesided_intervals > 0) {
+            uint64_t oi = stats_noncrt_onesided_intervals;
+            uint64_t os = stats_noncrt_onesided_skipped;
+            uint64_t of = stats_noncrt_onesided_fullcheck;
+            double skip_pct = 100.0 * (double)os / (double)oi;
+            double full_pct = 100.0 * (double)of / (double)oi;
+            log_msg("  one-sided(non-crt): intervals=%llu skipped=%llu (%.1f%%) fullcheck=%llu (%.1f%%)",
+                (unsigned long long)oi,
+                (unsigned long long)os,
+                skip_pct,
+                (unsigned long long)of,
+                full_pct);
+        }
+    }
 
     /* ── CRT-specific stats ── */
     if (g_crt_mode == CRT_MODE_SOLVER) {
@@ -5484,7 +5560,7 @@ static size_t crt_bkscan_and_submit(
 
         struct bkscan_result res;
         backward_scan_segment(surv, 0, surv_cnt,
-                              needed_gap, logbase, target,
+                              needed_gap, 0, logbase, target,
                               bn_candidate_is_prime, &res);
 
         total_tested  = res.tested;
@@ -6413,6 +6489,31 @@ static void rebase_for_gap_check(mpz_t new_base) {
                                         (unsigned long)td_extra_primes[i]);
 }
 
+/* Classify non-CRT consecutive-prime lane transitions under mod 6.
+   Returns:
+   1 = same lane (gap mod 6 == 0)
+   2 = alternation 5->1 (gap mod 6 == 2)
+   3 = alternation 1->5 (gap mod 6 == 4)
+   4 = unexpected transition */
+static inline int classify_noncrt_lane_pair(uint64_t base_mod6,
+                                            uint64_t prev,
+                                            uint64_t gap) {
+    uint64_t p_mod6 = (base_mod6 + (prev % 6ULL)) % 6ULL;
+    uint64_t g_mod6 = gap % 6ULL;
+
+    if (p_mod6 == 5ULL) {
+        if (g_mod6 == 0ULL) return 1;
+        if (g_mod6 == 2ULL) return 2;
+        return 4;
+    }
+    if (p_mod6 == 1ULL) {
+        if (g_mod6 == 0ULL) return 1;
+        if (g_mod6 == 4ULL) return 3;
+        return 4;
+    }
+    return 4;
+}
+
 // process a list of primes searching for gaps meeting the local threshold.
 // This implements dcct’s skip-ahead optimization in a slightly different
 // form: after fixing the current prime `prev` we compute the maximum gap
@@ -6439,6 +6540,22 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
                            const char *rpc_sign_key_local) {
     (void)header_local;     /* param kept for API compat; abort uses g_abort_pass */
     (void)rpc_method_local; /* method is always "getwork" now */
+    uint64_t lane_pairs_total = 0;
+    uint64_t lane_pairs_same = 0;
+    uint64_t lane_pairs_alt2 = 0;
+    uint64_t lane_pairs_alt4 = 0;
+    uint64_t lane_pairs_unexpected = 0;
+    uint64_t lane_qual_total = 0;
+    uint64_t lane_qual_same = 0;
+    uint64_t lane_qual_alt2 = 0;
+    uint64_t lane_qual_alt4 = 0;
+    uint64_t lane_qual_unexpected = 0;
+    uint64_t lane_base_mod6 = 0;
+    int track_lane_stats = (g_crt_mode == CRT_MODE_NONE);
+    if (track_lane_stats) {
+        ensure_gmp_tls();
+        lane_base_mod6 = (uint64_t)mpz_fdiv_ui(tls_base_mpz, 6UL);
+    }
     if (cnt > 1) __sync_fetch_and_add(&stats_pairs, (uint64_t)(cnt - 1));
     for (size_t i = 0; i + 1 < cnt; i++) {
 #ifdef WITH_RPC
@@ -6471,6 +6588,15 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
         uint64_t prev  = pr[i];       /* nAdd of gap start prime */
         uint64_t q     = pr[i + 1];   /* nAdd of gap end prime   */
         uint64_t gap   = q - prev;
+        int lane_kind = 0;
+        if (track_lane_stats) {
+            lane_kind = classify_noncrt_lane_pair(lane_base_mod6, prev, gap);
+            lane_pairs_total++;
+            if (lane_kind == 1) lane_pairs_same++;
+            else if (lane_kind == 2) lane_pairs_alt2++;
+            else if (lane_kind == 3) lane_pairs_alt4++;
+            else lane_pairs_unexpected++;
+        }
         double merit   = (double)gap / logbase;
         stats_last_gap = gap;
         log_extra_merit_sample("scan-candidates", merit, gap, target_local);
@@ -6485,6 +6611,14 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
         }
         if (merit < target_local)
             continue;
+
+        if (track_lane_stats) {
+            lane_qual_total++;
+            if (lane_kind == 1) lane_qual_same++;
+            else if (lane_kind == 2) lane_qual_alt2++;
+            else if (lane_kind == 3) lane_qual_alt4++;
+            else lane_qual_unexpected++;
+        }
 
         /* ── Quick gap verification ──
            Scan odd offsets between prev and q using bn_candidate_is_prime()
@@ -6593,6 +6727,20 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
             }
 #endif
     }   /* end for */
+    if (track_lane_stats && lane_pairs_total > 0) {
+        __sync_fetch_and_add(&stats_noncrt_lane_pairs_total, lane_pairs_total);
+        __sync_fetch_and_add(&stats_noncrt_lane_pairs_same, lane_pairs_same);
+        __sync_fetch_and_add(&stats_noncrt_lane_pairs_alt2, lane_pairs_alt2);
+        __sync_fetch_and_add(&stats_noncrt_lane_pairs_alt4, lane_pairs_alt4);
+        __sync_fetch_and_add(&stats_noncrt_lane_pairs_unexpected, lane_pairs_unexpected);
+        if (lane_qual_total > 0) {
+            __sync_fetch_and_add(&stats_noncrt_lane_qual_total, lane_qual_total);
+            __sync_fetch_and_add(&stats_noncrt_lane_qual_same, lane_qual_same);
+            __sync_fetch_and_add(&stats_noncrt_lane_qual_alt2, lane_qual_alt2);
+            __sync_fetch_and_add(&stats_noncrt_lane_qual_alt4, lane_qual_alt4);
+            __sync_fetch_and_add(&stats_noncrt_lane_qual_unexpected, lane_qual_unexpected);
+        }
+    }
     return 0;
 }
 
@@ -7489,10 +7637,32 @@ static void *worker_fn(void *arg) {
                    that previously ran 64-320 Fermat tests purely for UI stats,
                    reducing per-window Fermat cost by ~10x at shift ≥ 39. */
                 struct bkscan_result res_w;
+                size_t one_sided_min_gap = 0;
+                if (use_one_sided_skip && g_crt_mode == CRT_MODE_NONE) {
+                    one_sided_min_gap = (size_t)(one_sided_skip_merit * logbase);
+                    if (one_sided_min_gap < 2)
+                        one_sided_min_gap = 2;
+                    /* Skip can only trigger when gate is strictly above the
+                       bkscan jump target. Otherwise upper_gap is always >= gate,
+                       so one-sided path is inert and should stay on strict
+                       original bkscan behavior. */
+                    if (one_sided_min_gap <= needed_gap + 1)
+                        one_sided_min_gap = 0;
+                }
                 backward_scan_segment(pr, 0, cnt,
-                                      needed_gap, logbase, target_local,
+                                      needed_gap, one_sided_min_gap,
+                                      logbase, target_local,
                                       bn_candidate_is_prime,
                                       &res_w);
+
+                if (one_sided_min_gap > 0 && res_w.one_sided_considered > 0) {
+                    __sync_fetch_and_add(&stats_noncrt_onesided_intervals,
+                                         (uint64_t)res_w.one_sided_considered);
+                    __sync_fetch_and_add(&stats_noncrt_onesided_skipped,
+                                         (uint64_t)res_w.one_sided_skipped);
+                    __sync_fetch_and_add(&stats_noncrt_onesided_fullcheck,
+                                         (uint64_t)res_w.one_sided_fullcheck);
+                }
 
                 /* Cross-window carry: gap from previous window's last confirmed
                    prime to the first confirmed prime in this window.
@@ -7881,6 +8051,10 @@ int main(int argc, char **argv) {
         printf("  -e, --extra-verbose  write live merit events + partial-sieve-auto details to log file\n");
         printf("      --stats-verbose  include detailed CRT phase telemetry in STATS output\n");
         printf("      --sample-stride K smart scan: test every Kth survivor (default: 8, 1=off)\n");
+         printf("      --one-sided-skip   non-CRT CPU bkscan: skip second-side scan unless first-side gap is large\n");
+         printf("      --one-sided-skip-merit M  first-side gate merit for --one-sided-skip\n");
+         printf("                        default: auto from shift + scan-merit (manual override when set)\n");
+         printf("      --no-one-sided-skip  disable one-sided skip\n");
         printf("      --rgm-cal-min N   RGM region-scoring: minimum baseline samples before activating\n");
         printf("                        (default: 50000; lower = faster warmup, noisier early baseline)\n");
         printf("      --rgm-state-file F  persist RGM baseline across restarts: load on startup,\n");
@@ -7889,7 +8063,6 @@ int main(int argc, char **argv) {
         printf("      --mr-verify       MR base-3 verify Fermat/GPU survivors (catches pseudoprimes)\n");
         printf("      --crt-file FILE   load CRT sieve file (binary template or text gap-solver)\n");
         printf("      --crt-gap-scan MODE  CRT solver gap window: fixed|original|original-floor (default: fixed)\n");
-        printf("                           fixed=max(2*gap_target,10000), original=target*ln(start), original-floor=max(original,FLOOR)\n");
         printf("      --crt-gap-scan-floor N  FLOOR used by original-floor mode (default: 10000)\n");
         printf("      --crt-gap-scan-adaptive  adapt runtime CRT window from heap pressure (opt-in)\n");
         printf("      --crt-precision  favor CRT targeting/correctness over speed (strict prime checks)\n");
@@ -8158,6 +8331,21 @@ int main(int argc, char **argv) {
             cli_sample_stride = atoi(argv[++i]);
             if (cli_sample_stride < 1) cli_sample_stride = 1;
         }
+        else if (!strcmp(argv[i],"--one-sided-skip")) {
+            use_one_sided_skip = 1;
+        }
+        else if (!strcmp(argv[i],"--no-one-sided-skip")) {
+            use_one_sided_skip = 0;
+        }
+        else if (!strcmp(argv[i],"--one-sided-skip-merit") && i+1<argc) {
+            one_sided_skip_merit = atof(argv[++i]);
+            if (one_sided_skip_merit < 0.5)
+                one_sided_skip_merit = 0.5;
+            if (one_sided_skip_merit > 96.0)
+                one_sided_skip_merit = 96.0;
+            one_sided_skip_merit_user_set = 1;
+            use_one_sided_skip = 1;
+        }
         else if (!strcmp(argv[i],"--rgm-cal-min") && i+1<argc) {
             long long v = atoll(argv[++i]);
             cli_rgm_cal_min = (v > 0) ? (uint64_t)v : 1ULL;
@@ -8323,6 +8511,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "--adder-max (%lld) must be at most 2^shift (%lld)\n", (long long)adder_max, (long long)((int64_t)1 << shift));
         return 2;
     }
+    g_shift_runtime = shift;
 
     /* Compute sieve prime VALUE limit from COUNT using PNT upper bound:
        p_n < n × (ln(n) + ln(ln(n))) for n >= 6.
@@ -9037,6 +9226,14 @@ int main(int argc, char **argv) {
                 small_primes_count > 0 ? (unsigned long long)small_primes_cache[small_primes_count-1] : 0ULL);
         log_msg("merit thresholds: submit=%.4f  scan=%.4f\n",
             target, scan_target_runtime);
+        if (use_one_sided_skip) {
+            log_msg("one-sided skip: enabled (non-CRT CPU bkscan), merit>=%.2f on first side (%s)\n",
+                one_sided_skip_merit,
+                one_sided_skip_merit_user_set ? "manual" : "auto");
+            if ((use_cuda || use_opencl) && !no_primality) {
+                log_msg("one-sided skip note: GPU Fermat path active; one-sided gate/telemetry is CPU-bkscan-only, so one-sided(non-crt) STATS line is expected to be absent\n");
+            }
+        }
         if (cli_sieve_explicit) {
             log_msg("sieve-primes explicit: requested_count=%llu  effective_limit=%llu  loaded_count=%lu\n",
                 (unsigned long long)cli_sieve_prime_count,

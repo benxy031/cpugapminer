@@ -1,7 +1,8 @@
 #include "gap_scan.h"
 
 void backward_scan_segment(const uint64_t *pr, size_t lo, size_t hi,
-                           size_t needed_gap, double logbase, double target,
+                           size_t needed_gap, size_t one_sided_min_gap,
+                           double logbase, double target,
                            gap_prime_test_fn prime_test,
                            struct bkscan_result *res)
 {
@@ -11,6 +12,9 @@ void backward_scan_segment(const uint64_t *pr, size_t lo, size_t hi,
     res->best_gap   = 0;
     res->first_prime = 0;
     res->last_prime  = 0;
+    res->one_sided_considered = 0;
+    res->one_sided_skipped = 0;
+    res->one_sided_fullcheck = 0;
     res->qual_cnt    = 0;
     if (lo >= hi || !prime_test) return;
 
@@ -45,50 +49,157 @@ void backward_scan_segment(const uint64_t *pr, size_t lo, size_t hi,
           }
           bhi = l; }
 
-        /* Scan backward from bhi-1 toward scan_from+1 */
-        int found = 0;
-        for (size_t j = bhi; j > scan_from + 1; ) {
-            j--;
-            res->tested++;
-            if (prime_test(pr[j])) {
-                start_nAdd = pr[j];
-                scan_from  = j;
-                res->primes_found++;
-                res->last_prime = pr[j];
-                found = 1;
-                break;
-            }
-        }
+        if (one_sided_min_gap > 0) {
+            size_t upper_idx = hi;
+            uint64_t gate_pos = start_nAdd + one_sided_min_gap;
 
-        if (!found) {
-            /* No prime in [start, start+needed_gap]. Search forward for next. */
-            int have_next = 0;
-            for (size_t j = bhi; j < hi; j++) {
+            /* One-sided gate probe:
+               only search (target_pos, gate_pos) to decide skip/fullcheck.
+               A full forward search to hi is deferred until strictly needed. */
+            size_t j_gate = bhi;
+            while (j_gate < hi && pr[j_gate] < gate_pos) {
+                res->tested++;
+                if (prime_test(pr[j_gate])) {
+                    upper_idx = j_gate; /* first prime beyond target_pos and before gate */
+                    break;
+                }
+                j_gate++;
+            }
+
+            if (upper_idx < hi) {
+                res->one_sided_considered++;
+                /* Give-up/go-next: weak first-side signal. */
+                res->one_sided_skipped++;
+                start_nAdd = pr[upper_idx];
+                scan_from = upper_idx;
+                res->primes_found++;
+                res->last_prime = pr[upper_idx];
+                continue;
+            }
+
+            res->one_sided_considered++;
+            res->one_sided_fullcheck++;
+
+            /* Full two-sided check only for strong first-side intervals. */
+            int found = 0;
+            for (size_t j = bhi; j > scan_from + 1; ) {
+                j--;
                 res->tested++;
                 if (prime_test(pr[j])) {
-                    uint64_t gap = pr[j] - start_nAdd;
+                    start_nAdd = pr[j];
+                    scan_from = j;
+                    res->primes_found++;
+                    res->last_prime = pr[j];
+                    found = 1;
+                    break;
+                }
+            }
+
+            if (!found) {
+                /* Need the next prime right of target_pos only when no
+                   backward-side prime exists (to finalize a real gap). */
+                size_t j_next = j_gate;
+                if (j_next < bhi)
+                    j_next = bhi;
+
+                while (j_next < hi) {
+                    res->tested++;
+                    if (prime_test(pr[j_next])) {
+                        upper_idx = j_next;
+                        break;
+                    }
+                    j_next++;
+                }
+
+                if (upper_idx >= hi) {
+                    /* Tail safety: even without an upper prime beyond target_pos,
+                       there may still be a prime in (scan_from, target_pos].
+                       We must scan this interval before stopping so carry_last_prime
+                       remains correct across window boundaries. */
+                    int found_tail = 0;
+                    for (size_t j = bhi; j > scan_from + 1; ) {
+                        j--;
+                        res->tested++;
+                        if (prime_test(pr[j])) {
+                            start_nAdd = pr[j];
+                            scan_from = j;
+                            res->primes_found++;
+                            res->last_prime = pr[j];
+                            found_tail = 1;
+                            break;
+                        }
+                    }
+                    if (found_tail)
+                        continue;
+                    break;
+                }
+
+                {
+                    uint64_t gap = pr[upper_idx] - start_nAdd;
                     double merit = (double)gap / logbase;
 
                     if (merit > res->best_merit) {
                         res->best_merit = merit;
-                        res->best_gap   = gap;
+                        res->best_gap = gap;
                     }
 
                     if (merit >= target && res->qual_cnt < 64) {
                         res->qual_pairs[res->qual_cnt][0] = start_nAdd;
-                        res->qual_pairs[res->qual_cnt][1] = pr[j];
+                        res->qual_pairs[res->qual_cnt][1] = pr[upper_idx];
                         res->qual_cnt++;
                     }
+                }
 
+                start_nAdd = pr[upper_idx];
+                scan_from = upper_idx;
+                res->primes_found++;
+                res->last_prime = pr[upper_idx];
+            }
+        } else {
+            /* Original full two-sided scan behavior. */
+            int found = 0;
+            for (size_t j = bhi; j > scan_from + 1; ) {
+                j--;
+                res->tested++;
+                if (prime_test(pr[j])) {
                     start_nAdd = pr[j];
                     scan_from  = j;
                     res->primes_found++;
                     res->last_prime = pr[j];
-                    have_next = 1;
+                    found = 1;
                     break;
                 }
             }
-            if (!have_next) break; /* end of segment */
+
+            if (!found) {
+                int have_next = 0;
+                for (size_t j = bhi; j < hi; j++) {
+                    res->tested++;
+                    if (prime_test(pr[j])) {
+                        uint64_t gap = pr[j] - start_nAdd;
+                        double merit = (double)gap / logbase;
+
+                        if (merit > res->best_merit) {
+                            res->best_merit = merit;
+                            res->best_gap   = gap;
+                        }
+
+                        if (merit >= target && res->qual_cnt < 64) {
+                            res->qual_pairs[res->qual_cnt][0] = start_nAdd;
+                            res->qual_pairs[res->qual_cnt][1] = pr[j];
+                            res->qual_cnt++;
+                        }
+
+                        start_nAdd = pr[j];
+                        scan_from  = j;
+                        res->primes_found++;
+                        res->last_prime = pr[j];
+                        have_next = 1;
+                        break;
+                    }
+                }
+                if (!have_next) break; /* end of segment */
+            }
         }
     }
 }

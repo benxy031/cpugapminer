@@ -14,6 +14,9 @@ struct bkscan_result {
     uint64_t best_gap;           /* best verified gap size                   */
     uint64_t first_prime;        /* first prime found in segment (0=none)    */
     uint64_t last_prime;         /* last prime found in segment  (0=none)    */
+    size_t   one_sided_considered; /* intervals evaluated by one-sided gate   */
+    size_t   one_sided_skipped;    /* intervals skipped (give-up/go-next)     */
+    size_t   one_sided_fullcheck;  /* intervals that kept full two-sided scan */
     uint64_t qual_pairs[64][2];  /* [start_nAdd, end_nAdd] qualifying pairs  */
     size_t   qual_cnt;           /* number of qualifying gaps found          */
 };
@@ -21,7 +24,8 @@ struct bkscan_result {
 /* Standalone backward-scan on a segment of pr[lo..hi-1].
  * Caller provides prime_test callback and merges results into global stats. */
 void backward_scan_segment(const uint64_t *pr, size_t lo, size_t hi,
-                           size_t needed_gap, double logbase, double target,
+                           size_t needed_gap, size_t one_sided_min_gap,
+                           double logbase, double target,
                            gap_prime_test_fn prime_test,
                            struct bkscan_result *res);
 
