@@ -170,6 +170,12 @@ static _Atomic uint64_t gmp_timing_total_ns = 0;
 /* gap_verify tiny prefilter stats: how often it was checked and rejected. */
 static _Atomic uint64_t gap_verify_pf_checks = 0;
 static _Atomic uint64_t gap_verify_pf_hits = 0;
+/* GPU smart-scan telemetry (worker path only), log-file reporting only. */
+static volatile uint64_t stats_gpu_smart_regions_total = 0;
+static volatile uint64_t stats_gpu_smart_regions_pruned = 0;
+static volatile uint64_t stats_gpu_smart_verify_candidates = 0;
+static volatile uint64_t stats_gpu_smart_verified_primes = 0;
+static volatile uint64_t stats_gpu_smart_scanned_region_pairs = 0;
 
 /* Runtime toggle for gap_verify tiny prefilter.
    CPUGAP_GAP_VERIFY_PREFILTER=0 disables it for A/B diagnostics. */
@@ -755,6 +761,8 @@ static volatile uint64_t g_partial_seed_limit = 0;
 static volatile int use_extra_verbose = 0;
 /* if nonzero, print detailed CRT phase telemetry in periodic STATS output. */
 static volatile int use_stats_verbose = 0;
+/* if nonzero, write GPU smart-scan region telemetry to log file only. */
+static volatile int use_gpu_smart_telemetry = 0;
 /* if nonzero, adapt CRT producer/consumer split between passes. */
 static volatile int use_crt_auto_split = 0;
 /* if nonzero, allow CRT fermat consumers to use GPU accumulator (experimental). */
@@ -922,8 +930,6 @@ static inline int crt_precision_rounds_effective(void) {
     runtime value after applying defaults and mode-specific safety rules.
     It is kept for stats/log display alongside the submit threshold. */
 static volatile double g_scan_target_runtime = 20.0;
-/* One-time warning guard for CPU smart-scan stride clamping. */
-static volatile int g_warn_scan_merit_cpu_clamped = 0;
 
 #define ONE_SIDED_SKIP_MERIT_DEFAULT 4.0
 /* One-sided skip (give-up/go-next): in non-CRT CPU backward-scan mode,
@@ -1867,27 +1873,7 @@ static double ndiff_to_merit(uint64_t ndiff) {
 }
 
 static double resolve_scan_target(double submit_target, double scan_target_cfg) {
-    double scan_target = (scan_target_cfg > 0.0) ? scan_target_cfg : submit_target;
-
-    if (scan_target > submit_target) {
-    /* Clamp only when CPU smart-scan is active (non-CRT, sample stride > 1).
-       With sample-stride=1, smart-scan is disabled and scan-merit is inert. */
-    int clamp_for_cpu = (g_crt_mode == CRT_MODE_NONE && cli_sample_stride > 1);
-#ifdef WITH_GPU_FERMAT
-    if (clamp_for_cpu)
-        clamp_for_cpu = (g_gpu_count == 0);
-#endif
-        if (clamp_for_cpu) {
-            if (__sync_bool_compare_and_swap(&g_warn_scan_merit_cpu_clamped, 0, 1)) {
-                log_msg("scan-merit %.2f > submit target %.2f on CPU smart-scan; "
-                        "clamping scan threshold to submit target\n",
-                        scan_target, submit_target);
-            }
-            scan_target = submit_target;
-        }
-    }
-
-    return scan_target;
+    return (scan_target_cfg > 0.0) ? scan_target_cfg : submit_target;
 }
 
 /* Keep runtime submit threshold in sync with pass difficulty unless user
@@ -7819,6 +7805,13 @@ static void *worker_fn(void *arg) {
                             cli_rgm_cal_min   /* cal_min_samples                      */
                         );
                     }
+                    size_t regions_pruned = 0;
+                    if (gpu_reg_alive) {
+                        for (size_t r = 0; r < n_gap_regions; r++) {
+                            if (!gpu_reg_alive[r])
+                                regions_pruned++;
+                        }
+                    }
                     /* Collect verification candidates from surviving regions */
                     size_t v_alloc = cnt > 0 ? cnt : 1;
                     uint64_t *verify = (uint64_t *)malloc(v_alloc * sizeof(uint64_t));
@@ -7890,6 +7883,38 @@ static void *worker_fn(void *arg) {
                                 __sync_fetch_and_add(&stats_pairs,
                                                      (uint64_t)(est_full - 1 - region_pairs));
                         }
+
+                        if (use_gpu_smart_telemetry) {
+                            uint64_t total_regions =
+                                __sync_add_and_fetch(&stats_gpu_smart_regions_total,
+                                                     (uint64_t)n_gap_regions);
+                            uint64_t total_pruned =
+                                __sync_add_and_fetch(&stats_gpu_smart_regions_pruned,
+                                                     (uint64_t)regions_pruned);
+                            uint64_t total_verify_cands =
+                                __sync_add_and_fetch(&stats_gpu_smart_verify_candidates,
+                                                     (uint64_t)v_cnt);
+                            uint64_t total_verified_primes =
+                                __sync_add_and_fetch(&stats_gpu_smart_verified_primes,
+                                                     (uint64_t)pf);
+                            uint64_t total_region_pairs =
+                                __sync_add_and_fetch(&stats_gpu_smart_scanned_region_pairs,
+                                                     (uint64_t)region_pairs);
+
+                            log_file_only(
+                                "[gpu-smart-telemetry] regions_total=%llu regions_pruned=%llu verify_candidates=%llu verified_primes=%llu scanned_region_pairs=%llu totals: regions_total=%llu regions_pruned=%llu verify_candidates=%llu verified_primes=%llu scanned_region_pairs=%llu\n",
+                                (unsigned long long)n_gap_regions,
+                                (unsigned long long)regions_pruned,
+                                (unsigned long long)v_cnt,
+                                (unsigned long long)pf,
+                                (unsigned long long)region_pairs,
+                                (unsigned long long)total_regions,
+                                (unsigned long long)total_pruned,
+                                (unsigned long long)total_verify_cands,
+                                (unsigned long long)total_verified_primes,
+                                (unsigned long long)total_region_pairs);
+                        }
+
                         free(gap_reg_lo);
                         free(gap_reg_hi);
                         free(gpu_reg_alive);
@@ -8327,7 +8352,6 @@ int main(int argc, char **argv) {
         printf("      --scan-merit M    scan threshold for non-CRT CPU smart-scan stride.\n");
         printf("                        submit threshold remains --target (or network merit).\n");
         printf("                        M<=0 (or omitted) follows submit threshold automatically.\n");
-        printf("                        CPU-only runs clamp scan threshold to submit threshold.\n");
         printf("                        ignored in CRT mode and non-beneficial on CUDA/OpenCL paths.\n");
         printf("      --threads N       worker threads        (default: 1)\n");
         printf("      --adder-max M     adder upper bound     (default: 2^shift)\n");
@@ -8349,6 +8373,8 @@ int main(int argc, char **argv) {
         printf("      --wheel-sieve N      use wheel presieve backend (0 disables; 30, 210, 2310, 30030, 510510, or 9699690)\n");
         printf("  -e, --extra-verbose  write live merit events + partial-sieve-auto details to log file\n");
         printf("      --stats-verbose  include detailed CRT phase telemetry in STATS output\n");
+        printf("      --gpu-smart-telemetry  write GPU smart-scan coverage telemetry to log file\n");
+        printf("      --no-gpu-smart-telemetry  disable GPU smart-scan coverage telemetry\n");
         printf("      --sample-stride K smart scan: test every Kth survivor (default: 8, 1=off)\n");
          printf("      --one-sided-skip   non-CRT CPU bkscan: skip second-side scan unless first-side gap is large\n");
          printf("      --one-sided-skip-merit M  first-side gate merit for --one-sided-skip\n");
@@ -8514,6 +8540,8 @@ int main(int argc, char **argv) {
             use_wheel_sieve = 1;
         }
         else if (!strcmp(argv[i],"-e") || !strcmp(argv[i],"--extra-verbose")) use_extra_verbose = 1;
+        else if (!strcmp(argv[i],"--gpu-smart-telemetry")) use_gpu_smart_telemetry = 1;
+        else if (!strcmp(argv[i],"--no-gpu-smart-telemetry")) use_gpu_smart_telemetry = 0;
         else if (!strcmp(argv[i],"--stats-verbose")) use_stats_verbose = 1;
         else if (!strcmp(argv[i],"--crt-auto-split")) use_crt_auto_split = 1;
         else if (!strcmp(argv[i],"--crt-gpu-consumer")) use_crt_gpu_consumer = 1;
