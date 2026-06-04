@@ -1,4 +1,9 @@
 /*
+ * Copyright (C) 2026  cpugapminer contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+/*
  * gen_crt_exhaust.c  –  Exhaustive / random-restart CRT offset finder
  *
  * Ported and adapted from primeinterval.cpp (original author unknown).

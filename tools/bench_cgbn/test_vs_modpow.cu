@@ -1,4 +1,9 @@
 /*
+ * Copyright (C) 2026  cpugapminer contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+/*
  * test_vs_modpow.cu – verify that add+cond_sub doubling gives the same
  * Fermat pass count as cgbn_modular_power on 200k random 768-bit candidates.
  *

@@ -1,6 +1,13 @@
+/*
+ * Copyright (C) 2026  cpugapminer contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
 #include "primality_utils.h"
 
 #include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <x86intrin.h>
@@ -998,6 +1005,9 @@ static int fermat_u64_exact(uint64_t n)
  */
 #define FERMAT_WIN  4                  /* window width in bits   */
 #define FERMAT_WINSZ (1 << FERMAT_WIN) /* 16 entries: powers 1..15 */
+#define FERMAT_WIN_MIN 3
+#define FERMAT_WIN_MAX 5
+#define FERMAT_WINSZ_MAX (1 << FERMAT_WIN_MAX)
 
 /* Helper: extract 4-bit chunk starting at bit position `bit` in e[],
  * scanning from top limb downward.  Returns value 0..15. */
@@ -1010,6 +1020,233 @@ static inline uint32_t cpu_get_bits4(const uint64_t *e, int bit) {
     if (off > 60 && limb + 1 < FERMAT_CPU_MAX_LIMBS)
         w |= (uint32_t)(e[limb + 1] << (64 - off)) & 0xF;
     return w;
+}
+
+/* Forward declaration used by adaptive Euler dyn-window helper. */
+static inline int euler_u64(uint64_t n);
+
+/* Generic little-endian bit extraction for runtime-selected window sizes. */
+static inline uint32_t cpu_get_bits_w(const uint64_t *e, int bit_lo,
+                                      int win_bits, int nlimbs) {
+    uint32_t w = 0;
+    for (int k = 0; k < win_bits; k++) {
+        int b = bit_lo + k;
+        int limb = b >> 6;
+        if (limb >= nlimbs) break;
+        w |= (uint32_t)(((e[limb] >> (b & 63)) & 1u) << k);
+    }
+    return w;
+}
+
+/* Temporary runtime controls for adaptive CPU window selection:
+ *   CPUGAP_CPU_WINDOW_OVERRIDE=3|4|5  -> force fixed window size
+ *   CPUGAP_CPU_WINDOW_LOG=1           -> log selected window once per nlimbs */
+static int g_cpu_window_cfg_checked = 0;
+static int g_cpu_window_override = 0; /* 0=auto, else 3..5 */
+static int g_cpu_window_log = 0;
+static unsigned int g_cpu_window_logged_mask = 0;
+
+static inline void cpu_window_cfg_init_once(void) {
+    if (g_cpu_window_cfg_checked)
+        return;
+
+    const char *ov = getenv("CPUGAP_CPU_WINDOW_OVERRIDE");
+    if (ov && *ov) {
+        int v = atoi(ov);
+        if (v >= FERMAT_WIN_MIN && v <= FERMAT_WIN_MAX)
+            g_cpu_window_override = v;
+    }
+
+    const char *lg = getenv("CPUGAP_CPU_WINDOW_LOG");
+    if (lg && *lg && strcmp(lg, "0") != 0)
+        g_cpu_window_log = 1;
+
+    g_cpu_window_cfg_checked = 1;
+}
+
+/* Adaptive CPU window policy by active limb count.
+ * Small NL: lower precompute pressure; large NL: fewer multiplies per bit. */
+static inline int cpu_window_bits_for_nlimbs(int nlimbs) {
+    cpu_window_cfg_init_once();
+
+    int w;
+    if (g_cpu_window_override >= FERMAT_WIN_MIN &&
+        g_cpu_window_override <= FERMAT_WIN_MAX) {
+        w = g_cpu_window_override;
+    } else {
+        if (nlimbs <= 4) w = 3;
+        else if (nlimbs <= 12) w = 4;
+        else w = 5;
+    }
+
+    if (g_cpu_window_log && nlimbs > 0 && nlimbs <= 31) {
+        unsigned int bit = 1u << (unsigned int)nlimbs;
+        if ((g_cpu_window_logged_mask & bit) == 0u) {
+            g_cpu_window_logged_mask |= bit;
+            fprintf(stderr,
+                    "[cpu-window] nlimbs=%d -> win=%d (%s)\n",
+                    nlimbs, w,
+                    (g_cpu_window_override ? "override" : "auto"));
+            fflush(stderr);
+        }
+    }
+
+    return w;
+}
+
+static int fermat_test_cpu_nlimbs_dynwin(const uint64_t *n, int nlimbs, int win_bits)
+{
+    if (nlimbs <= 0 || nlimbs > FERMAT_CPU_MAX_LIMBS) return 0;
+    if (nlimbs == 1) return fermat_u64_exact(n[0]);
+    if ((n[0] & 1) == 0) return 0;
+    if (win_bits < FERMAT_WIN_MIN || win_bits > FERMAT_WIN_MAX)
+        win_bits = FERMAT_WIN;
+
+    uint64_t ninv = mont_ninv(n[0]);
+    uint64_t one_m[FERMAT_CPU_MAX_LIMBS];
+    uint64_t base_m[FERMAT_CPU_MAX_LIMBS];
+    uint64_t base2_m[FERMAT_CPU_MAX_LIMBS];
+    uint64_t res[FERMAT_CPU_MAX_LIMBS];
+    uint64_t e[FERMAT_CPU_MAX_LIMBS];
+    uint64_t one[FERMAT_CPU_MAX_LIMBS];
+    uint64_t win[FERMAT_WINSZ_MAX / 2][FERMAT_CPU_MAX_LIMBS];
+
+    int win_odd_count = 1 << (win_bits - 1);
+
+    cpu_rmodn_n(one_m, n, nlimbs);
+    memcpy(base_m, one_m, (size_t)nlimbs * sizeof(uint64_t));
+    cpu_moddbl_n(base_m, n, nlimbs);
+
+    memcpy(win[0], base_m, (size_t)nlimbs * sizeof(uint64_t));
+    MONTSQR_EXACT_DISPATCH(base2_m, base_m, base_m, n, ninv, nlimbs);
+    for (int i = 1; i < win_odd_count; i++)
+        MONTMUL_EXACT_DISPATCH(win[i], win[i - 1], base2_m, n, ninv, nlimbs);
+
+    memcpy(e, n, (size_t)nlimbs * sizeof(uint64_t));
+    e[0] -= 1;
+
+    int top = nlimbs - 1;
+    while (top > 0 && e[top] == 0) top--;
+    int msb = top * 64 + 63 - __builtin_clzll(e[top]);
+
+    memcpy(res, base_m, (size_t)nlimbs * sizeof(uint64_t));
+    int bit = msb - 1;
+    while (bit >= 0) {
+        if (bit < win_bits - 1) {
+            MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, nlimbs);
+            if ((e[bit >> 6] >> (bit & 63)) & 1u)
+                MONTMUL_EXACT_DISPATCH(res, res, base_m, n, ninv, nlimbs);
+            bit--;
+        } else {
+            uint32_t w = cpu_get_bits_w(e, bit - (win_bits - 1), win_bits, nlimbs);
+            if (w == 0) {
+                for (int i = 0; i < win_bits; i++)
+                    MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, nlimbs);
+                bit -= win_bits;
+            } else {
+                int z = __builtin_ctz(w);
+                int sq = win_bits - z;
+                for (int i = 0; i < sq; i++)
+                    MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, nlimbs);
+                MONTMUL_EXACT_DISPATCH(res, res, win[(w >> z) >> 1], n, ninv, nlimbs);
+                for (int i = 0; i < z; i++)
+                    MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, nlimbs);
+                bit -= win_bits;
+            }
+        }
+    }
+
+    memset(one, 0, (size_t)nlimbs * sizeof(uint64_t));
+    one[0] = 1;
+    MONTMUL_EXACT_DISPATCH(res, res, one, n, ninv, nlimbs);
+    if (res[0] != 1) return 0;
+    for (int i = 1; i < nlimbs; i++) if (res[i] != 0) return 0;
+    return 1;
+}
+
+static int euler_test_cpu_nlimbs_dynwin(const uint64_t *n, int nlimbs, int win_bits)
+{
+    if (nlimbs <= 0 || nlimbs > FERMAT_CPU_MAX_LIMBS) return 0;
+    if (nlimbs == 1) return euler_u64(n[0]);
+    if ((n[0] & 1) == 0) return 0;
+    if (win_bits < FERMAT_WIN_MIN || win_bits > FERMAT_WIN_MAX)
+        win_bits = FERMAT_WIN;
+
+    uint64_t ninv = mont_ninv(n[0]);
+    uint64_t one_m[FERMAT_CPU_MAX_LIMBS];
+    uint64_t base_m[FERMAT_CPU_MAX_LIMBS];
+    uint64_t base2_m[FERMAT_CPU_MAX_LIMBS];
+    uint64_t res[FERMAT_CPU_MAX_LIMBS];
+    uint64_t e[FERMAT_CPU_MAX_LIMBS];
+    uint64_t one[FERMAT_CPU_MAX_LIMBS];
+    uint64_t nm1[FERMAT_CPU_MAX_LIMBS];
+    uint64_t one_std[FERMAT_CPU_MAX_LIMBS];
+    uint64_t win[FERMAT_WINSZ_MAX / 2][FERMAT_CPU_MAX_LIMBS];
+
+    int win_odd_count = 1 << (win_bits - 1);
+
+    cpu_rmodn_n(one_m, n, nlimbs);
+    memcpy(base_m, one_m, (size_t)nlimbs * sizeof(uint64_t));
+    cpu_moddbl_n(base_m, n, nlimbs);
+
+    memcpy(win[0], base_m, (size_t)nlimbs * sizeof(uint64_t));
+    MONTSQR_EXACT_DISPATCH(base2_m, base_m, base_m, n, ninv, nlimbs);
+    for (int i = 1; i < win_odd_count; i++)
+        MONTMUL_EXACT_DISPATCH(win[i], win[i - 1], base2_m, n, ninv, nlimbs);
+
+    memcpy(e, n, (size_t)nlimbs * sizeof(uint64_t));
+    e[0] -= 1;
+    for (int i = 0; i < nlimbs - 1; i++)
+        e[i] = (e[i] >> 1) | (e[i + 1] << 63);
+    e[nlimbs - 1] >>= 1;
+
+    int top = nlimbs - 1;
+    while (top > 0 && e[top] == 0) top--;
+    int msb = top * 64 + 63 - __builtin_clzll(e[top]);
+
+    memcpy(res, base_m, (size_t)nlimbs * sizeof(uint64_t));
+    int bit = msb - 1;
+    while (bit >= 0) {
+        if (bit < win_bits - 1) {
+            MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, nlimbs);
+            if ((e[bit >> 6] >> (bit & 63)) & 1u)
+                MONTMUL_EXACT_DISPATCH(res, res, base_m, n, ninv, nlimbs);
+            bit--;
+        } else {
+            uint32_t w = cpu_get_bits_w(e, bit - (win_bits - 1), win_bits, nlimbs);
+            if (w == 0) {
+                for (int i = 0; i < win_bits; i++)
+                    MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, nlimbs);
+                bit -= win_bits;
+            } else {
+                int z = __builtin_ctz(w);
+                int sq = win_bits - z;
+                for (int i = 0; i < sq; i++)
+                    MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, nlimbs);
+                MONTMUL_EXACT_DISPATCH(res, res, win[(w >> z) >> 1], n, ninv, nlimbs);
+                for (int i = 0; i < z; i++)
+                    MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, nlimbs);
+                bit -= win_bits;
+            }
+        }
+    }
+
+    memset(one, 0, (size_t)nlimbs * sizeof(uint64_t));
+    one[0] = 1;
+    MONTMUL_EXACT_DISPATCH(res, res, one, n, ninv, nlimbs);
+
+    if (res[0] == 1) {
+        int ok = 1;
+        for (int i = 1; i < nlimbs; i++) if (res[i] != 0) { ok = 0; break; }
+        if (ok) return 1;
+    }
+
+    memset(one_std, 0, (size_t)nlimbs * sizeof(uint64_t));
+    one_std[0] = 1;
+    cpu_sub_n(nm1, n, one_std, nlimbs);
+    for (int i = 0; i < nlimbs; i++)
+        if (res[i] != nm1[i]) return 0;
+    return 1;
 }
 
 #define DECL_FERMAT_CORE_BUCKET(FN, MONTFN, SQRFN) \
@@ -1185,8 +1422,16 @@ DECL_FERMAT_EXACT(20)
 
 int fermat_test_cpu_nlimbs(const uint64_t *n, int nlimbs)
 {
+    if (nlimbs <= 0 || nlimbs > FERMAT_CPU_MAX_LIMBS)
+        return 0;
+    if (nlimbs == 1)
+        return fermat_u64_exact(n[0]);
+
+    int win_bits = cpu_window_bits_for_nlimbs(nlimbs);
+    if (win_bits != FERMAT_WIN)
+        return fermat_test_cpu_nlimbs_dynwin(n, nlimbs, win_bits);
+
     switch (nlimbs) {
-    case 1:  return fermat_u64_exact(n[0]);
     case 2:  return fermat_test_cpu_nlimbs_2(n);
     case 3:  return fermat_test_cpu_nlimbs_3(n);
     case 4:  return fermat_test_cpu_nlimbs_4(n);
@@ -1429,8 +1674,16 @@ DECL_EULER_EXACT(20)
 
 int euler_test_cpu_nlimbs(const uint64_t *n, int nlimbs)
 {
+    if (nlimbs <= 0 || nlimbs > FERMAT_CPU_MAX_LIMBS)
+        return 0;
+    if (nlimbs == 1)
+        return euler_u64(n[0]);
+
+    int win_bits = cpu_window_bits_for_nlimbs(nlimbs);
+    if (win_bits != FERMAT_WIN)
+        return euler_test_cpu_nlimbs_dynwin(n, nlimbs, win_bits);
+
     switch (nlimbs) {
-    case 1:  return euler_u64(n[0]);
     case 2:  return euler_test_cpu_nlimbs_2(n);
     case 3:  return euler_test_cpu_nlimbs_3(n);
     case 4:  return euler_test_cpu_nlimbs_4(n);

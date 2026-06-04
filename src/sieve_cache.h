@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026  cpugapminer contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
 #ifndef SIEVE_CACHE_H
 #define SIEVE_CACHE_H
 

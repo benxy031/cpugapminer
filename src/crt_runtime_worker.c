@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026  cpugapminer contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
 #include "crt_runtime_worker.h"
 #include "crt_runtime_cpu.h"
 

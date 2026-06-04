@@ -126,6 +126,43 @@ Target merit = 20.7 (safe floor for current network).
 > The kernel is compiled with `NL = 16` (1 024-bit capacity).  
 > Shifts > 768 exceed this limit and fall back to CPU Fermat automatically.
 
+## CGBN Shift Support Table
+
+`WITH_CGBN_FERMAT=1` does not mean every shift uses the CGBN kernel.
+Runtime uses CGBN only when `active_limbs = ceil((256 + shift)/64)` is one of:
+
+- `AL = 2, 4, 6, 8, 12, 16, 20`
+
+All other `AL` values (1,3,5,7,9,10,11,13,14,15,17,18,19,...) fall back to the
+scalar CUDA Fermat kernel.
+
+The table below shows practical shift ranges (`shift >= 1`) that actually run on CGBN.
+
+| Build (`GPU_BITS`) | `NL` | CGBN shift ranges |
+|--------------------|-----:|-------------------|
+| `512`              |    8 | `65-128` (AL=6), `193-256` (AL=8) |
+| `768`              |   12 | `65-128` (AL=6), `193-256` (AL=8), `449-512` (AL=12) |
+| `1024`             |   16 | `65-128` (AL=6), `193-256` (AL=8), `449-512` (AL=12), `705-768` (AL=16) |
+| `1280`             |   20 | `65-128` (AL=6), `193-256` (AL=8), `449-512` (AL=12), `705-768` (AL=16), `961-1024` (AL=20) |
+
+Notes:
+
+- Common shifts: `64` is scalar (AL=5), `68` is CGBN (AL=6), `512` is CGBN (AL=12), `768` is CGBN only if `GPU_BITS >= 1024`.
+- If a candidate needs more limbs than compiled `NL`, GPU path cannot represent it and falls back to CPU primality checks.
+
+## Upstream GapMiner Metric Mapping
+
+The original GapMiner status line prints `gaps/s`, `tests/s`, and `pps`, but those labels do not line up cleanly with our miner's CRT counters.
+
+| Upstream GapMiner | Meaning | Closest cpugapminer CRT stat |
+|-------------------|---------|-------------------------------|
+| `gaps/s` | Gap candidates processed by the sieve / Fermat pipeline | `gaps` / gap-event rate |
+| `tests/s` | Fermat tests performed on candidates | `tested/s` |
+| `pps` | Pairs-per-second style throughput inside the sieve pipeline | `pairs/s` |
+| accepted share output | Submitted work that passed validation | `accepted` |
+
+In other words, upstream `gaps/s` is a runtime mining throughput metric, not an accepted-share metric. For CRT-path comparisons in this codebase, the useful trio is `gaps`, `tested/s`, and `accepted`, with `est_model` vs `est_observed` kept separate to avoid confusing the predicted rate with the measured one.
+
 **Quick rule:** `safe_stride = floor(target_merit / 2)` prevents false negatives.  
 **Optimal throughput** in practice: `floor(target_merit / 4)` to `floor(target_merit / 3)`.  
 For target 20.7–21.5 the safe maximum is **10** but benchmark optimum is **5–7**.

@@ -1,4 +1,9 @@
 /*
+ * Copyright (C) 2026  cpugapminer contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+/*
  * test_dbl.cu – minimal test for CGBN add+cond_sub doubling correctness.
  *
  * Runs with exactly 1 CGBN group (8 threads, TPI=8) on 1 instance.

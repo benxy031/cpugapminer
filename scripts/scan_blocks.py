@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026  cpugapminer contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """
 scan_blocks.py — Čita blokove iz Gapcoin walleta/čvora putem RPC-a
 i ispisuje: height, shift, merit, gaplen, nonce, difficulty, adder, gapstart

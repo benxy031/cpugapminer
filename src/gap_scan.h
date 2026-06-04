@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026  cpugapminer contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
 #ifndef GAP_SCAN_H
 #define GAP_SCAN_H
 

@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026  cpugapminer contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
 #ifndef CRT_HEAP_H
 #define CRT_HEAP_H
 

@@ -1,4 +1,9 @@
 /*
+ * Copyright (C) 2026  cpugapminer contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+/*
  * mpresieve_avx512.h — AVX-512BW inner loops for the multi-table pre-sieve.
  *
  * Provides two functions called from mpresieve_tile() in main.c:

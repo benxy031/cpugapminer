@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026  cpugapminer contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
 #include "gap_scan.h"
 
 void backward_scan_segment(const uint64_t *pr, size_t lo, size_t hi,

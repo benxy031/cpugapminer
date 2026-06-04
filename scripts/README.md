@@ -202,3 +202,43 @@ by `--target` or the live network difficulty.
 | Record hunting + normal submissions | non-CRT | `--scan-merit 30` — jumps far for records, still submits all network-qualifying gaps |
 | Record hunting at large shifts (best option) | CRT | `--crt-merit 38` in `gen_crt`; no `--target` at runtime |
 | Submit all gaps (network + records) | CRT | CRT submits every found gap; node accepts what meets current difficulty |
+
+---
+
+## End-to-end A/B benchmark vs original GapMiner
+
+Use `scripts/bench_end_to_end_vs_original.sh` to run a fair, repeatable
+comparison between cpugapminer and upstream GapMiner.
+
+The script runs each miner twice:
+
+1. warmup run (discarded), then
+2. measured run (parsed)
+
+It extracts and averages these metrics from status lines (when present):
+
+- `pps`
+- `tests/s`
+- `gaps/s`
+
+### Quick example
+
+```bash
+./scripts/bench_end_to_end_vs_original.sh \
+   --cpugap-bin ./bin/gap_miner \
+   --original-bin /opt/GapMiner/gapminer \
+   --cpugap-args "--host 127.0.0.1 --port 4068 --user bench --pass x --shift 64 --threads 8" \
+   --original-args "--host 127.0.0.1 --port 4068 --user bench --pass x --shift 64 --threads 8" \
+   --warmup-sec 20 \
+   --measure-sec 120
+```
+
+Logs and a text summary are written under `/tmp/gap_ab/run_YYYYmmdd_HHMMSS/` by
+default (`--out-dir` to override).
+
+### Fairness checklist
+
+- Use the same node/pool, credentials, and shift.
+- Match threads and sieve-related options as closely as each miner allows.
+- Keep thermal/power state stable (no competing workloads).
+- Run multiple passes and compare median ratios, not just one run.

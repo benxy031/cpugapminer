@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026  cpugapminer contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
 /* gpu_fermat_opencl.c -- OpenCL backend for batch Fermat testing.
  *
  * This backend mirrors the gpu_fermat API used by CUDA path:

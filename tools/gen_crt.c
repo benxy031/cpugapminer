@@ -1,4 +1,9 @@
 /*
+ * Copyright (C) 2026  cpugapminer contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+/*
  * gen_crt.c  –  CRT (Chinese Remainder Theorem) gap solver for Gapcoin mining
  *
  * Two-phase algorithm compatible with GapMiner --calc-ctr parameters:

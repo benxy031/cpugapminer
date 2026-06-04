@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026  cpugapminer contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """
 find_records.py — Fetch the prime gap record list and show which gaps are
 beatable by cpugapminer at each shift.

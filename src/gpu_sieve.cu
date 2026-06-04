@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026  cpugapminer contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
 /* gpu_sieve.cu — GPU-accelerated presieve (batch composite marking)
  *
  * Experimental GPU sieve for the Phase-2 large-prime path.

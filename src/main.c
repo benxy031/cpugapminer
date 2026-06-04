@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026  cpugapminer contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
 #ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
 #endif
@@ -132,6 +137,39 @@ static uint64_t now_ms(void) {
     clock_gettime(CLOCK_REALTIME, &ts);
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
+
+static inline uint64_t now_ns_mono(void) {
+    struct timespec ts;
+#ifdef CLOCK_MONOTONIC_RAW
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* Temporary GMP path timing, enabled with CPUGAP_GMP_TIMING=1.
+ * Measures where the ordinary Fermat/Euler GMP path spends time. */
+static int gmp_timing_enabled(void)
+{
+    static int cached = -1;
+    if (cached >= 0)
+        return cached;
+
+    const char *env = getenv("CPUGAP_GMP_TIMING");
+    cached = (env && *env && strcmp(env, "0") != 0) ? 1 : 0;
+    return cached;
+}
+
+static _Atomic uint64_t gmp_timing_calls = 0;
+static _Atomic uint64_t gmp_timing_td_ns = 0;
+static _Atomic uint64_t gmp_timing_cand_ns = 0;
+static _Atomic uint64_t gmp_timing_powm_ns = 0;
+static _Atomic uint64_t gmp_timing_mr_ns = 0;
+static _Atomic uint64_t gmp_timing_total_ns = 0;
+/* gap_verify tiny prefilter stats: how often it was checked and rejected. */
+static _Atomic uint64_t gap_verify_pf_checks = 0;
+static _Atomic uint64_t gap_verify_pf_hits = 0;
 
 /* Mertens-style estimate for the fraction of integers that survive
    sieving by all primes up to `limit`.  This is a cheap live proxy for
@@ -1987,6 +2025,32 @@ static void print_stats(void) {
             (unsigned long long)stats_last_gap,
             (unsigned long long)stats_last_qual_gap);
 
+    if (gmp_timing_enabled()) {
+        uint64_t calls = atomic_load_explicit(&gmp_timing_calls, memory_order_relaxed);
+        uint64_t total_ns = atomic_load_explicit(&gmp_timing_total_ns, memory_order_relaxed);
+        if (calls > 0 && total_ns > 0) {
+            uint64_t td_ns = atomic_load_explicit(&gmp_timing_td_ns, memory_order_relaxed);
+            uint64_t cand_ns = atomic_load_explicit(&gmp_timing_cand_ns, memory_order_relaxed);
+            uint64_t powm_ns = atomic_load_explicit(&gmp_timing_powm_ns, memory_order_relaxed);
+            uint64_t mr_ns = atomic_load_explicit(&gmp_timing_mr_ns, memory_order_relaxed);
+            uint64_t other_ns = total_ns;
+            if (td_ns < other_ns) other_ns -= td_ns; else other_ns = 0;
+            if (cand_ns < other_ns) other_ns -= cand_ns; else other_ns = 0;
+            if (powm_ns < other_ns) other_ns -= powm_ns; else other_ns = 0;
+            if (mr_ns < other_ns) other_ns -= mr_ns; else other_ns = 0;
+            double avg_us = (double)total_ns / (double)calls / 1000.0;
+            double pct = 100.0 / (double)total_ns;
+            log_msg("  gmp_timing: calls=%llu avg=%.2fus  td=%.1f%% cand=%.1f%% powm=%.1f%% mr=%.1f%% other=%.1f%%",
+                    (unsigned long long)calls,
+                    avg_us,
+                    (double)td_ns * pct,
+                    (double)cand_ns * pct,
+                    (double)powm_ns * pct,
+                    (double)mr_ns * pct,
+                    (double)other_ns * pct);
+        }
+    }
+
     if (g_crt_mode == CRT_MODE_NONE && use_stats_verbose) {
         uint64_t lp = stats_noncrt_lane_pairs_total;
         uint64_t lq = stats_noncrt_lane_qual_total;
@@ -2285,6 +2349,17 @@ static void print_stats(void) {
     log_msg("  cpu: surv/Msieved=%.1f  pairs/Msieved=%.1f  false_gaps=%llu (%.2f%%)",
             surv_per_million, pairs_per_million,
             (unsigned long long)stats_false_gaps, false_gap_pct);
+    {
+        uint64_t pf_checks = atomic_load_explicit(&gap_verify_pf_checks, memory_order_relaxed);
+        uint64_t pf_hits = atomic_load_explicit(&gap_verify_pf_hits, memory_order_relaxed);
+        double pf_hit_pct = (pf_checks > 0)
+            ? (100.0 * (double)pf_hits / (double)pf_checks)
+            : 0.0;
+        log_msg("  gap_verify_prefilter: checks=%llu hits=%llu (%.2f%%)",
+                (unsigned long long)pf_checks,
+                (unsigned long long)pf_hits,
+                pf_hit_pct);
+    }
     if (use_partial_sieve_auto)
         log_msg("  partial_auto=on windows=%llu activations=%llu adjusts=%llu limit=%llu avg=%llu",
                 (unsigned long long)stats_partial_sieve_auto_windows,
@@ -4795,10 +4870,20 @@ static __thread mpz_t  tls_mr_d;           /* MR: odd part of n-1       */
 static __thread mpz_t  tls_mr_x;           /* MR: witness accumulator   */
 static __thread mpz_t  tls_mr_nm1;         /* MR: n-1                   */
 static __thread int    tls_gmp_inited = 0;  /* 0 until first init       */
+/* Capacity tracked in bits; grown on demand from set_base_bn(shift).
+    One-way growth avoids repeated realloc churn in hot paths. */
+static __thread size_t tls_gmp_alloc_bits = 0;
 /* Last offset represented by tls_cand_mpz.  Lets us update candidate with
     a cheap +delta when offsets are monotonic (common in sieve scans). */
 static __thread uint64_t tls_cand_last_offset = 0;
 static __thread int      tls_cand_last_valid  = 0;
+/* CPU-Fermat limb cache for mpz->limb conversion avoidance on monotonic offsets.
+   Stores candidate limbs in little-endian words for euler_test_cpu_nlimbs /
+   fermat_test_cpu_nlimbs. */
+static __thread uint64_t tls_cand_limbs[FERMAT_CPU_MAX_LIMBS];
+static __thread int      tls_cand_limbs_nl = 0;
+static __thread uint64_t tls_cand_limbs_last_offset = 0;
+static __thread int      tls_cand_limbs_valid = 0;
 
 /* Per-thread primality memoization cache (two-way set-associative).
     Caches bn_candidate_is_prime(offset) results for the current base.
@@ -4853,6 +4938,8 @@ static inline void prime_cache_store(uint64_t offset, int is_prime) {
    current base.  Changing base without invalidation can produce false gaps. */
 static inline void prime_cache_invalidate_base(void) {
     tls_cand_last_valid = 0;
+    tls_cand_limbs_valid = 0;
+    tls_cand_limbs_nl = 0;
     tls_prime_cache_epoch++;
     if (tls_prime_cache_epoch == 0) {
         memset(tls_prime_cache_gen, 0, sizeof(tls_prime_cache_gen));
@@ -4863,18 +4950,45 @@ static inline void prime_cache_invalidate_base(void) {
 
 static void ensure_gmp_tls(void) {
     if (__builtin_expect(!tls_gmp_inited, 0)) {
-        /* Pre-allocate all mpz to 384 bits (6 limbs) — enough for 284-bit
-           numbers, avoiding any internal reallocation during hot paths. */
-        mpz_init2(tls_base_mpz, 384);
-        mpz_init2(tls_cand_mpz, 384);
+        /* Initial capacity; set_base_bn() may grow this further based on shift. */
+        const size_t init_bits = 384;
+        mpz_init2(tls_base_mpz, init_bits);
+        mpz_init2(tls_cand_mpz, init_bits);
         mpz_init_set_ui(tls_two_mpz, 2);
-        mpz_init2(tls_exp_mpz, 384);
-        mpz_init2(tls_res_mpz, 384);
-        mpz_init2(tls_mr_d, 384);
-        mpz_init2(tls_mr_x, 384);
-        mpz_init2(tls_mr_nm1, 384);
+        mpz_init2(tls_exp_mpz, init_bits);
+        mpz_init2(tls_res_mpz, init_bits);
+        mpz_init2(tls_mr_d, init_bits);
+        mpz_init2(tls_mr_x, init_bits);
+        mpz_init2(tls_mr_nm1, init_bits);
+        tls_gmp_alloc_bits = init_bits;
         tls_gmp_inited = 1;
     }
+}
+
+/* Grow GMP TLS scratch capacity based on runtime shift.
+   target_bits = 256 (hash) + shift + safety margin, rounded to 64-bit boundary.
+   Grows only when needed; never shrinks. */
+static inline size_t gmp_target_bits_for_shift(int shift) {
+    if (shift < 0) shift = 0;
+    size_t bits = 256u + (size_t)shift + 128u; /* headroom for intermediates */
+    bits = (bits + 63u) & ~(size_t)63u;
+    if (bits < 384u) bits = 384u;
+    return bits;
+}
+
+static inline void ensure_gmp_tls_capacity_for_shift(int shift) {
+    size_t need_bits = gmp_target_bits_for_shift(shift);
+    if (!tls_gmp_inited || need_bits <= tls_gmp_alloc_bits)
+        return;
+
+    mpz_realloc2(tls_base_mpz, need_bits);
+    mpz_realloc2(tls_cand_mpz, need_bits);
+    mpz_realloc2(tls_exp_mpz, need_bits);
+    mpz_realloc2(tls_res_mpz, need_bits);
+    mpz_realloc2(tls_mr_d, need_bits);
+    mpz_realloc2(tls_mr_x, need_bits);
+    mpz_realloc2(tls_mr_nm1, need_bits);
+    tls_gmp_alloc_bits = need_bits;
 }
 
 /* Safe mpz addition for 64-bit offsets on platforms where unsigned long
@@ -4896,6 +5010,32 @@ static inline void mpz_add_u64(mpz_t rop, mpz_srcptr base, uint64_t off) {
 #endif
 }
 
+static inline int limbs_effective_nl(const uint64_t *limbs, int max_nl) {
+    int nl = max_nl;
+    while (nl > 1 && limbs[nl - 1] == 0)
+        nl--;
+    return nl;
+}
+
+/* Add 64-bit delta to little-endian limb array in place.
+   Returns 1 on success, 0 if carry overflows past max_nl. */
+static inline int limbs_add_u64(uint64_t *limbs, int max_nl, uint64_t delta) {
+    if (delta == 0)
+        return 1;
+
+    uint64_t old = limbs[0];
+    limbs[0] = old + delta;
+    uint64_t carry = (limbs[0] < old) ? 1u : 0u;
+    int i = 1;
+    while (carry && i < max_nl) {
+        old = limbs[i];
+        limbs[i] = old + carry;
+        carry = (limbs[i] < old) ? 1u : 0u;
+        i++;
+    }
+    return carry == 0;
+}
+
 /* Thread-local TD residues: tls_td_residues[i] = (base << shift) % td_extra_primes[i].         Precomputed once per mining pass in set_base_bn(); used for cheap pre-filtering. */
 static __thread uint32_t tls_td_residues[TD_EXTRA_CNT];
 
@@ -4904,6 +5044,7 @@ static __thread uint32_t tls_td_residues[TD_EXTRA_CNT];
    and the cached base_mod_p[] array for sieve_range. */
 static void set_base_bn(const uint8_t h256[32], int shift) {
     ensure_gmp_tls();
+    ensure_gmp_tls_capacity_for_shift(shift);
     /* Import h256 (big-endian, MSB first) into GMP */
     mpz_import(tls_base_mpz, 32, 1, 1, 1, 0, h256);
     mpz_mul_2exp(tls_base_mpz, tls_base_mpz, (unsigned long)shift);
@@ -5136,7 +5277,46 @@ static int mr_verify_cand(void) {
     return mr_verify_cand_s(s);
 }
 
+/* Tiny small-prime prefilter used only by gap_verify's dense odd scan.
+   Reuses cached base_mod_p residues and checks a handful of very small odd
+   primes before calling bn_candidate_is_prime(). Returns 1 if composite. */
+#define GAP_VERIFY_PREFILTER_FIRST_IDX   1   /* skip prime 2 */
+#define GAP_VERIFY_PREFILTER_PRIME_COUNT 12  /* primes 3..41 */
+static inline int gap_verify_smallprime_reject(uint64_t offset) {
+    if (!tls_base_mod_p_ready || !tls_base_mod_p || !small_primes_cache)
+        return 0;
+
+    atomic_fetch_add_explicit(&gap_verify_pf_checks, 1, memory_order_relaxed);
+
+    size_t end = GAP_VERIFY_PREFILTER_FIRST_IDX + GAP_VERIFY_PREFILTER_PRIME_COUNT;
+    if (end > small_primes_count)
+        end = small_primes_count;
+
+    for (size_t i = GAP_VERIFY_PREFILTER_FIRST_IDX; i < end; i++) {
+        uint32_t p = (uint32_t)small_primes_cache[i];
+        uint32_t off_mod_p = (offset < (uint64_t)p)
+                           ? (uint32_t)offset
+                           : (uint32_t)(offset % p);
+        uint32_t sum = (uint32_t)tls_base_mod_p[i] + off_mod_p;
+        uint32_t rem = (sum >= p) ? (sum - p) : sum;
+        if (rem == 0) {
+            atomic_fetch_add_explicit(&gap_verify_pf_hits, 1, memory_order_relaxed);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int bn_candidate_is_prime(uint64_t offset) {
+    int timing_enabled = gmp_timing_enabled();
+    uint64_t t_total0 = 0;
+    uint64_t t_td0 = 0;
+    uint64_t t_cand0 = 0;
+    uint64_t t_powm0 = 0;
+    uint64_t t_mr0 = 0;
+    if (timing_enabled)
+        t_total0 = now_ns_mono();
+
     /* Fast memoization hit: same offset for current base. */
     {
         int cached_val;
@@ -5149,6 +5329,8 @@ static int bn_candidate_is_prime(uint64_t offset) {
        (~242K).  In CRT mode the sieve window is ~12K wide, so offset <
        td_extra_primes[i] always holds and the division reduces to identity.
        Use a comparison + conditional subtract instead of two 64-bit divides. */
+    if (timing_enabled)
+        t_td0 = now_ns_mono();
     for (int i = 0; i < td_extra_count; i++) {
         uint32_t p   = td_extra_primes[i];
         /* off_mod_p = offset % p; skip division when offset < p (CRT common case) */
@@ -5158,10 +5340,22 @@ static int bn_candidate_is_prime(uint64_t offset) {
         uint32_t rem = sum >= p ? sum - p : sum;
         if (rem == 0) {
             prime_cache_store(offset, 0);
+            if (timing_enabled) {
+                atomic_fetch_add_explicit(&gmp_timing_td_ns,
+                    now_ns_mono() - t_td0, memory_order_relaxed);
+                atomic_fetch_add_explicit(&gmp_timing_total_ns,
+                    now_ns_mono() - t_total0, memory_order_relaxed);
+                atomic_fetch_add_explicit(&gmp_timing_calls, 1, memory_order_relaxed);
+            }
             return 0;
         }
     }
+    if (timing_enabled)
+        atomic_fetch_add_explicit(&gmp_timing_td_ns,
+            now_ns_mono() - t_td0, memory_order_relaxed);
 
+    if (timing_enabled)
+        t_cand0 = now_ns_mono();
     ensure_gmp_tls();
     /* candidate = base + offset.
        Monotonic fast path: if this thread previously tested a smaller
@@ -5194,13 +5388,21 @@ static int bn_candidate_is_prime(uint64_t offset) {
     }
     tls_cand_last_offset = offset;
     tls_cand_last_valid  = 1;
+    if (timing_enabled)
+        atomic_fetch_add_explicit(&gmp_timing_cand_ns,
+            now_ns_mono() - t_cand0, memory_order_relaxed);
 
     int is_prime;
     if (use_crt_precision && g_crt_mode == CRT_MODE_SOLVER) {
         /* Precision mode: in CRT solver runs, always use a stronger
            probable-prime check regardless of fast-path settings. */
+        if (timing_enabled)
+            t_mr0 = now_ns_mono();
         is_prime = (mpz_probab_prime_p(tls_cand_mpz,
                           crt_precision_rounds_effective()) > 0);
+        if (timing_enabled)
+            atomic_fetch_add_explicit(&gmp_timing_mr_ns,
+                now_ns_mono() - t_mr0, memory_order_relaxed);
     } else if (use_cpu_fermat) {
         /* Custom CPU Montgomery multiply path (--cpu-fermat).
            Extracts candidate limbs from tls_cand_mpz into a uint64_t array
@@ -5210,19 +5412,37 @@ static int bn_candidate_is_prime(uint64_t offset) {
            ADX code path is active (MULX+ADCX/ADOX dual carry chains).
            Note: mr_verify is not applied here — the Euler/Fermat test is
            already the primary filter; use --mr-verify only with GMP paths. */
-        uint64_t cpu_limbs[FERMAT_CPU_MAX_LIMBS];
-        memset(cpu_limbs, 0, sizeof(cpu_limbs));
-        size_t cpu_count = 0;
-        mpz_export(cpu_limbs, &cpu_count, -1 /* LSW first */,
-                   sizeof(uint64_t), 0 /* native endian */, 0 /* no nails */,
-                   tls_cand_mpz);
-        int cpu_nl = (cpu_count < 1) ? 1
-                   : (cpu_count > FERMAT_CPU_MAX_LIMBS) ? FERMAT_CPU_MAX_LIMBS
-                   : (int)cpu_count;
+        int have_cached_limbs = 0;
+        if (tls_cand_limbs_valid && offset >= tls_cand_limbs_last_offset) {
+            uint64_t delta = offset - tls_cand_limbs_last_offset;
+            if (delta == 0 || limbs_add_u64(tls_cand_limbs, FERMAT_CPU_MAX_LIMBS, delta)) {
+                tls_cand_limbs_last_offset = offset;
+                tls_cand_limbs_nl = limbs_effective_nl(tls_cand_limbs, FERMAT_CPU_MAX_LIMBS);
+                have_cached_limbs = 1;
+            } else {
+                tls_cand_limbs_valid = 0;
+                tls_cand_limbs_nl = 0;
+            }
+        }
+
+        if (!have_cached_limbs) {
+            memset(tls_cand_limbs, 0, sizeof(tls_cand_limbs));
+            size_t cpu_count = 0;
+            mpz_export(tls_cand_limbs, &cpu_count, -1 /* LSW first */,
+                       sizeof(uint64_t), 0 /* native endian */, 0 /* no nails */,
+                       tls_cand_mpz);
+            tls_cand_limbs_nl = (cpu_count < 1) ? 1
+                            : (cpu_count > FERMAT_CPU_MAX_LIMBS) ? FERMAT_CPU_MAX_LIMBS
+                            : (int)cpu_count;
+            tls_cand_limbs_last_offset = offset;
+            tls_cand_limbs_valid = 1;
+        }
+
+        int cpu_nl = tls_cand_limbs_nl;
         if (use_fast_euler)
-            is_prime = euler_test_cpu_nlimbs(cpu_limbs, cpu_nl);
+            is_prime = euler_test_cpu_nlimbs(tls_cand_limbs, cpu_nl);
         else
-            is_prime = fermat_test_cpu_nlimbs(cpu_limbs, cpu_nl);
+            is_prime = fermat_test_cpu_nlimbs(tls_cand_limbs, cpu_nl);
     } else if (use_fast_euler) {
         /* Strong base-2 Miller-Rabin (single round).
            Write n-1 = 2^s * d with d odd.  Compute x = 2^d mod n, then
@@ -5240,7 +5460,12 @@ static int bn_candidate_is_prime(uint64_t offset) {
         mpz_sub_ui(tls_mr_nm1, tls_cand_mpz, 1);       /* nm1 = n-1    */
         unsigned long s = mpz_scan1(tls_mr_nm1, 0);    /* s = v_2(nm1) */
         mpz_tdiv_q_2exp(tls_mr_d, tls_mr_nm1, s);      /* d = nm1>>s   */
+        if (timing_enabled)
+            t_powm0 = now_ns_mono();
         mpz_powm(tls_res_mpz, tls_two_mpz, tls_mr_d, tls_cand_mpz);
+        if (timing_enabled)
+            atomic_fetch_add_explicit(&gmp_timing_powm_ns,
+                now_ns_mono() - t_powm0, memory_order_relaxed);
         if (mpz_cmp_ui(tls_res_mpz, 1) == 0 ||
             mpz_cmp(tls_res_mpz, tls_mr_nm1) == 0) {
             is_prime = 1;
@@ -5259,27 +5484,54 @@ static int bn_candidate_is_prime(uint64_t offset) {
         }
         /* Optional base-3 MR pass.  tls_mr_nm1 and tls_mr_d are already
            set above, so mr_verify_cand_s() skips recomputing them.     */
-        if (is_prime && use_mr_verify)
+        if (is_prime && use_mr_verify) {
+            if (timing_enabled)
+                t_mr0 = now_ns_mono();
             is_prime = mr_verify_cand_s(s);
+            if (timing_enabled)
+                atomic_fetch_add_explicit(&gmp_timing_mr_ns,
+                    now_ns_mono() - t_mr0, memory_order_relaxed);
+        }
     } else if (use_fast_fermat) {
         /* Raw base-2 Fermat test: 2^(n-1) mod n == 1?
            Skips GMP's redundant internal trial-division (~700 primes
            up to 5000) that mpz_probab_prime_p does before MR.
            For sieve-filtered 284-bit candidates, this saves ~10-15%. */
         mpz_sub_ui(tls_exp_mpz, tls_cand_mpz, 1);
+        if (timing_enabled)
+            t_powm0 = now_ns_mono();
         mpz_powm(tls_res_mpz, tls_two_mpz, tls_exp_mpz, tls_cand_mpz);
+        if (timing_enabled)
+            atomic_fetch_add_explicit(&gmp_timing_powm_ns,
+                now_ns_mono() - t_powm0, memory_order_relaxed);
         is_prime = (mpz_cmp_ui(tls_res_mpz, 1) == 0);
         /* MR base-3 verification catches Fermat pseudoprimes */
-        if (is_prime && use_mr_verify)
+        if (is_prime && use_mr_verify) {
+            if (timing_enabled)
+                t_mr0 = now_ns_mono();
             is_prime = mr_verify_cand();
+            if (timing_enabled)
+                atomic_fetch_add_explicit(&gmp_timing_mr_ns,
+                    now_ns_mono() - t_mr0, memory_order_relaxed);
+        }
     } else {
         /* Probable-prime: cli_mr_rounds MR rounds (default 2; old = 10).
            2 rounds is effectively deterministic for sieve-filtered
            candidates at mining sizes (false-positive < 2^-128).     */
+        if (timing_enabled)
+            t_mr0 = now_ns_mono();
         is_prime = (mpz_probab_prime_p(tls_cand_mpz, cli_mr_rounds) > 0);
+        if (timing_enabled)
+            atomic_fetch_add_explicit(&gmp_timing_mr_ns,
+                now_ns_mono() - t_mr0, memory_order_relaxed);
     }
 
     prime_cache_store(offset, is_prime);
+    if (timing_enabled) {
+        atomic_fetch_add_explicit(&gmp_timing_total_ns,
+            now_ns_mono() - t_total0, memory_order_relaxed);
+        atomic_fetch_add_explicit(&gmp_timing_calls, 1, memory_order_relaxed);
+    }
     return is_prime;
 }
 
@@ -6632,7 +6884,10 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
             int false_gap = 0;
             uint64_t found_at = 0;
             for (uint64_t off = 2; off < gap; off += 2) {
-                if (bn_candidate_is_prime(prev + off)) {
+                uint64_t cand_off = prev + off;
+                if (gap_verify_smallprime_reject(cand_off))
+                    continue;
+                if (bn_candidate_is_prime(cand_off)) {
                     false_gap = 1;
                     found_at = off;
                     break;

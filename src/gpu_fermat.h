@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026  cpugapminer contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
 /* gpu_fermat.h — CUDA batch Fermat primality testing for Gapcoin
  *
  * Tests batches of large prime candidates using Fermat's little theorem:

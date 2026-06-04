@@ -1,4 +1,9 @@
 /*
+ * Copyright (C) 2026  cpugapminer contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+/*
  * tools/bench_cgbn/bench_fermat.cu
  *
  * Benchmark: 768-bit base-2 Fermat primality test using NVIDIA CGBN

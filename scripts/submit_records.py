@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026  cpugapminer contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """
 submit_records.py — Parse cpugapminer GAP FOUND logs and submit prime gap
 records to primegaps.cloudygo.com.

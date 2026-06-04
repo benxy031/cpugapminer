@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026  cpugapminer contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
 /* compat_win32.h — Windows (MinGW/MSVC) compatibility shims
  *
  * Include this header early in any source file that uses POSIX socket APIs,

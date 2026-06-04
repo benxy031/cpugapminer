@@ -1,4 +1,9 @@
 /*
+ * Copyright (C) 2026  cpugapminer contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+/*
  * bench_euler_vs_gmp.c
  *
  * Benchmarks euler_test_cpu_nlimbs() vs GMP mpz_powm (fast-euler style)

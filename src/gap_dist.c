@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026  cpugapminer contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
 /* gap_dist.c — Hardy-Littlewood gap distribution accumulator.
  *
  * Tracks a histogram of prime gaps observed during mining and exposes a
