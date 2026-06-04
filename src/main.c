@@ -171,6 +171,21 @@ static _Atomic uint64_t gmp_timing_total_ns = 0;
 static _Atomic uint64_t gap_verify_pf_checks = 0;
 static _Atomic uint64_t gap_verify_pf_hits = 0;
 
+/* Runtime toggle for gap_verify tiny prefilter.
+   CPUGAP_GAP_VERIFY_PREFILTER=0 disables it for A/B diagnostics. */
+static int gap_verify_prefilter_enabled(void)
+{
+    static int cached = -1;
+    if (cached >= 0)
+        return cached;
+
+    {
+        const char *env = getenv("CPUGAP_GAP_VERIFY_PREFILTER");
+        cached = !(env && *env && strcmp(env, "0") == 0);
+    }
+    return cached;
+}
+
 /* Mertens-style estimate for the fraction of integers that survive
    sieving by all primes up to `limit`.  This is a cheap live proxy for
    the conditional-density effect. */
@@ -5283,6 +5298,9 @@ static int mr_verify_cand(void) {
 #define GAP_VERIFY_PREFILTER_FIRST_IDX   1   /* skip prime 2 */
 #define GAP_VERIFY_PREFILTER_PRIME_COUNT 12  /* primes 3..41 */
 static inline int gap_verify_smallprime_reject(uint64_t offset) {
+    if (!gap_verify_prefilter_enabled())
+        return 0;
+
     if (!tls_base_mod_p_ready || !tls_base_mod_p || !small_primes_cache)
         return 0;
 
@@ -6888,9 +6906,35 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
                 if (gap_verify_smallprime_reject(cand_off))
                     continue;
                 if (bn_candidate_is_prime(cand_off)) {
-                    false_gap = 1;
-                    found_at = off;
-                    break;
+                    /* bn_candidate_is_prime() is a fast probable-prime filter.
+                       Confirm with one extra MR(base-3) pass before marking
+                       the whole interval as FALSE GAP. */
+                    int strict_prime = 1;
+                    ensure_gmp_tls();
+#if ULONG_MAX < UINT64_MAX
+                    if (cand_off >> 32) {
+                        mpz_set_ui(tls_exp_mpz, (unsigned long)(cand_off >> 32));
+                        mpz_mul_2exp(tls_exp_mpz, tls_exp_mpz, 32);
+                        mpz_add_ui(tls_exp_mpz, tls_exp_mpz,
+                                   (unsigned long)(cand_off & 0xFFFFFFFFUL));
+                        mpz_add(tls_cand_mpz, tls_base_mpz, tls_exp_mpz);
+                    } else {
+                        mpz_set(tls_cand_mpz, tls_base_mpz);
+                        mpz_add_ui(tls_cand_mpz, tls_cand_mpz, (unsigned long)cand_off);
+                    }
+#else
+                    mpz_set(tls_cand_mpz, tls_base_mpz);
+                    mpz_add_ui(tls_cand_mpz, tls_cand_mpz, (unsigned long)cand_off);
+#endif
+                    tls_cand_last_valid = 0;
+                    if (!mr_verify_cand())
+                        strict_prime = 0;
+
+                    if (strict_prime) {
+                        false_gap = 1;
+                        found_at = off;
+                        break;
+                    }
                 }
             }
             if (false_gap) {
