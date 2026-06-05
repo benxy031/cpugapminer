@@ -178,7 +178,7 @@ static volatile uint64_t stats_gpu_smart_verified_primes = 0;
 static volatile uint64_t stats_gpu_smart_scanned_region_pairs = 0;
 
 /* Runtime toggle for gap_verify tiny prefilter.
-   CPUGAP_GAP_VERIFY_PREFILTER=0 disables it for A/B diagnostics. */
+   Disabled by default; set CPUGAP_GAP_VERIFY_PREFILTER=1 to enable. */
 static int gap_verify_prefilter_enabled(void)
 {
     static int cached = -1;
@@ -187,7 +187,7 @@ static int gap_verify_prefilter_enabled(void)
 
     {
         const char *env = getenv("CPUGAP_GAP_VERIFY_PREFILTER");
-        cached = !(env && *env && strcmp(env, "0") == 0);
+        cached = (env && *env && strcmp(env, "0") != 0) ? 1 : 0;
     }
     return cached;
 }
@@ -2628,6 +2628,10 @@ static __thread int       tls_base_mod_p_ready = 0;
     tls_base_mod_p is rebuilt (new block header or rebase).  The GPU ctx
     re-uploads base_mod_p only when this value changes. */
 static __thread uint64_t  tls_gpu_base_mod_p_gen = 0;
+/* Monotonic generation for GPU base_mod_p cache invalidation.
+    Must be process-global (not per-thread), otherwise recreated worker threads
+    can reuse generation=1 and accidentally match stale GPU cache state. */
+static _Atomic uint64_t g_gpu_base_mod_p_gen = 1;
 
 /* Incremental L % p cache: eliminates per-prime 64-bit division in sieve_range.
    tls_L_mod_p[i]    = (current window's L) % small_primes_cache[i]
@@ -3294,7 +3298,7 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
                     const uint64_t *ph2_primes    = small_primes_cache + split_idx;
                     const uint64_t *ph2_base_mod_p = tls_base_mod_p + split_idx;
                     int ret = gpu_sieve_mark_segment_batch(
-                        tls_gpu_seg, bit_size, (seg_size + 1) >> 1,
+                        tls_gpu_seg, bit_size, seg_size,
                         bits,
                         ph2_primes, ph2_base_mod_p,
                         tls_gpu_base_mod_p_gen, L, R, n_ph2);
@@ -5077,7 +5081,9 @@ static void set_base_bn(const uint8_t h256[32], int shift) {
                 tls_base_mod_p[i] = mpz_fdiv_ui(tls_base_mpz, (unsigned long)p);
             }
             tls_base_mod_p_ready = 1;
-            tls_gpu_base_mod_p_gen++; /* invalidate GPU d_base_mod_p cache */
+            tls_gpu_base_mod_p_gen =
+                atomic_fetch_add_explicit(&g_gpu_base_mod_p_gen, 1,
+                                          memory_order_relaxed);
         }
 
         /* Precompute sieve_size % p for incremental L tracking.
@@ -6737,7 +6743,9 @@ static void rebase_for_gap_check(mpz_t new_base) {
                 tls_base_mod_p[i] = mpz_fdiv_ui(tls_base_mpz,
                                                  (unsigned long)small_primes_cache[i]);
             tls_base_mod_p_ready = 1;
-            tls_gpu_base_mod_p_gen++; /* invalidate GPU d_base_mod_p cache */
+            tls_gpu_base_mod_p_gen =
+                atomic_fetch_add_explicit(&g_gpu_base_mod_p_gen, 1,
+                                          memory_order_relaxed);
         }
         /* Recompute trial-division residues */
     for (int i = 0; i < td_extra_count; i++)
@@ -6814,6 +6822,9 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
     }
     if (cnt > 1) __sync_fetch_and_add(&stats_pairs, (uint64_t)(cnt - 1));
     for (size_t i = 0; i + 1 < cnt; i++) {
+        /* Hard stop on pass abort/new block: do not keep verifying old-window pairs. */
+        if (g_abort_pass || !keep_going)
+            return 0;
 #ifdef WITH_RPC
         /* During long scans, poll tip changes from this thread too.
            Otherwise, thread 0 may stay busy in this loop for seconds and
@@ -6888,6 +6899,8 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
             int false_gap = 0;
             uint64_t found_at = 0;
             for (uint64_t off = 2; off < gap; off += 2) {
+                if (g_abort_pass || !keep_going)
+                    return 0;
                 uint64_t cand_off = prev + off;
                 if (gap_verify_smallprime_reject(cand_off))
                     continue;
@@ -6913,8 +6926,15 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
                     mpz_add_ui(tls_cand_mpz, tls_cand_mpz, (unsigned long)cand_off);
 #endif
                     tls_cand_last_valid = 0;
-                    if (!mr_verify_cand())
+                    if (!mr_verify_cand()) {
                         strict_prime = 0;
+                    } else {
+                        /* Extra confirmation so FALSE GAP logging is based on
+                           a strong probable-prime verdict, not only base-3 MR. */
+                        int fg_rounds = (cli_mr_rounds >= 6) ? cli_mr_rounds : 6;
+                        if (mpz_probab_prime_p(tls_cand_mpz, fg_rounds) <= 0)
+                            strict_prime = 0;
+                    }
 
                     if (strict_prime) {
                         false_gap = 1;
@@ -6924,6 +6944,8 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
                 }
             }
             if (false_gap) {
+                if (g_abort_pass || !keep_going)
+                    return 0;
                 __sync_fetch_and_add(&stats_false_gaps, 1);
                 log_msg("[gap_verify] FALSE GAP: reported=%llu"
                         "  prime at nAdd+%llu (nAdd=%llu)\n",

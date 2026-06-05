@@ -344,7 +344,7 @@ uint64_t *sievegap_run_range(uint64_t L,
              * indexed by odd-position: segment[i] corresponds to L+2*i). */
             int mode = gpu_sieve_mark_segment_batch(phase2_bits_buf,
                                                     bit_bytes,
-                                                    (seg_size + 1) >> 1,
+                                                    seg_size,
                                                     bits,
                                                     small_primes + gpu_split,
                                                     base_mod_p + gpu_split,
