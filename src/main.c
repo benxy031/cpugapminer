@@ -1839,20 +1839,83 @@ static int cmp_u64(const void *a, const void *b) {
     return (va > vb) - (va < vb);
 }
 
+/* Thread-local scratch buffers for smart-scan/merge hot paths.
+   Grow-on-demand and reused across windows to avoid malloc/free churn. */
+static __thread uint64_t *tls_merge_tmp = NULL;
+static __thread size_t tls_merge_tmp_cap = 0;
+static __thread uint64_t *tls_smart_p1_cands = NULL;
+static __thread size_t tls_smart_p1_cands_cap = 0;
+static __thread uint64_t *tls_smart_p1_wbuf = NULL;
+static __thread size_t tls_smart_p1_wbuf_cap = 0;
+static __thread uint64_t *tls_smart_gap_reg_lo = NULL;
+static __thread size_t tls_smart_gap_reg_lo_cap = 0;
+static __thread uint64_t *tls_smart_gap_reg_hi = NULL;
+static __thread size_t tls_smart_gap_reg_hi_cap = 0;
+static __thread int *tls_smart_reg_alive = NULL;
+static __thread size_t tls_smart_reg_alive_cap = 0;
+static __thread uint64_t *tls_smart_verify = NULL;
+static __thread size_t tls_smart_verify_cap = 0;
+static __thread uint64_t *tls_smart_sampled = NULL;
+static __thread size_t tls_smart_sampled_cap = 0;
+
+static inline int ensure_tls_u64_buffer(uint64_t **buf, size_t *cap, size_t need) {
+    if (need == 0)
+        need = 1;
+    if (*cap >= need && *buf)
+        return 0;
+    size_t new_cap = (*cap > 0) ? *cap : 64;
+    while (new_cap < need) {
+        if (new_cap > (SIZE_MAX / 2)) {
+            new_cap = need;
+            break;
+        }
+        new_cap <<= 1;
+    }
+    uint64_t *new_buf = (uint64_t *)realloc(*buf, new_cap * sizeof(uint64_t));
+    if (!new_buf)
+        return -1;
+    *buf = new_buf;
+    *cap = new_cap;
+    return 0;
+}
+
+static inline int ensure_tls_int_buffer(int **buf, size_t *cap, size_t need) {
+    if (need == 0)
+        need = 1;
+    if (*cap >= need && *buf)
+        return 0;
+    size_t new_cap = (*cap > 0) ? *cap : 64;
+    while (new_cap < need) {
+        if (new_cap > (SIZE_MAX / 2)) {
+            new_cap = need;
+            break;
+        }
+        new_cap <<= 1;
+    }
+    int *new_buf = (int *)realloc(*buf, new_cap * sizeof(int));
+    if (!new_buf)
+        return -1;
+    *buf = new_buf;
+    *cap = new_cap;
+    return 0;
+}
+
 /* Merge two consecutive sorted halves of buf[0..total-1] in-place.
    buf[0..split-1] and buf[split..total-1] are each individually sorted
    ascending.  O(n) time, O(n) extra space; falls back to qsort on OOM. */
 static void merge_sorted_u64(uint64_t *buf, size_t split, size_t total) {
     if (split == 0 || split >= total) return;
-    uint64_t *tmp = (uint64_t *)malloc(total * sizeof(uint64_t));
-    if (!tmp) { qsort(buf, total, sizeof(uint64_t), cmp_u64); return; }
+    if (ensure_tls_u64_buffer(&tls_merge_tmp, &tls_merge_tmp_cap, total) != 0) {
+        qsort(buf, total, sizeof(uint64_t), cmp_u64);
+        return;
+    }
+    uint64_t *tmp = tls_merge_tmp;
     size_t ai = 0, bi = split, mi = 0;
     while (ai < split && bi < total)
         tmp[mi++] = (buf[ai] <= buf[bi]) ? buf[ai++] : buf[bi++];
     while (ai < split) tmp[mi++] = buf[ai++];
     while (bi < total) tmp[mi++] = buf[bi++];
     memcpy(buf, tmp, total * sizeof(uint64_t));
-    free(tmp);
 }
 
 static void format_est(char *buf, size_t sz, double est_sec) {
@@ -2007,7 +2070,7 @@ static void print_stats(void) {
 
     double bm = stats_best_merit;
         log_msg("STATS: elapsed=%.1fs  sieved=%llu (%.0f/s)  tested=%llu (%.0f/s)  "
-            "pps=%.0f  primes/s=%.0f  primes=%llu (%.1f%%)  "
+            "pps(pairs/s)=%.0f  primes/s=%.0f  primes=%llu (%.1f%%)  "
             "gaps=%llu (%.3f/s)  built=%llu  submitted=%llu  accepted=%llu  "
             "prob=%.2e/pair  est_model=%s  est_observed=%s (submit=%.4f scan=%.4f)  best=%.2f (gap=%llu)  last_gap=%llu  last_qual_gap=%llu",
             elapsed,
@@ -6820,7 +6883,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
         ensure_gmp_tls();
         lane_base_mod6 = (uint64_t)mpz_fdiv_ui(tls_base_mpz, 6UL);
     }
-    if (cnt > 1) __sync_fetch_and_add(&stats_pairs, (uint64_t)(cnt - 1));
+    if (cnt > 1) __atomic_fetch_add(&stats_pairs, (uint64_t)(cnt - 1), __ATOMIC_RELAXED);
     for (size_t i = 0; i + 1 < cnt; i++) {
         /* Hard stop on pass abort/new block: do not keep verifying old-window pairs. */
         if (g_abort_pass || !keep_going)
@@ -6946,7 +7009,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
             if (false_gap) {
                 if (g_abort_pass || !keep_going)
                     return 0;
-                __sync_fetch_and_add(&stats_false_gaps, 1);
+                __atomic_fetch_add(&stats_false_gaps, 1, __ATOMIC_RELAXED);
                 log_msg("[gap_verify] FALSE GAP: reported=%llu"
                         "  prime at nAdd+%llu (nAdd=%llu)\n",
                         (unsigned long long)gap,
@@ -6993,7 +7056,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
         }
 
         stats_last_qual_gap = gap;
-        __sync_fetch_and_add(&stats_gaps, 1);
+        __atomic_fetch_add(&stats_gaps, 1, __ATOMIC_RELAXED);
         log_extra_merit_event("qual", "scan-candidates", merit, gap,
                       target_local);
         /* nAdd = relative offset = prev (prime = base + nAdd). */
@@ -7035,17 +7098,17 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
 #endif
     }   /* end for */
     if (track_lane_stats && lane_pairs_total > 0) {
-        __sync_fetch_and_add(&stats_noncrt_lane_pairs_total, lane_pairs_total);
-        __sync_fetch_and_add(&stats_noncrt_lane_pairs_same, lane_pairs_same);
-        __sync_fetch_and_add(&stats_noncrt_lane_pairs_alt2, lane_pairs_alt2);
-        __sync_fetch_and_add(&stats_noncrt_lane_pairs_alt4, lane_pairs_alt4);
-        __sync_fetch_and_add(&stats_noncrt_lane_pairs_unexpected, lane_pairs_unexpected);
+        __atomic_fetch_add(&stats_noncrt_lane_pairs_total, lane_pairs_total, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&stats_noncrt_lane_pairs_same, lane_pairs_same, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&stats_noncrt_lane_pairs_alt2, lane_pairs_alt2, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&stats_noncrt_lane_pairs_alt4, lane_pairs_alt4, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&stats_noncrt_lane_pairs_unexpected, lane_pairs_unexpected, __ATOMIC_RELAXED);
         if (lane_qual_total > 0) {
-            __sync_fetch_and_add(&stats_noncrt_lane_qual_total, lane_qual_total);
-            __sync_fetch_and_add(&stats_noncrt_lane_qual_same, lane_qual_same);
-            __sync_fetch_and_add(&stats_noncrt_lane_qual_alt2, lane_qual_alt2);
-            __sync_fetch_and_add(&stats_noncrt_lane_qual_alt4, lane_qual_alt4);
-            __sync_fetch_and_add(&stats_noncrt_lane_qual_unexpected, lane_qual_unexpected);
+            __atomic_fetch_add(&stats_noncrt_lane_qual_total, lane_qual_total, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&stats_noncrt_lane_qual_same, lane_qual_same, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&stats_noncrt_lane_qual_alt2, lane_qual_alt2, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&stats_noncrt_lane_qual_alt4, lane_qual_alt4, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&stats_noncrt_lane_qual_unexpected, lane_qual_unexpected, __ATOMIC_RELAXED);
         }
     }
     return 0;
@@ -7129,7 +7192,7 @@ static void coop_fermat_assist(struct presieve_ctx *ctx) {
             /* Incremental stats: report every 4096 tests so the counter
                moves smoothly even with large sieve windows (33M+).     */
             if (((idx + 1) & 0xFFF) == 0)
-                __sync_fetch_and_add(&stats_tested, 4096);
+                __atomic_fetch_add(&stats_tested, 4096, __ATOMIC_RELAXED);
         }
 
         /* Signal worker: this batch is done, out[] is up to date. */
@@ -7182,7 +7245,7 @@ static void *presieve_helper_fn(void *arg) {
                 ctx->state = 2;
                 pthread_cond_signal(&ctx->cv_done);
             }
-            __sync_fetch_and_add(&stats_sieved, (uint64_t)(R - L));
+            __atomic_fetch_add(&stats_sieved, (uint64_t)(R - L), __ATOMIC_RELAXED);
             pthread_mutex_unlock(&ctx->mu);
         } else {
             /* state=3: no sieving needed, just assist with Fermat */
@@ -7685,13 +7748,17 @@ static void *worker_fn(void *arg) {
                 if (use_smart && g_gpu_count > 0) {
                     p1_cnt  = (cnt + (size_t)smart_K - 1) / (size_t)smart_K;
                     p1_wcap = p1_cnt / 4 + 64;
-                    p1_cands = (uint64_t *)malloc(p1_cnt * sizeof(uint64_t));
-                    p1_wbuf  = (uint64_t *)malloc(p1_wcap * sizeof(uint64_t));
-                    if (!p1_cands || !p1_wbuf) {
-                        free(p1_cands); free(p1_wbuf);
+                    if (ensure_tls_u64_buffer(&tls_smart_p1_cands,
+                                              &tls_smart_p1_cands_cap,
+                                              p1_cnt) != 0 ||
+                        ensure_tls_u64_buffer(&tls_smart_p1_wbuf,
+                                              &tls_smart_p1_wbuf_cap,
+                                              p1_wcap) != 0) {
                         p1_cands = p1_wbuf = NULL;
                         use_smart = 0;
                     } else {
+                        p1_cands = tls_smart_p1_cands;
+                        p1_wbuf = tls_smart_p1_wbuf;
                         for (size_t s = 0, j = 0; j < cnt; j += (size_t)smart_K, s++)
                             p1_cands[s] = pr[j];
                     }
@@ -7757,7 +7824,7 @@ static void *worker_fn(void *arg) {
                 if (use_smart) {
                     /* --- Phase 1: GPU tests sampled candidates ----------- */
                     size_t sp = gpu_batch_filter(p1_cands, p1_cnt);
-                    __sync_fetch_and_add(&stats_tested, (uint64_t)p1_cnt);
+                    __atomic_fetch_add(&stats_tested, (uint64_t)p1_cnt, __ATOMIC_RELAXED);
 
                     uint64_t *sampled_primes = p1_cands; /* reuse buffer */
                     size_t sp_cnt = sp;
@@ -7777,9 +7844,18 @@ static void *worker_fn(void *arg) {
                     /* Region threshold: always network merit, not scan_merit */
                     size_t gpu_rth = (size_t)(target_local * logbase);
                     if (gpu_rth < 2) gpu_rth = 2;
-                    uint64_t *gap_reg_lo = (uint64_t *)malloc(gap_reg_cap * sizeof(uint64_t));
-                    uint64_t *gap_reg_hi = (uint64_t *)malloc(gap_reg_cap * sizeof(uint64_t));
+                    uint64_t *gap_reg_lo = NULL;
+                    uint64_t *gap_reg_hi = NULL;
                     int *gpu_reg_alive = NULL;
+                    if (ensure_tls_u64_buffer(&tls_smart_gap_reg_lo,
+                                              &tls_smart_gap_reg_lo_cap,
+                                              gap_reg_cap) == 0 &&
+                        ensure_tls_u64_buffer(&tls_smart_gap_reg_hi,
+                                              &tls_smart_gap_reg_hi_cap,
+                                              gap_reg_cap) == 0) {
+                        gap_reg_lo = tls_smart_gap_reg_lo;
+                        gap_reg_hi = tls_smart_gap_reg_hi;
+                    }
                     if (sp_cnt >= 1 && gap_reg_lo && gap_reg_hi) {
                         if (cnt > 0 && sampled_primes[0] - pr[0] >= gpu_rth) {
                             gap_reg_lo[n_gap_regions] = 0;
@@ -7801,11 +7877,13 @@ static void *worker_fn(void *arg) {
                     }
                     /* Keep all gap regions alive — GPU handles full verification. */
                     if (n_gap_regions > 0) {
-                        gpu_reg_alive = (int *)malloc(n_gap_regions * sizeof(int));
-                        if (gpu_reg_alive) {
+                        if (ensure_tls_int_buffer(&tls_smart_reg_alive,
+                                                  &tls_smart_reg_alive_cap,
+                                                  n_gap_regions) == 0)
+                            gpu_reg_alive = tls_smart_reg_alive;
+                        if (gpu_reg_alive)
                             for (size_t r = 0; r < n_gap_regions; r++)
                                 gpu_reg_alive[r] = 1;
-                        }
                     }
 
                     /* Option B: score regions using sampled-prime gap spread.
@@ -7836,7 +7914,11 @@ static void *worker_fn(void *arg) {
                     }
                     /* Collect verification candidates from surviving regions */
                     size_t v_alloc = cnt > 0 ? cnt : 1;
-                    uint64_t *verify = (uint64_t *)malloc(v_alloc * sizeof(uint64_t));
+                    uint64_t *verify = NULL;
+                    if (ensure_tls_u64_buffer(&tls_smart_verify,
+                                              &tls_smart_verify_cap,
+                                              v_alloc) == 0)
+                        verify = tls_smart_verify;
                     size_t v_cnt = 0;
                     if (verify && n_gap_regions > 0) {
                         #define GPU_COLLECT_REGION(lo_val, hi_val) do {        \
@@ -7868,7 +7950,7 @@ static void *worker_fn(void *arg) {
                         for (size_t i = 0; i < vp; i++)
                             pr[pf++] = verify[i];
                     }
-                    __sync_fetch_and_add(&stats_tested, (uint64_t)v_cnt);
+                    __atomic_fetch_add(&stats_tested, (uint64_t)v_cnt, __ATOMIC_RELAXED);
                     if (pf > sp_cnt) merge_sorted_u64(pr, sp_cnt, pf);
                     cnt = pf;
 
@@ -7902,8 +7984,9 @@ static void *worker_fn(void *arg) {
                             size_t est_full = (size_t)((double)orig_cnt
                                             * (double)sp_cnt / (double)p1_cnt);
                             if (est_full > 1 + region_pairs)
-                                __sync_fetch_and_add(&stats_pairs,
-                                                     (uint64_t)(est_full - 1 - region_pairs));
+                                __atomic_fetch_add(&stats_pairs,
+                                                   (uint64_t)(est_full - 1 - region_pairs),
+                                                   __ATOMIC_RELAXED);
                         }
 
                         if (use_gpu_smart_telemetry) {
@@ -7937,18 +8020,14 @@ static void *worker_fn(void *arg) {
                                 (unsigned long long)total_region_pairs);
                         }
 
-                        free(gap_reg_lo);
-                        free(gap_reg_hi);
-                        free(gpu_reg_alive);
-                        if (found_block) { free(p1_cands); free(p1_wbuf); free(verify); goto worker_done; }
+                        if (found_block) { goto worker_done; }
                     }
-                    free(p1_cands); p1_cands = NULL;
-                    free(p1_wbuf);  p1_wbuf = NULL;
-                    free(verify);
+                    p1_cands = NULL;
+                    p1_wbuf  = NULL;
                 } else {
                     /* GPU full test (non-smart) */
                     pf = gpu_batch_filter(pr, cnt);
-                    __sync_fetch_and_add(&stats_tested, (uint64_t)cnt);
+                    __atomic_fetch_add(&stats_tested, (uint64_t)cnt, __ATOMIC_RELAXED);
                     cnt = pf;
                 }
             } else
@@ -8002,12 +8081,15 @@ static void *worker_fn(void *arg) {
                                       &res_w);
 
                 if (one_sided_min_gap > 0 && res_w.one_sided_considered > 0) {
-                    __sync_fetch_and_add(&stats_noncrt_onesided_intervals,
-                                         (uint64_t)res_w.one_sided_considered);
-                    __sync_fetch_and_add(&stats_noncrt_onesided_skipped,
-                                         (uint64_t)res_w.one_sided_skipped);
-                    __sync_fetch_and_add(&stats_noncrt_onesided_fullcheck,
-                                         (uint64_t)res_w.one_sided_fullcheck);
+                    __atomic_fetch_add(&stats_noncrt_onesided_intervals,
+                                       (uint64_t)res_w.one_sided_considered,
+                                       __ATOMIC_RELAXED);
+                    __atomic_fetch_add(&stats_noncrt_onesided_skipped,
+                                       (uint64_t)res_w.one_sided_skipped,
+                                       __ATOMIC_RELAXED);
+                    __atomic_fetch_add(&stats_noncrt_onesided_fullcheck,
+                                       (uint64_t)res_w.one_sided_fullcheck,
+                                       __ATOMIC_RELAXED);
                 }
 
                 /* Cross-window carry: gap from previous window's last confirmed
@@ -8070,7 +8152,7 @@ static void *worker_fn(void *arg) {
                 carry_last_prime = res_w.last_prime;
 
                 /* Flush tested count and update prime/pair stats. */
-                __sync_fetch_and_add(&stats_tested, (uint64_t)res_w.tested);
+                __atomic_fetch_add(&stats_tested, (uint64_t)res_w.tested, __ATOMIC_RELAXED);
 
                 /* Stats: estimate full-window consecutive prime pairs for
                    accurate est calculation.  Backward scan only tests ~8
@@ -8082,11 +8164,13 @@ static void *worker_fn(void *arg) {
                   size_t est_window_primes =
                       (size_t)((double)orig_cnt * prime_rate);
                   if (est_window_primes > 1)
-                      __sync_fetch_and_add(&stats_pairs,
-                                           (uint64_t)(est_window_primes - 1));
+                      __atomic_fetch_add(&stats_pairs,
+                                         (uint64_t)(est_window_primes - 1),
+                                         __ATOMIC_RELAXED);
                 }
-                __sync_fetch_and_add(&stats_primes_found,
-                                     (uint64_t)res_w.primes_found);
+                __atomic_fetch_add(&stats_primes_found,
+                                   (uint64_t)res_w.primes_found,
+                                   __ATOMIC_RELAXED);
 
                 free(p1_cands); p1_cands = NULL;
                 free(p1_wbuf);  p1_wbuf  = NULL;
@@ -8104,7 +8188,7 @@ static void *worker_fn(void *arg) {
                         pr[pf++] = pr[idx];
                     worker_tested++;
                     if ((worker_tested & 0xFFF) == 0)
-                        __sync_fetch_and_add(&stats_tested, 4096);
+                        __atomic_fetch_add(&stats_tested, 4096, __ATOMIC_RELAXED);
                 }
                 psc.coop.active = 0;
                 __sync_synchronize();
@@ -8148,17 +8232,17 @@ static void *worker_fn(void *arg) {
                         remainder = orig_cnt - reported;
                     }
                     if (remainder > 0)
-                        __sync_fetch_and_add(&stats_tested, (uint64_t)remainder);
+                        __atomic_fetch_add(&stats_tested, (uint64_t)remainder, __ATOMIC_RELAXED);
                 }
                 cnt = pf;
-                __sync_fetch_and_add(&stats_primes_found, (uint64_t)pf);
+                __atomic_fetch_add(&stats_primes_found, (uint64_t)pf, __ATOMIC_RELAXED);
 
             /* ============================================================= */
             } else {
                 /* no_primality: skip all testing */
                 psc.coop.active = 0;
                 pf = cnt;
-                __sync_fetch_and_add(&stats_tested, (uint64_t)orig_cnt);
+                __atomic_fetch_add(&stats_tested, (uint64_t)orig_cnt, __ATOMIC_RELAXED);
             }
 
             /* Smart-scan path handles gap scanning internally (region-based).
@@ -9801,7 +9885,7 @@ int main(int argc, char **argv) {
                 if (R <= L) continue;
                 size_t cnt=0;
                 uint64_t *pr = sieve_range(L, R, &cnt, h256, shift);
-                __sync_fetch_and_add(&stats_sieved, (uint64_t)(R - L));
+                __atomic_fetch_add(&stats_sieved, (uint64_t)(R - L), __ATOMIC_RELAXED);
                 /* primality – compact pr[] in-place using big-prime BN test */
                 size_t pf = 0;
                 size_t orig_cnt_st = cnt;
@@ -9813,12 +9897,20 @@ int main(int argc, char **argv) {
                 if (use_smart_st) {
                     /* --- Phase 1: sample every Kth survivor --------------- */
                     size_t p1n = (cnt + (size_t)smart_K_st - 1) / (size_t)smart_K_st;
-                    uint64_t *sampled = (uint64_t *)malloc(p1n * sizeof(uint64_t));
+                    uint64_t *sampled = NULL;
+                    if (ensure_tls_u64_buffer(&tls_smart_sampled,
+                                              &tls_smart_sampled_cap,
+                                              p1n) == 0)
+                        sampled = tls_smart_sampled;
                     if (!sampled) { use_smart_st = 0; goto st_full; }
 
                     size_t sp = 0;
                     /* Build phase-1 candidate array */
-                    uint64_t *p1_arr = (uint64_t *)malloc(p1n * sizeof(uint64_t));
+                    uint64_t *p1_arr = NULL;
+                    if (ensure_tls_u64_buffer(&tls_smart_p1_wbuf,
+                                              &tls_smart_p1_wbuf_cap,
+                                              p1n) == 0)
+                        p1_arr = tls_smart_p1_wbuf;
                     if (p1_arr) {
                         for (size_t j = 0, k = 0; j < cnt; j += (size_t)smart_K_st)
                             p1_arr[k++] = pr[j];
@@ -9835,8 +9927,7 @@ int main(int argc, char **argv) {
                                 sampled[sp++] = pr[j];
                         }
                     }
-                    free(p1_arr);
-                    __sync_fetch_and_add(&stats_tested, (uint64_t)p1n);
+                    __atomic_fetch_add(&stats_tested, (uint64_t)p1n, __ATOMIC_RELAXED);
 
                     size_t needed = (size_t)(scan_target_runtime * logbase);
                     if (needed < 2) needed = 2;
@@ -9844,9 +9935,18 @@ int main(int argc, char **argv) {
                     /* Identify gap regions (boundaries only) */
                     size_t n_greg_st = 0;
                     size_t greg_cap_st = sp + 2;
-                    uint64_t *greg_lo_st = (uint64_t *)malloc(greg_cap_st * sizeof(uint64_t));
-                    uint64_t *greg_hi_st = (uint64_t *)malloc(greg_cap_st * sizeof(uint64_t));
+                    uint64_t *greg_lo_st = NULL;
+                    uint64_t *greg_hi_st = NULL;
                     int *greg_alive_st = NULL;
+                    if (ensure_tls_u64_buffer(&tls_smart_gap_reg_lo,
+                                              &tls_smart_gap_reg_lo_cap,
+                                              greg_cap_st) == 0 &&
+                        ensure_tls_u64_buffer(&tls_smart_gap_reg_hi,
+                                              &tls_smart_gap_reg_hi_cap,
+                                              greg_cap_st) == 0) {
+                        greg_lo_st = tls_smart_gap_reg_lo;
+                        greg_hi_st = tls_smart_gap_reg_hi;
+                    }
 
                     if (sp > 0 && cnt > 0 && greg_lo_st && greg_hi_st) {
                         if (sampled[0] - pr[0] >= needed) {
@@ -9870,7 +9970,10 @@ int main(int argc, char **argv) {
 
                     /* Edge probing: eliminate false-positive regions */
                     if (n_greg_st > 0) {
-                        greg_alive_st = (int *)malloc(n_greg_st * sizeof(int));
+                        if (ensure_tls_int_buffer(&tls_smart_reg_alive,
+                                                  &tls_smart_reg_alive_cap,
+                                                  n_greg_st) == 0)
+                            greg_alive_st = tls_smart_reg_alive;
                         if (greg_alive_st) {
                             size_t eprobes = 0;
                             for (size_t r = 0; r < n_greg_st; r++) {
@@ -9906,14 +10009,18 @@ int main(int argc, char **argv) {
                                     greg_alive_st[r] = 0;
                             }
                             if (eprobes > 0)
-                                __sync_fetch_and_add(&stats_tested, (uint64_t)eprobes);
+                                __atomic_fetch_add(&stats_tested, (uint64_t)eprobes, __ATOMIC_RELAXED);
                         }
                     }
 
                     /* Collect verification candidates (surviving regions only) */
                     size_t v_alloc = cnt > 0 ? cnt : 1, v_cnt = 0;
-                    uint64_t *verify = (uint64_t *)malloc(v_alloc * sizeof(uint64_t));
-                    if (!verify) { free(sampled); free(greg_lo_st); free(greg_hi_st); free(greg_alive_st); use_smart_st = 0; goto st_full; }
+                    uint64_t *verify = NULL;
+                    if (ensure_tls_u64_buffer(&tls_smart_verify,
+                                              &tls_smart_verify_cap,
+                                              v_alloc) == 0)
+                        verify = tls_smart_verify;
+                    if (!verify) { use_smart_st = 0; goto st_full; }
 
                     #define COLLECT_ST(lo_val, hi_val) do {                      \
                         size_t _lo = 0, _hi = cnt;                              \
@@ -9951,10 +10058,10 @@ int main(int argc, char **argv) {
                                 pr[pf++] = verify[i];
                         }
                     }
-                    __sync_fetch_and_add(&stats_tested, (uint64_t)v_cnt);
+                    __atomic_fetch_add(&stats_tested, (uint64_t)v_cnt, __ATOMIC_RELAXED);
                     if (pf > sp) merge_sorted_u64(pr, sp, pf);
                     cnt = pf;
-                    __sync_fetch_and_add(&stats_primes_found, (uint64_t)pf);
+                    __atomic_fetch_add(&stats_primes_found, (uint64_t)pf, __ATOMIC_RELAXED);
 
                     /* Scan only fully-verified gap regions (same fix as cooperative path) */
                     {
@@ -9999,15 +10106,11 @@ int main(int argc, char **argv) {
                             size_t est_full = (size_t)((double)orig_cnt_st
                                             * (double)sp / (double)p1n);
                             if (est_full > 1 + region_pairs_st)
-                                __sync_fetch_and_add(&stats_pairs,
-                                                     (uint64_t)(est_full - 1 - region_pairs_st));
+                                __atomic_fetch_add(&stats_pairs,
+                                                   (uint64_t)(est_full - 1 - region_pairs_st),
+                                                   __ATOMIC_RELAXED);
                         }
                     }
-                    free(greg_lo_st);
-                    free(greg_hi_st);
-                    free(greg_alive_st);
-                    free(sampled);
-                    free(verify);
                 } else {
                 st_full:
                     if (!no_primality) {
@@ -10022,12 +10125,12 @@ int main(int argc, char **argv) {
                                 if (bn_candidate_is_prime(pr[i])) pr[pf++] = pr[i];
                             }
                         }
-                        __sync_fetch_and_add(&stats_tested, (uint64_t)test_cnt);
+                        __atomic_fetch_add(&stats_tested, (uint64_t)test_cnt, __ATOMIC_RELAXED);
                         cnt = pf;
-                        __sync_fetch_and_add(&stats_primes_found, (uint64_t)pf);
+                        __atomic_fetch_add(&stats_primes_found, (uint64_t)pf, __ATOMIC_RELAXED);
                     } else {
                         pf = cnt;
-                        __sync_fetch_and_add(&stats_tested, (uint64_t)cnt);
+                        __atomic_fetch_add(&stats_tested, (uint64_t)cnt, __ATOMIC_RELAXED);
                     }
                 }
                 /* Smart-scan handles gap scanning via regions above;
