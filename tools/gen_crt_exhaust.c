@@ -81,16 +81,105 @@ static const int PRIMES[] = {
  * Worst case: merit=30, bits=1024 → gap≈26640 → interval≈13321.       */
 #define MAX_INTERVAL 16384
 
+/* Phase-1 diagnostic kernel (shadow only; does NOT affect search order). */
+#define PHASE1_A_DEFAULT 5.8
+#define PHASE1_B_DEFAULT 3.3
+
+typedef struct {
+    long   remaining;
+    double score_raw;
+    double score_mean;
+    double a;
+    double b;
+    double scale;
+} Phase1Diag;
+
 typedef struct {
     uint8_t  buf[N_PRIMES_MAX + 1][MAX_INTERVAL]; /* layered sieve    */
     int      ii[N_PRIMES_MAX];   /* current offsets                   */
+    int      best_ii[N_PRIMES_MAX];
+    int      phase2_shadow_ii[N_PRIMES_MAX];
     int      n_primes;
     int      interval;           /* half of gap + 1 (bit positions)   */
     int      gap_size;
     long     min_cand;           /* best candidate count so far       */
+    long     best_cand;          /* selected production-best count     */
     long     max_cand;
     long     iter;
+    int      has_best;
+    int      has_phase2_shadow;
+    Phase1Diag best_phase1;
+    Phase1Diag phase2_shadow;
+    long     phase2_shadow_cand;
+    int      phase3_enabled;
+    int      phase3_delta;
+    double   phase3_mean_eps;
 } SearchState;
+
+static int phase1_better(const Phase1Diag *a, long a_cand,
+                         const Phase1Diag *b, long b_cand) {
+    if (a->score_mean != b->score_mean)
+        return a->score_mean > b->score_mean;
+    if (a->score_raw != b->score_raw)
+        return a->score_raw > b->score_raw;
+    return a_cand < b_cand;
+}
+
+static int production_better_phase3(const SearchState *S,
+                                    long cand_cnt,
+                                    const Phase1Diag *cand_p1,
+                                    long best_cnt,
+                                    const Phase1Diag *best_p1) {
+    if (cand_cnt > S->min_cand + S->phase3_delta)
+        return 0;
+
+    if (cand_cnt < best_cnt - S->phase3_delta)
+        return 1;
+    if (best_cnt < cand_cnt - S->phase3_delta)
+        return 0;
+
+    if (cand_p1->score_mean > best_p1->score_mean + S->phase3_mean_eps)
+        return 1;
+    if (best_p1->score_mean > cand_p1->score_mean + S->phase3_mean_eps)
+        return 0;
+
+    if (cand_p1->score_raw != best_p1->score_raw)
+        return cand_p1->score_raw > best_p1->score_raw;
+    return cand_cnt < best_cnt;
+}
+
+static void maybe_update_phase2_shadow(SearchState *S, long cnt,
+                                       const Phase1Diag *p1) {
+    if (!S->has_phase2_shadow ||
+        phase1_better(p1, cnt, &S->phase2_shadow, S->phase2_shadow_cand)) {
+        S->phase2_shadow = *p1;
+        S->phase2_shadow_cand = cnt;
+        memcpy(S->phase2_shadow_ii, S->ii, (size_t)S->n_primes * sizeof(int));
+        S->has_phase2_shadow = 1;
+    }
+}
+
+static Phase1Diag phase1_diag_from_state(const SearchState *S, double a, double b) {
+    Phase1Diag d;
+    d.remaining = 0;
+    d.score_raw = 0.0;
+    d.score_mean = 0.0;
+    d.a = a;
+    d.b = b;
+    d.scale = (S->interval > 1) ? (double)(S->interval - 1) : 1.0;
+
+    const uint8_t *cand = S->buf[S->n_primes - 1];
+    double center = 0.5 * (double)(S->interval - 1);
+    for (int j = 0; j < S->interval; j++) {
+        if (!cand[j]) continue;
+        d.remaining++;
+        double t = fabs(((double)j - center) / d.scale);
+        d.score_raw += exp(-a * pow(t, b));
+    }
+    if (d.remaining > 0)
+        d.score_mean = d.score_raw / (double)d.remaining;
+    return d;
+}
 
 /* ------------------------------------------------------------------ */
 /* Rebuild layers from_level..n_primes-1 using current ii[].          */
@@ -173,7 +262,8 @@ static void compute_crt(const int *ii, int n_primes, int gap_size,
 /* ------------------------------------------------------------------ */
 static void write_solution(const char *path, const int *ii, int n_primes,
                             long n_cand, int gap_size,
-                            double merit, int shift) {
+                            double merit, int shift,
+                            const Phase1Diag *p1) {
     char crt_str[256];
     compute_crt(ii, n_primes, gap_size, crt_str, sizeof(crt_str));
 
@@ -192,6 +282,15 @@ static void write_solution(const char *path, const int *ii, int n_primes,
     fprintf(f, "shift %d\n", shift);
     fprintf(f, "gap_target %d\n", gap_size);
     fprintf(f, "n_candidates %ld\n", n_cand);
+    if (p1) {
+        fprintf(f, "# phase1_kernel exp(-a*|x/scale|^b)\n");
+        fprintf(f, "# phase1_a %.6f\n", p1->a);
+        fprintf(f, "# phase1_b %.6f\n", p1->b);
+        fprintf(f, "# phase1_scale %.6f\n", p1->scale);
+        fprintf(f, "# phase1_remaining %ld\n", p1->remaining);
+        fprintf(f, "# phase1_score_raw %.9f\n", p1->score_raw);
+        fprintf(f, "# phase1_score_mean %.9f\n", p1->score_mean);
+    }
     fprintf(f, "2 1\n");  /* forces adj=1; skipped by template builder */
     for (int k = 0; k < n_primes; k++)
         fprintf(f, "%d %d\n", PRIMES[k], (2 * ii[k]) % PRIMES[k]);
@@ -216,15 +315,40 @@ static void search_exhaustive(SearchState *S, const char *outfile,
     /* ii[0] runs 1..PRIMES[0]-1 = 1..2. */
     while (S->ii[0] < PRIMES[0]) {
         long cnt = count_candidates(S);
+        Phase1Diag p1 = phase1_diag_from_state(S,
+                                               PHASE1_A_DEFAULT,
+                                               PHASE1_B_DEFAULT);
+        maybe_update_phase2_shadow(S, cnt, &p1);
         iter++;
 
         if (cnt < S->min_cand) {
             S->min_cand = cnt;
             printf("\rmin=%ld  ", cnt);
             for (int k=0;k<n;k++) printf("%d ",S->ii[k]);
-            printf("  (iter %ld)\n", iter);
+            printf("  p1_raw=%.4f mean=%.6f  (iter %ld)\n",
+                   p1.score_raw, p1.score_mean, iter);
+        }
+
+        int update_best = 0;
+        if (!S->has_best) {
+            update_best = 1;
+        } else if (S->phase3_enabled) {
+            update_best = production_better_phase3(S,
+                                                   cnt,
+                                                   &p1,
+                                                   S->best_cand,
+                                                   &S->best_phase1);
+        } else if (cnt < S->best_cand) {
+            update_best = 1;
+        }
+
+        if (update_best) {
+            S->best_cand = cnt;
+            S->best_phase1 = p1;
+            memcpy(S->best_ii, S->ii, (size_t)n * sizeof(int));
+            S->has_best = 1;
             /* Overwrite file with this new best (single-solution output). */
-            write_solution(outfile, S->ii, n, cnt, S->gap_size, merit, shift);
+            write_solution(outfile, S->ii, n, cnt, S->gap_size, merit, shift, &p1);
         }
         if (cnt > S->max_cand) S->max_cand = cnt;
 
@@ -274,15 +398,40 @@ static void search_random(SearchState *S, const char *outfile,
         }
         rebuild_from(S, 0);
         long cnt = count_candidates(S);
+        Phase1Diag p1 = phase1_diag_from_state(S,
+                                               PHASE1_A_DEFAULT,
+                                               PHASE1_B_DEFAULT);
+        maybe_update_phase2_shadow(S, cnt, &p1);
         iter++;
 
         if (cnt < S->min_cand) {
             S->min_cand = cnt;
             printf("\rmin=%ld  ", cnt);
             for (int k=0;k<n;k++) printf("%d ",S->ii[k]);
-            printf("  (iter %ld)\n", iter);
+            printf("  p1_raw=%.4f mean=%.6f  (iter %ld)\n",
+                   p1.score_raw, p1.score_mean, iter);
+        }
+
+        int update_best = 0;
+        if (!S->has_best) {
+            update_best = 1;
+        } else if (S->phase3_enabled) {
+            update_best = production_better_phase3(S,
+                                                   cnt,
+                                                   &p1,
+                                                   S->best_cand,
+                                                   &S->best_phase1);
+        } else if (cnt < S->best_cand) {
+            update_best = 1;
+        }
+
+        if (update_best) {
+            S->best_cand = cnt;
+            S->best_phase1 = p1;
+            memcpy(S->best_ii, S->ii, (size_t)n * sizeof(int));
+            S->has_best = 1;
             /* Overwrite file with this new best (single-solution output). */
-            write_solution(outfile, S->ii, n, cnt, S->gap_size, merit, shift);
+            write_solution(outfile, S->ii, n, cnt, S->gap_size, merit, shift, &p1);
         }
         if (cnt > S->max_cand) S->max_cand = cnt;
 
@@ -308,6 +457,9 @@ static void usage(const char *prog) {
         "                   all solutions within min+2 are saved).\n"
         "  --ctr-exhaust    Force exhaustive search even for large n_primes.\n"
         "  --ctr-random     Force random search even for small n_primes.\n"
+        "  --phase3         Enable hybrid selection (feature-gated; default: off).\n"
+        "  --phase3-delta N Candidate tolerance window for phase3 (default: 2).\n"
+        "  --phase3-mean-eps E  Minimum phase1 mean improvement (default: 0.0005).\n"
         "\nAutomatic: exhaustive for n_primes <= %d, random otherwise.\n",
         prog, N_PRIMES_MAX, MAX_EXHAUST_PRIMES);
 }
@@ -319,6 +471,9 @@ int main(int argc, char *argv[]) {
     char   outfile[256] = "crt_exhaust.txt";
     int    force_exhaust = 0;
     int    force_random  = 0;
+    int    phase3_enabled = 0;
+    int    phase3_delta = 2;
+    double phase3_mean_eps = 0.0005;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--ctr-primes") && i+1 < argc)
@@ -335,6 +490,12 @@ int main(int argc, char *argv[]) {
             force_exhaust = 1;
         else if (!strcmp(argv[i], "--ctr-random"))
             force_random = 1;
+        else if (!strcmp(argv[i], "--phase3"))
+            phase3_enabled = 1;
+        else if (!strcmp(argv[i], "--phase3-delta") && i+1 < argc)
+            phase3_delta = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--phase3-mean-eps") && i+1 < argc)
+            phase3_mean_eps = atof(argv[++i]);
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             usage(argv[0]); return 0;
         } else {
@@ -342,6 +503,9 @@ int main(int argc, char *argv[]) {
             usage(argv[0]); return 1;
         }
     }
+
+    if (phase3_delta < 0) phase3_delta = 0;
+    if (phase3_mean_eps < 0.0) phase3_mean_eps = 0.0;
 
     if (n_primes < 1 || n_primes > N_PRIMES_MAX) {
         fprintf(stderr, "error: --ctr-primes must be 1..%d\n", N_PRIMES_MAX);
@@ -386,6 +550,9 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "  gap_size  : %d\n", gap_size);
     fprintf(stderr, "  interval  : %d  (bit positions)\n", interval);
     fprintf(stderr, "  search    : %s\n", do_exhaust ? "EXHAUSTIVE" : "RANDOM");
+    if (phase3_enabled)
+        fprintf(stderr, "  phase3    : on  (delta=%d mean_eps=%.6f)\n",
+                phase3_delta, phase3_mean_eps);
     if (do_exhaust)
         fprintf(stderr, "  space     : %.3g  combinations\n", space);
     fprintf(stderr, "  output    : %s\n", outfile);
@@ -398,13 +565,42 @@ int main(int argc, char *argv[]) {
     S->interval  = interval;
     S->gap_size  = gap_size;
     S->min_cand  = interval + 1;  /* worse than any real value */
+    S->best_cand = interval + 1;
     S->max_cand  = 0;
+    S->phase3_enabled = phase3_enabled;
+    S->phase3_delta = phase3_delta;
+    S->phase3_mean_eps = phase3_mean_eps;
 
     if (do_exhaust) {
         search_exhaustive(S, outfile, merit, bits);
     } else {
         search_random(S, outfile, merit, bits, 0);
     }
+
+    if (S->has_best) {
+        fprintf(stderr, "\n========================================\n");
+        fprintf(stderr, "  best: %ld candidates%s\n",
+            S->best_cand,
+            S->phase3_enabled ? "  (phase3 selection)" : "");
+        fprintf(stderr,
+                "  phase1(score): raw=%.4f  mean=%.6f  remaining=%ld  [a=%.2f b=%.2f]\n",
+                S->best_phase1.score_raw,
+                S->best_phase1.score_mean,
+                S->best_phase1.remaining,
+                S->best_phase1.a,
+                S->best_phase1.b);
+        if (S->has_phase2_shadow) {
+            fprintf(stderr,
+                    "  phase2(shadow): p1-best=%ld cand  raw=%.4f  mean=%.6f"
+                    "  (delta_vs_best=%+ld)\n",
+                    S->phase2_shadow_cand,
+                    S->phase2_shadow.score_raw,
+                    S->phase2_shadow.score_mean,
+                    S->phase2_shadow_cand - S->best_cand);
+        }
+        fprintf(stderr, "========================================\n");
+    }
+
     free(S);
     return 0;
 }

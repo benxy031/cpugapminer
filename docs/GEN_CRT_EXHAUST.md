@@ -26,6 +26,7 @@ make gen_crt_exhaust
 ```
 gen_crt_exhaust --ctr-primes N --ctr-merit M [--ctr-bits B]
                 [--ctr-file FILE] [--ctr-exhaust] [--ctr-random]
+                [--phase3] [--phase3-delta N] [--phase3-mean-eps E]
 
   --ctr-primes N   Number of CRT primes (1..40).  Primes used: 3,5,7,...
   --ctr-merit  M   Target merit (gap_size = ceil(M × (256+bits) × ln2)).
@@ -33,6 +34,9 @@ gen_crt_exhaust --ctr-primes N --ctr-merit M [--ctr-bits B]
   --ctr-file   F   Output file (default: crt_exhaust.txt).
   --ctr-exhaust    Force exhaustive even for large n_primes (slow).
   --ctr-random     Force random even for small n_primes.
+    --phase3         Enable feature-gated hybrid production selection (default: off).
+    --phase3-delta N Candidate tolerance window for phase3 (default: 2).
+    --phase3-mean-eps E  Minimum phase1 mean improvement (default: 0.0005).
 ```
 
 **Automatic mode selection:**
@@ -42,6 +46,11 @@ gen_crt_exhaust --ctr-primes N --ctr-merit M [--ctr-bits B]
 The output file is **overwritten** each time a new minimum is found, so the
 file always holds exactly one solution — the best found so far.  This makes
 it directly loadable by the miner with `--crt-file`.
+
+When `--phase3` is enabled, the selected production best may differ from the
+absolute minimum candidate-count solution, but only inside a conservative
+window (`min_candidates + phase3-delta`). Outside that window, candidate-count
+minimum still wins.
 
 **Note on n_primes:** The file's `n_primes` header is N+1 (includes prime 2
 as the first entry `2 1`).  This is required by the miner to set `adj=1` in
@@ -55,6 +64,29 @@ as N stacked layers `buf[0..n_primes-1]`.  When the odometer counter
 increments prime `k`, only layers `k..n_primes-1` are rebuilt.  For the
 innermost prime (most frequent change), this is O(interval / p_last) instead
 of O(n × interval), giving ~10–30× speedup over a naive full re-evaluation.
+
+## Phase Reporting and Selection
+
+`gen_crt_exhaust` reports:
+
+1. **Minimum candidates** observed (`min=...`) during search.
+2. **Phase 1 diagnostics** for the selected production best.
+3. **Phase 2 shadow** (`phase2(shadow)`) as a comparison-only tracker by
+    phase1 kernel quality.
+
+The phase1 kernel is:
+
+```
+exp(-a * |x/scale|^b)
+```
+
+with defaults `a=5.8`, `b=3.3`.
+
+Selection rules:
+- Default (`--phase3` off): production best = strict minimum `n_candidates`.
+- With `--phase3`: hybrid ranking uses phase1 score inside `delta`, while
+    preserving a hard guard so selected best never exceeds
+    `min_candidates + phase3-delta`.
 
 ---
 
@@ -95,6 +127,12 @@ bin/gen_crt_exhaust \
 bin/gen_crt_exhaust \
     --ctr-primes 14 --ctr-merit 22 --ctr-bits 64 --ctr-random \
     --ctr-file crt/crt_s64_m22_exhaust.txt
+
+# merit 22, phase3 enabled (A/B testing only)
+bin/gen_crt_exhaust \
+    --ctr-primes 14 --ctr-merit 22 --ctr-bits 64 --ctr-random \
+    --phase3 --phase3-delta 2 --phase3-mean-eps 0.0005 \
+    --ctr-file crt/crt_s64_m22_exhaust_phase3.txt
 ```
 
 ### shift 68  (log2(primorial) ≈ 64.8 with 15 primes)
@@ -278,6 +316,13 @@ merit 22.00
 shift 128
 gap_target 1953
 n_candidates 614
+# phase1_kernel exp(-a*|x/scale|^b)
+# phase1_a 5.800000
+# phase1_b 3.300000
+# phase1_scale 976.000000
+# phase1_remaining 614
+# phase1_score_raw 545.123456789
+# phase1_score_mean 0.887823219
 3 2
 5 1
 7 3

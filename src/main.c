@@ -2368,22 +2368,33 @@ static void print_stats(void) {
         double avg_primes = (double)stats_gpu_sieve_primes / (double)stats_gpu_sieve_calls;
         double calls = (double)stats_gpu_sieve_calls;
         double avg_base_up = (double)stats_gpu_sieve_us_base_upload / calls;
+        double avg_zero = (double)stats_gpu_sieve_us_zero / calls;
         double avg_compute_k0 = (double)stats_gpu_sieve_us_compute_k0 / calls;
         double avg_mark = (double)stats_gpu_sieve_us_mark / calls;
         double avg_compact = (double)stats_gpu_sieve_us_compact / calls;
         double avg_pack = (double)stats_gpu_sieve_us_pack / calls;
         double avg_bits_dl = (double)stats_gpu_sieve_us_bits_dl / calls;
         double avg_merge = (double)stats_gpu_sieve_us_merge / calls;
+        double k0_inc_pct = (calls > 0.0)
+            ? (100.0 * (double)stats_gpu_sieve_k0_inc_calls / calls)
+            : 0.0;
         log_msg("  gpu_sieve_calls=%llu  gpu_sieve_primes/call=%.0f  gpu_sieve_fallback=%llu  surv_calls=%llu",
             (unsigned long long)stats_gpu_sieve_calls,
             avg_primes,
             (unsigned long long)stats_gpu_sieve_fallback,
             (unsigned long long)stats_gpu_sieve_surv_calls);
+        log_msg("  gpu_sieve_k0_mode: inc=%llu full=%llu prep=%llu (inc=%.1f%%)",
+            (unsigned long long)stats_gpu_sieve_k0_inc_calls,
+            (unsigned long long)stats_gpu_sieve_k0_full_calls,
+            (unsigned long long)stats_gpu_sieve_k0_delta_preps,
+            k0_inc_pct);
         {
             char timing_line[256];
             int n = snprintf(timing_line, sizeof(timing_line), "  gpu_sieve_us/call:");
             if (avg_base_up > 0.0)
                 n += snprintf(timing_line + n, sizeof(timing_line) - (size_t)n, " base_up=%.1f", avg_base_up);
+            if (avg_zero > 0.0)
+                n += snprintf(timing_line + n, sizeof(timing_line) - (size_t)n, " zero=%.1f", avg_zero);
             if (avg_compute_k0 > 0.0)
                 n += snprintf(timing_line + n, sizeof(timing_line) - (size_t)n, " compute_k0=%.1f", avg_compute_k0);
             if (avg_mark > 0.0)

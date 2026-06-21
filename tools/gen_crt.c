@@ -124,6 +124,28 @@ static const int    WEIGHT_PRIMES[]   = {3,5,7,11,13,17,19,23,29,31};
  * candidates that are not clustered into weak dense runs. */
 #define CLUSTER_PENALTY_WEIGHT 0.45
 
+/* ------------------------------------------------------------------ */
+/* Phase-1 diagnostic score (shadow only; does NOT affect optimisation)
+ *
+ * Kernel from forum fit idea:
+ *   K(x) = exp(-a * |x/scale|^b)
+ *
+ * We compute this only for final/best solutions to avoid perturbing hot
+ * optimisation loops. Lower score implies sparser candidate mass under this
+ * kernel (heuristically better for long-gap probability).
+ */
+#define PHASE1_A_DEFAULT 5.8
+#define PHASE1_B_DEFAULT 3.3
+
+typedef struct {
+    int    remaining;
+    double score_raw;
+    double score_mean;
+    double a;
+    double b;
+    double scale;
+} Phase1Diag;
+
 static double position_weight(int d) {
     /* Positions coprime to small primes are harder to eliminate by
      * subsequent sieving (no small factor to anchor a residue test)
@@ -149,6 +171,37 @@ typedef struct {
     double w_score;       /* weighted fitness used for optimization     */
 } Solution;
 
+static Phase1Diag phase1_diag(const int *offsets, int n_primes, int gap_size,
+                              uint8_t *buf, double a, double b) {
+    Phase1Diag d;
+    d.remaining = 0;
+    d.score_raw = 0.0;
+    d.score_mean = 0.0;
+    d.a = a;
+    d.b = b;
+    d.scale = (gap_size > 0) ? (double)gap_size : 1.0;
+
+    memset(buf, 0, (size_t)(gap_size + 1));
+    for (int i = 0; i < n_primes; i++) {
+        int p = PRIMES[i];
+        int o = offsets[i] % p;
+        for (int x = (o ? o : p); x <= gap_size; x += p)
+            buf[x] = 1;
+    }
+
+    /* Center kernel around the middle of [1..gap_size]. */
+    double center = 0.5 * (double)gap_size;
+    for (int x = 1; x <= gap_size; x++) {
+        if (buf[x]) continue;
+        d.remaining++;
+        double t = fabs(((double)x - center) / d.scale);
+        d.score_raw += exp(-a * pow(t, b));
+    }
+    if (d.remaining > 0)
+        d.score_mean = d.score_raw / (double)d.remaining;
+    return d;
+}
+
 static bool solution_better(const Solution *a, const Solution *b) {
     if (a->n_candidates != b->n_candidates)
         return a->n_candidates < b->n_candidates;
@@ -160,6 +213,25 @@ static bool solution_better_metrics(int a_cnt, double a_w,
     if (a_cnt != b_cnt)
         return a_cnt < b_cnt;
     return a_w < b_w;
+}
+
+static bool solution_better_phase3(const Solution *a, const Phase1Diag *a_p1,
+                                   const Solution *b, const Phase1Diag *b_p1,
+                                   int delta_candidates,
+                                   double mean_eps) {
+    if (a->n_candidates < b->n_candidates - delta_candidates)
+        return true;
+    if (b->n_candidates < a->n_candidates - delta_candidates)
+        return false;
+
+    if (a_p1->score_mean > b_p1->score_mean + mean_eps)
+        return true;
+    if (b_p1->score_mean > a_p1->score_mean + mean_eps)
+        return false;
+
+    if (a_p1->score_raw != b_p1->score_raw)
+        return a_p1->score_raw > b_p1->score_raw;
+    return solution_better(a, b);
 }
 
 /* ---- helpers ---- */
@@ -883,7 +955,8 @@ static void *ils_worker(void *arg) {
 /* Write CRT text file                                                 */
 /* ------------------------------------------------------------------ */
 static void write_crt_file(const char *path, const Solution *sol,
-                           double merit, int shift) {
+                           double merit, int shift,
+                           const Phase1Diag *p1) {
     FILE *f = fopen(path, "w");
     if (!f) { perror(path); exit(1); }
 
@@ -893,6 +966,15 @@ static void write_crt_file(const char *path, const Solution *sol,
     fprintf(f, "shift %d\n", shift);
     fprintf(f, "gap_target %d\n", sol->gap_size);
     fprintf(f, "n_candidates %d\n", sol->n_candidates);
+    if (p1) {
+        fprintf(f, "# phase1_kernel exp(-a*|x/scale|^b)\n");
+        fprintf(f, "# phase1_a %.6f\n", p1->a);
+        fprintf(f, "# phase1_b %.6f\n", p1->b);
+        fprintf(f, "# phase1_scale %.6f\n", p1->scale);
+        fprintf(f, "# phase1_remaining %d\n", p1->remaining);
+        fprintf(f, "# phase1_score_raw %.9f\n", p1->score_raw);
+        fprintf(f, "# phase1_score_mean %.9f\n", p1->score_mean);
+    }
 
     for (int i = 0; i < sol->n_primes; i++)
         fprintf(f, "%d %d\n", PRIMES[i], sol->offsets[i]);
@@ -922,6 +1004,9 @@ static void usage(const char *prog) {
         "  --ctr-range  R        Percent deviation from n_primes (default: 0)\n"
         "  --ctr-file   FILE     Output CRT file path (required)\n"
         "  --threads    N        Parallel threads for greedy+ILS (default: CPU count)\n"
+        "  --phase3             Enable hybrid selection (feature-gated; default: off)\n"
+        "  --phase3-delta N     Candidate tolerance window for phase3 (default: 2)\n"
+        "  --phase3-mean-eps E  Minimum phase1 mean improvement for phase3 (default: 0.0005)\n"
         "  --help                Show this help\n"
         "\n"
         "Gap size = ceil(merit * (256 + shift) * ln2)\n"
@@ -952,6 +1037,9 @@ int main(int argc, char **argv) {
     int    ctr_range    = 0;
     char  *ctr_file     = NULL;
     int    n_threads    = 0;   /* 0 = auto-detect */
+    bool   phase3_enabled = false;
+    int    phase3_delta = 2;
+    double phase3_mean_eps = 0.0005;
 
     static struct option long_opts[] = {
         {"calc-ctr",       no_argument,       NULL, 'C'},
@@ -965,12 +1053,15 @@ int main(int argc, char **argv) {
         {"ctr-range",      required_argument, NULL, 'r'},
         {"ctr-file",       required_argument, NULL, 'o'},
         {"threads",        required_argument, NULL, 'T'},
+        {"phase3",         no_argument,       NULL, 'P'},
+        {"phase3-delta",   required_argument, NULL, 'd'},
+        {"phase3-mean-eps",required_argument, NULL, 'q'},
         {"help",           no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "Cp:m:b:s:ef:i:r:o:T:h",
+    while ((opt = getopt_long(argc, argv, "Cp:m:b:s:ef:i:r:o:T:Pd:q:h",
                               long_opts, NULL)) != -1) {
         switch (opt) {
         case 'C': /* --calc-ctr: accepted for compat, always active */ break;
@@ -984,6 +1075,9 @@ int main(int argc, char **argv) {
         case 'r': ctr_range    = atoi(optarg); break;
         case 'o': ctr_file     = optarg;        break;
         case 'T': n_threads    = atoi(optarg); break;
+        case 'P': phase3_enabled = true;         break;
+        case 'd': phase3_delta = atoi(optarg);   break;
+        case 'q': phase3_mean_eps = atof(optarg); break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 1;
         }
@@ -1006,6 +1100,8 @@ int main(int argc, char **argv) {
     if (ctr_fixed > ctr_primes) ctr_fixed = ctr_primes;
     if (ctr_ivs < 2) ctr_ivs = 2;
     if (ctr_strength < 1) ctr_strength = 1;
+    if (phase3_delta < 0) phase3_delta = 0;
+    if (phase3_mean_eps < 0.0) phase3_mean_eps = 0.0;
 
     /* resolve thread count */
     if (n_threads <= 0)
@@ -1036,6 +1132,9 @@ int main(int argc, char **argv) {
                 ctr_range,
                 ctr_primes - ctr_primes * ctr_range / 100,
                 ctr_primes + ctr_primes * ctr_range / 100);
+    if (phase3_enabled)
+        fprintf(stderr, "  phase3      : on  (delta=%d mean_eps=%.6f)\n",
+                phase3_delta, phase3_mean_eps);
     fprintf(stderr, "\n");
 
     srand((unsigned)time(NULL));
@@ -1057,6 +1156,28 @@ int main(int argc, char **argv) {
     global_best.w_score      = 1e18;
     global_best.n_primes     = 0;
     global_best.gap_size     = 0;
+
+    Solution phase1_shadow_best;
+    phase1_shadow_best.offsets      = NULL;
+    phase1_shadow_best.n_candidates = INT_MAX;
+    phase1_shadow_best.w_score      = 1e18;
+    phase1_shadow_best.n_primes     = 0;
+    phase1_shadow_best.gap_size     = 0;
+    Phase1Diag phase1_shadow_diag;
+    phase1_shadow_diag.remaining  = 0;
+    phase1_shadow_diag.score_raw  = -1.0;
+    phase1_shadow_diag.score_mean = -1.0;
+    phase1_shadow_diag.a          = PHASE1_A_DEFAULT;
+    phase1_shadow_diag.b          = PHASE1_B_DEFAULT;
+    phase1_shadow_diag.scale      = 1.0;
+
+    Phase1Diag global_best_phase1;
+    global_best_phase1.remaining  = 0;
+    global_best_phase1.score_raw  = 0.0;
+    global_best_phase1.score_mean = 0.0;
+    global_best_phase1.a          = PHASE1_A_DEFAULT;
+    global_best_phase1.b          = PHASE1_B_DEFAULT;
+    global_best_phase1.scale      = 1.0;
 
     int greedy_best_cnt = INT_MAX;
     int phase_best_cnt  = INT_MAX;
@@ -1269,15 +1390,126 @@ int main(int argc, char **argv) {
 
         /* ---- find best in population ---- */
         int best_idx = 0;
-        for (int i = 1; i < pop_size; i++)
-            if (solution_better(&pop[i], &pop[best_idx]))
-                best_idx = i;
+        Phase1Diag best_idx_diag;
+        int have_best_idx_diag = 0;
+
+        if (phase3_enabled) {
+            int pop_min_cnt = pop[0].n_candidates;
+            for (int i = 1; i < pop_size; i++)
+                if (pop[i].n_candidates < pop_min_cnt)
+                    pop_min_cnt = pop[i].n_candidates;
+
+            int min_anchor = pop_min_cnt + phase3_delta;
+            int seeded = 0;
+            for (int i = 0; i < pop_size; i++) {
+                if (pop[i].n_candidates <= min_anchor) {
+                    best_idx = i;
+                    seeded = 1;
+                    break;
+                }
+            }
+            if (!seeded)
+                best_idx = 0;
+
+            best_idx_diag = phase1_diag(pop[best_idx].offsets,
+                                        np,
+                                        gs,
+                                        buf,
+                                        PHASE1_A_DEFAULT,
+                                        PHASE1_B_DEFAULT);
+            have_best_idx_diag = 1;
+            for (int i = 1; i < pop_size; i++) {
+                if (pop[i].n_candidates > min_anchor)
+                    continue;
+                Phase1Diag cand_diag = phase1_diag(pop[i].offsets,
+                                                   np,
+                                                   gs,
+                                                   buf,
+                                                   PHASE1_A_DEFAULT,
+                                                   PHASE1_B_DEFAULT);
+                if (solution_better_phase3(&pop[i], &cand_diag,
+                                           &pop[best_idx], &best_idx_diag,
+                                           phase3_delta,
+                                           phase3_mean_eps)) {
+                    best_idx = i;
+                    best_idx_diag = cand_diag;
+                }
+            }
+        } else {
+            for (int i = 1; i < pop_size; i++)
+                if (solution_better(&pop[i], &pop[best_idx]))
+                    best_idx = i;
+        }
 
         phase_best_cnt = pop[best_idx].n_candidates;
 
-        if (!global_best.offsets || solution_better(&pop[best_idx], &global_best)) {
-            if (global_best.offsets) sol_free(&global_best);
+        /* Phase-2 shadow ranking: independently track highest phase1 score.
+           This does NOT affect production best selection. */
+        int shadow_idx = 0;
+        Phase1Diag shadow_diag = phase1_diag(pop[0].offsets,
+                                             np,
+                                             gs,
+                                             buf,
+                                             PHASE1_A_DEFAULT,
+                                             PHASE1_B_DEFAULT);
+        for (int i = 1; i < pop_size; i++) {
+            Phase1Diag cand_diag = phase1_diag(pop[i].offsets,
+                                               np,
+                                               gs,
+                                               buf,
+                                               PHASE1_A_DEFAULT,
+                                               PHASE1_B_DEFAULT);
+            int better = 0;
+            if (cand_diag.score_mean > shadow_diag.score_mean) {
+                better = 1;
+            } else if (cand_diag.score_mean == shadow_diag.score_mean &&
+                       cand_diag.score_raw > shadow_diag.score_raw) {
+                better = 1;
+            } else if (cand_diag.score_mean == shadow_diag.score_mean &&
+                       cand_diag.score_raw == shadow_diag.score_raw &&
+                       solution_better(&pop[i], &pop[shadow_idx])) {
+                better = 1;
+            }
+            if (better) {
+                shadow_idx = i;
+                shadow_diag = cand_diag;
+            }
+        }
+
+        if (!phase1_shadow_best.offsets ||
+            shadow_diag.score_mean > phase1_shadow_diag.score_mean ||
+            (shadow_diag.score_mean == phase1_shadow_diag.score_mean &&
+             shadow_diag.score_raw > phase1_shadow_diag.score_raw) ||
+            (shadow_diag.score_mean == phase1_shadow_diag.score_mean &&
+             shadow_diag.score_raw == phase1_shadow_diag.score_raw &&
+             solution_better(&pop[shadow_idx], &phase1_shadow_best))) {
+            if (phase1_shadow_best.offsets) sol_free(&phase1_shadow_best);
+            phase1_shadow_best = sol_clone(&pop[shadow_idx]);
+            phase1_shadow_diag = shadow_diag;
+        }
+
+        if (!global_best.offsets) {
             global_best = sol_clone(&pop[best_idx]);
+            if (phase3_enabled && have_best_idx_diag)
+                global_best_phase1 = best_idx_diag;
+        } else {
+            int replace_global = 0;
+            if (phase3_enabled && have_best_idx_diag) {
+                replace_global = solution_better_phase3(&pop[best_idx],
+                                                        &best_idx_diag,
+                                                        &global_best,
+                                                        &global_best_phase1,
+                                                        phase3_delta,
+                                                        phase3_mean_eps);
+            } else {
+                replace_global = solution_better(&pop[best_idx], &global_best);
+            }
+            if (replace_global) {
+                sol_free(&global_best);
+                global_best = sol_clone(&pop[best_idx]);
+                if (phase3_enabled && have_best_idx_diag)
+                    global_best_phase1 = best_idx_diag;
+            }
         }
 
         for (int i = 0; i < pop_size; i++) sol_free(&pop[i]);
@@ -1304,6 +1536,34 @@ int main(int argc, char **argv) {
                 : 0.0);
     fprintf(stderr, "========================================\n");
 
+    uint8_t *p1_buf = (uint8_t *)calloc((size_t)(global_best.gap_size + 1), 1);
+    if (!p1_buf) {
+        perror("calloc");
+        sol_free(&global_best);
+        return 1;
+    }
+    Phase1Diag p1 = phase1_diag(global_best.offsets,
+                                global_best.n_primes,
+                                global_best.gap_size,
+                                p1_buf,
+                                PHASE1_A_DEFAULT,
+                                PHASE1_B_DEFAULT);
+    free(p1_buf);
+
+    fprintf(stderr,
+            "  phase1(score): raw=%.4f  mean=%.6f  remaining=%d  [a=%.2f b=%.2f]\n",
+            p1.score_raw, p1.score_mean, p1.remaining, p1.a, p1.b);
+        if (phase1_shadow_best.offsets) {
+        fprintf(stderr,
+            "  phase2(shadow): p1-best=%d cand  raw=%.4f  mean=%.6f"
+            "  (delta_vs_best=%+d)\n",
+            phase1_shadow_best.n_candidates,
+            phase1_shadow_diag.score_raw,
+            phase1_shadow_diag.score_mean,
+            phase1_shadow_best.n_candidates - global_best.n_candidates);
+        }
+    fprintf(stderr, "========================================\n");
+
     /* print offsets */
     fprintf(stderr, "\n  prime -> offset:\n");
     for (int i = 0; i < global_best.n_primes; i++)
@@ -1311,8 +1571,10 @@ int main(int argc, char **argv) {
                 PRIMES[i], global_best.offsets[i]);
 
     /* ---- Write output file ---- */
-    write_crt_file(ctr_file, &global_best, ctr_merit, sh);
+    write_crt_file(ctr_file, &global_best, ctr_merit, sh, &p1);
 
+    if (phase1_shadow_best.offsets)
+        sol_free(&phase1_shadow_best);
     sol_free(&global_best);
     return 0;
 }

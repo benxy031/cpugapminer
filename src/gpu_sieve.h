@@ -30,6 +30,7 @@ typedef struct {
     uint8_t  *d_bits;         /* device memory: packed output bitmap */
     uint64_t *d_primes;       /* device memory: prime array (H→D copy input) */
     uint64_t *d_k0;           /* device memory: starting index per prime (H→D copy input) */
+    uint32_t *d_delta_mod;    /* device memory: cached (delta_idx % prime) per prime */
     size_t    d_segment_cap;  /* max segment size allocated */
     size_t    d_bits_cap;     /* max packed bitmap bytes allocated */
     size_t    d_primes_cap;   /* max primes in device array */
@@ -58,13 +59,24 @@ typedef struct {
     uint32_t *h_surv_count_pinned;   /* pinned host: count staging (1 element) */
     uint32_t  survivors_cap;         /* max survivors before bitmap fallback */
     uint32_t  last_surv_count;       /* survivors from last compact-mode call */
-    /* Per-call timing (filled by gpu_sieve_mark_batch, in microseconds). */
-    uint64_t  last_us_base_upload;   /* H->D base_mod_p transfer (rare) */
-    uint64_t  last_us_compute_k0;    /* kernel_compute_k0 execution */
-    uint64_t  last_us_mark;          /* kernel_mark_composites execution */
+    /* Per-call timing (filled by gpu_sieve_mark_batch, in microseconds).
+     * These are per-stream elapsed timings and can include queueing delay when
+     * multiple pooled contexts are active on the same GPU. */
+    uint64_t  last_us_base_upload;   /* upload/setup before active-surface clear */
+    uint64_t  last_us_zero;          /* active-surface clear (bits or segment) */
+    uint64_t  last_us_compute_k0;    /* kernel_compute_k0 or delta_mod prep */
+    uint64_t  last_us_mark;          /* composite-mark stage */
     uint64_t  last_us_compact;       /* kernel_compact_survivors execution */
     uint64_t  last_us_pack;          /* kernel_pack_bits execution (overflow path only) */
     uint64_t  last_us_bits_dl;       /* D->H bits download */
+    uint64_t  last_k0_L;             /* window L used for current d_k0 residue state */
+    size_t    last_k0_segment_len;   /* segment_len used for current d_k0 residue state */
+    int       last_k0_n_primes;      /* prime count used for current d_k0 residue state */
+    int       k0_cache_valid;        /* 1 when d_k0 holds valid per-prime k0 residues */
+    uint32_t  last_delta_idx;        /* cached delta_idx used for d_delta_mod */
+    int       delta_mod_valid;       /* 1 when d_delta_mod matches last_delta_idx */
+    uint32_t  last_k0_mode_inc;      /* 1 if last call used incremental k0 path */
+    uint32_t  last_k0_delta_prepared;/* 1 if last call recomputed d_delta_mod */
 } gpu_sieve_ctx_t;
 
 /* ═══════════════════════════════════════════════════════════════════

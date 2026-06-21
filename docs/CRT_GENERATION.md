@@ -76,6 +76,7 @@ Where `N#` is the primorial (product of the first N primes).
 |   192 |     35 |           149 |           189.9 |        2 |       6522 |       6832 |       7764 |
 |   256 |     43 |           191 |           249.2 |        6 |       7453 |       7808 |       8873 |
 |   384 |     60 |           281 |           383.3 |        0 |       9316 |       9760 |      11091 |
+|   450 |     68 |           337 |           449.6 |        0 |      10248 |      10736 |      12200 |
 |   512 |     75 |           379 |           509.0 |        2 |      11180 |      11712 |      13309 |
 |   640 |     89 |           461 |           631.2 |        8 |      13043 |      13664 |      15527 |
 |   720 |     98 |           521 |           711.6 |        8 |      14207 |      14884 |      16913 |
@@ -100,7 +101,37 @@ Where `N#` is the primorial (product of the first N primes).
 | `--ctr-fixed F` | Number of small primes frozen during evolution. Scale with prime count: 8 for ≤23, 10 for 24–33, 11 for 34–49, 12 for 50–73, 13 for 74–95, 14 for 96–118, 15 for 119+. |
 | `--ctr-ivs I` | Population size for evolution. Quick test: 20, production: **1 000**. |
 | `--ctr-range R` | Percent deviation from `--ctr-primes`. Explores nearby prime counts for potentially better results. |
+| `--phase3` | Enable feature-gated hybrid final selection (default: off). |
+| `--phase3-delta N` | Candidate tolerance window used by phase3 (default: 2). |
+| `--phase3-mean-eps E` | Minimum phase1 mean improvement required in phase3 comparisons (default: 0.0005). |
 | `--ctr-file FILE` | Output file path (required) |
+
+## Phase Reporting and Selection
+
+`gen_crt` now reports three layers:
+
+1. **Production best** (always used for file output)
+   - Default (`--phase3` off): minimum `n_candidates`, weighted tie-break.
+   - With `--phase3`: hybrid selection enabled, but constrained by a
+     conservative anchor (`min_candidates + phase3_delta`) so selection
+     cannot drift far from the best candidate-count basin.
+2. **Phase 1 diagnostics** (`phase1(score)`) for the selected production best.
+3. **Phase 2 shadow** (`phase2(shadow)`) — best solution by phase1 kernel
+   score, reported for comparison only.
+
+The phase1 kernel is:
+
+```
+exp(-a * |x/scale|^b)
+```
+
+with defaults `a=5.8`, `b=3.3`.
+
+Interpretation:
+- `n_candidates`: primary workload metric (lower is better).
+- `phase1_score_mean`: spatial quality metric among survivors (higher is better).
+- `phase2(shadow)` delta: how many candidates the phase1-best differs from
+  production best.
 
 ## How to Calculate ctr-bits
 
@@ -174,6 +205,19 @@ Expected: ~610 candidates.
 ```
 
 Expected: ~640 candidates.
+
+### Shift 64 (merit 22, phase3 enabled)
+
+```bash
+./bin/gen_crt --calc-ctr \
+  --ctr-primes 15 --ctr-merit 22 --ctr-bits 4 \
+  --ctr-strength 10000 --ctr-evolution --ctr-fixed 8 --ctr-ivs 1000 \
+  --phase3 --phase3-delta 2 --phase3-mean-eps 0.0005 \
+  --ctr-file crt/crt_s64_m22_phase3.txt
+```
+
+Use this only for controlled A/B tests. Keep default (`--phase3` off) for
+baseline generation until mining-side validation confirms net benefit.
 
 ### Shift 68 (merit 22–30)
 
@@ -281,6 +325,36 @@ Expected: ~680 candidates.
 ```
 
 Expected: ~750 candidates.
+
+### Shift 450 (merit 22)
+
+68 primes fit in shift 450 (log₂(68#) ≈ 449.6, ctr-bits=0).
+
+```bash
+./bin/gen_crt --calc-ctr \
+  --ctr-primes 68 --ctr-merit 22 --ctr-bits 0 \
+  --ctr-strength 10000 --ctr-evolution --ctr-fixed 12 --ctr-ivs 1000 \
+  --ctr-file crt/crt_s450_m22.txt
+```
+
+### Shift 450 (merit 23)
+
+```bash
+./bin/gen_crt --calc-ctr \
+  --ctr-primes 68 --ctr-merit 23 --ctr-bits 0 \
+  --ctr-strength 10000 --ctr-evolution --ctr-fixed 12 --ctr-ivs 1000 \
+  --ctr-file crt/crt_s450_m23.txt
+```
+
+### Shift 450 (merit 23, phase3)
+
+```bash
+./bin/gen_crt --calc-ctr \
+  --ctr-primes 68 --ctr-merit 23 --ctr-bits 0 \
+  --ctr-strength 10000 --ctr-evolution --ctr-fixed 12 --ctr-ivs 1000 \
+  --phase3 --phase3-delta 2 --phase3-mean-eps 0.0005 \
+  --ctr-file crt/crt_s450_m23_phase3.txt
+```
 
 ### Shift 512 (merit 22)
 

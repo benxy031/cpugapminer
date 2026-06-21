@@ -295,15 +295,23 @@ int gpu_sieve_mark_segment_batch(
 
     if (rc == 0 || rc == 1) {
         uint64_t us_base_up = g_gpu_sieve_ctx[idx][slot].last_us_base_upload;
+        uint64_t us_zero = g_gpu_sieve_ctx[idx][slot].last_us_zero;
         uint64_t us_k0 = g_gpu_sieve_ctx[idx][slot].last_us_compute_k0;
         uint64_t us_mark = g_gpu_sieve_ctx[idx][slot].last_us_mark;
         uint64_t us_compact = g_gpu_sieve_ctx[idx][slot].last_us_compact;
         uint64_t us_pack = g_gpu_sieve_ctx[idx][slot].last_us_pack;
         uint64_t us_bits_dl = g_gpu_sieve_ctx[idx][slot].last_us_bits_dl;
+        uint64_t k0_inc = g_gpu_sieve_ctx[idx][slot].last_k0_mode_inc ? 1ULL : 0ULL;
+        uint64_t k0_prepare = g_gpu_sieve_ctx[idx][slot].last_k0_delta_prepared ? 1ULL : 0ULL;
+
+        __atomic_fetch_add(&stats_gpu_sieve_k0_inc_calls, k0_inc, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&stats_gpu_sieve_k0_full_calls, 1ULL - k0_inc, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&stats_gpu_sieve_k0_delta_preps, k0_prepare, __ATOMIC_RELAXED);
 
         /* When GPU_SIEVE_TIMING is off, these stay zero; skip hot-path atomics. */
-        if ((us_base_up | us_k0 | us_mark | us_compact | us_pack | us_bits_dl) != 0) {
+        if ((us_base_up | us_zero | us_k0 | us_mark | us_compact | us_pack | us_bits_dl) != 0) {
             __atomic_fetch_add(&stats_gpu_sieve_us_base_upload, us_base_up, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&stats_gpu_sieve_us_zero,        us_zero, __ATOMIC_RELAXED);
             __atomic_fetch_add(&stats_gpu_sieve_us_compute_k0,  us_k0, __ATOMIC_RELAXED);
             __atomic_fetch_add(&stats_gpu_sieve_us_mark,        us_mark, __ATOMIC_RELAXED);
             __atomic_fetch_add(&stats_gpu_sieve_us_compact,     us_compact, __ATOMIC_RELAXED);

@@ -536,11 +536,12 @@ remain on the CPU.
 
 - Device-resident cache of Phase 2 primes (`d_primes`)
 - Device-resident cache of `base_mod_p` for the current header (`d_base_mod_p`)
-- `kernel_compute_k0`: compute first-hit offsets `k0[j]` from `base_mod_p[j]`
-  plus the current window start `L`
-- `kernel_mark_composites`: mark Phase 2 composites into a byte-per-candidate
-  scratch buffer (`d_segment`)
-- `kernel_pack_bits`: pack `d_segment` into a bit-packed bitmap (`d_bits`)
+- `kernel_compute_k0`: first full pass computes first-hit residues `k0[j]`;
+  subsequent windows use incremental cached updates when possible
+- direct packed-bitmap mark path (`kernel_mark_composites_bits` and fused
+  incremental variant) is the default fast path in bitmap mode
+- legacy scratch+pack path (`kernel_mark_composites` + `kernel_pack_bits`)
+  is still available as a runtime fallback/diagnostic path
 - `kernel_compact_survivors`: try to compact Phase 2 survivors into a fixed-cap
   `uint32_t` list before falling back to bitmap mode
 
@@ -552,9 +553,10 @@ remain on the CPU.
    extraction.
 4. If the compact survivor count fits in `GPU_SIEVE_SURV_CAP`, the GPU returns
    survivor positions directly.
-5. Otherwise the GPU falls back to bitmap mode, downloads `d_bits`, and the CPU
-   OR-merges that bitmap into `bits[]`.
-6. CPU applies the Phase 3 CRT filter, then turns the final bitmap (or the
+5. Otherwise the GPU runs bitmap mode. By default it marks directly into
+  packed `d_bits`; optional diagnostic mode can force legacy scratch+pack.
+6. Bitmap mode downloads `d_bits`, and the CPU OR-merges that bitmap into `bits[]`.
+7. CPU applies the Phase 3 CRT filter, then turns the final bitmap (or the
    compact survivor list intersected with `bits[]`) into the `tls_pr[]`
    survivor array used by later primality / gap checks.
 
@@ -595,8 +597,11 @@ buffers are sized from the finalized CLI values at startup, not hardcoded.
 
 | Variable | Effect |
 |----------|--------|
-| `GPU_SIEVE_POOL` | pooled contexts per selected CUDA device (default `2`, max `4`) |
+| `GPU_SIEVE_POOL` | pooled contexts per selected CUDA device (default `3`, max `4`) |
 | `GPU_SIEVE_TIMING` | enable per-stage CUDA timing collection |
+| `GPU_SIEVE_TIMING_SERIAL` | diagnostic mode: serialize GPU sieve calls for cleaner timing attribution (not for production throughput runs) |
+| `GPU_SIEVE_DIRECT_BITS` | bitmap mode selector: default `1` (direct packed-bit marking), set `0` to force legacy scratch+pack path |
+| `GPU_SIEVE_CLEAR_KERNEL` | diagnostic mode: replace `cudaMemsetAsync` clear with a simple clear kernel (`1`=on); default off |
 | `GPU_SIEVE_SURV_CAP` | compact survivor cap before bitmap fallback |
 
 **New stats fields** (visible in STATS output when GPU sieve is active):
@@ -613,11 +618,40 @@ gpu_sieve_calls=152  gpu_sieve_primes/call=984398  gpu_sieve_fallback=0  surv_ca
 When `GPU_SIEVE_TIMING=1`, a second line may appear:
 
 ```
-gpu_sieve_us/call: base_up=... compute_k0=... mark=... pack=... bits_dl=... merge=...
+gpu_sieve_us/call: base_up=... zero=... compute_k0=... mark=... compact=... pack=... bits_dl=... merge=...
 ```
 
 Zero-valued stages are omitted. If all timing averages are zero, this line is
 suppressed entirely.
+
+When verbose non-CRT stats are enabled, additional lane-distribution lines may
+appear:
+
+```
+lane(non-crt): pairs=... same=... alt+2=... alt+4=... unexpected=...
+lane(non-crt,qual): pairs=... same=... alt+2=... alt+4=... unexpected=...
+```
+
+- `lane(non-crt)` — distribution over all adjacent prime pairs seen by the
+  non-CRT gap scan
+- `lane(non-crt,qual)` — the same distribution, but only for pairs whose gap
+  merit reached the scan/submit threshold
+- `same` — both primes stay in the same modulo-6 lane (`gap mod 6 == 0`)
+- `alt+2` — lane transition `5 mod 6 -> 1 mod 6` (`gap mod 6 == 2`)
+- `alt+4` — lane transition `1 mod 6 -> 5 mod 6` (`gap mod 6 == 4`)
+- `unexpected` — anything outside those valid modulo-6 transitions; this
+  should stay near zero and mainly acts as a sanity check
+
+Small `lane(non-crt,qual)` sample sizes are not statistically meaningful. For
+example, `pairs=1 alt+4=100%` only means the single qualifying gap in that
+sample happened to be of the `1 mod 6 -> 5 mod 6` type.
+
+Operational note:
+
+- `GPU_SIEVE_TIMING_SERIAL=1` and `GPU_SIEVE_CLEAR_KERNEL=1` are intended for
+  diagnostics only. Keep them disabled for normal mining runs.
+- `GPU_SIEVE_DIRECT_BITS` is enabled by default and is currently the preferred
+  production bitmap path.
 
 **Performance note:**
 

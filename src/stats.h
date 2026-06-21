@@ -36,6 +36,7 @@ extern volatile uint64_t stats_gpu_sieve_calls;
 extern volatile uint64_t stats_gpu_sieve_primes;
 extern volatile uint64_t stats_gpu_sieve_fallback;
 extern volatile uint64_t stats_gpu_sieve_us_base_upload;
+extern volatile uint64_t stats_gpu_sieve_us_zero;
 extern volatile uint64_t stats_gpu_sieve_us_compute_k0;
 extern volatile uint64_t stats_gpu_sieve_us_mark;
 extern volatile uint64_t stats_gpu_sieve_us_compact;
@@ -43,6 +44,9 @@ extern volatile uint64_t stats_gpu_sieve_us_pack;
 extern volatile uint64_t stats_gpu_sieve_us_bits_dl;
 extern volatile uint64_t stats_gpu_sieve_us_merge;
 extern volatile uint64_t stats_gpu_sieve_surv_calls;  /* calls that returned compact survivors */
+extern volatile uint64_t stats_gpu_sieve_k0_inc_calls;   /* compute_k0 used incremental path */
+extern volatile uint64_t stats_gpu_sieve_k0_full_calls;  /* compute_k0 used full recompute */
+extern volatile uint64_t stats_gpu_sieve_k0_delta_preps; /* incremental calls that rebuilt d_delta_mod */
 extern volatile uint64_t stats_crt_tmpl_hits;  /* times per-nonce CRT template was applied */
 extern volatile uint64_t stats_false_gaps;     /* rejected as false after interior verification */
 extern volatile uint64_t stats_partial_sieve_auto_windows;    /* windows evaluated by partial-sieve-auto */
