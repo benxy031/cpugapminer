@@ -793,10 +793,9 @@ gpu_fermat_ctx *gpu_fermat_init(int device_id, size_t max_batch)
         return NULL;
     }
 
-    /* Query device name */
-    cudaDeviceProp prop;
-    if (cudaGetDeviceProperties(&prop, device_id) == cudaSuccess)
-        strncpy(ctx->dev_name, prop.name, sizeof(ctx->dev_name) - 1);
+    /* Keep init compatible with older CUDA runtimes that may lack
+       cudaGetDeviceProperties_v2 at link time. */
+    (void)snprintf(ctx->dev_name, sizeof(ctx->dev_name), "cuda:%d", device_id);
 
     ctx->device_id = device_id;
     ctx->max_batch = max_batch;
