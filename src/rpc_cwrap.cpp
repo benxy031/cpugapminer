@@ -133,7 +133,12 @@ int rpc_submit(const char *url, const char *user, const char *pass, const char *
                     fprintf(stderr, "RPC error object: %s\n", errdump);
                     free(errdump);
                 }
-                ret = -1;
+                /* Deserialization/validation errors from submitblock are
+                   deterministic for the current payload: don't retry. */
+                if (code == -22)
+                    ret = 1;
+                else
+                    ret = -1;
             }
             json_decref(root);
         }

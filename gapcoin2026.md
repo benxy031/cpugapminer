@@ -207,3 +207,78 @@ else:
 - verify merkle root byte order in header serialization
 - verify coinbase output script equals configured payout script (when override is enabled)
 - verify candidate still matches active template/pass id (stale protection)
+
+## 10. Real-World Validation Snapshot
+
+The following production-style behavior was observed in live mining after applying the compatibility fixes:
+
+- qualifying gap found and submitted in GBT mode
+- RPC response: `{"result":null,"error":null,...}`
+- miner log: `submitblock: ACCEPTED (result=null)`
+- async submit status moved to `ACCEPTED`
+- node advanced to a new tip immediately after submission (`NEW BLOCK ... mining on top`)
+- stats reflected `accepted=1`
+
+Interpretation:
+
+- `result=null` with `error=null` is accepted for this wallet RPC
+- block payload format is valid for `submitblock`
+- end-to-end flow (candidate -> block assembly -> submit -> chain tip update) is working
+
+## 11. CRT Path And nAdd Explained
+
+This section explains the most common source of integration mistakes in high-shift mining.
+
+### 11.1 What CRT Path Means
+
+In CRT-based mining, the miner does not test random candidates one-by-one.
+It uses a residue system to skip values that are guaranteed composite, then only
+tests survivors. This makes high-shift search practical.
+
+Conceptually, each tested candidate is still a number of the form:
+
+$$
+N = (H \ll nShift) + nAdd
+$$
+
+where:
+
+- $H$ is derived from the block header hash context
+- $nShift$ is the shift parameter (for example, 705)
+- $nAdd$ is the additive offset that selects the exact candidate inside that shift space
+
+### 11.2 What nAdd Is (And What It Is Not)
+
+- `nAdd` is not a cosmetic metadata field; it is part of PoW candidate construction.
+- changing `nAdd` changes the integer being tested for primality and gap quality.
+- at higher shifts, `nAdd` is often much larger than 64-bit and must be handled as a big integer.
+
+### 11.3 Serialization Requirement In submitblock Mode
+
+For modern GBT submit path, full block assembly must preserve the exact `nAdd`
+value found by the solver.
+
+Practical rule:
+
+1. serialize `nAdd` as little-endian byte array (minimal representation)
+2. prefix it with CompactSize length
+3. include it in the variable-length header portion exactly as consensus expects
+
+If this is done incorrectly (wrong endian, truncated to 64-bit, wrong length),
+the node typically returns decode/validation errors during `submitblock`.
+
+### 11.4 Difference Between Legacy getwork And GBT submitblock
+
+- legacy `getwork` submit path usually sends a compact payload format specific to that RPC workflow
+- GBT `submitblock` requires a full serialized block
+
+Do not reuse legacy payload construction inside GBT `submitblock` path.
+That mismatch is a common cause of `Block decode failed`.
+
+### 11.5 Minimal Developer Checklist For CRT + nAdd
+
+- keep `nAdd` as big integer through the whole pipeline
+- avoid downcasting `nAdd` to `uint64_t` in assembly code
+- ensure `nShift` in submitted block matches the solver context
+- use stale-pass/template guards so `nAdd` is submitted with the correct header context
+- log header size and serialized block length in debug mode for forensic checks

@@ -40,7 +40,7 @@ static int      build_block_from_gbt_and_payload(const char *gbt_json,
                                                  const char *header_payload_hex,
                                                  int nshift_val,
                                                  uint32_t nonce_val,
-                                                 uint64_t nadd_val,
+                                                 mpz_srcptr nadd_val,
                                                  char outhex[16384]);
 static void     pass_state_snapshot_nonce_hdr80(uint32_t *nonce_out,
                                                 uint8_t hdr80_out[80]);
@@ -668,10 +668,14 @@ static int build_mining_pass_from_gbt(const char *url,
 
     char blockhex[16384];
     memset(blockhex, 0, sizeof(blockhex));
-    if (!build_block_from_gbt_and_payload(gbt, "", shift, 0, 0, blockhex)) {
+    mpz_t nadd_zero;
+    mpz_init_set_ui(nadd_zero, 0);
+    if (!build_block_from_gbt_and_payload(gbt, "", shift, 0, nadd_zero, blockhex)) {
+        mpz_clear(nadd_zero);
         free(gbt);
         return 0;
     }
+    mpz_clear(nadd_zero);
 
     if (strlen(blockhex) < 160) {
         log_msg("rpc: gbt fallback produced short block hex\n");
@@ -4421,7 +4425,7 @@ static int json_extract_u64_hex_field(const char *json, const char *key,
 #ifdef WITH_RPC
 static int build_block_from_gbt_and_payload(const char *gbt_json, const char *header_payload_hex,
                                              int nshift_val, uint32_t nonce_val,
-                                             uint64_t nadd_val,
+                                             mpz_srcptr nadd_val,
                                              char outhex[16384]) {
     char prevhex[65] = {0};
     uint32_t curtime = (uint32_t)time(NULL);
@@ -4579,8 +4583,8 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
     unsigned char merkle_root[32]; memcpy(merkle_root, layer[0], 32);
     free(layer[0]); free(layer);
 
-    // build header (Gapcoin header includes additional fields: nDifficulty (8 bytes), nShift and nAdd vector)
-    unsigned char headerbin[96]; unsigned char *hp = headerbin;
+    // build header (Gapcoin header includes additional fields: nDifficulty (8 bytes), nShift and variable nAdd vector)
+    unsigned char headerbin[4096]; unsigned char *hp = headerbin;
     memset(headerbin, 0, sizeof(headerbin));
     memcpy(hp, &version, 4); hp += 4;
     unsigned char prevbin[32]; memset(prevbin, 0, 32);
@@ -4604,19 +4608,48 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
     // Wallet PoW parser imports nAdd bytes as LE (ary_to_mpz order=-1,endian=-1).
     // For nadd=0 write a single 0x00 byte (length 1).
     {
-        unsigned char nadd_bytes[8];
-        int nadd_len;
-        if (nadd_val == 0) {
-            nadd_bytes[0] = 0;
-            nadd_len = 1;
-        } else {
-            /* write little-endian directly */
-            nadd_len = 0;
-            uint64_t tmp = nadd_val;
-            while (tmp > 0) { nadd_bytes[nadd_len++] = (unsigned char)(tmp & 0xff); tmp >>= 8; }
+        unsigned char nadd_zero = 0;
+        unsigned char *nadd_bytes = &nadd_zero;
+        size_t nadd_len = 1;
+        if (nadd_val && mpz_sgn(nadd_val) != 0) {
+            size_t alloc_len = (size_t)((mpz_sizeinbase(nadd_val, 2) + 7) / 8);
+            size_t count = 0;
+            if (alloc_len == 0)
+                alloc_len = 1;
+            nadd_bytes = (unsigned char *)malloc(alloc_len);
+            if (!nadd_bytes) {
+                log_msg("ERROR: malloc nAdd bytes failed\n");
+                for (size_t i = 0; i < total_txs; i++) free(txraws[i]);
+                free(txraws);
+                free(txraw_lens);
+                if (tx_bytes) free(tx_bytes);
+                if (tx_lens) free(tx_lens);
+                return 0;
+            }
+            mpz_export(nadd_bytes, &count, -1, 1, 0, 0, nadd_val); /* LE byte order */
+            if (count == 0) {
+                nadd_bytes[0] = 0;
+                count = 1;
+            }
+            nadd_len = count;
+        }
+        /* CompactSize can take up to 9 bytes; ensure header buffer is sufficient. */
+        if ((size_t)(hp - headerbin) + 9 + nadd_len > sizeof(headerbin)) {
+            log_msg("ERROR: header buffer too small for nAdd serialization (need>%lu bytes)\n",
+                    (unsigned long)((size_t)(hp - headerbin) + 9 + nadd_len));
+            if (nadd_bytes != &nadd_zero)
+                free(nadd_bytes);
+            for (size_t i = 0; i < total_txs; i++) free(txraws[i]);
+            free(txraws);
+            free(txraw_lens);
+            if (tx_bytes) free(tx_bytes);
+            if (tx_lens) free(tx_lens);
+            return 0;
         }
         write_compact_size(&hp, (uint64_t)nadd_len);
         memcpy(hp, nadd_bytes, nadd_len); hp += nadd_len;
+        if (nadd_bytes != &nadd_zero)
+            free(nadd_bytes);
     }
     /* Gapcoin header is variable length: 4+32+32+4+8+4+2+(CompactSize+nAdd_bytes)
        For nadd=0 that is 88 bytes (CompactSize=1 + 1 zero byte).
@@ -4630,6 +4663,16 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
                                 (total_txs <= 0xFFFFFFFFULL) ? 5 : 9;
     size_t full_len = header_size + txcount_varint_len;
     for (size_t i=0;i<total_txs;i++) full_len += txraw_lens[i];
+    if (full_len * 2 + 1 > 16384) {
+        log_msg("ERROR: serialized submitblock payload too large for buffer (%lu bytes)\n",
+                (unsigned long)full_len);
+        for (size_t i = 0; i < total_txs; i++) free(txraws[i]);
+        free(txraws);
+        free(txraw_lens);
+        if (tx_bytes) free(tx_bytes);
+        if (tx_lens) free(tx_lens);
+        return 0;
+    }
     unsigned char *full = malloc(full_len + 8);
     unsigned char *fp = full;
     memcpy(fp, headerbin, header_size); fp += header_size;
@@ -4673,8 +4716,18 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
 
     // Detailed debug: log header, txcount and first tx prefix for byte-for-byte comparison
     char tmphex[1024*4]; size_t dbg_len = full_len < 200 ? full_len : 200; bytes_to_hex(full, dbg_len, tmphex);
-    char headerhex[200]; bytes_to_hex(headerbin, header_size, headerhex); headerhex[header_size*2]='\0';
-    log_file_only("DEBUG block header hex: %s\n", headerhex);
+    {
+        size_t headerhex_len = header_size * 2 + 1;
+        char *headerhex = (char *)malloc(headerhex_len);
+        if (headerhex) {
+            bytes_to_hex(headerbin, header_size, headerhex);
+            log_file_only("DEBUG block header hex: %s\n", headerhex);
+            free(headerhex);
+        } else {
+            log_msg("WARN: OOM allocating header debug hex buffer (header_size=%lu)\n",
+                    (unsigned long)header_size);
+        }
+    }
     log_file_only("DEBUG txcount=%lu first_bytes=%s\n", (unsigned long)total_txs, tmphex + 160);
 
     // Verify that the coinbase tx bytes appear immediately after header + txcount varint
@@ -4851,9 +4904,12 @@ static int assemble_mining_block(uint64_t nadd_val, uint64_t expect_seq,
             log_msg("[assemble] missing cached gbt template for submitblock mode\n");
             return 0;
         }
+        mpz_t nadd_mpz;
+        mpz_init_set_ui(nadd_mpz, nadd_val);
         int ok = build_block_from_gbt_and_payload(gbt, "", pass_snap.nshift,
                               pass_snap.nonce,
-                                                  nadd_val, out_hex);
+                                                  nadd_mpz, out_hex);
+        mpz_clear(nadd_mpz);
         free(gbt);
         if (!ok)
             log_msg("[assemble] failed to build submitblock payload from gbt\n");
@@ -4916,6 +4972,22 @@ static int assemble_mining_block_mpz(uint32_t mining_nonce, mpz_t nadd_val,
                 (unsigned long long)expect_seq, (unsigned long long)current_seq);
         return 0;
     }
+
+    if (__atomic_load_n(&g_rpc_mining_mode, __ATOMIC_RELAXED) == RPC_MINING_GBT) {
+        char *gbt = rpc_dup_cached_gbt_json();
+        if (!gbt) {
+            log_msg("[assemble] missing cached gbt template for submitblock mode\n");
+            return 0;
+        }
+        int ok = build_block_from_gbt_and_payload(gbt, "", pass_snap.nshift,
+                                                  mining_nonce,
+                                                  nadd_val, out_hex);
+        free(gbt);
+        if (!ok)
+            log_msg("[assemble] failed to build submitblock payload from gbt (mpz)\n");
+        return ok;
+    }
+
     unsigned char buf[1024]; /* enough for nAdd up to ~7400 bits */
     unsigned char *p = buf;
     memcpy(p, pass_snap.hdr80, 80); p += 80;
@@ -10210,8 +10282,10 @@ int main(int argc, char **argv) {
         }
         /* --p is interpreted as nAdd directly (prime = h256<<shift + nAdd). */
         uint64_t build_nadd = (uint64_t)build_p;
+        mpz_t build_nadd_mpz;
+        mpz_init_set_ui(build_nadd_mpz, build_nadd);
         if (build_block_from_gbt_and_payload(gbt, payload_hex, shift,
-                                            0, build_nadd, blockhex)) {
+                                            0, build_nadd_mpz, blockhex)) {
             log_msg("Built blockhex: %s\n", blockhex);
             if (rpc_url) {
                 log_msg("Submitting built block via RPC...\n");
@@ -10221,6 +10295,7 @@ int main(int argc, char **argv) {
         } else {
             log_msg("Failed to build block from GBT\n");
         }
+        mpz_clear(build_nadd_mpz);
         free(gbt);
         stop_stats_thread();
         return 0;
