@@ -48,7 +48,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
-#include <pthread.h>
+#include <mutex>
 #include <cuda_runtime.h>
 
 #define GPU_SIEVE_THREADS_PER_BLOCK 256
@@ -79,7 +79,7 @@ static int gpu_sieve_timing_serial_enabled(void)
     return cached;
 }
 
-static pthread_mutex_t g_gpu_sieve_timing_serial_mu = PTHREAD_MUTEX_INITIALIZER;
+static std::mutex g_gpu_sieve_timing_serial_mu;
 
 /* Runtime A/B switch for the direct packed-bitmap mark path.
  * Default ON; set GPU_SIEVE_DIRECT_BITS=0 to force scratch+pack fallback. */
@@ -974,7 +974,7 @@ int gpu_sieve_mark_batch(
      *                bits_dl (ev6/ev7) */
     cudaEvent_t ev0, ev1, ev2, ev3, ev4, ev5, ev6, ev7;
     if (timing && gpu_sieve_timing_serial_enabled()) {
-        pthread_mutex_lock(&g_gpu_sieve_timing_serial_mu);
+        g_gpu_sieve_timing_serial_mu.lock();
         timing_serial_lock_held = 1;
     }
     if (timing) {
@@ -1250,7 +1250,7 @@ int gpu_sieve_mark_batch(
                         }
                         /* h_bits is intentionally not filled in compact mode. */
                             if (timing_serial_lock_held) {
-                                pthread_mutex_unlock(&g_gpu_sieve_timing_serial_mu);
+                                g_gpu_sieve_timing_serial_mu.unlock();
                                 timing_serial_lock_held = 0;
                             }
                         return 1;
@@ -1346,7 +1346,7 @@ int gpu_sieve_mark_batch(
         memcpy(h_bits, ctx->h_bits_pinned, out_bytes);
     }
     if (timing_serial_lock_held) {
-        pthread_mutex_unlock(&g_gpu_sieve_timing_serial_mu);
+        g_gpu_sieve_timing_serial_mu.unlock();
         timing_serial_lock_held = 0;
     }
     return 0; /* bitmap mode */
@@ -1359,7 +1359,7 @@ timing_cleanup:
         cudaEventDestroy(ev6); cudaEventDestroy(ev7);
     }
     if (timing_serial_lock_held) {
-        pthread_mutex_unlock(&g_gpu_sieve_timing_serial_mu);
+        g_gpu_sieve_timing_serial_mu.unlock();
         timing_serial_lock_held = 0;
     }
     return -1;
