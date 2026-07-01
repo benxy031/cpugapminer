@@ -105,6 +105,16 @@ extern volatile uint64_t stats_cramer_heap_skip;    /* windows skipped by score<
 /* score sum stored as scaled integer (×1e9) to avoid atomic double */
 extern volatile uint64_t stats_cramer_score_sum_e9; /* sum of cramer_score×1e9 */
 
+/* PGT trend telemetry (log-only; does not affect mining decisions). */
+extern volatile uint64_t stats_pgt_records_total;       /* observed global best-gap updates */
+extern volatile uint64_t stats_pgt_records_above_trend; /* updates where gap exceeded k=1 trend */
+extern volatile uint64_t stats_pgt_records_above_cramer;/* updates where gap exceeded log^2 bound */
+extern volatile uint64_t stats_pgt_records_above_submit;/* updates where gap exceeded submit threshold */
+extern volatile uint64_t stats_pgt_last_gap;            /* last record gap seen by observer */
+extern volatile uint64_t stats_pgt_last_trend_gap_e3;   /* last trend gap, scaled ×1000 */
+extern volatile uint64_t stats_pgt_last_ratio_e3;       /* last gap/trend ratio, scaled ×1000 */
+extern volatile uint64_t stats_pgt_last_submit_ratio_e3;/* last gap/(target*logbase), scaled ×1000 */
+
 /* Rolling-window state used by print_stats(). */
 #define RATE_RING_SLOTS 6
 struct rate_ring_slot {

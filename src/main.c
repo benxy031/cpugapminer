@@ -960,7 +960,7 @@ static double auto_one_sided_skip_merit(int shift, double scan_target_runtime) {
 /* Number of edge-probe candidates per side when eliminating false-positive
    regions in the two-phase smart scan.  Higher values catch more false
    positives but cost more Fermat tests up-front.                            */
-#define EDGE_PROBE_N 3
+#define EDGE_PROBE_N 5
 
 /* ── CRT (Chinese Remainder Theorem) sieve support ──
    Supports two formats:
@@ -1939,6 +1939,46 @@ static double resolve_scan_target(double submit_target, double scan_target_cfg) 
     return (scan_target_cfg > 0.0) ? scan_target_cfg : submit_target;
 }
 
+/* Log-only PGT observer for k=1 trend behavior.
+   Uses the paper's prime-gap trend proxy: log^2(x) - 2*log(x)*log(log(x)).
+   Called only when the global best gap is updated; this is not on hot paths. */
+static void pgt_observe_record_gap(uint64_t gap, double logbase,
+                                   double submit_target_merit) {
+    if (gap < 2 || !(logbase > 2.0))
+        return;
+
+    double ll = log(logbase);
+    if (!(ll > 0.0))
+        return;
+
+    double trend = logbase * logbase - 2.0 * logbase * ll;
+    if (trend < 2.0)
+        trend = 2.0;
+    double cramer = logbase * logbase;
+    double submit_gap = (submit_target_merit > 0.0)
+        ? (submit_target_merit * logbase)
+        : 0.0;
+
+    uint64_t trend_e3 = (uint64_t)(trend * 1000.0 + 0.5);
+    uint64_t ratio_e3 = (uint64_t)(((double)gap / trend) * 1000.0 + 0.5);
+    uint64_t submit_ratio_e3 = (submit_gap > 0.0)
+        ? (uint64_t)(((double)gap / submit_gap) * 1000.0 + 0.5)
+        : 0;
+
+    __atomic_fetch_add(&stats_pgt_records_total, 1, __ATOMIC_RELAXED);
+    if ((double)gap > trend)
+        __atomic_fetch_add(&stats_pgt_records_above_trend, 1, __ATOMIC_RELAXED);
+    if ((double)gap > cramer)
+        __atomic_fetch_add(&stats_pgt_records_above_cramer, 1, __ATOMIC_RELAXED);
+    if (submit_gap > 0.0 && (double)gap >= submit_gap)
+        __atomic_fetch_add(&stats_pgt_records_above_submit, 1, __ATOMIC_RELAXED);
+
+    stats_pgt_last_gap = gap;
+    stats_pgt_last_trend_gap_e3 = trend_e3;
+    stats_pgt_last_ratio_e3 = ratio_e3;
+    stats_pgt_last_submit_ratio_e3 = submit_ratio_e3;
+}
+
 /* Keep runtime submit threshold in sync with pass difficulty unless user
    explicitly overrode --target.  If --scan-merit was not provided (or reset
    with <=0), scan threshold follows submit threshold. */
@@ -2088,6 +2128,34 @@ static void print_stats(void) {
             bm, (unsigned long long)stats_best_gap,
             (unsigned long long)stats_last_gap,
             (unsigned long long)stats_last_qual_gap);
+
+    {
+        uint64_t pgt_rec = stats_pgt_records_total;
+        uint64_t pgt_above_trend = stats_pgt_records_above_trend;
+        uint64_t pgt_above_cramer = stats_pgt_records_above_cramer;
+        uint64_t pgt_above_submit = stats_pgt_records_above_submit;
+        double pgt_trend_pct = (pgt_rec > 0)
+            ? (100.0 * (double)pgt_above_trend / (double)pgt_rec)
+            : 0.0;
+        double pgt_cramer_pct = (pgt_rec > 0)
+            ? (100.0 * (double)pgt_above_cramer / (double)pgt_rec)
+            : 0.0;
+        double pgt_submit_pct = (pgt_rec > 0)
+            ? (100.0 * (double)pgt_above_submit / (double)pgt_rec)
+            : 0.0;
+        log_msg("  pgt: rec=%llu above_trend=%llu (%.1f%%) above_cramer=%llu (%.1f%%) above_submit=%llu (%.1f%%) last_gap=%llu last_trend=%.1f last_ratio=%.3f last_vs_submit=%.3f",
+            (unsigned long long)pgt_rec,
+            (unsigned long long)pgt_above_trend,
+            pgt_trend_pct,
+            (unsigned long long)pgt_above_cramer,
+            pgt_cramer_pct,
+            (unsigned long long)pgt_above_submit,
+            pgt_submit_pct,
+            (unsigned long long)stats_pgt_last_gap,
+            (double)stats_pgt_last_trend_gap_e3 / 1000.0,
+            (double)stats_pgt_last_ratio_e3 / 1000.0,
+            (double)stats_pgt_last_submit_ratio_e3 / 1000.0);
+    }
 
     if (gmp_timing_enabled()) {
         uint64_t calls = atomic_load_explicit(&gmp_timing_calls, memory_order_relaxed);
@@ -5924,6 +5992,7 @@ static size_t crt_bkscan_and_submit(
     if (best_merit_loc > stats_best_merit) {
         stats_best_merit = best_merit_loc;
         stats_best_gap = best_gap_local;
+        pgt_observe_record_gap(best_gap_local, logbase, target);
         log_extra_merit_event("best", "crt-bkscan", best_merit_loc,
                               best_gap_local, target);
     }
@@ -6078,6 +6147,7 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
         if (!best_needs_validation && merit > stats_best_merit) {
             stats_best_merit = merit;
             stats_best_gap   = gap;
+            pgt_observe_record_gap(gap, logbase, target);
             log_extra_merit_event("best", "crt-gpu", merit, gap, target);
         }
         if (merit < target) continue;
@@ -6138,6 +6208,7 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
         if (merit > stats_best_merit) {
             stats_best_merit = merit;
             stats_best_gap   = gap;
+            pgt_observe_record_gap(gap, logbase, target);
             log_extra_merit_event("best", "crt-gpu", merit, gap, target);
         }
 
@@ -6947,6 +7018,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
         if (merit > stats_best_merit) {
             stats_best_merit = merit;
             stats_best_gap   = gap;
+            pgt_observe_record_gap(gap, logbase, target_local);
             log_extra_merit_event("best", "scan-candidates", merit, gap,
                                   target_local);
         }
@@ -8129,6 +8201,8 @@ static void *worker_fn(void *arg) {
                 if (res_w.best_merit > stats_best_merit) {
                     stats_best_merit = res_w.best_merit;
                     stats_best_gap   = res_w.best_gap;
+                    pgt_observe_record_gap(res_w.best_gap, logbase,
+                                           target_local);
                     log_extra_merit_event("best", "bkscan-worker",
                                           res_w.best_merit,
                                           res_w.best_gap,

@@ -151,9 +151,13 @@ jobs:
         shell: pwsh
         run: |
           $nvcc = "$env:CUDA_PATH\bin\nvcc.exe"
+          # windows-latest can ship a newer MSVC toolset than CUDA 12.4
+          # officially supports; allow it in CI to avoid host_config.h hard-fail.
+          $unsupported = "-allow-unsupported-compiler"
           # Compile for Pascal (sm_61 = GTX 1050 Ti), Turing (sm_75),
           # Ampere (sm_86) + PTX fallback for newer hardware.
           & $nvcc -O3 `
+            $unsupported `
             -gencode arch=compute_61,code=sm_61 `
             -gencode arch=compute_75,code=sm_75 `
             -gencode arch=compute_86,code=sm_86 `
@@ -166,6 +170,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
           & $nvcc -O3 `
+            $unsupported `
             -gencode arch=compute_61,code=sm_61 `
             -gencode arch=compute_75,code=sm_75 `
             -gencode arch=compute_86,code=sm_86 `

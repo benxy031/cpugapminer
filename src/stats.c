@@ -103,6 +103,14 @@ volatile uint64_t stats_cramer_scored       = 0;
 volatile uint64_t stats_cramer_skipped      = 0;
 volatile uint64_t stats_cramer_heap_skip    = 0;
 volatile uint64_t stats_cramer_score_sum_e9 = 0;
+volatile uint64_t stats_pgt_records_total = 0;
+volatile uint64_t stats_pgt_records_above_trend = 0;
+volatile uint64_t stats_pgt_records_above_cramer = 0;
+volatile uint64_t stats_pgt_records_above_submit = 0;
+volatile uint64_t stats_pgt_last_gap = 0;
+volatile uint64_t stats_pgt_last_trend_gap_e3 = 0;
+volatile uint64_t stats_pgt_last_ratio_e3 = 0;
+volatile uint64_t stats_pgt_last_submit_ratio_e3 = 0;
 
 struct rate_ring_slot rate_ring[RATE_RING_SLOTS];
 int rate_ring_idx = 0;
