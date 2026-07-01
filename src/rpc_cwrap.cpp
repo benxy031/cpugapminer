@@ -179,7 +179,7 @@ char *rpc_call(const char *url, const char *user, const char *pass, const char *
 }
 
 char *rpc_getblocktemplate(const char *url, const char *user, const char *pass) {
-    char *res = rpc_call(url, user, pass, "getblocktemplate", "{}");
+    char *res = rpc_call(url, user, pass, "getblocktemplate", "[{}]");
     if (res) {
         /* parse previousblockhash via JSON parser and report header received.
            This is more robust than string searching and avoids false positives. */
@@ -189,7 +189,15 @@ char *rpc_getblocktemplate(const char *url, const char *user, const char *pass) 
         if (!root) {
             fprintf(stderr, "Failed to parse getblocktemplate response: %s\n", jerr.text);
         } else {
-            json_t *prev = json_object_get(root, "previousblockhash");
+            json_t *result = json_object_get(root, "result");
+            json_t *prev = NULL;
+            if (result && json_is_object(result)) {
+                prev = json_object_get(result, "previousblockhash");
+            }
+            if (!prev) {
+                /* Legacy fallback: some wrappers return bare object. */
+                prev = json_object_get(root, "previousblockhash");
+            }
             if (prev && json_is_string(prev)) {
                 const char *current = json_string_value(prev);
                 if (current && current[0]) {

@@ -36,14 +36,22 @@ static int      bn_candidate_is_prime(uint64_t offset);
 #ifdef WITH_RPC
 static int      build_mining_pass(const char *url, const char *user, const char *pass, int shift);
 static int      assemble_mining_block(uint64_t nadd_val, uint64_t expect_seq, char out_hex[16384]);
+static int      build_block_from_gbt_and_payload(const char *gbt_json,
+                                                 const char *header_payload_hex,
+                                                 int nshift_val,
+                                                 uint32_t nonce_val,
+                                                 uint64_t nadd_val,
+                                                 char outhex[16384]);
 static void     pass_state_snapshot_nonce_hdr80(uint32_t *nonce_out,
                                                 uint8_t hdr80_out[80]);
 static void     submit_gap_block_common(const char *blockhex, double merit,
                                         const char *rpc_url,
                                         const char *rpc_user,
                                         const char *rpc_pass,
+                                        const char *rpc_method,
                                         const char *rpc_sign_key,
                                         const char *queue_note);
+extern char    *rpc_getblocktemplate(const char *url, const char *user, const char *pass);
 extern int      rpc_getwork_data(const char *url, const char *user, const char *pass, char data_out[161], uint64_t *ndiff_out);
 #endif
 #ifdef WITH_RPC
@@ -125,6 +133,10 @@ static int rpc_tip_poll_ms = 1000;
  * Prevents the miner from exhausting a barren nonce/adder combination.
  * Default: 600 s (10 min).  Set with --nonce-rotate-s. */
 static int g_nonce_rotate_ms = 600000;
+/* Optional override for coinbase output scriptPubKey bytes (hex string).
+ * Used by GBT submitblock flow to pay rewards to a wallet-owned script. */
+static const char *g_coinbase_script_hex = NULL;
+static int g_warned_coinbase_script_missing = 0;
 #ifdef WITH_RPC
 /* Per-thread tip poll state used to keep long scan loops responsive. */
 static __thread int tls_rpc_tip_poll_enabled = 0;
@@ -146,6 +158,24 @@ static inline uint64_t now_ns_mono(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
 #endif
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static int is_valid_hex_string(const char *s)
+{
+    if (!s || !s[0])
+        return 0;
+    size_t n = strlen(s);
+    if ((n & 1u) != 0u)
+        return 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (!((c >= '0' && c <= '9') ||
+              (c >= 'a' && c <= 'f') ||
+              (c >= 'A' && c <= 'F'))) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 /* Temporary GMP path timing, enabled with CPUGAP_GMP_TIMING=1.
@@ -517,6 +547,54 @@ struct pass_state {
 static struct pass_state g_pass = {0};
 static pthread_mutex_t g_pass_lock = PTHREAD_MUTEX_INITIALIZER;
 
+enum rpc_mining_mode {
+    RPC_MINING_AUTO = 0,
+    RPC_MINING_GETWORK = 1,
+    RPC_MINING_GBT = 2,
+};
+static _Atomic int g_rpc_mining_mode = RPC_MINING_AUTO;
+static pthread_mutex_t g_gbt_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static char *g_gbt_cache_json = NULL;
+
+static void rpc_set_mining_mode(enum rpc_mining_mode mode) {
+    int old_mode = __atomic_exchange_n(&g_rpc_mining_mode, (int)mode, __ATOMIC_RELAXED);
+    if (old_mode == (int)mode)
+        return;
+    if (mode == RPC_MINING_GETWORK)
+        log_msg("rpc mining mode: getwork (legacy)\n");
+    else if (mode == RPC_MINING_GBT)
+        log_msg("rpc mining mode: getblocktemplate + submitblock\n");
+}
+
+static void rpc_cache_gbt_json(const char *gbt_json) {
+    pthread_mutex_lock(&g_gbt_cache_lock);
+    if (g_gbt_cache_json) {
+        free(g_gbt_cache_json);
+        g_gbt_cache_json = NULL;
+    }
+    if (gbt_json)
+        g_gbt_cache_json = strdup(gbt_json);
+    pthread_mutex_unlock(&g_gbt_cache_lock);
+}
+
+static char *rpc_dup_cached_gbt_json(void) {
+    char *dup = NULL;
+    pthread_mutex_lock(&g_gbt_cache_lock);
+    if (g_gbt_cache_json)
+        dup = strdup(g_gbt_cache_json);
+    pthread_mutex_unlock(&g_gbt_cache_lock);
+    return dup;
+}
+
+static void rpc_clear_cached_gbt_json(void) {
+    pthread_mutex_lock(&g_gbt_cache_lock);
+    if (g_gbt_cache_json) {
+        free(g_gbt_cache_json);
+        g_gbt_cache_json = NULL;
+    }
+    pthread_mutex_unlock(&g_gbt_cache_lock);
+}
+
 static void pass_state_snapshot(struct pass_state *out) {
     pthread_mutex_lock(&g_pass_lock);
     *out = g_pass;
@@ -578,6 +656,86 @@ static int pass_state_try_advance_nonce(uint64_t expect_seq,
     }
     pthread_mutex_unlock(&g_pass_lock);
     return ok;
+}
+
+static int build_mining_pass_from_gbt(const char *url,
+                                      const char *user,
+                                      const char *pass,
+                                      int shift) {
+    char *gbt = rpc_getblocktemplate(url, user, pass);
+    if (!gbt)
+        return 0;
+
+    char blockhex[16384];
+    memset(blockhex, 0, sizeof(blockhex));
+    if (!build_block_from_gbt_and_payload(gbt, "", shift, 0, 0, blockhex)) {
+        free(gbt);
+        return 0;
+    }
+
+    if (strlen(blockhex) < 160) {
+        log_msg("rpc: gbt fallback produced short block hex\n");
+        free(gbt);
+        return 0;
+    }
+
+    uint8_t hdr80[80];
+    for (int i = 0; i < 80; i++) {
+        unsigned int bv = 0;
+        if (sscanf(blockhex + i * 2, "%2x", &bv) != 1) {
+            free(gbt);
+            return 0;
+        }
+        hdr80[i] = (uint8_t)bv;
+    }
+
+    char prevhex[65] = {0};
+    for (int i = 0; i < 32; i++)
+        sprintf(prevhex + 2 * i, "%02x", hdr80[4 + 31 - i]);
+
+    uint8_t hdr84[84], sha_raw[32], h256[32];
+    uint32_t nonce = 0;
+    for (;;) {
+        memcpy(hdr84, hdr80, 80);
+        memcpy(hdr84 + 80, &nonce, 4);
+        double_sha256(hdr84, 84, sha_raw);
+        if (sha_raw[31] >= 0x80)
+            break;
+        if (++nonce == 0)
+            break;
+    }
+    for (int k = 0; k < 32; k++)
+        h256[k] = sha_raw[31 - k];
+
+    uint64_t ndiff = 0;
+    for (int i = 0; i < 8; i++)
+        ndiff |= ((uint64_t)hdr80[72 + i]) << (8 * i);
+
+    struct pass_state next = {0};
+    memcpy(next.h256, h256, 32);
+    memcpy(next.hdr80, hdr80, 80);
+    next.nonce = nonce;
+    next.nshift = (uint16_t)shift;
+    next.ndiff = ndiff;
+    next.net_ndiff = ndiff;
+    strncpy(next.prevhex, prevhex, 64);
+    next.prevhex[64] = '\0';
+    next.height = 0;
+    pass_state_publish(&next);
+
+    rpc_cache_gbt_json(gbt);
+    free(gbt);
+    rpc_set_mining_mode(RPC_MINING_GBT);
+    if ((!g_coinbase_script_hex || !g_coinbase_script_hex[0]) &&
+        !g_warned_coinbase_script_missing) {
+        g_warned_coinbase_script_missing = 1;
+        log_msg("WARN: GBT+submitblock mode without --coinbase-script-hex may produce wallet-invisible coinbase outputs on some nodes\n");
+        log_msg("      set --coinbase-script-hex <scriptPubKeyHex> to force payout to your wallet address\n");
+    }
+    log_file_only("build_mining_pass[gbt]: nonce=%u ndiff=%llu h256[0..3]=%02x%02x%02x%02x prevhex=%.16s...\n",
+                  nonce, (unsigned long long)ndiff,
+                  h256[0], h256[1], h256[2], h256[3], prevhex);
+    return 1;
 }
 
 /* ── Per-pass stratum dedup ─────────────────────────────────────────────
@@ -2381,7 +2539,10 @@ static void print_stats(void) {
                 (unsigned long long)pre_span_drop,
                 (unsigned long long)pre_den_drop);
             if (stats_crt_gpu_accum_flush_count > 0 ||
-                stats_crt_gpu_accum_collect_count > 0) {
+                stats_crt_gpu_accum_collect_count > 0 ||
+                stats_crt_cuda_fb_no_accum > 0 ||
+                stats_crt_cuda_fb_limb_mismatch > 0 ||
+                stats_crt_cuda_fb_add_fail > 0) {
                 double avg_flush_ms = (stats_crt_gpu_accum_flush_count > 0)
                     ? (double)stats_crt_gpu_accum_flush_ms /
                       (double)stats_crt_gpu_accum_flush_count : 0.0;
@@ -2399,6 +2560,10 @@ static void print_stats(void) {
                     (unsigned long long)stats_crt_gpu_accum_batch_le_2048,
                     (unsigned long long)stats_crt_gpu_accum_batch_le_4096,
                     (unsigned long long)stats_crt_gpu_accum_batch_gt_4096);
+                log_msg("  phase1: crt_cuda_fb no_accum=%llu limb=%llu add_fail=%llu",
+                    (unsigned long long)stats_crt_cuda_fb_no_accum,
+                    (unsigned long long)stats_crt_cuda_fb_limb_mismatch,
+                    (unsigned long long)stats_crt_cuda_fb_add_fail);
 #ifdef WITH_GPU_FERMAT
                 if (use_crt_gpu_batch_adaptive) {
                     log_msg("  phase1: accum adaptive up=%llu down=%llu hold=%llu last_threshold=%llu",
@@ -4130,8 +4295,8 @@ static unsigned char *build_coinbase_tx_opreturn(const char *opdata_hex, uint64_
 }
 
 // Build a minimal coinbase tx without OP_RETURN (use single-byte scriptPubKey OP_TRUE)
-static unsigned char *build_coinbase_tx_minimal(uint64_t value_satoshis, uint64_t height, size_t *out_len) __attribute__((unused));
-static unsigned char *build_coinbase_tx_minimal(uint64_t value_satoshis, uint64_t height, size_t *out_len) {
+static unsigned char *build_coinbase_tx_minimal(uint64_t value_satoshis, uint64_t height, const char *payout_script_hex, size_t *out_len) __attribute__((unused));
+static unsigned char *build_coinbase_tx_minimal(uint64_t value_satoshis, uint64_t height, const char *payout_script_hex, size_t *out_len) {
     // estimate size conservatively
     size_t cap = 8192;
     unsigned char *tx = calloc(1, cap);
@@ -4167,12 +4332,48 @@ static unsigned char *build_coinbase_tx_minimal(uint64_t value_satoshis, uint64_
     write_byte(&p, 1);
     // value
     write_u64_le(&p, value_satoshis);
-    // pk_script: single OP_TRUE (0x51)
-    size_t pk_script_len = 1;
+    unsigned char *pk_script = NULL;
+    size_t pk_script_len = 0;
+    unsigned char op_true_script[1] = { 0x51 };
+
+    if (payout_script_hex && payout_script_hex[0]) {
+        size_t hexlen = strlen(payout_script_hex);
+        if ((hexlen & 1u) == 0u && hexlen <= 2048u) {
+            size_t script_bytes = hexlen / 2;
+            unsigned char *tmp = (unsigned char *)malloc(script_bytes ? script_bytes : 1);
+            int ok = (tmp != NULL);
+            for (size_t i = 0; ok && i < script_bytes; i++) {
+                unsigned int v = 0;
+                if (sscanf(payout_script_hex + 2 * i, "%2x", &v) != 1) {
+                    ok = 0;
+                    break;
+                }
+                tmp[i] = (unsigned char)v;
+            }
+            if (ok && script_bytes > 0) {
+                pk_script = tmp;
+                pk_script_len = script_bytes;
+            } else {
+                free(tmp);
+                log_msg("WARN: invalid --coinbase-script-hex, using default OP_TRUE script\n");
+            }
+        } else {
+            log_msg("WARN: invalid --coinbase-script-hex length, using default OP_TRUE script\n");
+        }
+    }
+    if (!pk_script) {
+        pk_script = op_true_script;
+        pk_script_len = 1;
+    }
+
     write_compact_size(&p, pk_script_len);
-    write_byte(&p, 0x51);
+    memcpy(p, pk_script, pk_script_len);
+    p += pk_script_len;
     // locktime
     write_u32_le(&p, 0);
+
+    if (pk_script != op_true_script)
+        free(pk_script);
 
     *out_len = p - tx;
     log_file_only("DEBUG coinbase minimal: scriptsig_len=%lu extranonce_len=%lu pk_script_len=%lu tx_len=%lu\n",
@@ -4180,43 +4381,56 @@ static unsigned char *build_coinbase_tx_minimal(uint64_t value_satoshis, uint64_
     return tx;
 }
 
+static int json_extract_u64_hex_field(const char *json, const char *key,
+                                      uint64_t *out_val) {
+    if (!json || !key || !out_val)
+        return 0;
+    char pat[64];
+    if (snprintf(pat, sizeof(pat), "\"%s\"", key) <= 0)
+        return 0;
+    const char *p = strstr(json, pat);
+    if (!p)
+        return 0;
+    const char *c = strchr(p, ':');
+    if (!c)
+        return 0;
+    const char *q1 = strchr(c, '"');
+    if (!q1)
+        return 0;
+    const char *q2 = strchr(q1 + 1, '"');
+    if (!q2 || q2 <= q1 + 1)
+        return 0;
+
+    uint64_t v = 0;
+    for (const char *it = q1 + 1; it < q2; ++it) {
+        char ch = *it;
+        int nib;
+        if (ch >= '0' && ch <= '9') nib = ch - '0';
+        else if (ch >= 'a' && ch <= 'f') nib = 10 + (ch - 'a');
+        else if (ch >= 'A' && ch <= 'F') nib = 10 + (ch - 'A');
+        else return 0;
+        v = (v << 4) | (uint64_t)nib;
+    }
+    *out_val = v;
+    return 1;
+}
+
 // Build a full block hex from the GBT JSON and our header payload (we place payload in coinbase OP_RETURN).
 // This is a minimal assembler: it extracts previousblockhash, curtime, version if present, builds coinbase tx,
 // computes merkle root and serializes header + tx count + txs, hex-encodes into outhex.
 #ifdef WITH_RPC
 static int build_block_from_gbt_and_payload(const char *gbt_json, const char *header_payload_hex,
-                                             int nshift_val, uint64_t nadd_val,
+                                             int nshift_val, uint32_t nonce_val,
+                                             uint64_t nadd_val,
                                              char outhex[16384]) {
     char prevhex[65] = {0};
     uint32_t curtime = (uint32_t)time(NULL);
     uint32_t version = 2;
-    uint64_t ndifficulty = 0x0014d29966377819ULL; /* default difficulty */
-    /* parse difficulty field (hex) from GBT - HexBits output is a hex string representing 8 bytes big-endian */
-    const char *bts = strstr(gbt_json, "\"difficulty\"");
-    if (bts) {
-        const char *c = strchr(bts, ':');
-        if (c) {
-            const char *quote = strchr(c, '"');
-            if (quote) {
-                const char *q2 = strchr(quote+1, '"');
-                if (q2) {
-                    size_t len = q2 - (quote+1);
-                    if (len > 0 && len < 32) {
-                        char buf[32]; memcpy(buf, quote+1, len); buf[len] = '\0';
-                        uint64_t v = 0;
-                        for (size_t i = 0; i < len; ++i) {
-                            char ch = buf[i]; int val = 0;
-                            if (ch >= '0' && ch <= '9') val = ch - '0';
-                            else if (ch >= 'a' && ch <= 'f') val = 10 + ch - 'a';
-                            else if (ch >= 'A' && ch <= 'F') val = 10 + ch - 'A';
-                            else continue;
-                            v = (v << 4) | (uint64_t)val;
-                        }
-                        ndifficulty = v;
-                    }
-                }
-            }
-        }
+    uint64_t ndifficulty = 0x0014d29966377819ULL; /* fallback only */
+    /* Modern wallet exposes 64-bit network target under "bits". */
+    if (!json_extract_u64_hex_field(gbt_json, "bits", &ndifficulty)) {
+        /* Legacy fallback for older JSON shapes. */
+        (void)json_extract_u64_hex_field(gbt_json, "difficulty", &ndifficulty);
     }
     const char *p = strstr(gbt_json, "\"previousblockhash\"");
     if (p) { const char *q = strchr(p, '"'); if (q) { q = strchr(q+1, '"'); if (q) { const char *r = strchr(q+1, '"'); if (r) { const char *s = strchr(r+1, '"'); if (s && s-r-1 < 65) strncpy(prevhex, r+1, s-(r+1)); } } } }
@@ -4237,7 +4451,7 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
     size_t coin_txlen;
     unsigned char *coin_tx = NULL;
     const char *cbtxn = strstr(gbt_json, "\"coinbasetxn\"");
-    if (cbtxn) {
+    if (cbtxn && !(g_coinbase_script_hex && g_coinbase_script_hex[0])) {
         const char *d = strstr(cbtxn, "\"data\"");
         if (d) {
             const char *col = strchr(d, ':');
@@ -4257,9 +4471,19 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
             }
         }
     }
+    if (g_coinbase_script_hex && g_coinbase_script_hex[0]) {
+        log_file_only("GBT coinbase mode: local coinbase tx with --coinbase-script-hex (len=%lu hex chars)\n",
+                      (unsigned long)strlen(g_coinbase_script_hex));
+    }
     if (!coin_tx) {
-        if (!header_payload_hex || header_payload_hex[0] == '\0') {
-            coin_tx = build_coinbase_tx_minimal(coinbase_value, block_height, &coin_txlen);
+        if (g_coinbase_script_hex && g_coinbase_script_hex[0]) {
+            coin_tx = build_coinbase_tx_minimal(coinbase_value, block_height,
+                                               g_coinbase_script_hex,
+                                               &coin_txlen);
+        } else if (!header_payload_hex || header_payload_hex[0] == '\0') {
+            coin_tx = build_coinbase_tx_minimal(coinbase_value, block_height,
+                                               g_coinbase_script_hex,
+                                               &coin_txlen);
         } else {
             coin_tx = build_coinbase_tx_opreturn(header_payload_hex, coinbase_value, block_height, &coin_txlen);
         }
@@ -4364,19 +4588,20 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
         for (int i=0;i<32;i++) { unsigned int v=0; sscanf(prevhex + i*2, "%2x", &v); prevbin[31-i] = (unsigned char)v; }
     }
     memcpy(hp, prevbin, 32); hp += 32;
-    // header expects merkle root in little-endian (reverse byte order)
-    for (int i=0;i<32;i++) hp[i] = merkle_root[31-i];
+    // serialize merkle root in the same byte order as computed hash bytes
+    memcpy(hp, merkle_root, 32);
     hp += 32;
     memcpy(hp, &curtime, 4); hp += 4;
     // nDifficulty is 8 bytes in Gapcoin header; write ndifficulty little-endian
     uint64_t diff64 = ndifficulty;
     for (int i = 0; i < 8; ++i) { hp[i] = (unsigned char)(diff64 & 0xff); diff64 >>= 8; }
     hp += 8;
-    uint32_t nonce = 0; memcpy(hp, &nonce, 4); hp += 4;
+    memcpy(hp, &nonce_val, 4); hp += 4;
     // nShift (uint16_t) – must match the shift used to find the prime
     uint16_t nshift = (uint16_t)nshift_val;
     memcpy(hp, &nshift, 2); hp += 2;
-    // nAdd: serialize as big-endian minimal byte array with CompactSize prefix.
+    // nAdd: serialize as little-endian minimal byte array with CompactSize prefix.
+    // Wallet PoW parser imports nAdd bytes as LE (ary_to_mpz order=-1,endian=-1).
     // For nadd=0 write a single 0x00 byte (length 1).
     {
         unsigned char nadd_bytes[8];
@@ -4385,16 +4610,10 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
             nadd_bytes[0] = 0;
             nadd_len = 1;
         } else {
-            /* write little-endian first, then reverse to big-endian */
+            /* write little-endian directly */
             nadd_len = 0;
             uint64_t tmp = nadd_val;
             while (tmp > 0) { nadd_bytes[nadd_len++] = (unsigned char)(tmp & 0xff); tmp >>= 8; }
-            /* reverse in-place to get big-endian (BN_bn2bin order) */
-            for (int _i = 0; _i < nadd_len / 2; _i++) {
-                unsigned char _t = nadd_bytes[_i];
-                nadd_bytes[_i] = nadd_bytes[nadd_len - 1 - _i];
-                nadd_bytes[nadd_len - 1 - _i] = _t;
-            }
         }
         write_compact_size(&hp, (uint64_t)nadd_len);
         memcpy(hp, nadd_bytes, nadd_len); hp += nadd_len;
@@ -4406,7 +4625,10 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
     log_file_only("DEBUG header_size=%lu (expected 88)\n", (unsigned long)header_size);
 
     // serialize full block: header + varint txcount + tx raw bytes
-    size_t full_len = header_size + 1;
+    size_t txcount_varint_len = (total_txs < 0xFD) ? 1 :
+                                (total_txs <= 0xFFFF) ? 3 :
+                                (total_txs <= 0xFFFFFFFFULL) ? 5 : 9;
+    size_t full_len = header_size + txcount_varint_len;
     for (size_t i=0;i<total_txs;i++) full_len += txraw_lens[i];
     unsigned char *full = malloc(full_len + 8);
     unsigned char *fp = full;
@@ -4520,13 +4742,19 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
 /* =========================================================================
  * Mining pass state: build_mining_pass() + assemble_mining_block()
  *
- * Protocol fix: gapcoind uses getwork not getblocktemplate+submitblock.
- * getwork (no params) returns an 80-byte header with gapcoind's own coinbase
- * TX already included; gapcoind saves the complete block in
- * mapNewBlock[hashMerkleRoot].  Submission via getwork[data] lets gapcoind
- * look up that saved block by merkle root and inject our nNonce+nShift+nAdd.
+ * Dual protocol support:
+ *  - legacy wallets: getwork(data) for both template and submission
+ *  - modern wallets: getblocktemplate + submitblock
  *
- * build_mining_pass(): calls getwork → gets 80-byte header hex + nDifficulty,
+ * build_mining_pass(): first tries getwork (legacy). If unavailable,
+ *   synthesizes hdr80 + nDifficulty from getblocktemplate and switches to
+ *   submitblock mode.
+ *
+ * getwork path: getwork (no params) returns an 80-byte header with wallet
+ * coinbase TX already included; wallet maps merkle root to full block and
+ * submission uses getwork[data] with nNonce+nShift+nAdd payload.
+ *
+ * common mining base path:
  *   decodes header, finds nNonce so SHA256d(hdr80+nNonce)[31] >= 0x80
  *   (Gapcoin requires mpz_sizeinbase(hash,2) == 256), byte-reverses to h256
  *   (BN_bin2bn/uint256_mod_small expect h256[0] = MSB = sha_raw[31]).
@@ -4539,7 +4767,11 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
 static int build_mining_pass(const char *url, const char *user, const char *pass, int shift) {
     char data_hex[161] = {0};
     uint64_t ndiff = 0;
-    if (!rpc_getwork_data(url, user, pass, data_hex, &ndiff)) return 0;
+    if (!rpc_getwork_data(url, user, pass, data_hex, &ndiff)) {
+        return build_mining_pass_from_gbt(url, user, pass, shift);
+    }
+    rpc_set_mining_mode(RPC_MINING_GETWORK);
+    rpc_clear_cached_gbt_json();
     /* decode 80-byte header from hex exactly as getwork returns it (wire
        order: little-endian fields).  No per-word swapping is needed for
        hashing or submission; gapcoind stores the raw wire header in
@@ -4550,6 +4782,17 @@ static int build_mining_pass(const char *url, const char *user, const char *pass
         sscanf(data_hex + i*2, "%2x", &bv);
         hdr80[i] = (uint8_t)bv;
     }
+    /* Canonical network difficulty is always header bytes 72..79 (LE uint64). */
+    uint64_t ndiff_hdr = 0;
+    for (int i = 0; i < 8; i++)
+        ndiff_hdr |= ((uint64_t)hdr80[72 + i]) << (8 * i);
+
+    if (ndiff != 0 && ndiff != ndiff_hdr) {
+        log_file_only("build_mining_pass: getwork difficulty mismatch json=%llu header=%llu (using header)\n",
+                      (unsigned long long)ndiff,
+                      (unsigned long long)ndiff_hdr);
+    }
+    ndiff = ndiff_hdr;
     /* extract prevhex: bytes 4..35 of hdr80 are prevhash in LE wire order.
        Display as big-endian hex (byte-reversed) to match Bitcoin convention. */
     char prevhex[65] = {0};
@@ -4601,6 +4844,22 @@ static int assemble_mining_block(uint64_t nadd_val, uint64_t expect_seq,
                 (unsigned long long)expect_seq, (unsigned long long)current_seq);
         return 0;
     }
+
+    if (__atomic_load_n(&g_rpc_mining_mode, __ATOMIC_RELAXED) == RPC_MINING_GBT) {
+        char *gbt = rpc_dup_cached_gbt_json();
+        if (!gbt) {
+            log_msg("[assemble] missing cached gbt template for submitblock mode\n");
+            return 0;
+        }
+        int ok = build_block_from_gbt_and_payload(gbt, "", pass_snap.nshift,
+                              pass_snap.nonce,
+                                                  nadd_val, out_hex);
+        free(gbt);
+        if (!ok)
+            log_msg("[assemble] failed to build submitblock payload from gbt\n");
+        return ok;
+    }
+
     /* getwork submit format: hdr80(80) + nNonce(4,LE) + nShift(2,LE) + nAdd(raw LE, ≥ 1 byte)
      * Gapcoin header:  version(4)+prevhash(32)+merkle(32)+time(4)+nDifficulty(8) = 80 bytes.
      * nNonce(4) goes at offset 80, nShift(2) at offset 84, nAdd at offset 86+.
@@ -4836,16 +5095,46 @@ static int verify_pow_hex(const char *blockhex) {
     return valid;
 }
 
+/* Extract/display block hash from submitted payload.
+   Gapcoin block hash uses the first 84 header bytes
+   (version..nBits..nNonce), while nShift/nAdd are PoW parameters. */
+static int blockhash84_from_hex(const char *blockhex, char out_hash_hex[65]) {
+    if (!blockhex || !out_hash_hex)
+        return 0;
+    size_t hexlen = strlen(blockhex);
+    if (hexlen < 168)
+        return 0;
+
+    unsigned char hdr84[84];
+    for (size_t i = 0; i < 84; i++) {
+        unsigned int bv = 0;
+        if (sscanf(blockhex + i * 2, "%2x", &bv) != 1)
+            return 0;
+        hdr84[i] = (unsigned char)bv;
+    }
+
+    unsigned char hash_raw[32];
+    double_sha256(hdr84, 84, hash_raw);
+    for (int i = 0; i < 32; i++)
+        sprintf(out_hash_hex + i * 2, "%02x", hash_raw[31 - i]);
+    out_hash_hex[64] = '\0';
+    return 1;
+}
+
 /* Build a mining pass from stratum work data. */
 
 static void submit_gap_block_common(const char *blockhex, double merit,
                                     const char *rpc_url,
                                     const char *rpc_user,
                                     const char *rpc_pass,
+                                    const char *rpc_method,
                                     const char *rpc_sign_key,
                                     const char *queue_note)
 {
 #ifdef WITH_RPC
+    int submitblock_mode =
+        (__atomic_load_n(&g_rpc_mining_mode, __ATOMIC_RELAXED) == RPC_MINING_GBT);
+
     if (g_stratum) {
         if (!verify_pow_hex(blockhex)) {
             log_msg(">>> SKIPPING invalid PoW (stale pass)\n");
@@ -4874,17 +5163,38 @@ static void submit_gap_block_common(const char *blockhex, double merit,
         log_msg("    signature: %s\n", sig);
     }
 
-    if (!verify_pow_hex(blockhex)) {
-        log_msg(">>> SKIPPING: local PoW verification FAILED\n");
-        return;
+    if (!submitblock_mode) {
+        if (!verify_pow_hex(blockhex)) {
+            log_msg(">>> SKIPPING: local PoW verification FAILED\n");
+            return;
+        }
+    } else {
+        /* verify_pow_hex() currently decodes legacy getwork payload format.
+           In submitblock mode we enqueue full block hex, so node-side PoW
+           validation is authoritative until full-block local parser exists. */
+        log_file_only("[verify_pow] skipped local check for submitblock mode\n");
+    }
+
+    {
+        char submit_block_hash[65];
+        if (blockhash84_from_hex(blockhex, submit_block_hash)) {
+            log_msg(">>> submit payload blockhash=%s  merit=%.6f\n",
+                    submit_block_hash, merit);
+        } else {
+            log_file_only("[submit] unable to parse blockhash from payload\n");
+        }
     }
 
     struct submit_job _job;
+    const char *submit_method = (rpc_method && rpc_method[0]) ? rpc_method : "getwork";
+    if (__atomic_load_n(&g_rpc_mining_mode, __ATOMIC_RELAXED) == RPC_MINING_GBT)
+        submit_method = "submitblock";
+
     memset(&_job, 0, sizeof(_job));
     strncpy(_job.url, rpc_url, sizeof(_job.url) - 1);
     strncpy(_job.user, rpc_user ? rpc_user : "", sizeof(_job.user) - 1);
     strncpy(_job.pass, rpc_pass ? rpc_pass : "", sizeof(_job.pass) - 1);
-    strncpy(_job.method, "getwork", sizeof(_job.method) - 1);
+    strncpy(_job.method, submit_method, sizeof(_job.method) - 1);
     memcpy(_job.hex, blockhex, sizeof(_job.hex));
     _job.retries = rpc_default_retries;
     enqueue_job(&_job);
@@ -6054,8 +6364,12 @@ static size_t crt_bkscan_and_submit(
 #ifdef WITH_RPC
         if (rpc_url && !g_abort_pass) {
             char blockhex[16384];
+            uint64_t submit_expect_seq = 0;
+            struct pass_state submit_snap;
+            pass_state_snapshot(&submit_snap);
+            submit_expect_seq = submit_snap.pass_seq;
             memset(blockhex, 0, sizeof(blockhex));
-            if (assemble_mining_block_mpz(nonce, nAdd_prime, 0, blockhex)) {
+            if (assemble_mining_block_mpz(nonce, nAdd_prime, submit_expect_seq, blockhex)) {
                 __sync_fetch_and_add(&stats_blocks, 1);
                 log_file_only("Built blockhex: %s\n", blockhex);
                 if (header_meets_target_hex(blockhex)) {
@@ -6067,7 +6381,7 @@ static size_t crt_bkscan_and_submit(
                     __sync_fetch_and_add(&stats_submits, 1);
                     submit_gap_block_common(blockhex, merit,
                                             rpc_url, rpc_user, rpc_pass,
-                                            NULL, "");
+                                            NULL, NULL, "");
                 }
             } else {
                 log_msg("Failed to assemble block\n");
@@ -6244,8 +6558,12 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
 #ifdef WITH_RPC
         if (rpc_url && !g_abort_pass) {
             char blockhex[16384];
+            uint64_t submit_expect_seq = 0;
+            struct pass_state submit_snap;
+            pass_state_snapshot(&submit_snap);
+            submit_expect_seq = submit_snap.pass_seq;
             memset(blockhex, 0, sizeof(blockhex));
-            if (assemble_mining_block_mpz(nonce, nAdd_prime, 0, blockhex)) {
+            if (assemble_mining_block_mpz(nonce, nAdd_prime, submit_expect_seq, blockhex)) {
                 __sync_fetch_and_add(&stats_blocks, 1);
                 log_file_only("Built blockhex: %s\n", blockhex);
                 if (header_meets_target_hex(blockhex)) {
@@ -6257,7 +6575,7 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
                     __sync_fetch_and_add(&stats_submits, 1);
                     submit_gap_block_common(blockhex, merit,
                                             rpc_url, rpc_user, rpc_pass,
-                                            NULL, "");
+                                            NULL, NULL, "");
                 }
             } else {
                 log_msg("Failed to assemble block\n");
@@ -6471,7 +6789,8 @@ static void gpu_accum_destroy(struct gpu_accum *a) {
     Return codes:
       0 = added, no flush needed
       1 = added, flush recommended now
-      2 = preflush needed before add (caller should flush+retry once) */
+    2 = preflush needed before add (caller should flush+retry once)
+     -1 = allocation/setup failure; caller must not treat as added */
 static int gpu_accum_add(struct gpu_accum *a,
                          const uint64_t base_limbs[GPU_NLIMBS],
                          const uint64_t *offsets, size_t cnt,
@@ -6514,12 +6833,12 @@ static int gpu_accum_add(struct gpu_accum *a,
         size_t new_cap = (b->total + cnt) * 2;
         uint64_t *nl = (uint64_t *)realloc(b->limbs,
             new_cap * (size_t)gpu_al * sizeof(uint64_t));
-        if (!nl) return 0;
+        if (!nl) return -1;
         b->limbs = nl;
         b->capacity = new_cap;
         if (new_cap > b->res_cap) {
             uint8_t *nr = (uint8_t *)realloc(b->results, new_cap);
-            if (!nr) return 0;
+            if (!nr) return -1;
             b->results = nr;
             b->res_cap = new_cap;
         }
@@ -6529,7 +6848,7 @@ static int gpu_accum_add(struct gpu_accum *a,
         size_t nwc = b->win_cap * 2;
         struct gpu_accum_win *nw = (struct gpu_accum_win *)realloc(
             b->wins, nwc * sizeof(b->wins[0]));
-        if (!nw) return 0;
+        if (!nw) return -1;
         b->wins = nw;
         b->win_cap = nwc;
     }
@@ -6549,7 +6868,9 @@ static int gpu_accum_add(struct gpu_accum *a,
     w->cand_start = b->total;
     w->cand_count = cnt;
     w->surv = (uint64_t *)malloc(cnt * sizeof(uint64_t));
-    if (w->surv) memcpy(w->surv, offsets, cnt * sizeof(uint64_t));
+    if (!w->surv)
+        return -1;
+    memcpy(w->surv, offsets, cnt * sizeof(uint64_t));
     w->surv_cnt   = cnt;
     w->cramer_score = cramer_score;
     w->nonce      = nonce;
@@ -6948,7 +7269,7 @@ static inline int classify_noncrt_lane_pair(uint64_t base_mod6,
    base = h256<<shift.  logbase = log(base) (precomputed, constant across
    all candidates in this window).  nAdd = pr[i] directly. */
 static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
-                           double logbase, int shift_sc,
+                           double logbase, uint64_t expect_seq, int shift_sc,
                            const char *header_local,
                            const char *rpc_url_local,
                            const char *rpc_user_local,
@@ -6956,7 +7277,6 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
                            const char *rpc_method_local,
                            const char *rpc_sign_key_local) {
     (void)header_local;     /* param kept for API compat; abort uses g_abort_pass */
-    (void)rpc_method_local; /* method is always "getwork" now */
     uint64_t lane_pairs_total = 0;
     uint64_t lane_pairs_same = 0;
     uint64_t lane_pairs_alt2 = 0;
@@ -7166,7 +7486,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
             if (rpc_url_local) {
                 if (g_abort_pass) continue;
                 char blockhex[16384]; memset(blockhex, 0, sizeof(blockhex));
-                if (assemble_mining_block(nadd_sc, 0, blockhex)) {
+                if (assemble_mining_block(nadd_sc, expect_seq, blockhex)) {
                     __sync_fetch_and_add(&stats_blocks, 1);
                     log_file_only("Built blockhex: %s\n", blockhex);
                     if (header_meets_target_hex(blockhex)) {
@@ -7177,6 +7497,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
                         submit_gap_block_common(blockhex, merit,
                                                 rpc_url_local, rpc_user_local,
                                                 rpc_pass_local,
+                                                rpc_method_local,
                                                 rpc_sign_key_local,
                                                 " (mining continues)");
                         if (!keep_going) return 1;
@@ -7446,6 +7767,7 @@ static void *worker_fn(void *arg) {
     uint8_t  h256_local[32];
     memcpy(h256_local, wa->h256, 32);
     int      shift_local            = wa->shift;
+    uint64_t pass_seq_local         = wa->pass_seq;
     int64_t  adder_max_local        = wa->adder_max;
     uint64_t sieve_size_local       = wa->sieve_size;
     double   target_local           = wa->target;
@@ -8064,6 +8386,7 @@ static void *worker_fn(void *arg) {
                                 region_pairs += seg_cnt - 1;
                                 if (scan_candidates(pr + lo_idx, seg_cnt,
                                                     target_local, logbase,
+                                                    pass_seq_local,
                                                     shift_local, header_local,
                                                     rpc_url_local, rpc_user_local,
                                                     rpc_pass_local, rpc_method_local,
@@ -8197,6 +8520,7 @@ static void *worker_fn(void *arg) {
                         uint64_t xw_pair[2] = { carry_last_prime,
                                                 res_w.first_prime };
                         if (scan_candidates(xw_pair, 2, target_local, logbase,
+                                            pass_seq_local,
                                             shift_local, header_local,
                                             rpc_url_local, rpc_user_local,
                                             rpc_pass_local, rpc_method_local,
@@ -8230,8 +8554,9 @@ static void *worker_fn(void *arg) {
                     stats_crt_consumer_last_qual_gap = pair[1] - pair[0];
                     stats_last_qual_gap = pair[1] - pair[0];
                     stats_last_gap = pair[1] - pair[0];
-                    if (scan_candidates(pair, 2,
+                        if (scan_candidates(pair, 2,
                             target_local, logbase,
+                            pass_seq_local,
                             shift_local, header_local,
                             rpc_url_local, rpc_user_local,
                             rpc_pass_local, rpc_method_local,
@@ -8352,6 +8677,7 @@ static void *worker_fn(void *arg) {
                 if (carry_last_prime && carry_last_prime < pr[0]) {
                     uint64_t xw[2] = { carry_last_prime, pr[0] };
                     if (scan_candidates(xw, 2, target_local, logbase,
+                                        pass_seq_local,
                                         shift_local,
                                         header_local,
                                         rpc_url_local, rpc_user_local, rpc_pass_local,
@@ -8369,6 +8695,7 @@ static void *worker_fn(void *arg) {
                 }
                 {
                     int sc_ret = scan_candidates(pr, cnt, target_local, logbase,
+                                    pass_seq_local,
                                     shift_local,
                                     header_local,
                                     rpc_url_local, rpc_user_local, rpc_pass_local,
@@ -8538,6 +8865,8 @@ int main(int argc, char **argv) {
         printf("  -u, --user USER       pool/RPC username (e.g. worker.1)\n");
         printf("      --pass PASS       pool/RPC password\n");
         printf("      --rpc-url URL     full RPC URL (overrides --host/--port)\n");
+        printf("      --coinbase-script-hex HEX  override coinbase scriptPubKey for GBT submitblock\n");
+        printf("                        set to wallet-owned script hex to receive mined rewards\n");
         printf("  -s, --shift N         prime size shift      (default: 20)\n");
         printf("      --sieve-size S    sieve size            (default: 33554432)\n");
         printf("      --sieve-primes N  number of sieve primes (GapMiner-compatible)\n");
@@ -8696,6 +9025,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--stratum") && i+1<argc) stratum_arg = argv[++i];
         else if (!strcmp(argv[i],"--rpc-url") && i+1<argc) rpc_url = argv[++i];
         else if ((!strcmp(argv[i],"-u") || !strcmp(argv[i],"--user") || !strcmp(argv[i],"--rpc-user")) && i+1<argc) rpc_user = argv[++i];
+        else if (!strcmp(argv[i],"--coinbase-script-hex") && i+1<argc) g_coinbase_script_hex = argv[++i];
         else if ((!strcmp(argv[i],"--pass") || !strcmp(argv[i],"--rpc-pass")) && i+1<argc) rpc_pass = argv[++i];
         else if (!strcmp(argv[i],"--rpc-method") && i+1<argc) rpc_method = argv[++i];
         else if (!strcmp(argv[i],"--rpc-rate") && i+1<argc) cli_rpc_rate = (unsigned int)atoi(argv[++i]);
@@ -8945,6 +9275,13 @@ int main(int argc, char **argv) {
     }
     if (use_cuda && use_opencl) {
         fprintf(stderr, "Use either --cuda or --opencl, not both in one run.\n");
+        return 2;
+    }
+    if (g_coinbase_script_hex &&
+        (!is_valid_hex_string(g_coinbase_script_hex) ||
+         strlen(g_coinbase_script_hex) > 2048u)) {
+        fprintf(stderr,
+                "--coinbase-script-hex expects even-length hex string up to 2048 chars\n");
         return 2;
     }
     if (use_crt_precision) {
@@ -9873,7 +10210,8 @@ int main(int argc, char **argv) {
         }
         /* --p is interpreted as nAdd directly (prime = h256<<shift + nAdd). */
         uint64_t build_nadd = (uint64_t)build_p;
-        if (build_block_from_gbt_and_payload(gbt, payload_hex, shift, build_nadd, blockhex)) {
+        if (build_block_from_gbt_and_payload(gbt, payload_hex, shift,
+                                            0, build_nadd, blockhex)) {
             log_msg("Built blockhex: %s\n", blockhex);
             if (rpc_url) {
                 log_msg("Submitting built block via RPC...\n");
@@ -9901,6 +10239,14 @@ int main(int argc, char **argv) {
                 &target,
                 &scan_target_cfg,
                 0);
+            uint64_t st_pass_seq = 0;
+#ifdef WITH_RPC
+            if (rpc_url) {
+                struct pass_state pass_snap_st;
+                pass_state_snapshot(&pass_snap_st);
+                st_pass_seq = pass_snap_st.pass_seq;
+            }
+#endif
             int64_t num_windows = ((int64_t)adder_max + (int64_t)sieve_size - 1) / (int64_t)sieve_size;
             double logbase = uint256_log_approx(h256, shift);
             g_sieve_size_for_L_cache = sieve_size;
@@ -9936,6 +10282,7 @@ int main(int argc, char **argv) {
                 st_wa.tid = 0;
                 st_wa.nthreads = 1;
                 st_wa.crt_role = 0;
+                st_wa.pass_seq = st_pass_seq;
 
                 struct crt_runtime_worker_ctx rt_ctx_st;
                 crt_runtime_init_worker_ctx(&rt_ctx_st, 1);
@@ -10166,7 +10513,7 @@ int main(int argc, char **argv) {
                             && pr[0] - st_carry_last >= needed) {
                             uint64_t xw_pair[2] = { st_carry_last, pr[0] };
                             if (scan_candidates(xw_pair, 2,
-                                               target, logbase, shift,
+                                               target, logbase, st_pass_seq, shift,
                                                header, rpc_url, rpc_user,
                                                rpc_pass, rpc_method,
                                                rpc_sign_key))
@@ -10187,7 +10534,7 @@ int main(int argc, char **argv) {
                             if (seg_cnt >= 2) {
                                 region_pairs_st += seg_cnt - 1;
                                 if (scan_candidates(pr + lo_idx, seg_cnt,
-                                                   target, logbase, shift,
+                                                   target, logbase, st_pass_seq, shift,
                                                    header, rpc_url, rpc_user,
                                                    rpc_pass, rpc_method,
                                                    rpc_sign_key))
@@ -10244,6 +10591,7 @@ int main(int argc, char **argv) {
                         gap_dist_accumulate(pr, cnt);
                     }
                     if (scan_candidates(pr, cnt, target, logbase,
+                                       st_pass_seq,
                                        shift, header,
                                        rpc_url, rpc_user, rpc_pass,
                                        rpc_method, rpc_sign_key)) {
@@ -10412,6 +10760,14 @@ int main(int argc, char **argv) {
             }
             pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);
             struct worker_args *wargs = malloc(sizeof(struct worker_args) * num_threads);
+            uint64_t workers_pass_seq = 0;
+#ifdef WITH_RPC
+            if (rpc_url) {
+                struct pass_state pass_snap_workers;
+                pass_state_snapshot(&pass_snap_workers);
+                workers_pass_seq = pass_snap_workers.pass_seq;
+            }
+#endif
             /* Partition the adder range evenly across threads so every core
                has its own non-overlapping slice to search.  With the old
                stride-by-nthreads design, thread i only touched windows
@@ -10436,6 +10792,7 @@ int main(int argc, char **argv) {
                 wargs[t].adder_max         = sz;
                 memcpy(wargs[t].h256, h256, 32);
                 wargs[t].shift             = shift;
+                wargs[t].pass_seq          = workers_pass_seq;
                 wargs[t].sieve_size        = sieve_size;
                 g_sieve_size_for_L_cache   = sieve_size;
                 wargs[t].target            = target;

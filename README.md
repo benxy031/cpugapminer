@@ -1225,6 +1225,19 @@ coinbase transaction, computes the merkle root, and assembles the full block
 header.  `bits` sets the network difficulty target; merit (`gap / log(p)`) is
 computed locally and is not reported to the node.
 
+On newer wallet/node builds, default template coinbase outputs may not be
+wallet-owned.  In that case, submitted blocks can be accepted on-chain but not
+credited in your wallet balance.  Use `--coinbase-script-hex` in GBT mode to
+force the coinbase output script to your own address script.
+
+Quick workflow:
+
+1. Get `scriptPubKey` for your payout address from wallet RPC (`getaddressinfo`
+  or `validateaddress`).
+2. Start miner with `--coinbase-script-hex <scriptPubKeyHex>`.
+3. Verify reward ownership by checking that coinbase `vout[0].scriptPubKey.hex`
+  in `getblock <hash> 2` matches your script.
+
 ### Primality testing
 
 After sieving, each candidate undergoes a probabilistic primality test using
@@ -1819,6 +1832,7 @@ presieve tile period, making it cache-neutral. All other P values
 | `--rpc-url URL`       | --            | JSON-RPC endpoint of `gapcoind` |
 | `--rpc-user USER`     | --            | RPC username |
 | `--rpc-pass PASS`     | --            | RPC password |
+| `--coinbase-script-hex HEX` | --       | In GBT+submitblock mode, force coinbase payout script (`scriptPubKey`) to wallet-owned output (hex). Recommended for new wallets where default template coinbase can be `OP_TRUE`. |
 | `--rpc-method METH`   | `getwork`     | Submission method |
 | `--rpc-rate MS`       | 0             | Minimum ms between submissions |
 | `--rpc-poll-ms MS`    | 1000          | Tip poll interval for `getbestblockhash`; lower reduces stale window |
@@ -1906,12 +1920,15 @@ bin/gap_miner \
   --rpc-url  http://127.0.0.1:31397/ \
   --rpc-user USER \
   --rpc-pass PASS \
+  --coinbase-script-hex YOUR_SCRIPT_PUBKEY_HEX \
   --shift 28 \
   --threads 6 \
   --fast-fermat
 ```
 
 The header is selected automatically from `getblocktemplate`.
+When mining against wallets that use GBT+submitblock, set
+`--coinbase-script-hex` so accepted blocks are credited to your wallet.
 Default `--sieve-size` (33 554 432) and `--sieve-primes` (900 000) match
 the original GapMiner and work well for most setups.
 

@@ -29,6 +29,7 @@ struct worker_args {
     int nthreads;
     uint8_t  h256[32];   /* 256-bit base hash (big-endian) */
     int shift;
+    uint64_t pass_seq;    /* expected mining pass sequence for submit guards */
     int64_t adder_max;
     uint64_t sieve_size;
     double target;

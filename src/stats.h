@@ -97,6 +97,9 @@ extern volatile uint64_t stats_crt_gpu_accum_batch_le_1024;
 extern volatile uint64_t stats_crt_gpu_accum_batch_le_2048;
 extern volatile uint64_t stats_crt_gpu_accum_batch_le_4096;
 extern volatile uint64_t stats_crt_gpu_accum_batch_gt_4096;
+extern volatile uint64_t stats_crt_cuda_fb_no_accum;
+extern volatile uint64_t stats_crt_cuda_fb_limb_mismatch;
+extern volatile uint64_t stats_crt_cuda_fb_add_fail;
 
 /* Cramér-model score stats (CRT paths only). */
 extern volatile uint64_t stats_cramer_scored;       /* windows whose score was computed */

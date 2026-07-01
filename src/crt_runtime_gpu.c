@@ -83,6 +83,8 @@ int crt_runtime_gpu_process_mono_window(
 
     struct gpu_accum *acc = crt_runtime_gpu_try_init_accum(ctx,
                                                            &g_mono_accum_rr);
+    if (!acc)
+        __sync_fetch_and_add(&stats_crt_cuda_fb_no_accum, 1);
 
     if (acc) {
         ctx->ensure_gmp_tls();
@@ -92,11 +94,7 @@ int crt_runtime_gpu_process_mono_window(
         size_t nexp = 0;
         mpz_export(bl, &nexp, -1, 8, 0, 0, ctx->tls_base_mpz);
 
-        if (nexp <= (size_t)GPU_NLIMBS) {
-            __sync_fetch_and_add(&stats_tested, (uint64_t)surv_cnt);
-            __sync_fetch_and_add(&stats_crt_solver_mono_gpu_tests,
-                                 (uint64_t)surv_cnt);
-
+        if (nexp <= (size_t)gpu_al) {
             int add_rc = ctx->gpu_accum_add(
                 acc, bl,
                 surv, surv_cnt, 0.0,
@@ -119,26 +117,30 @@ int crt_runtime_gpu_process_mono_window(
                     nAdd, rpc_url_local,
                     rpc_user_local, rpc_pass_local);
             }
+            if (add_rc < 0) {
+                __sync_fetch_and_add(&stats_crt_cuda_fb_add_fail, 1);
+                return 0;
+            }
+
+            __sync_fetch_and_add(&stats_tested, (uint64_t)surv_cnt);
+            __sync_fetch_and_add(&stats_crt_solver_mono_gpu_tests,
+                                 (uint64_t)surv_cnt);
             if (add_rc == 1)
                 ctx->gpu_accum_flush(acc);
 
             mpz_add(nAdd, nAdd, ctx->g_crt_primorial_mpz);
             return 1;
         }
-        /* Limb overflow: fall through to direct batch path. */
+        /* Active GPU stride is too small for this nonce; let the caller
+           fall back to the CPU CRT scan path so the window is still
+           fully verified and submitted correctly. */
+        __sync_fetch_and_add(&stats_crt_cuda_fb_limb_mismatch, 1);
     }
 
-    size_t pf = ctx->gpu_batch_filter(surv, surv_cnt);
-    __sync_fetch_and_add(&stats_tested, (uint64_t)surv_cnt);
-    __sync_fetch_and_add(&stats_crt_solver_mono_gpu_tests,
-                         (uint64_t)surv_cnt);
-    __sync_fetch_and_add(&stats_crt_windows, 1);
-    __sync_fetch_and_add(&stats_primes_found, (uint64_t)pf);
-    if (pf >= 2)
-        __sync_fetch_and_add(&stats_pairs, (uint64_t)(pf - 1));
-
-    mpz_add(nAdd, nAdd, ctx->g_crt_primorial_mpz);
-    return 1;
+    /* If the accumulator path is unavailable, fall back to the CPU CRT
+       path. The direct gpu_batch_filter() helper only returns survivor
+       counts; it does not perform CRT gap scanning or submission. */
+    return 0;
 }
 
 int crt_runtime_gpu_process_consumer_item(
@@ -157,20 +159,20 @@ int crt_runtime_gpu_process_consumer_item(
 
     struct gpu_accum *acc = crt_runtime_gpu_try_init_accum(ctx,
                                                            &g_cons_accum_rr);
-    if (!acc)
+    if (!acc) {
+        __sync_fetch_and_add(&stats_crt_cuda_fb_no_accum, 1);
         return 0;
+    }
 
     int gpu_al = ctx->gpu_accum_get_stride(acc);
     uint64_t bl[GPU_NLIMBS];
     memset(bl, 0, (size_t)gpu_al * sizeof(uint64_t));
     size_t nexp = 0;
     mpz_export(bl, &nexp, -1, 8, 0, 0, w->base);
-    if (nexp > (size_t)GPU_NLIMBS)
+    if (nexp > (size_t)gpu_al) {
+        __sync_fetch_and_add(&stats_crt_cuda_fb_limb_mismatch, 1);
         return 0;
-
-    __sync_fetch_and_add(&stats_tested, (uint64_t)w->surv_cnt);
-    __sync_fetch_and_add(&stats_crt_solver_consumer_gpu_tests,
-                         (uint64_t)w->surv_cnt);
+    }
 
     int add_rc = ctx->gpu_accum_add(
         acc, bl,
@@ -196,6 +198,14 @@ int crt_runtime_gpu_process_consumer_item(
             w->nAdd, rpc_url_local,
             rpc_user_local, rpc_pass_local);
     }
+    if (add_rc < 0) {
+        __sync_fetch_and_add(&stats_crt_cuda_fb_add_fail, 1);
+        return 0;
+    }
+
+    __sync_fetch_and_add(&stats_tested, (uint64_t)w->surv_cnt);
+    __sync_fetch_and_add(&stats_crt_solver_consumer_gpu_tests,
+                         (uint64_t)w->surv_cnt);
     if (add_rc == 1)
         ctx->gpu_accum_flush(acc);
 
