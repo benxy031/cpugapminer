@@ -2134,6 +2134,12 @@ static void print_stats(void) {
         uint64_t pgt_above_trend = stats_pgt_records_above_trend;
         uint64_t pgt_above_cramer = stats_pgt_records_above_cramer;
         uint64_t pgt_above_submit = stats_pgt_records_above_submit;
+        double last_vs_best = (stats_best_gap > 0)
+            ? ((double)stats_last_gap / (double)stats_best_gap)
+            : 0.0;
+        double last_vs_qual = (stats_last_qual_gap > 0)
+            ? ((double)stats_last_gap / (double)stats_last_qual_gap)
+            : 0.0;
         double pgt_trend_pct = (pgt_rec > 0)
             ? (100.0 * (double)pgt_above_trend / (double)pgt_rec)
             : 0.0;
@@ -2143,7 +2149,7 @@ static void print_stats(void) {
         double pgt_submit_pct = (pgt_rec > 0)
             ? (100.0 * (double)pgt_above_submit / (double)pgt_rec)
             : 0.0;
-        log_msg("  pgt: rec=%llu above_trend=%llu (%.1f%%) above_cramer=%llu (%.1f%%) above_submit=%llu (%.1f%%) last_gap=%llu last_trend=%.1f last_ratio=%.3f last_vs_submit=%.3f",
+        log_msg("  pgt: rec=%llu above_trend=%llu (%.1f%%) above_cramer=%llu (%.1f%%) above_submit=%llu (%.1f%%) last_gap=%llu last_trend=%.1f last_ratio=%.3f last_vs_submit=%.3f last_vs_best=%.3f last_vs_qual=%.3f",
             (unsigned long long)pgt_rec,
             (unsigned long long)pgt_above_trend,
             pgt_trend_pct,
@@ -2154,7 +2160,9 @@ static void print_stats(void) {
             (unsigned long long)stats_pgt_last_gap,
             (double)stats_pgt_last_trend_gap_e3 / 1000.0,
             (double)stats_pgt_last_ratio_e3 / 1000.0,
-            (double)stats_pgt_last_submit_ratio_e3 / 1000.0);
+            (double)stats_pgt_last_submit_ratio_e3 / 1000.0,
+            last_vs_best,
+            last_vs_qual);
     }
 
     if (gmp_timing_enabled()) {

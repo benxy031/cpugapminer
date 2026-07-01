@@ -366,7 +366,7 @@ default on RTX 3060-class hardware is:
 - keep producer-consumer GPU-consumer as an advanced opt-in (near tie at
   shift 512; otherwise monolithic won)
 
-`pps` in miner stats means **primes per second**.
+`pps` in miner stats means **pairs per second** (rolling ~30 s consecutive-prime-pair rate).
 
 Recommended mode by shift (matrix result):
 
@@ -818,7 +818,7 @@ Benchmarked on NVIDIA GeForce RTX 3060 at shift 64
 | | Before | After | Change |
 |---|---|---|---|
 | Sieve throughput | 562 M/s | 633 M/s | **+12.6%** |
-| Primes/s (pps) | 737 K | 924 K | **+25.4%** |
+| Pairs/s (pps) | 737 K | 924 K | **+25.4%** |
 
 CPU-only runs show no measurable gain because Fermat testing dominates the
 pipeline in CPU mode.  The improvement is visible when CUDA offloads Fermat
@@ -1155,7 +1155,7 @@ Recommended command for RTX 3060, shift=160:
   --sample-stride 5 --cuda
 ```
 
-Typical output: ~353 M sieved/s, ~311k pps, est ~10m (merit target ~20.5).
+Typical output: ~353 M sieved/s, ~311k pairs/s (pps), est ~10m (merit target ~20.5).
 
 ### `--sample-stride` tuning with `--cuda`
 
@@ -2014,7 +2014,7 @@ python3 scripts/inspect_tx.py /tmp/gap_miner_block_<timestamp>.hex
 Every 5 s the miner prints a line like:
 
 ```
-STATS: elapsed=30.0s  sieved=5502926848 (183400328/s)  tested=8665707 (288809/s)  primes=1244781 (14.4%)  gaps=0 (0.000/s)  built=0  submitted=0  accepted=0  prob=8.74e-10/pair  est=22.4m (target=20.86)  best=9.77 (gap=2022)  pgt: rec=0 above_trend=0 (0.0%) above_cramer=0 (0.0%) above_submit=0 (0.0%) last_gap=0 last_trend=0.0 last_ratio=0.000 last_vs_submit=0.000
+STATS: elapsed=30.0s  sieved=5502926848 (183400328/s)  tested=8665707 (288809/s)  primes=1244781 (14.4%)  gaps=0 (0.000/s)  built=0  submitted=0  accepted=0  prob=8.74e-10/pair  est=22.4m (target=20.86)  best=9.77 (gap=2022)  last_gap=0  last_qual_gap=0  pgt: rec=0 above_trend=0 (0.0%) above_cramer=0 (0.0%) above_submit=0 (0.0%) last_gap=0 last_trend=0.0 last_ratio=0.000 last_vs_submit=0.000 last_vs_best=0.000 last_vs_qual=0.000
 ```
 
 | Field | Meaning |
@@ -2029,9 +2029,9 @@ STATS: elapsed=30.0s  sieved=5502926848 (183400328/s)  tested=8665707 (288809/s)
 | `prob` | Per-pair probability of a qualifying gap (`e^(-target)`, Cramér–Granville heuristic) |
 | `est` | Estimated time to find a qualifying gap at current rate.  For backward-scan, pairs/s is extrapolated from the Fermat pass rate (`primes / tested × total_survivors`), not counted directly — since the backward scan only tests ~5% of survivors, the extrapolation estimates how many consecutive prime pairs the full window contains. |
 | `best` | Best verified gap merit seen so far (from the sampling pass and qualifying-gap forward searches) |
-| `pgt` | Log-only prime-gap trend telemetry. `rec` counts best-gap updates seen by the observer; `above_trend` / `above_cramer` / `above_submit` count how many of those records exceeded the k=1 trend proxy, the Cramér `log^2(p)` ceiling, or the current submit threshold (`target × logbase`). `last_ratio` is `gap / trend`, and `last_vs_submit` is `gap / (target × logbase)`; both are shown for the most recent record gap. |
+| `pgt` | Log-only prime-gap trend telemetry. `rec` counts best-gap updates seen by the observer; `above_trend` / `above_cramer` / `above_submit` count how many of those records exceeded the k=1 trend proxy, the Cramér `log^2(p)` ceiling, or the current submit threshold (`target × logbase`). `last_ratio` is `gap / trend`, `last_vs_submit` is `gap / (target × logbase)`, and `last_vs_best` / `last_vs_qual` compare the current `last_gap` against `best` and `last_qual_gap`. |
 | `gpu_batch` | (CUDA only) Average candidates per GPU flush.  Higher = better GPU utilization.  Absent when not using `--cuda`. |
-| `pps` | Primes found per second (actual measured rate = `primes / elapsed`).  Directly comparable to GapMiner's `tests/s` field.  Note: GapMiner's `pps` field is a theoretical CRT-scaled estimate, not the actual measured rate. |
+| `pps` | Consecutive prime pairs per second, computed from the rolling ~30 s `pairs_rate`.  Directly comparable to GapMiner's `tests/s` field.  Note: GapMiner's `pps` field is a theoretical CRT-scaled estimate, not the actual measured rate. |
 | `gaplist` | (CRT producer-consumer only) Number of sieved windows waiting in the priority heap.  Ideal: saw-tooth oscillating between ~100 and ~3000.  Persistently 0 = fermat threads too fast / sieve-primes too low.  Persistently near 4096 = sieve too fast, add fermat threads or reduce sieve-primes. |
 
 ### Why `gaps=0` and `submitted=0` are normal early on
