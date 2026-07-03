@@ -57,12 +57,26 @@ void backward_scan_segment(const uint64_t *pr, size_t lo, size_t hi,
         if (one_sided_min_gap > 0) {
             size_t upper_idx = hi;
             uint64_t gate_pos = start_nAdd + one_sided_min_gap;
+            size_t gate_hi = hi;
+
+            /* Binary search: first index in pr[scan_from+1..hi-1] >= gate_pos */
+            {
+                size_t l = bhi, h = hi;
+                while (l < h) {
+                    size_t m = l + (h - l) / 2;
+                    if (pr[m] < gate_pos)
+                        l = m + 1;
+                    else
+                        h = m;
+                }
+                gate_hi = l;
+            }
 
             /* One-sided gate probe:
                only search (target_pos, gate_pos) to decide skip/fullcheck.
                A full forward search to hi is deferred until strictly needed. */
             size_t j_gate = bhi;
-            while (j_gate < hi && pr[j_gate] < gate_pos) {
+            while (j_gate < gate_hi) {
                 res->tested++;
                 if (prime_test(pr[j_gate])) {
                     upper_idx = j_gate; /* first prime beyond target_pos and before gate */
@@ -104,8 +118,6 @@ void backward_scan_segment(const uint64_t *pr, size_t lo, size_t hi,
                 /* Need the next prime right of target_pos only when no
                    backward-side prime exists (to finalize a real gap). */
                 size_t j_next = j_gate;
-                if (j_next < bhi)
-                    j_next = bhi;
 
                 while (j_next < hi) {
                     res->tested++;
@@ -117,25 +129,9 @@ void backward_scan_segment(const uint64_t *pr, size_t lo, size_t hi,
                 }
 
                 if (upper_idx >= hi) {
-                    /* Tail safety: even without an upper prime beyond target_pos,
-                       there may still be a prime in (scan_from, target_pos].
-                       We must scan this interval before stopping so carry_last_prime
-                       remains correct across window boundaries. */
-                    int found_tail = 0;
-                    for (size_t j = bhi; j > scan_from + 1; ) {
-                        j--;
-                        res->tested++;
-                        if (prime_test(pr[j])) {
-                            start_nAdd = pr[j];
-                            scan_from = j;
-                            res->primes_found++;
-                            res->last_prime = pr[j];
-                            found_tail = 1;
-                            break;
-                        }
-                    }
-                    if (found_tail)
-                        continue;
+                    /* Backward interval (scan_from, target_pos] was already fully
+                       checked in the full two-sided pass above.  No backward or
+                       upper prime found => end of segment. */
                     break;
                 }
 

@@ -6365,7 +6365,7 @@ static size_t crt_bkscan_and_submit(
         if (res.best_gap > 0) {
             last_gap_local = res.best_gap;
             stats_last_gap = res.best_gap;
-            log_extra_merit_sample("crt-bkscan", res.best_merit,
+            log_extra_merit_sample("crt-cpu", res.best_merit,
                                    res.best_gap, target);
         }
 
@@ -6383,7 +6383,7 @@ static size_t crt_bkscan_and_submit(
         stats_best_merit = best_merit_loc;
         stats_best_gap = best_gap_local;
         pgt_observe_record_gap(best_gap_local, logbase, target);
-        log_extra_merit_event("best", "crt-bkscan", best_merit_loc,
+        log_extra_merit_event("best", "crt-cpu", best_merit_loc,
                               best_gap_local, target);
     }
     if (best_gap_local > stats_crt_consumer_best_gap)
@@ -6414,7 +6414,7 @@ static size_t crt_bkscan_and_submit(
 
         __sync_fetch_and_add(&stats_gaps, 1);
         stats_last_qual_gap = gap;
-        log_extra_merit_event("qual", "crt-bkscan", merit, gap, target);
+        log_extra_merit_event("qual", "crt-cpu", merit, gap, target);
 
         mpz_t nAdd_prime;
         mpz_init(nAdd_prime);
@@ -7411,7 +7411,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
         }
         double merit   = (double)gap / logbase;
         stats_last_gap = gap;
-        log_extra_merit_sample("scan-candidates", merit, gap, target_local);
+        log_extra_merit_sample("noncrt-cpu", merit, gap, target_local);
         /* Track best merit seen (lock-free: small races are harmless).
            Updated for ALL pairs so the stats display shows progress.
            Note: smart-scan false gaps may inflate this — cosmetic only. */
@@ -7419,7 +7419,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
             stats_best_merit = merit;
             stats_best_gap   = gap;
             pgt_observe_record_gap(gap, logbase, target_local);
-            log_extra_merit_event("best", "scan-candidates", merit, gap,
+            log_extra_merit_event("best", "noncrt-cpu", merit, gap,
                                   target_local);
         }
         if (merit < target_local)
@@ -7540,7 +7540,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
 
         stats_last_qual_gap = gap;
         __atomic_fetch_add(&stats_gaps, 1, __ATOMIC_RELAXED);
-        log_extra_merit_event("qual", "scan-candidates", merit, gap,
+        log_extra_merit_event("qual", "noncrt-cpu", merit, gap,
                       target_local);
         /* nAdd = relative offset = prev (prime = base + nAdd). */
         uint64_t nadd_sc = prev;
@@ -8329,6 +8329,14 @@ static void *worker_fn(void *arg) {
                     /* Region threshold: always network merit, not scan_merit */
                     size_t gpu_rth = (size_t)(target_local * logbase);
                     if (gpu_rth < 2) gpu_rth = 2;
+                    size_t one_sided_gpu_min_gap = 0;
+                    if (use_one_sided_skip && g_crt_mode == CRT_MODE_NONE) {
+                        one_sided_gpu_min_gap = (size_t)(one_sided_skip_merit * logbase);
+                        if (one_sided_gpu_min_gap < 2)
+                            one_sided_gpu_min_gap = 2;
+                        if (one_sided_gpu_min_gap <= gpu_rth + 1)
+                            one_sided_gpu_min_gap = 0;
+                    }
                     uint64_t *gap_reg_lo = NULL;
                     uint64_t *gap_reg_hi = NULL;
                     int *gpu_reg_alive = NULL;
@@ -8369,6 +8377,37 @@ static void *worker_fn(void *arg) {
                         if (gpu_reg_alive)
                             for (size_t r = 0; r < n_gap_regions; r++)
                                 gpu_reg_alive[r] = 1;
+                    }
+
+                    if (gpu_reg_alive && one_sided_gpu_min_gap > 0 && n_gap_regions > 0) {
+                        size_t one_sided_considered = 0;
+                        size_t one_sided_skipped = 0;
+                        size_t one_sided_fullcheck = 0;
+                        for (size_t r = 0; r < n_gap_regions; r++) {
+                            uint64_t lo = gap_reg_lo[r];
+                            uint64_t hi = gap_reg_hi[r];
+                            uint64_t hi_eff = (hi == UINT64_MAX && cnt > 0)
+                                              ? pr[cnt - 1] : hi;
+                            uint64_t reg_gap = (hi_eff > lo) ? (hi_eff - lo) : 0;
+                            one_sided_considered++;
+                            if (reg_gap < (uint64_t)one_sided_gpu_min_gap) {
+                                gpu_reg_alive[r] = 0;
+                                one_sided_skipped++;
+                            } else {
+                                one_sided_fullcheck++;
+                            }
+                        }
+                        if (one_sided_considered > 0) {
+                            __atomic_fetch_add(&stats_noncrt_onesided_intervals,
+                                               (uint64_t)one_sided_considered,
+                                               __ATOMIC_RELAXED);
+                            __atomic_fetch_add(&stats_noncrt_onesided_skipped,
+                                               (uint64_t)one_sided_skipped,
+                                               __ATOMIC_RELAXED);
+                            __atomic_fetch_add(&stats_noncrt_onesided_fullcheck,
+                                               (uint64_t)one_sided_fullcheck,
+                                               __ATOMIC_RELAXED);
+                        }
                     }
 
                     /* Option B: score regions using sampled-prime gap spread.
@@ -8588,6 +8627,16 @@ static void *worker_fn(void *arg) {
                     && res_w.first_prime > carry_last_prime) {
                     uint64_t xw_gap   = res_w.first_prime - carry_last_prime;
                     double   xw_merit = (double)xw_gap / logbase;
+                    stats_last_gap = xw_gap;
+                    if (xw_merit < target_local && xw_merit > stats_best_merit) {
+                        stats_best_merit = xw_merit;
+                        stats_best_gap   = xw_gap;
+                        pgt_observe_record_gap(xw_gap, logbase, target_local);
+                        log_extra_merit_event("best", "noncrt-cpu",
+                                              xw_merit,
+                                              xw_gap,
+                                              target_local);
+                    }
                     if (xw_merit >= target_local) {
                         uint64_t xw_pair[2] = { carry_last_prime,
                                                 res_w.first_prime };
@@ -8607,13 +8656,13 @@ static void *worker_fn(void *arg) {
                     stats_best_gap   = res_w.best_gap;
                     pgt_observe_record_gap(res_w.best_gap, logbase,
                                            target_local);
-                    log_extra_merit_event("best", "bkscan-worker",
+                    log_extra_merit_event("best", "noncrt-cpu",
                                           res_w.best_merit,
                                           res_w.best_gap,
                                           target_local);
                 }
                 if (res_w.best_merit > 0.0)
-                    log_extra_merit_sample("bkscan-worker",
+                    log_extra_merit_sample("noncrt-cpu",
                                            res_w.best_merit,
                                            res_w.best_gap,
                                            target_local);
@@ -8976,7 +9025,7 @@ int main(int argc, char **argv) {
         printf("      --gpu-smart-telemetry  write GPU smart-scan coverage telemetry to log file\n");
         printf("      --no-gpu-smart-telemetry  disable GPU smart-scan coverage telemetry\n");
         printf("      --sample-stride K smart scan: test every Kth survivor (default: 8, 1=off)\n");
-         printf("      --one-sided-skip   non-CRT CPU bkscan: skip second-side scan unless first-side gap is large\n");
+         printf("      --one-sided-skip   non-CRT gate: CPU bkscan + GPU smart path skip second-side/full verify unless first-side gap is large\n");
          printf("      --one-sided-skip-merit M  first-side gate merit for --one-sided-skip\n");
          printf("                        default: auto from shift + scan-merit (manual override when set)\n");
          printf("      --no-one-sided-skip  disable one-sided skip\n");
@@ -10162,12 +10211,9 @@ int main(int argc, char **argv) {
         log_msg("merit thresholds: submit=%.4f  scan=%.4f\n",
             target, scan_target_runtime);
         if (use_one_sided_skip) {
-            log_msg("one-sided skip: enabled (non-CRT CPU bkscan), merit>=%.2f on first side (%s)\n",
+            log_msg("one-sided skip: enabled (non-CRT CPU bkscan + GPU smart), merit>=%.2f on first side (%s)\n",
                 one_sided_skip_merit,
                 one_sided_skip_merit_user_set ? "manual" : "auto");
-            if ((use_cuda || use_opencl) && !no_primality) {
-                log_msg("one-sided skip note: GPU Fermat path active; one-sided gate/telemetry is CPU-bkscan-only, so one-sided(non-crt) STATS line is expected to be absent\n");
-            }
         }
         if (cli_sieve_explicit) {
             log_msg("sieve-primes explicit: requested_count=%llu  effective_limit=%llu  loaded_count=%lu\n",

@@ -1501,6 +1501,12 @@ then Phase 2 verifies all survivors inside surviving regions.  A gap-verify
 safety net (`bn_candidate_is_prime` + 25-round MR) catches any remaining
 false gaps before submission.
 
+With `--one-sided-skip` enabled (non-CRT), the GPU smart path applies a
+first-side gate before Phase 2. Regions whose sampled span is below
+`one_sided_skip_merit * logbase` are skipped, while strong regions continue
+to full verification. The effect is visible in the `one-sided(non-crt)`
+STATS counters (`intervals`, `skipped`, `fullcheck`).
+
 #### Full test (`--sample-stride 1`)
 
 Disables both backward-scan and smart-scan.  Every sieve survivor is
@@ -1849,6 +1855,8 @@ presieve tile period, making it cache-neutral. All other P values
 | `--fast-euler`        | off           | Fast Euler-Plumb base-2 primality path (CPU).  Mutually exclusive with `--fast-fermat`. |
 | `--mr-rounds N`       | 2             | Miller-Rabin rounds for `mpz_probab_prime_p` (default path, not `--fast-fermat`).  Old default was 10; 2 rounds gives false-positive rate < 2^-128 for sieve-filtered candidates. |
 | `--sample-stride K`   | 8             | Controls gap scanning strategy.  K > 1 enables backward-scan (CPU) or two-phase smart-scan (GPU).  Set to 1 for full-test (all survivors tested). |
+| `--one-sided-skip` / `--no-one-sided-skip` | off | Enable/disable non-CRT first-side gating. CPU backward-scan skips second-side scan unless the first-side span is large enough; GPU smart path prunes weak regions before phase-2 verification. |
+| `--one-sided-skip-merit M` | auto | Merit gate for `--one-sided-skip` (`M * logbase` as minimum first-side span). If omitted, `M` is auto-derived from runtime scan merit. |
 | `--sievegap`          | off           | Enable standalone non-CRT sieve path (`src/sievegap.c`).  Bypasses legacy non-CRT presieve/wheel/adaptive path in `sieve_range()`.  Ignored when CRT mode is active (`--crt-file`). |
 | `--partial-sieve-auto` / `--partial-sieve` | off | Adaptive non-CRT sieve-prime limiting.  Adjusts sieve depth periodically based on runtime behavior. |
 | `--adaptive-presieve` | off           | Adaptive non-CRT presieve window skipping for dense windows after presieve. |
