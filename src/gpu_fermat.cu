@@ -450,6 +450,53 @@ __global__ void fermat_kernel_t(const uint64_t * __restrict__ cands,
     results[idx] = ok ? 1 : 0;
 }
 
+/* SoA-specialized scalar kernel for generic AL.
+   Layout: cands_soa[(limb * count) + idx]. */
+template<int AL>
+__global__ void fermat_kernel_soa_t(const uint64_t * __restrict__ cands_soa,
+                                    uint8_t        * __restrict__ results,
+                                    uint32_t count)
+{
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) return;
+
+    uint64_t n[AL];
+    for (int i = 0; i < AL; i++)
+        n[i] = __ldg(&cands_soa[(size_t)i * (size_t)count + idx]);
+
+    if ((n[0] & 1) == 0) { results[idx] = 0; return; }
+
+    uint64_t ninv = compute_ninv(n[0]);
+
+    uint64_t base_m[AL];
+    compute_rmodn_t<AL>(base_m, n);
+    moddbl_t<AL>(base_m, n);
+
+    int top = AL - 1;
+    while (top > 0 && n[top] == 0) top--;
+
+    uint64_t e[AL];
+    for (int i = 0; i < AL; i++) e[i] = n[i];
+    e[0]--;
+    int msb_e = top * 64 + (63 - __clzll(e[top]));
+
+    uint64_t res[AL];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+    fermat_expmod<AL, 3>(res, e, msb_e, n, ninv, base_m);
+#else
+    if constexpr (AL <= 7)
+        fermat_expmod<AL, 4>(res, e, msb_e, n, ninv, base_m);
+    else
+        fermat_expmod<AL, 3>(res, e, msb_e, n, ninv, base_m);
+#endif
+
+    int ok = (res[0] == 1);
+    for (int i = 1; i < AL; i++)
+        ok &= (res[i] == 0);
+
+    results[idx] = ok ? 1 : 0;
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  CGBN-based Fermat kernel: template<BITS, TPI> covers all even AL.
  *
@@ -576,9 +623,47 @@ int fermat_block_size_for_kernel()
     return cached;
 }
 
+static __host__ __forceinline__ int cgbn_supports_al(int al)
+{
+#if defined(CGBN_FERMAT_AVAILABLE)
+    switch (al) {
+    #if NL >= 2
+    case 2:
+    #endif
+    #if NL >= 4
+    case 4:
+    #endif
+    #if NL >= 6
+    case 6:
+    #endif
+    #if NL >= 8
+    case 8:
+    #endif
+    #if NL >= 12
+    case 12:
+    #endif
+    #if NL >= 16
+    case 16:
+    #endif
+    #if NL >= 20
+    case 20:
+    #endif
+        return 1;
+    default:
+        return 0;
+    }
+#else
+    (void)al;
+    return 0;
+#endif
+}
+
 static cudaError_t launch_fermat(int al, cudaStream_t stream,
-                                 const uint64_t *d_cands, uint8_t *d_results,
-                                 uint32_t count)
+                                 const uint64_t *d_cands,
+                                 const uint64_t *d_cands_soa,
+                                 uint8_t *d_results,
+                                 uint32_t count,
+                                 int use_soa_scalar)
 {
 #if defined(CGBN_FERMAT_AVAILABLE)
     /* CGBN dispatch for even AL values.
@@ -651,7 +736,10 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
     do { \
         int block = fermat_block_size_for_kernel<W>(); \
         int grid  = (int)((count + (uint32_t)block - 1u) / (uint32_t)block); \
-        fermat_kernel_t<W><<<grid, block, 0, stream>>>(d_cands, d_results, count); \
+        if (use_soa_scalar) \
+            fermat_kernel_soa_t<W><<<grid, block, 0, stream>>>(d_cands_soa, d_results, count); \
+        else \
+            fermat_kernel_t<W><<<grid, block, 0, stream>>>(d_cands, d_results, count); \
     } while (0); \
     return cudaPeekAtLastError()
 
@@ -737,8 +825,10 @@ struct gpu_fermat_ctx {
     /* Double-buffered async pipeline: 2 slots for overlap */
     cudaStream_t stream[2];
     uint64_t *d_cands[2];      /* device candidate buffers  */
+    uint64_t *d_cands_soa[2];  /* device SoA cands for scalar AL */
     uint8_t  *d_results[2];    /* device result buffers     */
     uint64_t *h_cands[2];      /* pinned host staging cands */
+    uint64_t *h_cands_soa[2];  /* pinned host SoA scalar AL */
     uint8_t  *h_results[2];    /* pinned host staging res   */
     size_t    pending[2];      /* candidates in-flight per slot (0=idle) */
     char      dev_name[256];
@@ -838,6 +928,20 @@ gpu_fermat_ctx *gpu_fermat_init(int device_id, size_t max_batch)
             goto fail;
         }
 
+        err = cudaMalloc(&ctx->d_cands_soa[s], max_batch * NL * sizeof(uint64_t));
+        if (err != cudaSuccess) {
+            fprintf(stderr, "gpu_fermat: cudaMalloc cands_soa[%d] (%zu B): %s\n",
+                s, max_batch * (size_t)NL * sizeof(uint64_t), cudaGetErrorString(err));
+            goto fail;
+        }
+
+        err = cudaMallocHost(&ctx->h_cands_soa[s], max_batch * NL * sizeof(uint64_t));
+        if (err != cudaSuccess) {
+            fprintf(stderr, "gpu_fermat: cudaMallocHost cands_soa[%d]: %s\n",
+                s, cudaGetErrorString(err));
+            goto fail;
+        }
+
         ctx->pending[s] = 0;
         ctx->event_inited[s] = 0;
         ctx->slot_cv_inited[s] = 0;
@@ -906,26 +1010,47 @@ int gpu_fermat_submit(gpu_fermat_ctx *ctx, int slot,
     if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->slot_mu[slot]); return -1; }
 
     int active_limbs = __atomic_load_n(&ctx->active_limbs, __ATOMIC_RELAXED);
-    /* Use compact stride: callers now pack candidates at active_limbs
-       width instead of full NL.  This cuts CPU build time, memcpy, and
-       H2D transfer by NL/AL (e.g. 2.67× at shift=128). */
-    int stride = active_limbs;
-    size_t bytes = count * (size_t)stride * sizeof(uint64_t);
+    int use_soa_scalar = !cgbn_supports_al(active_limbs);
 
-    /* Copy candidates into pinned staging buffer.
-       After this memcpy the caller's buffer can be reused. */
-    memcpy(ctx->h_cands[slot], candidates, bytes);
+    if (use_soa_scalar) {
+        /* Non-CGBN AL: AoS->SoA prepack for coalesced scalar kernel loads. */
+        uint64_t *dst = ctx->h_cands_soa[slot];
+        const uint64_t *src = candidates;
+        int stride = active_limbs;
+        for (size_t i = 0; i < count; i++) {
+            size_t b = i * (size_t)stride;
+            for (int limb = 0; limb < stride; limb++)
+                dst[(size_t)limb * count + i] = src[b + (size_t)limb];
+        }
 
-    /* Async H→D on stream[slot] */
-    err = cudaMemcpyAsync(ctx->d_cands[slot], ctx->h_cands[slot],
-                          bytes,
-                          cudaMemcpyHostToDevice, ctx->stream[slot]);
-    if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->slot_mu[slot]); return -1; }
+        size_t soa_bytes = count * (size_t)stride * sizeof(uint64_t);
+        err = cudaMemcpyAsync(ctx->d_cands_soa[slot], ctx->h_cands_soa[slot],
+                              soa_bytes,
+                              cudaMemcpyHostToDevice, ctx->stream[slot]);
+        if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->slot_mu[slot]); return -1; }
+    } else {
+        /* Use compact stride: callers now pack candidates at active_limbs
+           width instead of full NL.  This cuts CPU build time, memcpy, and
+           H2D transfer by NL/AL (e.g. 2.67x at shift=128). */
+        int stride = active_limbs;
+        size_t bytes = count * (size_t)stride * sizeof(uint64_t);
 
-    /* Launch kernel — dispatch to narrowest matching specialization */
+        /* Copy candidates into pinned staging buffer.
+           After this memcpy the caller's buffer can be reused. */
+        memcpy(ctx->h_cands[slot], candidates, bytes);
+
+        /* Async H->D on stream[slot] */
+        err = cudaMemcpyAsync(ctx->d_cands[slot], ctx->h_cands[slot],
+                              bytes,
+                              cudaMemcpyHostToDevice, ctx->stream[slot]);
+        if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->slot_mu[slot]); return -1; }
+    }
+
+    /* Launch kernel — CGBN for supported AL, scalar AoS/SoA otherwise. */
     err = launch_fermat(active_limbs, ctx->stream[slot],
-                        ctx->d_cands[slot], ctx->d_results[slot],
-                        (uint32_t)count);
+                        ctx->d_cands[slot], ctx->d_cands_soa[slot],
+                        ctx->d_results[slot], (uint32_t)count,
+                        use_soa_scalar);
     if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->slot_mu[slot]); return -1; }
 
     /* Async D→H on stream[slot] */
@@ -1028,8 +1153,10 @@ void gpu_fermat_destroy(gpu_fermat_ctx *ctx)
         if (ctx->pending[s] && ctx->stream[s])
             cudaStreamSynchronize(ctx->stream[s]);
         if (ctx->d_cands[s])   cudaFree(ctx->d_cands[s]);
+        if (ctx->d_cands_soa[s]) cudaFree(ctx->d_cands_soa[s]);
         if (ctx->d_results[s]) cudaFree(ctx->d_results[s]);
         if (ctx->h_cands[s])   cudaFreeHost(ctx->h_cands[s]);
+        if (ctx->h_cands_soa[s]) cudaFreeHost(ctx->h_cands_soa[s]);
         if (ctx->h_results[s]) cudaFreeHost(ctx->h_results[s]);
         if (ctx->stream[s])    cudaStreamDestroy(ctx->stream[s]);
     }

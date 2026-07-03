@@ -455,11 +455,17 @@ valid power-of-2 TPI ≤ 8:
 | 20 | 1280  | 8   | 5     | |
 
 AL values 1, 3, 5, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19 and all other AL
-values without a valid (integer LIMBS ≤ TPI) pair fall back to the existing
-scalar `fermat_kernel_t`.
+values without a valid (integer LIMBS ≤ TPI) pair now run through the scalar
+CUDA path with an AoS->SoA prepack. The scalar kernel reads SoA layout
+`cands_soa[limb * count + idx]`, which improves global-load coalescing versus
+the old AoS stride loads on non-CGBN ALs.
 
 The CGBN kernel is chosen automatically at runtime when `al` matches a
 supported entry in the dispatch table; no runtime flag is required.
+
+For AL values not supported by CGBN, runtime automatically enables the scalar
+SoA path (same dispatch width, different candidate layout). CGBN-supported ALs
+keep the existing AoS input path and cooperative CGBN kernel dispatch.
 
 #### Startup log messages
 
