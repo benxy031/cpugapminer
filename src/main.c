@@ -34,14 +34,15 @@
 static void     set_base_bn(const uint8_t h256[32], int shift);
 static int      bn_candidate_is_prime(uint64_t offset);
 #ifdef WITH_RPC
+#define SUBMIT_BLOCK_HEX_CAP (256 * 1024)
 static int      build_mining_pass(const char *url, const char *user, const char *pass, int shift);
-static int      assemble_mining_block(uint64_t nadd_val, uint64_t expect_seq, char out_hex[16384]);
+static int      assemble_mining_block(uint64_t nadd_val, uint64_t expect_seq, char out_hex[SUBMIT_BLOCK_HEX_CAP]);
 static int      build_block_from_gbt_and_payload(const char *gbt_json,
                                                  const char *header_payload_hex,
                                                  int nshift_val,
                                                  uint32_t nonce_val,
                                                  mpz_srcptr nadd_val,
-                                                 char outhex[16384]);
+                                                 char outhex[SUBMIT_BLOCK_HEX_CAP]);
 static void     pass_state_snapshot_nonce_hdr80(uint32_t *nonce_out,
                                                 uint8_t hdr80_out[80]);
 static void     submit_gap_block_common(const char *blockhex, double merit,
@@ -666,7 +667,7 @@ static int build_mining_pass_from_gbt(const char *url,
     if (!gbt)
         return 0;
 
-    char blockhex[16384];
+    char blockhex[SUBMIT_BLOCK_HEX_CAP];
     memset(blockhex, 0, sizeof(blockhex));
     mpz_t nadd_zero;
     mpz_init_set_ui(nadd_zero, 0);
@@ -4055,7 +4056,7 @@ struct submit_job {
     char user[128];
     char pass[128];
     char method[32];
-    char hex[16384];
+    char hex[SUBMIT_BLOCK_HEX_CAP];
     int retries;
 };
 
@@ -4426,7 +4427,7 @@ static int json_extract_u64_hex_field(const char *json, const char *key,
 static int build_block_from_gbt_and_payload(const char *gbt_json, const char *header_payload_hex,
                                              int nshift_val, uint32_t nonce_val,
                                              mpz_srcptr nadd_val,
-                                             char outhex[16384]) {
+                                             char outhex[SUBMIT_BLOCK_HEX_CAP]) {
     char prevhex[65] = {0};
     uint32_t curtime = (uint32_t)time(NULL);
     uint32_t version = 2;
@@ -4663,7 +4664,7 @@ static int build_block_from_gbt_and_payload(const char *gbt_json, const char *he
                                 (total_txs <= 0xFFFFFFFFULL) ? 5 : 9;
     size_t full_len = header_size + txcount_varint_len;
     for (size_t i=0;i<total_txs;i++) full_len += txraw_lens[i];
-    if (full_len * 2 + 1 > 16384) {
+    if (full_len * 2 + 1 > SUBMIT_BLOCK_HEX_CAP) {
         log_msg("ERROR: serialized submitblock payload too large for buffer (%lu bytes)\n",
                 (unsigned long)full_len);
         for (size_t i = 0; i < total_txs; i++) free(txraws[i]);
@@ -4886,7 +4887,7 @@ static int build_mining_pass(const char *url, const char *user, const char *pass
 }
 
 static int assemble_mining_block(uint64_t nadd_val, uint64_t expect_seq,
-                                 char out_hex[16384]) {
+                                 char out_hex[SUBMIT_BLOCK_HEX_CAP]) {
     struct pass_state pass_snap;
     uint64_t current_seq = 0;
     /* Stale-pass guard: reject if g_pass was overwritten since the worker
@@ -4964,7 +4965,7 @@ static int assemble_mining_block(uint64_t nadd_val, uint64_t expect_seq,
    nonce, so CRT mining at large shifts (512+) can submit properly. */
 static int assemble_mining_block_mpz(uint32_t mining_nonce, mpz_t nadd_val,
                                      uint64_t expect_seq,
-                                     char out_hex[16384]) {
+                                     char out_hex[SUBMIT_BLOCK_HEX_CAP]) {
     struct pass_state pass_snap;
     uint64_t current_seq = 0;
     if (!pass_state_snapshot_if_seq(expect_seq, &pass_snap, &current_seq)) {
@@ -6435,7 +6436,7 @@ static size_t crt_bkscan_and_submit(
                 (unsigned)nonce, nAdd_str);
 #ifdef WITH_RPC
         if (rpc_url && !g_abort_pass) {
-            char blockhex[16384];
+            char blockhex[SUBMIT_BLOCK_HEX_CAP];
             uint64_t submit_expect_seq = 0;
             struct pass_state submit_snap;
             pass_state_snapshot(&submit_snap);
@@ -6629,7 +6630,7 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
                 (unsigned)nonce, nAdd_str);
 #ifdef WITH_RPC
         if (rpc_url && !g_abort_pass) {
-            char blockhex[16384];
+            char blockhex[SUBMIT_BLOCK_HEX_CAP];
             uint64_t submit_expect_seq = 0;
             struct pass_state submit_snap;
             pass_state_snapshot(&submit_snap);
@@ -7557,7 +7558,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
 #ifdef WITH_RPC
             if (rpc_url_local) {
                 if (g_abort_pass) continue;
-                char blockhex[16384]; memset(blockhex, 0, sizeof(blockhex));
+                char blockhex[SUBMIT_BLOCK_HEX_CAP]; memset(blockhex, 0, sizeof(blockhex));
                 if (assemble_mining_block(nadd_sc, expect_seq, blockhex)) {
                     __sync_fetch_and_add(&stats_blocks, 1);
                     log_file_only("Built blockhex: %s\n", blockhex);
@@ -10320,7 +10321,7 @@ int main(int argc, char **argv) {
         }
         char *gbt = rpc_getblocktemplate(rpc_url, rpc_user, rpc_pass);
         if (!gbt) { log_msg("Failed to fetch GBT\n"); stop_stats_thread(); return 2; }
-        char blockhex[16384]; memset(blockhex,0,sizeof(blockhex));
+        char blockhex[SUBMIT_BLOCK_HEX_CAP]; memset(blockhex,0,sizeof(blockhex));
         char payload_hex[197] = {0};
         if (!no_opreturn) {
             if (build_p == 0 && build_q == 0) { log_msg("--build-only requires --p and --q when not using --no-opreturn\n"); free(gbt); stop_stats_thread(); return 2; }

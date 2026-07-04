@@ -32,6 +32,7 @@
 #include <QWidget>
 
 #include <algorithm>
+#include <cmath>
 #include <functional>
 #include <memory>
 
@@ -67,6 +68,7 @@ QString formatHashrate(double hps) {
 class MiniDiffHashChart : public QWidget {
 public:
     enum class Mode {
+        ClassicDualAxis,
         DifficultyVsHashrate,
         TimeTrend
     };
@@ -97,6 +99,11 @@ public:
 
     void setMode(Mode mode) {
         mode_ = mode;
+        update();
+    }
+
+    void setShowSamples(bool show) {
+        showSamples_ = show;
         update();
     }
 
@@ -134,6 +141,89 @@ protected:
             return;
         }
 
+        if (mode_ == Mode::ClassicDualAxis) {
+            double minDiff = samples_.first().x();
+            double maxDiff = samples_.first().x();
+            double minHash = samples_.first().y();
+            double maxHash = samples_.first().y();
+            for (const QPointF &pt : samples_) {
+                minDiff = std::min(minDiff, pt.x());
+                maxDiff = std::max(maxDiff, pt.x());
+                minHash = std::min(minHash, pt.y());
+                maxHash = std::max(maxHash, pt.y());
+            }
+
+            const double diffPad = std::max((maxDiff - minDiff) * 0.08, 1e-9);
+            const bool useLogHash = (minHash > 0.0) && ((maxHash / std::max(minHash, 1e-12)) >= 8.0);
+            auto toHashScaled = [useLogHash](double y) {
+                return useLogHash ? std::log10(std::max(y, 1e-12)) : y;
+            };
+            auto fromHashScaled = [useLogHash](double sy) {
+                return useLogHash ? std::pow(10.0, sy) : sy;
+            };
+
+            const double minHashScaledRaw = toHashScaled(minHash);
+            const double maxHashScaledRaw = toHashScaled(maxHash);
+            const double hashPad = std::max((maxHashScaledRaw - minHashScaledRaw) * 0.08, 1e-9);
+
+            minDiff -= diffPad;
+            maxDiff += diffPad;
+            const double minHashScaled = minHashScaledRaw - hashPad;
+            const double maxHashScaled = maxHashScaledRaw + hashPad;
+
+            const int bandGap = 10;
+            const int halfH = plot.height() / 2;
+            QRect diffBand(plot.left(), plot.top(), plot.width(), std::max(20, halfH - bandGap / 2));
+            QRect hashBand(plot.left(), plot.top() + halfH + bandGap / 2, plot.width(), std::max(20, halfH - bandGap / 2));
+
+            p.fillRect(diffBand, QColor(56, 22, 22, 70));
+            p.fillRect(hashBand, QColor(22, 34, 64, 70));
+
+            QPolygonF diffLine;
+            QPolygonF hashLine;
+            const int n = static_cast<int>(samples_.size());
+            diffLine.reserve(n);
+            hashLine.reserve(n);
+            for (int i = 0; i < n; ++i) {
+                const double nx = (n <= 1) ? 0.0 : static_cast<double>(i) / static_cast<double>(n - 1);
+                const qreal px = plot.left() + nx * plot.width();
+
+                const double diffNorm = (samples_[i].x() - minDiff) / (maxDiff - minDiff);
+                const double hashNorm = (toHashScaled(samples_[i].y()) - minHashScaled) / (maxHashScaled - minHashScaled);
+                diffLine.append(QPointF(px, diffBand.bottom() - diffNorm * diffBand.height()));
+                hashLine.append(QPointF(px, hashBand.bottom() - hashNorm * hashBand.height()));
+            }
+
+            p.setPen(QPen(QColor(210, 60, 60), 2.0));
+            if (diffLine.size() >= 2) p.drawPolyline(diffLine);
+            p.setPen(QPen(QColor(70, 120, 255), 2.0, Qt::DashLine));
+            if (hashLine.size() >= 2) p.drawPolyline(hashLine);
+
+            p.setPen(QColor(70, 80, 96));
+            p.drawLine(plot.left(), diffBand.bottom() + bandGap / 2, plot.right(), diffBand.bottom() + bandGap / 2);
+
+            p.setPen(QPen(QColor(210, 60, 60), 1.6));
+            p.drawLine(plot.left(), diffBand.top(), plot.left(), diffBand.bottom());
+            p.setPen(QPen(QColor(70, 120, 255), 1.6));
+            p.drawLine(plot.right(), hashBand.top(), plot.right(), hashBand.bottom());
+
+            p.setPen(QColor(210, 60, 60));
+            p.drawText(6, diffBand.top() + 6, QString::number(maxDiff, 'g', 5));
+            p.drawText(6, diffBand.center().y(), QString::number((minDiff + maxDiff) * 0.5, 'g', 5));
+            p.drawText(6, diffBand.bottom(), QString::number(minDiff, 'g', 5));
+            p.drawText(8, diffBand.center().y() - 12, "Difficulty");
+
+            p.setPen(QColor(70, 120, 255));
+            p.drawText(plot.right() - 95, hashBand.top() + 6, formatHashrate(fromHashScaled(maxHashScaled)));
+            p.drawText(plot.right() - 95, hashBand.center().y(), formatHashrate(fromHashScaled((minHashScaled + maxHashScaled) * 0.5)));
+            p.drawText(plot.right() - 95, hashBand.bottom(), formatHashrate(fromHashScaled(minHashScaled)));
+            p.drawText(plot.right() - 80, hashBand.center().y() + 14, useLogHash ? "Hashrate (log)" : "Hashrate");
+
+            p.setPen(QColor(175, 185, 200));
+            p.drawText(plot.center().x() - 90, rect().bottom() - 8, "Last ~5 days (sampled blocks)");
+            return;
+        }
+
         if (mode_ == Mode::DifficultyVsHashrate) {
             double minX = samples_.first().x();
             double maxX = samples_.first().x();
@@ -147,50 +237,75 @@ protected:
             }
 
             const double padX = std::max((maxX - minX) * 0.08, 1e-9);
-            const double padY = std::max((maxY - minY) * 0.08, 1e-9);
+            const bool useLogY = (minY > 0.0) && ((maxY / std::max(minY, 1e-12)) >= 8.0);
+
+            auto toScaledY = [useLogY](double y) {
+                return useLogY ? std::log10(std::max(y, 1e-12)) : y;
+            };
+            auto fromScaledY = [useLogY](double sy) {
+                return useLogY ? std::pow(10.0, sy) : sy;
+            };
+
+            double minYScaled = toScaledY(minY);
+            double maxYScaled = toScaledY(maxY);
+            const double padY = std::max((maxYScaled - minYScaled) * 0.08, 1e-9);
             minX -= padX;
             maxX += padX;
-            minY -= padY;
-            maxY += padY;
+            minYScaled -= padY;
+            maxYScaled += padY;
 
             QPolygonF poly;
             poly.reserve(samples_.size());
             for (const QPointF &pt : samples_) {
                 const double nx = (pt.x() - minX) / (maxX - minX);
-                const double ny = (pt.y() - minY) / (maxY - minY);
+                const double ny = (toScaledY(pt.y()) - minYScaled) / (maxYScaled - minYScaled);
                 const qreal px = plot.left() + nx * plot.width();
                 const qreal py = plot.bottom() - ny * plot.height();
                 poly.append(QPointF(px, py));
             }
 
-            QVector<QPointF> sorted = samples_;
-            std::sort(sorted.begin(), sorted.end(), [](const QPointF &a, const QPointF &b) {
-                return a.x() < b.x();
-            });
+            struct BinAcc {
+                double sumX = 0.0;
+                double sumY = 0.0;
+                int count = 0;
+            };
+
+            const int n = static_cast<int>(samples_.size());
+            const int binCount = std::clamp(n / 4, 10, 28);
+            QVector<BinAcc> bins(binCount);
+            const double xSpan = std::max(maxX - minX, 1e-9);
+
+            for (const QPointF &pt : samples_) {
+                const double rel = (pt.x() - minX) / xSpan;
+                int b = static_cast<int>(rel * static_cast<double>(binCount));
+                if (b < 0) b = 0;
+                if (b >= binCount) b = binCount - 1;
+                bins[b].sumX += pt.x();
+                bins[b].sumY += pt.y();
+                bins[b].count += 1;
+            }
 
             QPolygonF trend;
-            trend.reserve(sorted.size());
-            const int n = static_cast<int>(sorted.size());
-            for (int i = 0; i < n; ++i) {
-                const int from = std::max(0, i - 2);
-                const int to = std::min(n - 1, i + 2);
-                double avgY = 0.0;
-                for (int j = from; j <= to; ++j) avgY += sorted[j].y();
-                avgY /= static_cast<double>(to - from + 1);
-
-                const double nx = (sorted[i].x() - minX) / (maxX - minX);
-                const double ny = (avgY - minY) / (maxY - minY);
+            trend.reserve(binCount);
+            for (int i = 0; i < binCount; ++i) {
+                if (bins[i].count == 0) continue;
+                const double avgX = bins[i].sumX / static_cast<double>(bins[i].count);
+                const double avgY = bins[i].sumY / static_cast<double>(bins[i].count);
+                const double nx = (avgX - minX) / (maxX - minX);
+                const double ny = (toScaledY(avgY) - minYScaled) / (maxYScaled - minYScaled);
                 const qreal px = plot.left() + nx * plot.width();
                 const qreal py = plot.bottom() - ny * plot.height();
                 trend.append(QPointF(px, py));
             }
 
-            p.setPen(QPen(QColor(86, 198, 255), 2.2));
+            p.setPen(QPen(QColor(86, 198, 255), 2.4));
             if (trend.size() >= 2) p.drawPolyline(trend);
 
-            p.setBrush(QColor(255, 168, 76));
-            p.setPen(Qt::NoPen);
-            for (const QPointF &pt : poly) p.drawEllipse(pt, 3.0, 3.0);
+            if (showSamples_) {
+                p.setBrush(QColor(255, 168, 76, 170));
+                p.setPen(Qt::NoPen);
+                for (const QPointF &pt : poly) p.drawEllipse(pt, 2.2, 2.2);
+            }
 
             // Distinct axis colors in scatter mode: Y=cyan (hashrate), X=orange (difficulty).
             p.setPen(QPen(QColor(86, 198, 255), 1.6));
@@ -199,9 +314,14 @@ protected:
             p.drawLine(plot.left(), plot.bottom(), plot.right(), plot.bottom());
 
             p.setPen(QColor(86, 198, 255));
-            p.drawText(6, plot.top() + 6, formatHashrate(maxY));
-            p.drawText(6, plot.bottom(), formatHashrate(minY));
-            p.drawText(8, plot.center().y(), "Hashrate");
+            for (int i = 0; i <= 4; ++i) {
+                const double frac = static_cast<double>(i) / 4.0;
+                const double scaled = maxYScaled - frac * (maxYScaled - minYScaled);
+                const double yVal = fromScaledY(scaled);
+                const int y = plot.top() + (plot.height() * i) / 4;
+                p.drawText(6, y + 4, formatHashrate(yVal));
+            }
+            p.drawText(8, plot.center().y(), useLogY ? "Hashrate (log)" : "Hashrate");
 
             p.setPen(QColor(255, 168, 76));
             p.drawText(plot.left(), rect().bottom() - 8, QString::number(minX, 'g', 6));
@@ -259,7 +379,8 @@ protected:
     }
 
 private:
-    Mode mode_ = Mode::DifficultyVsHashrate;
+    Mode mode_ = Mode::ClassicDualAxis;
+    bool showSamples_ = true;
     QVector<QPointF> samples_;
 };
 }
@@ -272,6 +393,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
         statusBar()->showMessage("RPC endpoint set. Loading chain data...");
         historicalSamplesLoaded_ = false;
         historicalSamplesLoading_ = false;
+        hashCalibrationReady_ = false;
+        hashPerDifficulty_ = -1.0;
         if (diffHashChart_) {
             auto *chart = static_cast<MiniDiffHashChart *>(diffHashChart_);
             chart->clearSamples();
@@ -292,11 +415,18 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     connect(chartModeCombo_, &QComboBox::currentIndexChanged, this, [this](int idx) {
         if (!diffHashChart_) return;
         auto *chart = static_cast<MiniDiffHashChart *>(diffHashChart_);
-        if (idx == 1) {
-            chart->setMode(MiniDiffHashChart::Mode::TimeTrend);
-        } else {
+        if (idx == 0) {
+            chart->setMode(MiniDiffHashChart::Mode::ClassicDualAxis);
+        } else if (idx == 1) {
             chart->setMode(MiniDiffHashChart::Mode::DifficultyVsHashrate);
+        } else {
+            chart->setMode(MiniDiffHashChart::Mode::TimeTrend);
         }
+    });
+    connect(chartSamplesToggle_, &QCheckBox::toggled, this, [this](bool enabled) {
+        if (!diffHashChart_) return;
+        auto *chart = static_cast<MiniDiffHashChart *>(diffHashChart_);
+        chart->setShowSamples(enabled);
     });
     connect(liveModeToggle_, &QCheckBox::toggled, this, [this](bool enabled) {
         if (!liveTimer_) return;
@@ -395,9 +525,14 @@ void MainWindow::setupUi() {
     recordsStatusValue_ = new QLabel("Not loaded");
     chainForm->addRow("Records", recordsStatusValue_);
     chartModeCombo_ = new QComboBox(chainBox);
+    chartModeCombo_->addItem("Classic Dual Axis (5d)");
     chartModeCombo_->addItem("Difficulty vs Hashrate");
     chartModeCombo_->addItem("Trend Through Time");
+    chartModeCombo_->setCurrentIndex(0);
     chainForm->addRow("Graph Mode", chartModeCombo_);
+    chartSamplesToggle_ = new QCheckBox("Show Samples", chainBox);
+    chartSamplesToggle_->setChecked(true);
+    chainForm->addRow("Graph Style", chartSamplesToggle_);
     diffHashChart_ = new MiniDiffHashChart(chainBox);
     chainForm->addRow("Diff/Speed Graph", diffHashChart_);
     chainBox->setLayout(chainForm);
@@ -563,6 +698,8 @@ void MainWindow::refreshOverview() {
                                               const double hps = powResult.toDouble(-1.0);
                                               networkSpeedValue_->setText(formatHashrate(hps));
                                               if (diffHashChart_ && difficulty > 0.0 && hps >= 0.0) {
+                                                  hashPerDifficulty_ = hps / difficulty;
+                                                  hashCalibrationReady_ = true;
                                                   auto *chart = static_cast<MiniDiffHashChart *>(diffHashChart_);
                                                   chart->addSample(difficulty, hps);
                                               }
@@ -573,6 +710,8 @@ void MainWindow::refreshOverview() {
                                                             const double hps = hashResult.toDouble(-1.0);
                                                             networkSpeedValue_->setText(formatHashrate(hps));
                                                             if (diffHashChart_ && difficulty > 0.0 && hps >= 0.0) {
+                                                                hashPerDifficulty_ = hps / difficulty;
+                                                                hashCalibrationReady_ = true;
                                                                 auto *chart = static_cast<MiniDiffHashChart *>(diffHashChart_);
                                                                 chart->addSample(difficulty, hps);
                                                             }
@@ -588,6 +727,8 @@ void MainWindow::refreshOverview() {
                                               const double hps = powResult.toDouble(-1.0);
                                               networkSpeedValue_->setText(formatHashrate(hps));
                                               if (diffHashChart_ && fallbackDifficulty > 0.0 && hps >= 0.0) {
+                                                  hashPerDifficulty_ = hps / fallbackDifficulty;
+                                                  hashCalibrationReady_ = true;
                                                   auto *chart = static_cast<MiniDiffHashChart *>(diffHashChart_);
                                                   chart->addSample(fallbackDifficulty, hps);
                                               }
@@ -598,6 +739,8 @@ void MainWindow::refreshOverview() {
                                                             const double hps = hashResult.toDouble(-1.0);
                                                             networkSpeedValue_->setText(formatHashrate(hps));
                                                             if (diffHashChart_ && fallbackDifficulty > 0.0 && hps >= 0.0) {
+                                                                hashPerDifficulty_ = hps / fallbackDifficulty;
+                                                                hashCalibrationReady_ = true;
                                                                 auto *chart = static_cast<MiniDiffHashChart *>(diffHashChart_);
                                                                 chart->addSample(fallbackDifficulty, hps);
                                                             }
@@ -971,13 +1114,16 @@ void MainWindow::loadHistoricalChartSamples() {
                       return;
                   }
 
-                  const int points = std::min(28, tip + 1);
+                  // Approximate 5-day window (Gapcoin ~2 min block target => ~720 blocks/day).
+                  const int historyPoints = std::min(96, tip + 1);
+                  const int historySpan = std::min(5 * 720, tip);
+                  const int points = historyPoints;
                   if (points <= 0) {
                       historicalSamplesLoading_ = false;
                       return;
                   }
 
-                  const int span = std::min(720, tip);
+                  const int span = historySpan;
                   const int step = std::max(1, (points > 1) ? (span / (points - 1)) : 1);
                   const int start = std::max(0, tip - step * (points - 1));
 
@@ -1008,6 +1154,13 @@ void MainWindow::loadHistoricalChartSamples() {
                                               [this, chart, h, idx, fetchNext](const QJsonValue &blockResult) {
                                                   const QJsonObject block = blockResult.toObject();
                                                   const double diff = block.value("difficulty").toDouble(-1.0);
+
+                                                  if (diff > 0.0 && hashCalibrationReady_ && hashPerDifficulty_ > 0.0) {
+                                                      const double estHps = diff * hashPerDifficulty_;
+                                                      chart->addSample(diff, estHps);
+                                                      (*fetchNext)(idx + 1);
+                                                      return;
+                                                  }
 
                                                   rpc_.call("getnetworkminingpower", QJsonArray{h},
                                                             [chart, diff, idx, fetchNext](const QJsonValue &powResult) {

@@ -47,6 +47,8 @@ private:
     int lastKnownTip_ = -1;
     bool historicalSamplesLoaded_ = false;
     bool historicalSamplesLoading_ = false;
+    bool hashCalibrationReady_ = false;
+    double hashPerDifficulty_ = -1.0;
     QHash<int, double> recordMeritByGap_;
 
     QLineEdit *urlEdit_ = nullptr;
@@ -66,6 +68,7 @@ private:
     QLabel *peersOverviewValue_ = nullptr;
     QWidget *diffHashChart_ = nullptr;
     QComboBox *chartModeCombo_ = nullptr;
+    QCheckBox *chartSamplesToggle_ = nullptr;
 
     QSpinBox *recentCount_ = nullptr;
     QPushButton *loadBlocksBtn_ = nullptr;

@@ -14,8 +14,14 @@ This is a standalone Qt GUI blockchain reader intended as a future add-on for th
 - Mini chart in Chain Overview: Difficulty (x-axis) vs Network Speed / hashrate (y-axis), updated in live mode
 	- primary RPC metrics: `getdifficulty` (difficulty) and `getnetworkminingpower` (network speed)
 	- compatibility fallback: `getblockchaininfo.difficulty` and `getnetworkhashps`
-- Graph mode toggle: `Difficulty vs Hashrate` or `Trend Through Time` (difficulty + hashrate over time)
-- Historical backfill: on connect/refresh, chart preloads recent historical samples from chain (`getblock` + `getnetworkhashps`) so graph is visible immediately, then continues in live mode
+	- hashrate axis uses adaptive log scaling when the value range is wide (clearer spread)
+- Graph mode toggle:
+	- `Classic Dual Axis (5d)` (red difficulty line left axis + blue hashrate line right axis, similar to classic wallet charts)
+	- `Difficulty vs Hashrate`
+	- `Trend Through Time` (difficulty + hashrate over time)
+- Graph sample toggle: `Show Samples` ON/OFF for switching between `Trend + samples` and `Trend only`
+- Historical backfill: on connect/refresh, chart preloads about 5 days of historical samples from chain (up to ~3600 blocks, sampled to ~96 points), then continues in live mode
+	- historical hashrate is calibrated from current live ratio (`network speed / difficulty`) to avoid flat or unsupported per-height RPC results
 - Live peers count (from `getnetworkinfo` / fallback `getconnectioncount`) shown in Overview, Block, and Transaction views
 - Recent blocks list (`getblockcount`, `getblockhash`, `getblock`) with columns:
 	- `height`, `hash`, `shift`, `merit`, `record`, `time`, `tx`
