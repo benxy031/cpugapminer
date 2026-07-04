@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 /* On MSVC (nvcc DLL build) use CRITICAL_SECTION shim; elsewhere use winpthreads / glibc. */
 #ifdef _MSC_VER
 #  include "compat_win32.h"
@@ -575,8 +576,83 @@ void cgbn_fermat_kernel_t(cgbn_mem_t<BITS> *cands,
     results[id] = (uint8_t)cgbn_equals_ui32(env, r, 1);
 }
 
+/* SoA variant for CGBN path.
+   Input layout: cands_soa[(limb * n) + id], limb is uint64 limb index.
+   We repack one candidate into local cgbn_mem_t<BITS> before cgbn_load(). */
+template<uint32_t BITS, uint32_t TPI_VAL>
+__global__ static
+void cgbn_fermat_kernel_soa_t(const uint64_t * __restrict__ cands_soa,
+                              uint8_t * __restrict__ results,
+                              uint32_t n)
+{
+    int32_t id = (int32_t)((blockIdx.x * blockDim.x + threadIdx.x) / TPI_VAL);
+    if ((uint32_t)id >= n) return;
+
+    typedef cgbn_context_t<TPI_VAL, CgbnFermatParams<TPI_VAL>> ctx_t;
+    typedef cgbn_env_t<ctx_t, BITS>                             env_t;
+    typedef typename env_t::cgbn_t                              bn_t;
+
+    ctx_t    ctx(cgbn_no_checks);
+    env_t    env(ctx);
+    bn_t     N, e, r, t, base;
+    uint32_t np0;
+    int32_t  pos;
+
+    constexpr int AL_BITS = (int)(BITS / 64u);
+    constexpr int INSTANCES_PER_BLOCK = (int)(CgbnFermatParams<TPI_VAL>::TPB / TPI_VAL);
+    __shared__ cgbn_mem_t<BITS> sh_n_mem[INSTANCES_PER_BLOCK];
+    const int lane = (int)(threadIdx.x & (TPI_VAL - 1));
+    const int local_instance = (int)(threadIdx.x / TPI_VAL);
+
+    /* Cooperative load: each lane loads a subset of limbs into shared memory
+       so we avoid TPIx redundant per-candidate loads from global SoA storage. */
+    uint64_t *n64 = reinterpret_cast<uint64_t *>(&sh_n_mem[local_instance]);
+#pragma unroll
+    for (int i = lane; i < AL_BITS; i += (int)TPI_VAL)
+        n64[i] = __ldg(&cands_soa[(size_t)i * (size_t)n + (uint32_t)id]);
+
+    __syncwarp();
+    cgbn_load    (env, N,    &sh_n_mem[local_instance]);
+    cgbn_sub_ui32(env, e,    N, 1);
+    cgbn_set_ui32(env, base, 2);
+    np0 = cgbn_bn2mont(env, r, base, N);
+    pos = (int32_t)(BITS - 1) - (int32_t)cgbn_clz(env, e) - 1;
+
+    while (pos >= 0) {
+        cgbn_mont_sqr(env, r, r, N, np0);
+        if (cgbn_compare(env, r, N) >= 0)
+            cgbn_sub(env, r, r, N);
+        if (cgbn_extract_bits_ui32(env, e, (uint32_t)pos, 1)) {
+            uint32_t carry = cgbn_add(env, t, r, r);
+            if (carry || cgbn_compare(env, t, N) >= 0)
+                cgbn_sub(env, r, t, N);
+            else
+                cgbn_set(env, r, t);
+        }
+        pos--;
+    }
+    cgbn_mont2bn(env, r, r, N, np0);
+    results[id] = (uint8_t)cgbn_equals_ui32(env, r, 1);
+}
+
 #define CGBN_FERMAT_AVAILABLE 1
 #endif /* WITH_CGBN_FERMAT */
+
+static __host__ __forceinline__ int gpu_fermat_cgbn_soa_enabled()
+{
+    static int initialized = 0;
+    static int enabled = 1;
+    if (!initialized) {
+        const char *env = getenv("GPU_FERMAT_CGBN_SOA");
+        if (env && *env) {
+            while (*env && isspace((unsigned char)*env)) env++;
+            enabled = !(*env == '0' || *env == 'n' || *env == 'N' ||
+                        *env == 'f' || *env == 'F');
+        }
+        initialized = 1;
+    }
+    return enabled;
+}
 
 /* ── Kernel dispatch: launch the narrowest specialization that fits ──
    Candidates are stored at active_limbs stride, and the kernel
@@ -663,7 +739,7 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
                                  const uint64_t *d_cands_soa,
                                  uint8_t *d_results,
                                  uint32_t count,
-                                 int use_soa_scalar)
+                                 int use_soa_layout)
 {
 #if defined(CGBN_FERMAT_AVAILABLE)
     /* CGBN dispatch for even AL values.
@@ -682,10 +758,15 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
                     fprintf(stderr, "GPU Fermat: CGBN kernel active " \
                             "(AL=%d, %d-bit, TPI=%d)\n", \
                             (AL_VAL), (AL_VAL) * 64, (TPI_VAL)); \
-                cgbn_fermat_kernel_t<(AL_VAL)*64u, (TPI_VAL)><<<grid, tpb, 0, stream>>>( \
-                    reinterpret_cast<cgbn_mem_t<(AL_VAL)*64u>*>( \
-                        const_cast<uint64_t*>(d_cands)), \
-                    d_results, count); \
+                if (use_soa_layout) { \
+                    cgbn_fermat_kernel_soa_t<(AL_VAL)*64u, (TPI_VAL)><<<grid, tpb, 0, stream>>>( \
+                        d_cands_soa, d_results, count); \
+                } else { \
+                    cgbn_fermat_kernel_t<(AL_VAL)*64u, (TPI_VAL)><<<grid, tpb, 0, stream>>>( \
+                        reinterpret_cast<cgbn_mem_t<(AL_VAL)*64u>*>( \
+                            const_cast<uint64_t*>(d_cands)), \
+                        d_results, count); \
+                } \
                 return cudaPeekAtLastError(); \
             }
         switch (al) {
@@ -736,7 +817,7 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
     do { \
         int block = fermat_block_size_for_kernel<W>(); \
         int grid  = (int)((count + (uint32_t)block - 1u) / (uint32_t)block); \
-        if (use_soa_scalar) \
+        if (use_soa_layout) \
             fermat_kernel_soa_t<W><<<grid, block, 0, stream>>>(d_cands_soa, d_results, count); \
         else \
             fermat_kernel_t<W><<<grid, block, 0, stream>>>(d_cands, d_results, count); \
@@ -1010,9 +1091,12 @@ int gpu_fermat_submit(gpu_fermat_ctx *ctx, int slot,
     if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->slot_mu[slot]); return -1; }
 
     int active_limbs = __atomic_load_n(&ctx->active_limbs, __ATOMIC_RELAXED);
-    int use_soa_scalar = !cgbn_supports_al(active_limbs);
+    int cgbn_path = cgbn_supports_al(active_limbs);
+    int use_soa_scalar = !cgbn_path;
+    int use_soa_cgbn = cgbn_path && gpu_fermat_cgbn_soa_enabled();
+    int use_soa_layout = use_soa_scalar || use_soa_cgbn;
 
-    if (use_soa_scalar) {
+    if (use_soa_layout) {
         /* Non-CGBN AL: AoS->SoA prepack for coalesced scalar kernel loads. */
         uint64_t *dst = ctx->h_cands_soa[slot];
         const uint64_t *src = candidates;
@@ -1050,7 +1134,7 @@ int gpu_fermat_submit(gpu_fermat_ctx *ctx, int slot,
     err = launch_fermat(active_limbs, ctx->stream[slot],
                         ctx->d_cands[slot], ctx->d_cands_soa[slot],
                         ctx->d_results[slot], (uint32_t)count,
-                        use_soa_scalar);
+                        use_soa_layout);
     if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->slot_mu[slot]); return -1; }
 
     /* Async D→H on stream[slot] */
