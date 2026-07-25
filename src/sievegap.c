@@ -36,6 +36,12 @@ static __thread size_t tls_gpu_bits_cap = 0;
 static __thread uint64_t *tls_base_scratch = NULL;
 static __thread size_t tls_base_scratch_cap = 0;
 
+/* Phase-1 blocked marking cache: per-prime L mod p and fixed block-step delta.
+ * This removes repeated modulo in the block hot loop. */
+static __thread uint64_t *tls_l_mod_scratch = NULL;
+static __thread uint64_t *tls_l_delta_scratch = NULL;
+static __thread size_t tls_l_mod_cap = 0;
+
 static int ensure_base_scratch_capacity(size_t count) {
     if (tls_base_scratch_cap >= count)
         return 0;
@@ -46,6 +52,28 @@ static int ensure_base_scratch_capacity(size_t count) {
         return -1;
     }
     tls_base_scratch_cap = count;
+    return 0;
+}
+
+static int ensure_l_mod_scratch_capacity(size_t count) {
+    if (tls_l_mod_cap >= count)
+        return 0;
+    free(tls_l_mod_scratch);
+    free(tls_l_delta_scratch);
+    tls_l_mod_scratch = (uint64_t *)malloc(count * sizeof(uint64_t));
+    if (!tls_l_mod_scratch) {
+        tls_l_mod_cap = 0;
+        tls_l_delta_scratch = NULL;
+        return -1;
+    }
+    tls_l_delta_scratch = (uint64_t *)malloc(count * sizeof(uint64_t));
+    if (!tls_l_delta_scratch) {
+        free(tls_l_mod_scratch);
+        tls_l_mod_scratch = NULL;
+        tls_l_mod_cap = 0;
+        return -1;
+    }
+    tls_l_mod_cap = count;
     return 0;
 }
 
@@ -212,6 +240,127 @@ static inline void mark_prime_cpu(uint8_t *bits,
         bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
 }
 
+static inline void mark_prime_cpu_lmod(uint8_t *bits,
+                                       uint64_t L,
+                                       uint64_t R,
+                                       uint64_t p,
+                                       uint64_t base_mod_p,
+                                       uint64_t l_mod_p,
+                                       size_t bit_bytes) {
+    uint64_t rem = base_mod_p + l_mod_p;
+    if (rem >= p)
+        rem -= p;
+
+    uint64_t m = (rem == 0) ? L : (L + (p - rem));
+    if ((m & 1ULL) == 0ULL)
+        m += p;
+
+    uint64_t pos = (m - L) >> 1;
+    uint64_t pos_end = (R - L) >> 1;
+
+    if (pos >= pos_end)
+        return;
+
+    if (pos + 7 * p >= pos_end) {
+        for (; pos < pos_end; pos += p)
+            bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+        return;
+    }
+
+    uint64_t q = p >> 3;
+    uint64_t r = p & 7;
+    uint64_t b = pos & 7;
+    uint32_t off[8];
+    uint8_t msk[8];
+    uint64_t acc = b;
+    for (int k = 0; k < 8; k++, acc += r) {
+        off[k] = (uint32_t)((uint64_t)k * q + (acc >> 3));
+        msk[k] = (uint8_t)(1u << (acc & 7));
+    }
+
+    uint8_t *s = bits + (pos >> 3);
+
+#if defined(__AVX2__)
+    if (p <= 64) {
+        uint8_t mlo[32] = {0};
+        uint8_t mhi[32] = {0};
+        for (int k = 0; k < 8; k++) {
+            uint32_t o = off[k];
+            if (o < 32u)
+                mlo[o] |= msk[k];
+            else
+                mhi[o - 32u] |= msk[k];
+        }
+        __m256i mask_lo = _mm256_loadu_si256((const __m256i *)mlo);
+        __m256i mask_hi = _mm256_loadu_si256((const __m256i *)mhi);
+        size_t span = (p <= 32) ? 32u : 64u;
+
+        while (pos + 7 * p < pos_end) {
+            size_t s_off = (size_t)(s - bits);
+            if (s_off + span > bit_bytes)
+                break;
+            __m256i v0 = _mm256_loadu_si256((const __m256i *)s);
+            v0 = _mm256_or_si256(v0, mask_lo);
+            _mm256_storeu_si256((__m256i *)s, v0);
+            if (span == 64u) {
+                __m256i v1 = _mm256_loadu_si256((const __m256i *)(s + 32));
+                v1 = _mm256_or_si256(v1, mask_hi);
+                _mm256_storeu_si256((__m256i *)(s + 32), v1);
+            }
+            s += p;
+            pos += 8 * p;
+        }
+    } else
+#endif
+#if defined(__SSE2__)
+    if (p <= 32) {
+        uint8_t mlo[16] = {0};
+        uint8_t mhi[16] = {0};
+        for (int k = 0; k < 8; k++) {
+            uint32_t o = off[k];
+            if (o < 16u)
+                mlo[o] |= msk[k];
+            else
+                mhi[o - 16u] |= msk[k];
+        }
+        __m128i mask_lo = _mm_loadu_si128((const __m128i *)mlo);
+        __m128i mask_hi = _mm_loadu_si128((const __m128i *)mhi);
+        size_t span = (p <= 16) ? 16u : 32u;
+
+        while (pos + 7 * p < pos_end) {
+            size_t s_off = (size_t)(s - bits);
+            if (s_off + span > bit_bytes)
+                break;
+            __m128i v0 = _mm_loadu_si128((const __m128i *)s);
+            v0 = _mm_or_si128(v0, mask_lo);
+            _mm_storeu_si128((__m128i *)s, v0);
+            if (span == 32u) {
+                __m128i v1 = _mm_loadu_si128((const __m128i *)(s + 16));
+                v1 = _mm_or_si128(v1, mask_hi);
+                _mm_storeu_si128((__m128i *)(s + 16), v1);
+            }
+            s += p;
+            pos += 8 * p;
+        }
+    } else
+#endif
+    while (pos + 7 * p < pos_end) {
+        s[off[0]] |= msk[0];
+        s[off[1]] |= msk[1];
+        s[off[2]] |= msk[2];
+        s[off[3]] |= msk[3];
+        s[off[4]] |= msk[4];
+        s[off[5]] |= msk[5];
+        s[off[6]] |= msk[6];
+        s[off[7]] |= msk[7];
+        s += p;
+        pos += 8 * p;
+    }
+
+    for (; pos < pos_end; pos += p)
+        bits[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+}
+
 /* Extract survivor offsets from odd-only bitmap using 64-bit chunks.
  * bits[k]=0 means candidate survives, so we iterate over ~composite_mask. */
 static inline size_t extract_survivors_ctz(const uint8_t *bits,
@@ -274,11 +423,12 @@ uint64_t *sievegap_run_range(uint64_t L,
     }
 
     uint64_t seg_size = R - L;
+    uint64_t odd_count = (seg_size + 1ULL) >> 1;
     size_t bit_bytes = (size_t)((seg_size + 15ULL) >> 4);
     if (bit_bytes == 0)
         bit_bytes = 1;
 
-    if (ensure_bits_capacity(bit_bytes) != 0 || ensure_survivor_capacity((size_t)seg_size) != 0) {
+    if (ensure_bits_capacity(bit_bytes) != 0 || ensure_survivor_capacity((size_t)odd_count) != 0) {
         *out_count = 0;
         return NULL;
     }
@@ -313,6 +463,17 @@ uint64_t *sievegap_run_range(uint64_t L,
         }
     }
 
+    uint64_t block_step = SIEVEGAP_GPU_SPLIT_BITS << 1;
+    int have_l_mod_cache = 0;
+    if (gpu_split > sieve_start && ensure_l_mod_scratch_capacity(gpu_split) == 0) {
+        for (size_t i = sieve_start; i < gpu_split; i++) {
+            uint64_t p = small_primes[i];
+            tls_l_mod_scratch[i] = L % p;
+            tls_l_delta_scratch[i] = block_step % p;
+        }
+        have_l_mod_cache = 1;
+    }
+
     /* Block size matches L1D cache (32 KB = SIEVEGAP_GPU_SPLIT_BITS bits).
      * Inner prime loop touches only blk_bit_bytes bytes of bitmap per pass,
      * keeping the working set hot across all primes in the block. */
@@ -328,7 +489,27 @@ uint64_t *sievegap_run_range(uint64_t L,
 
         for (size_t i = sieve_start; i < gpu_split; i++) {
             uint64_t base = eff_base ? eff_base[i] : 0;
-            mark_prime_cpu(blk_bits, blk_L, blk_R, small_primes[i], base, blk_bit_bytes);
+            if (have_l_mod_cache) {
+                mark_prime_cpu_lmod(blk_bits,
+                                    blk_L,
+                                    blk_R,
+                                    small_primes[i],
+                                    base,
+                                    tls_l_mod_scratch[i],
+                                    blk_bit_bytes);
+            } else {
+                mark_prime_cpu(blk_bits, blk_L, blk_R, small_primes[i], base, blk_bit_bytes);
+            }
+        }
+
+        if (have_l_mod_cache && blk_end_bit < seg_bits) {
+            for (size_t i = sieve_start; i < gpu_split; i++) {
+                uint64_t p = small_primes[i];
+                uint64_t next = tls_l_mod_scratch[i] + tls_l_delta_scratch[i];
+                if (next >= p)
+                    next -= p;
+                tls_l_mod_scratch[i] = next;
+            }
         }
     }
 
@@ -410,10 +591,7 @@ uint64_t *sievegap_run_range(uint64_t L,
     }
 #endif
 
-    {
-        uint64_t odd_count = (seg_size + 1ULL) >> 1;
-        out = extract_survivors_ctz(bits, odd_count, L, tls_survivors);
-    }
+    out = extract_survivors_ctz(bits, odd_count, L, tls_survivors);
 
     *out_count = out;
     return tls_survivors;
@@ -423,6 +601,8 @@ void sievegap_free_tls_buffers(void) {
     free(tls_bits);
     free(tls_survivors);
     free(tls_base_scratch);
+    free(tls_l_mod_scratch);
+    free(tls_l_delta_scratch);
 #ifdef WITH_CUDA
     free(tls_gpu_bits);
     tls_gpu_bits = NULL;
@@ -434,4 +614,7 @@ void sievegap_free_tls_buffers(void) {
     tls_survivors_cap = 0;
     tls_base_scratch = NULL;
     tls_base_scratch_cap = 0;
+    tls_l_mod_scratch = NULL;
+    tls_l_delta_scratch = NULL;
+    tls_l_mod_cap = 0;
 }

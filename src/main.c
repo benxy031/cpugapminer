@@ -9114,6 +9114,7 @@ int main(int argc, char **argv) {
     int target_explicit = 0;  /* set to 1 if user passes --target */
     int scan_target_explicit = 0; /* set to 1 if user passes --scan-merit > 0 */
     int cli_sieve_explicit = 0; /* set to 1 if user passes --sieve-primes */
+    int cli_gpu_sieve_explicit_on = 0; /* set to 1 only when user passes --gpu-sieve */
     int cli_heap_explicit = 0;  /* set to 1 if user passes --heap */
     unsigned int cli_wheel_sieve = 0;
     const char *rpc_url = NULL, *rpc_user = NULL, *rpc_pass = NULL, *rpc_method = "getwork";
@@ -9323,10 +9324,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--gpu-sieve")) {
             extern int g_gpu_sieve_enable;
             g_gpu_sieve_enable = 1;
+            cli_gpu_sieve_explicit_on = 1;
         }
         else if (!strcmp(argv[i],"--no-gpu-sieve")) {
             extern int g_gpu_sieve_enable;
             g_gpu_sieve_enable = 0;
+            cli_gpu_sieve_explicit_on = 0;
         }
 #endif
 #endif
@@ -9582,11 +9585,9 @@ int main(int argc, char **argv) {
             {
                 extern int g_gpu_sieve_enable;
                 if (g_gpu_sieve_enable) {
-                    /* GPU Phase-2 sieve co-enabled with sievegap: large-prime
-                       marking runs in the presieve helper thread's GPU sieve
-                       stream while the main thread runs GPU Fermat — giving
-                       true GPU-only pipeline overlap on the same device. */
-                    log_msg("sievegap: GPU Phase-2 sieve enabled (pipeline overlap with GPU Fermat)\n");
+                    log_msg("sievegap: forcing --no-gpu-sieve (GPU Phase-2 sieve disabled)\n");
+                    g_gpu_sieve_enable = 0;
+                    cli_gpu_sieve_explicit_on = 0;
                 }
             }
 #endif
@@ -9791,10 +9792,11 @@ int main(int argc, char **argv) {
        In GPU non-CRT mode, GPU Fermat cost ∝ shift² while sieve cost ∝ shift.
        At large shifts, sieving more primes (cheaper per candidate eliminated)
        is worth more than the extra sieve time costs.  Auto-scale the sieve
-       prime count based on shift when GPU is active and no explicit override. */
+       prime count based on shift only when --gpu-sieve is explicitly enabled
+       and no explicit sieve-primes override is provided. */
 #ifdef WITH_GPU_FERMAT
     if (!cli_sieve_explicit && g_crt_mode != CRT_MODE_SOLVER &&
-        (use_cuda || use_opencl) && shift > 64) {
+        (use_cuda || use_opencl) && cli_gpu_sieve_explicit_on && shift > 64) {
         /* scale = (shift/64)^1.5: at shift=128 →2x, shift=256→6x, shift=512→17x.
            Cap at 10M primes (prime limit ~185M) to bound init time.           */
         double scale = pow((double)shift / 64.0, 1.5);
