@@ -1872,6 +1872,11 @@ presieve tile period, making it cache-neutral. All other P values
 | `--no-cpu-fermat`     | off           | Disable custom CPU Montgomery path and use default GMP-based path. |
 | `--mr-rounds N`       | 2             | Miller-Rabin rounds for `mpz_probab_prime_p` (default path, not `--fast-fermat`).  Old default was 10; 2 rounds gives false-positive rate < 2^-128 for sieve-filtered candidates. |
 | `--sample-stride K`   | 8             | Controls gap scanning strategy.  K > 1 enables backward-scan (CPU) or two-phase smart-scan (GPU).  Set to 1 for full-test (all survivors tested). |
+| `--auto-tune` / `--no-auto-tune` | off | Non-CRT auto-tuner for `--sample-stride` + `--sieve-limit`.  Periodically explores and exploits profiles using STATS telemetry. |
+| `--auto-tune-interval N` | 30 | Auto-tune decision interval in seconds (non-CRT).  Lower reacts faster, higher is less noisy. |
+| `--auto-tune-objective MODE` | `balanced` | Auto-tune objective: `speed` (maximize tested/s), `quality` (favor stronger candidate stream + merit/gap events), `balanced` (mixed). |
+| `--auto-tune-lock-after-win` / `--no-auto-tune-lock-after-win` | on | After a qualifying win, lock tuner to the winning profile for several intervals to reduce post-win oscillation. |
+| `--auto-tune-lock-intervals N` | 4 | Number of auto-tune intervals to keep the winning profile locked after a qualifying win. |
 | `--gpu-smart-telemetry` / `--no-gpu-smart-telemetry` | off | Enable/disable extra non-CRT GPU smart-scan coverage telemetry in log output. |
 | `--one-sided-skip` / `--no-one-sided-skip` | off | Enable/disable non-CRT first-side gating. CPU backward-scan skips second-side scan unless the first-side span is large enough; GPU smart path prunes weak regions before phase-2 verification. |
 | `--one-sided-skip-merit M` | auto | Merit gate for `--one-sided-skip` (`M * logbase` as minimum first-side span). If omitted, `M` is auto-derived from runtime scan merit. |
@@ -1943,6 +1948,7 @@ Examples:
 | `--opencl [DEV,...]`  | off           | Enable OpenCL GPU Fermat path (requires `WITH_OPENCL=1` build).  Optional device list selects GPU devices (e.g. `--opencl 0,1`).  Do not combine with `--cuda` in one run. |
 | `--opencl-platform N` | 0             | OpenCL platform index used with `--opencl`. |
 | `--gpu-batch N`       | 4096          | Accumulate N candidates across CRT windows before flushing to GPU (CRT mode only; non-CRT paths send full sieve windows directly).  Larger values improve GPU utilization at the cost of slightly delayed gap processing.  When unset in CRT+GPU mode, shift-band defaults may apply (`2048/4096/8192/16384`). |
+| `--gpu-direct-batch N` | 65536 | Non-CRT direct GPU Fermat chunk cap (per submit/flush call in direct path).  Useful for tuning flush cadence/overhead independently from CRT `--gpu-batch`. |
 | `--stratum HOST:PORT` | --            | Connect to a Gapcoin stratum pool instead of using RPC/GBT (requires `WITH_RPC=1` build). |
 | `-u` / `--user`       | --            | Alias for `--rpc-user` |
 | `--pass`              | --            | Alias for `--rpc-pass` |

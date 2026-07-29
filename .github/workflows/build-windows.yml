@@ -373,10 +373,18 @@ jobs:
           name: gap_miner-win64-opencl
           path: release-assets/gap_miner-win64-opencl
 
+      - name: Pack release archives
+        run: |
+          set -euo pipefail
+          cd release-assets
+          zip -r gap_miner-win64-cpu.zip gap_miner-win64-cpu
+          zip -r gap_miner-win64-cuda.zip gap_miner-win64-cuda
+          zip -r gap_miner-win64-opencl.zip gap_miner-win64-opencl
+
       - name: Upload assets to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release-assets/gap_miner-win64-cpu/**
-            release-assets/gap_miner-win64-cuda/**
-            release-assets/gap_miner-win64-opencl/**
+            release-assets/gap_miner-win64-cpu.zip
+            release-assets/gap_miner-win64-cuda.zip
+            release-assets/gap_miner-win64-opencl.zip

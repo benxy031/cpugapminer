@@ -62,17 +62,30 @@ extern int      rpc_getwork_data(const char *url, const char *user, const char *
 static stratum_ctx *g_stratum = NULL;   /* non-NULL when mining via stratum pool */
 #endif
 #define GPU_MAX_DEVS  8
+#ifndef GPU_THREAD_BATCH
+#define GPU_THREAD_BATCH (1 << 16)
+#endif
 static int             g_gpu_batch_size = 0;  /* --gpu-batch; 0 = use default (4096) */
 #if defined(WITH_CUDA) || defined(WITH_OPENCL)
 #define WITH_GPU_FERMAT 1
 #include "gpu_fermat.h"
 #define GPU_MAX_BATCH   (1 << 21)   /* 2M candidates per batch (CRT accum) */
-#define GPU_THREAD_BATCH (1 << 16)  /* 64K cands per per-thread direct-path ctx */
 static gpu_fermat_ctx *g_gpu_ctx[GPU_MAX_DEVS];
 static int             g_gpu_count = 0;
 static int             g_gpu_device_ids[GPU_MAX_DEVS]; /* parallel to g_gpu_ctx */
 static int             g_gpu_active_limbs_global = 0;  /* set after GPU init  */
 #endif
+
+/* Compile-safe GPU-runtime gate used by startup/log paths. */
+static inline int gpu_fermat_active_runtime(void)
+{
+#if defined(WITH_CUDA) || defined(WITH_OPENCL)
+    return g_gpu_count > 0;
+#else
+    return 0;
+#endif
+}
+
 #include "stats.h"
 #include "sieve_cache.h"
 #include "gap_scan.h"
@@ -1067,6 +1080,25 @@ static inline void log_extra_merit_sample(const char *source,
    K=1 disables sampling (test all survivors — the old behaviour).          */
 #define DEFAULT_SAMPLE_STRIDE 8
 static int cli_sample_stride = DEFAULT_SAMPLE_STRIDE;
+
+enum {
+    AUTO_TUNE_OBJECTIVE_SPEED = 0,
+    AUTO_TUNE_OBJECTIVE_BALANCED = 1,
+    AUTO_TUNE_OBJECTIVE_QUALITY = 2,
+};
+
+#define AUTO_TUNE_MAX_PROFILES 16
+static volatile int use_auto_tune = 0;
+static int cli_auto_tune_interval_sec = 30;
+static int cli_auto_tune_objective = AUTO_TUNE_OBJECTIVE_BALANCED;
+static int cli_auto_tune_lock_after_win = 1;
+static int cli_auto_tune_lock_intervals = 4;
+
+/* Non-CRT direct GPU batch cap (gpu_batch_filter chunk cap).
+ * 0 => use GPU_THREAD_BATCH default.
+ * This is independent from --gpu-batch (CRT accumulator threshold). */
+static int cli_gpu_direct_batch = 0;
+static volatile int g_gpu_direct_batch_cap = 0;
 
 /* Number of Miller-Rabin rounds for the default (non --fast-fermat) path.
    2 rounds is effectively deterministic for sieve-filtered random composites
@@ -2184,6 +2216,329 @@ static double refresh_runtime_targets(int target_explicit,
     return scan_target;
 }
 
+struct noncrt_autotune_profile {
+    int stride;
+    uint64_t sieve_limit;
+};
+
+struct noncrt_autotune_state {
+    int initialized;
+    int exploring;
+    int exploit_left;
+    int eval_idx;
+    int best_idx;
+    double best_score;
+    uint64_t next_ms;
+    uint64_t last_ms;
+    uint64_t last_tested;
+    uint64_t last_primes;
+    uint64_t last_gaps;
+    uint64_t last_pairs;
+    uint64_t last_flushes;
+    uint64_t last_batched;
+    double last_best_merit;
+    double prev_tested_rate;
+    double prev_pairs_rate;
+    int have_prev_rates;
+    int lock_left;
+    struct noncrt_autotune_profile prof[AUTO_TUNE_MAX_PROFILES];
+    int prof_n;
+};
+
+static struct noncrt_autotune_state g_noncrt_autotune = {0};
+
+static uint64_t approx_prime_count_from_limit(uint64_t limit)
+{
+    if (limit < 64ULL)
+        return limit;
+    double x = (double)limit;
+    double lx = log(x);
+    if (!(lx > 1.0))
+        return 6ULL;
+    double n = x / lx;
+    if (n < 6.0)
+        n = 6.0;
+    return (uint64_t)(n + 0.5);
+}
+
+static const char *auto_tune_objective_name(int obj)
+{
+    if (obj == AUTO_TUNE_OBJECTIVE_SPEED) return "speed";
+    if (obj == AUTO_TUNE_OBJECTIVE_QUALITY) return "quality";
+    return "balanced";
+}
+
+static uint64_t clamp_sieve_limit(uint64_t v)
+{
+    if (v < 1000000ULL) v = 1000000ULL;
+    if (v > 80000000ULL) v = 80000000ULL;
+    return v;
+}
+
+static void noncrt_autotune_add_profile(struct noncrt_autotune_state *st,
+                                        int stride,
+                                        uint64_t sieve_limit)
+{
+    if (!st || st->prof_n >= AUTO_TUNE_MAX_PROFILES)
+        return;
+    if (stride < 1)
+        stride = 1;
+    sieve_limit = clamp_sieve_limit(sieve_limit);
+    for (int i = 0; i < st->prof_n; i++) {
+        if (st->prof[i].stride == stride &&
+            st->prof[i].sieve_limit == sieve_limit)
+            return;
+    }
+    st->prof[st->prof_n].stride = stride;
+    st->prof[st->prof_n].sieve_limit = sieve_limit;
+    st->prof_n++;
+}
+
+static void noncrt_autotune_apply_profile(const struct noncrt_autotune_profile *p)
+{
+    if (!p)
+        return;
+    cli_sample_stride = p->stride;
+    cli_sieve_prime_limit = p->sieve_limit;
+    cli_sieve_prime_count = approx_prime_count_from_limit(cli_sieve_prime_limit);
+}
+
+static double noncrt_autotune_score(int objective,
+                                    double tested_rate,
+                                    double pairs_rate,
+                                    double pair_eff,
+                                    double prime_pass,
+                                    double gap_rate,
+                                    double merit_gain)
+{
+    if (objective == AUTO_TUNE_OBJECTIVE_SPEED) {
+        /* Raw throughput first, but keep pair rate meaningful. */
+        return 0.75 * tested_rate +
+               0.60 * pairs_rate +
+               pair_eff * 4.0e6;
+    }
+    if (objective == AUTO_TUNE_OBJECTIVE_QUALITY) {
+        /* Prefer qualifying-gap likelihood over brute tested/s. */
+        return 0.20 * tested_rate +
+               1.80 * pairs_rate +
+               pair_eff * 2.4e7 +
+               prime_pass * 2.5e7 +
+               gap_rate * 7.5e7 +
+               merit_gain * 6.0e6;
+    }
+    /* Balanced default: still throughput-aware, but pps dominates. */
+    return 0.45 * tested_rate +
+           1.20 * pairs_rate +
+           pair_eff * 1.5e7 +
+           prime_pass * 1.0e7 +
+           gap_rate * 4.0e7 +
+           merit_gain * 2.0e6;
+}
+
+static void noncrt_autotune_tick(uint64_t now_ms,
+                                 double elapsed,
+                                 double best_merit)
+{
+    if (!use_auto_tune || g_crt_mode != CRT_MODE_NONE)
+        return;
+    if (elapsed < 1.0)
+        return;
+
+    struct noncrt_autotune_state *st = &g_noncrt_autotune;
+    if (!st->initialized) {
+        uint64_t base_limit = cli_sieve_prime_limit;
+        if (base_limit == 0)
+            base_limit = 10000000ULL;
+
+        st->prof_n = 0;
+        noncrt_autotune_add_profile(st, cli_sample_stride, base_limit);
+        noncrt_autotune_add_profile(st, 2, base_limit / 2);
+        noncrt_autotune_add_profile(st, 2, base_limit);
+        noncrt_autotune_add_profile(st, 2, base_limit * 2);
+        noncrt_autotune_add_profile(st, 3, base_limit / 2);
+        noncrt_autotune_add_profile(st, 3, base_limit);
+        noncrt_autotune_add_profile(st, 3, base_limit * 2);
+        noncrt_autotune_add_profile(st, 4, base_limit / 2);
+        noncrt_autotune_add_profile(st, 4, base_limit);
+        noncrt_autotune_add_profile(st, 4, base_limit * 2);
+
+        st->exploring = 1;
+        st->exploit_left = 0;
+        st->eval_idx = 0;
+        st->best_idx = 0;
+        st->best_score = -1.0;
+        st->last_ms = now_ms;
+        st->last_tested = stats_tested;
+        st->last_primes = stats_primes_found;
+        st->last_gaps = stats_gaps;
+        st->last_pairs = stats_pairs;
+        st->last_flushes = stats_gpu_flushes;
+        st->last_batched = stats_gpu_batched;
+        st->last_best_merit = best_merit;
+        st->lock_left = 0;
+        st->next_ms = now_ms + (uint64_t)cli_auto_tune_interval_sec * 1000ULL;
+        st->initialized = 1;
+
+        if (st->prof_n > 0) {
+            noncrt_autotune_apply_profile(&st->prof[0]);
+            log_msg("auto-tune: enabled objective=%s interval=%ds start_profile stride=%d sieve_limit=%llu\n",
+                    auto_tune_objective_name(cli_auto_tune_objective),
+                    cli_auto_tune_interval_sec,
+                    st->prof[0].stride,
+                    (unsigned long long)st->prof[0].sieve_limit);
+        }
+        return;
+    }
+
+    if (now_ms < st->next_ms)
+        return;
+
+    double dt = (double)(now_ms - st->last_ms) / 1000.0;
+    if (dt <= 0.5)
+        dt = 0.5;
+
+    uint64_t d_tested = stats_tested - st->last_tested;
+    uint64_t d_primes = stats_primes_found - st->last_primes;
+    uint64_t d_gaps = stats_gaps - st->last_gaps;
+    uint64_t d_pairs = stats_pairs - st->last_pairs;
+    uint64_t d_flushes = stats_gpu_flushes - st->last_flushes;
+    uint64_t d_batched = stats_gpu_batched - st->last_batched;
+    double merit_gain = best_merit - st->last_best_merit;
+    if (merit_gain < 0.0)
+        merit_gain = 0.0;
+
+    double tested_rate = (double)d_tested / dt;
+    double pairs_rate = (double)d_pairs / dt;
+    double gap_rate = (double)d_gaps / dt;
+    double prime_pass = (d_tested > 0) ? (double)d_primes / (double)d_tested : 0.0;
+    double pair_eff = (tested_rate > 1.0) ? (pairs_rate / tested_rate) : 0.0;
+    int saw_win = (d_gaps > 0) ? 1 : 0;
+
+    double anti_pattern_penalty = 0.0;
+    if (st->have_prev_rates &&
+        st->prev_tested_rate > 1.0 &&
+        st->prev_pairs_rate > 1.0) {
+        double tested_rel = tested_rate / st->prev_tested_rate;
+        double pairs_rel = pairs_rate / st->prev_pairs_rate;
+        if (tested_rel > 1.03 && pairs_rel < 0.97) {
+            double tested_gain = tested_rel - 1.0;
+            double pairs_drop = 1.0 - pairs_rel;
+            anti_pattern_penalty = (tested_gain + pairs_drop) * 8.0e6;
+            if (cli_auto_tune_objective == AUTO_TUNE_OBJECTIVE_QUALITY)
+                anti_pattern_penalty *= 1.35;
+            else if (cli_auto_tune_objective == AUTO_TUNE_OBJECTIVE_SPEED)
+                anti_pattern_penalty *= 0.35;
+        }
+    }
+
+    double score = noncrt_autotune_score(cli_auto_tune_objective,
+                                         tested_rate,
+                                         pairs_rate,
+                                         pair_eff,
+                                         prime_pass,
+                                         gap_rate,
+                                         merit_gain);
+    score -= anti_pattern_penalty;
+
+    if (st->eval_idx >= 0 && st->eval_idx < st->prof_n) {
+        if (score > st->best_score) {
+            st->best_score = score;
+            st->best_idx = st->eval_idx;
+        }
+    }
+
+    if (d_flushes > 0) {
+        double avg_batch = (double)d_batched / (double)d_flushes;
+        double target_batch = (cli_auto_tune_objective == AUTO_TUNE_OBJECTIVE_QUALITY)
+            ? 48000.0 : 56000.0;
+        int cap = (g_gpu_direct_batch_cap >= 64) ? g_gpu_direct_batch_cap : GPU_THREAD_BATCH;
+        if (avg_batch < target_batch * 0.90 && cap < GPU_THREAD_BATCH) {
+            cap += 2048;
+            if (cap > GPU_THREAD_BATCH) cap = GPU_THREAD_BATCH;
+            g_gpu_direct_batch_cap = cap;
+        } else if (avg_batch > target_batch * 1.10 && cap > 8192) {
+            cap -= 2048;
+            if (cap < 8192) cap = 8192;
+            g_gpu_direct_batch_cap = cap;
+        }
+    }
+
+    if (saw_win && cli_auto_tune_lock_after_win && st->prof_n > 0) {
+        if (st->eval_idx >= 0 && st->eval_idx < st->prof_n) {
+            st->best_idx = st->eval_idx;
+            if (score > st->best_score)
+                st->best_score = score;
+        }
+        st->lock_left = cli_auto_tune_lock_intervals;
+    }
+
+    if (st->prof_n > 0) {
+        const char *mode = "explore";
+        if (st->lock_left > 0) {
+            st->eval_idx = st->best_idx;
+            st->lock_left--;
+            mode = "lock";
+            if (st->lock_left == 0) {
+                st->exploring = 1;
+                st->best_score = -1.0;
+                st->best_idx = st->eval_idx;
+                st->exploit_left = 0;
+            }
+        } else if (st->exploring) {
+            st->eval_idx = (st->eval_idx + 1) % st->prof_n;
+            mode = "explore";
+            if (st->eval_idx == 0) {
+                st->exploring = 0;
+                st->exploit_left = 3;
+                st->eval_idx = st->best_idx;
+                mode = "exploit";
+            }
+        } else {
+            mode = "exploit";
+            if (st->exploit_left > 0) {
+                st->exploit_left--;
+                st->eval_idx = st->best_idx;
+            } else {
+                st->exploring = 1;
+                st->best_score = -1.0;
+                st->best_idx = st->eval_idx;
+                st->eval_idx = 0;
+                mode = "explore";
+            }
+        }
+
+        noncrt_autotune_apply_profile(&st->prof[st->eval_idx]);
+        log_msg("  auto-tune: score=%.2f tested/s=%.0f pairs/s=%.0f eff=%.3f pass=%.3f gaps/s=%.4f merit_gain=%.3f penalty=%.0f wins=%llu lock_left=%d -> stride=%d sieve_limit=%llu gpu_direct_batch_cap=%d mode=%s\n",
+                score,
+                tested_rate,
+                pairs_rate,
+            pair_eff,
+                prime_pass,
+                gap_rate,
+                merit_gain,
+            anti_pattern_penalty,
+                (unsigned long long)d_gaps,
+                st->lock_left,
+                st->prof[st->eval_idx].stride,
+                (unsigned long long)st->prof[st->eval_idx].sieve_limit,
+                (g_gpu_direct_batch_cap >= 64) ? g_gpu_direct_batch_cap : GPU_THREAD_BATCH,
+                mode);
+    }
+
+    st->last_ms = now_ms;
+    st->last_tested = stats_tested;
+    st->last_primes = stats_primes_found;
+    st->last_gaps = stats_gaps;
+    st->last_pairs = stats_pairs;
+    st->last_flushes = stats_gpu_flushes;
+    st->last_batched = stats_gpu_batched;
+    st->last_best_merit = best_merit;
+    st->prev_tested_rate = tested_rate;
+    st->prev_pairs_rate = pairs_rate;
+    st->have_prev_rates = 1;
+    st->next_ms = now_ms + (uint64_t)cli_auto_tune_interval_sec * 1000ULL;
+}
+
 static void print_stats(void) {
     static uint64_t auto_split_last_rebalance_ms = 0;
     uint64_t now = now_ms();
@@ -2602,10 +2957,11 @@ static void print_stats(void) {
 #ifdef WITH_GPU_FERMAT
     if (stats_gpu_flushes > 0) {
         double avg_batch = (double)stats_gpu_batched / (double)stats_gpu_flushes;
-        log_msg("  gpu_flushes=%llu  gpu_batched=%llu  gpu_batch=%.0f",
+        log_msg("  gpu_flushes=%llu  gpu_batched=%llu  gpu_batch=%.0f  gpu_direct_batch_cap=%d",
                 (unsigned long long)stats_gpu_flushes,
                 (unsigned long long)stats_gpu_batched,
-                avg_batch);
+                avg_batch,
+                (g_gpu_direct_batch_cap >= 64) ? g_gpu_direct_batch_cap : GPU_THREAD_BATCH);
     }
 #endif
 #ifdef WITH_CUDA
@@ -2704,6 +3060,9 @@ static void print_stats(void) {
         log_msg("  sieve_model: keep~%.3e boost~%.1fx (limit=%llu)",
                 sieve_keep, sieve_boost,
                 (unsigned long long)sieve_limit_for_model);
+
+    if (g_crt_mode == CRT_MODE_NONE)
+        noncrt_autotune_tick(now, elapsed, bm);
 
     /* ── Merit sensitivity: ETA sweep + pairs/s needed ──
        For each merit level from (net-1) to (net+1) in steps of 0.5,
@@ -6184,8 +6543,11 @@ static size_t gpu_batch_filter(uint64_t *offsets, size_t cnt) {
     /* Allocate flat candidate buffer: cnt × gpu_al limbs.
        Cap at per-thread context batch size (GPU_THREAD_BATCH); the pipeline
        loop below handles any overflow in subsequent chunks. */
+    size_t batch_cap = (size_t)GPU_THREAD_BATCH;
+    if (g_gpu_direct_batch_cap >= 64 && g_gpu_direct_batch_cap < GPU_THREAD_BATCH)
+        batch_cap = (size_t)g_gpu_direct_batch_cap;
     size_t batch = cnt;
-    if (batch > (size_t)GPU_THREAD_BATCH) batch = (size_t)GPU_THREAD_BATCH;
+    if (batch > batch_cap) batch = batch_cap;
 
     /* Reuse per-thread staging buffers to avoid malloc/free in hot path.
        These are file-scope TLS so free_sieve_buffers() releases them on
@@ -9054,6 +9416,12 @@ int main(int argc, char **argv) {
         printf("      --gpu-smart-telemetry  write GPU smart-scan coverage telemetry to log file\n");
         printf("      --no-gpu-smart-telemetry  disable GPU smart-scan coverage telemetry\n");
         printf("      --sample-stride K smart scan: test every Kth survivor (default: 8, 1=off)\n");
+        printf("      --auto-tune       non-CRT auto-tune sample-stride + sieve-limit every N seconds\n");
+        printf("      --auto-tune-interval N  auto-tune interval in seconds (default: 30)\n");
+        printf("      --auto-tune-objective MODE  speed|balanced|quality (default: balanced)\n");
+        printf("      --auto-tune-lock-after-win  lock current best profile for a few intervals after a win (default: on)\n");
+        printf("      --no-auto-tune-lock-after-win  disable lock-after-win behavior\n");
+        printf("      --auto-tune-lock-intervals N  lock duration in tune intervals (default: 4)\n");
          printf("      --one-sided-skip   non-CRT gate: CPU bkscan + GPU smart path skip second-side/full verify unless first-side gap is large\n");
          printf("      --one-sided-skip-merit M  first-side gate merit for --one-sided-skip\n");
          printf("                        default: auto from shift + scan-merit (manual override when set)\n");
@@ -9095,6 +9463,7 @@ int main(int argc, char **argv) {
         printf("      --opencl [DEV,...] use OpenCL GPU(s) for Fermat testing scaffold (e.g. --opencl 0)\n");
         printf("      --opencl-platform N OpenCL platform index (default: 0)\n");
         printf("      --gpu-batch N     accumulate N candidates before GPU flush (default: 4096)\n");
+        printf("      --gpu-direct-batch N  non-CRT direct GPU Fermat chunk cap (default: 65536)\n");
         return 1;
     }
     const char *header = NULL;
@@ -9319,6 +9688,11 @@ int main(int argc, char **argv) {
             g_gpu_batch_size = atoi(argv[++i]);
             if (g_gpu_batch_size < 64) g_gpu_batch_size = 64;
         }
+        else if (!strcmp(argv[i],"--gpu-direct-batch") && i+1<argc) {
+            cli_gpu_direct_batch = atoi(argv[++i]);
+            if (cli_gpu_direct_batch < 64) cli_gpu_direct_batch = 64;
+            if (cli_gpu_direct_batch > GPU_THREAD_BATCH) cli_gpu_direct_batch = GPU_THREAD_BATCH;
+        }
 #ifdef WITH_CUDA
 #ifndef WITH_CRT_GPU_CONSUMER
         else if (!strcmp(argv[i],"--gpu-sieve")) {
@@ -9339,6 +9713,34 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--sample-stride") && i+1<argc) {
             cli_sample_stride = atoi(argv[++i]);
             if (cli_sample_stride < 1) cli_sample_stride = 1;
+        }
+        else if (!strcmp(argv[i],"--auto-tune")) {
+            use_auto_tune = 1;
+        }
+        else if (!strcmp(argv[i],"--no-auto-tune")) {
+            use_auto_tune = 0;
+        }
+        else if (!strcmp(argv[i],"--auto-tune-interval") && i+1<argc) {
+            cli_auto_tune_interval_sec = atoi(argv[++i]);
+            if (cli_auto_tune_interval_sec < 10) cli_auto_tune_interval_sec = 10;
+            if (cli_auto_tune_interval_sec > 600) cli_auto_tune_interval_sec = 600;
+        }
+        else if (!strcmp(argv[i],"--auto-tune-objective") && i+1<argc) {
+            const char *obj = argv[++i];
+            if (!strcmp(obj, "speed")) cli_auto_tune_objective = AUTO_TUNE_OBJECTIVE_SPEED;
+            else if (!strcmp(obj, "quality")) cli_auto_tune_objective = AUTO_TUNE_OBJECTIVE_QUALITY;
+            else cli_auto_tune_objective = AUTO_TUNE_OBJECTIVE_BALANCED;
+        }
+        else if (!strcmp(argv[i],"--auto-tune-lock-after-win")) {
+            cli_auto_tune_lock_after_win = 1;
+        }
+        else if (!strcmp(argv[i],"--no-auto-tune-lock-after-win")) {
+            cli_auto_tune_lock_after_win = 0;
+        }
+        else if (!strcmp(argv[i],"--auto-tune-lock-intervals") && i+1<argc) {
+            cli_auto_tune_lock_intervals = atoi(argv[++i]);
+            if (cli_auto_tune_lock_intervals < 1) cli_auto_tune_lock_intervals = 1;
+            if (cli_auto_tune_lock_intervals > 32) cli_auto_tune_lock_intervals = 32;
         }
         else if (!strcmp(argv[i],"--one-sided-skip")) {
             use_one_sided_skip = 1;
@@ -9430,6 +9832,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Use either --cuda or --opencl, not both in one run.\n");
         return 2;
     }
+
+    if (cli_gpu_direct_batch > 0)
+        g_gpu_direct_batch_cap = cli_gpu_direct_batch;
+
     if (g_coinbase_script_hex &&
         (!is_valid_hex_string(g_coinbase_script_hex) ||
          strlen(g_coinbase_script_hex) > 2048u)) {
@@ -10307,6 +10713,17 @@ int main(int argc, char **argv) {
         log_file_only("extra verbose enabled (-e/--extra-verbose): live merit events + partial-sieve-auto details\n");
     if (use_stats_verbose)
         log_msg("stats verbosity: detailed (--stats-verbose)\n");
+    if (g_gpu_direct_batch_cap >= 64)
+        log_msg("gpu direct batch cap: %d (--gpu-direct-batch)\n",
+                g_gpu_direct_batch_cap);
+    if (use_auto_tune)
+        log_msg("auto-tune: enabled objective=%s interval=%ds lock-after-win=%s lock-intervals=%d (non-CRT only)\n",
+                auto_tune_objective_name(cli_auto_tune_objective),
+            cli_auto_tune_interval_sec,
+            cli_auto_tune_lock_after_win ? "on" : "off",
+            cli_auto_tune_lock_intervals);
+    if (use_auto_tune && g_crt_mode == CRT_MODE_NONE && !gpu_fermat_active_runtime())
+        log_msg("auto-tune: CPU-only mode (gpu batch tuning skipped)\n");
     if (use_crt_auto_split)
         log_msg("CRT auto split: enabled (--crt-auto-split)\n");
 
