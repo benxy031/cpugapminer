@@ -1236,6 +1236,17 @@ wallet-owned.  In that case, submitted blocks can be accepted on-chain but not
 credited in your wallet balance.  Use `--coinbase-script-hex` in GBT mode to
 force the coinbase output script to your own address script.
 
+#### Coinbase payout override (`--coinbase-script-hex`)
+
+Use this flag only in GBT+submitblock mode when you want deterministic payout
+ownership.
+
+- `HEX` is the raw destination `scriptPubKey` in hex (not the address text).
+- The miner inserts this script into coinbase `vout[0]` during local block
+  assembly.
+- If this flag is omitted on some wallet builds, a template/default coinbase
+  output may be valid for consensus but not spendable by your wallet.
+
 Quick workflow:
 
 1. Get `scriptPubKey` for your payout address from wallet RPC (`getaddressinfo`
@@ -1841,6 +1852,8 @@ presieve tile period, making it cache-neutral. All other P values
 | `--target T`          | *(node bits)* | Minimum merit `gap/log(p)` to build a block |
 | `--scan-merit M`      | auto (`--target`) | Non-CRT CPU smart-scan threshold.  Controls stride/jump distance for scanning while submission threshold remains `--target` (or network merit).  Ignored in CRT mode and generally non-beneficial on CUDA/OpenCL paths. |
 | `--threads N`         | 1             | Worker threads; each thread runs the full sieve + primality (Fermat/Miller-Rabin) + gap-scan pipeline over its own disjoint slice of the adder range (`tid, tid+N, tid+2N, …`) |
+| `--host HOST`         | `127.0.0.1`   | RPC host shortcut. Used to build `--rpc-url` when full URL is not passed. |
+| `--port PORT`         | `31397`       | RPC port shortcut. Used together with `--host` to build `--rpc-url`. |
 | `--rpc-url URL`       | --            | JSON-RPC endpoint of `gapcoind` |
 | `--rpc-user USER`     | --            | RPC username |
 | `--rpc-pass PASS`     | --            | RPC password |
@@ -1850,11 +1863,16 @@ presieve tile period, making it cache-neutral. All other P values
 | `--rpc-poll-ms MS`    | 1000          | Tip poll interval for `getbestblockhash`; lower reduces stale window |
 | `--rpc-retries N`     | 3             | Retry attempts on failure |
 | `--rpc-sign-key KEY`  | --            | HMAC key to sign payloads |
+| `--nonce-rotate-s S`  | 600           | Force nonce rotation after `S` seconds without finding a qualifying block (`0` disables rotation). |
 | `--log-file FILE`     | --            | Append all log messages to FILE |
 | `--fast-fermat`       | off           | Fast single-base Fermat primality test |
 | `--fast-euler`        | off           | Fast Euler-Plumb base-2 primality path (CPU).  Mutually exclusive with `--fast-fermat`. |
+| `--no-fast-euler`     | off           | Disable fast Euler path and use Miller-Rabin (`--mr-rounds`) probable-prime testing. |
+| `--cpu-fermat`        | off           | Use custom CPU Montgomery-multiply primality path instead of GMP `mpz_powm` base-2 path. |
+| `--no-cpu-fermat`     | off           | Disable custom CPU Montgomery path and use default GMP-based path. |
 | `--mr-rounds N`       | 2             | Miller-Rabin rounds for `mpz_probab_prime_p` (default path, not `--fast-fermat`).  Old default was 10; 2 rounds gives false-positive rate < 2^-128 for sieve-filtered candidates. |
 | `--sample-stride K`   | 8             | Controls gap scanning strategy.  K > 1 enables backward-scan (CPU) or two-phase smart-scan (GPU).  Set to 1 for full-test (all survivors tested). |
+| `--gpu-smart-telemetry` / `--no-gpu-smart-telemetry` | off | Enable/disable extra non-CRT GPU smart-scan coverage telemetry in log output. |
 | `--one-sided-skip` / `--no-one-sided-skip` | off | Enable/disable non-CRT first-side gating. CPU backward-scan skips second-side scan unless the first-side span is large enough; GPU smart path prunes weak regions before phase-2 verification. |
 | `--one-sided-skip-merit M` | auto | Merit gate for `--one-sided-skip` (`M * logbase` as minimum first-side span). If omitted, `M` is auto-derived from runtime scan merit. |
 | `--sievegap`          | off           | Enable standalone non-CRT sieve path (`src/sievegap.c`).  Bypasses legacy non-CRT presieve/wheel/adaptive path in `sieve_range()`.  Ignored when CRT mode is active (`--crt-file`). |
@@ -1866,6 +1884,8 @@ presieve tile period, making it cache-neutral. All other P values
 | `--wheel-sieve N`     | 0 (disabled)  | Select wheel-presieve backend for non-CRT runs.  Supported values: `30`, `210`, `2310`, `30030`, `510510`, `9699690`. |
 | `-e` / `--extra-verbose` | off       | Write detailed `--partial-sieve-auto` adjustments to the log file only. |
 | `--stats-verbose`     | off           | Include detailed CRT phase telemetry (`cramer`, `phase1`, accumulator histograms, score calibration) in periodic STATS output.  Default output stays concise. |
+| `--rgm-cal-min N`     | 50000         | Minimum baseline sample count before RGM region-scoring telemetry becomes active. |
+| `--rgm-state-file FILE` | --          | Persist/restore RGM baseline state across restarts. |
 | `--crt-file FILE`     | --            | Load a CRT sieve file (binary `.bin` or text `.txt`).  Text files enable CRT-aligned mining; binary files enable template tiling. |
 | `--fermat-threads N` / `-d N` | 0 (monolithic) | Number of Fermat consumer threads for CRT producer-consumer mode.  Default `0` = monolithic (all threads sieve+fermat independently).  Set to `N` to enable producer-consumer with `threads - N` sieve and `N` fermat threads.  Consumers are CPU by default unless `--crt-gpu-consumer` is also set with `--cuda`. |
 | `--crt-gpu-consumer` | off | Experimental CRT producer-consumer mode: route consumer windows through the GPU accumulator path when `--cuda` is active. |
@@ -1886,6 +1906,7 @@ presieve tile period, making it cache-neutral. All other P values
 | `--primorial P`       | off           | Align every sieve window to multiples of P# = 2×3×5×…×P.  All candidates are guaranteed coprime to every prime ≤ P, so the presieve template handles those composites at zero extra Phase 1 cost.  `sieve-size` is snapped to the nearest multiple of P# so alignment is preserved across consecutive windows.  P must be a prime ≤ 53 (e.g. `13` → P#=30030, `17` → P#=510510, `23` → P#=223092870).  Incompatible with CRT mode (`--crt-file`). |
 | `--no-primality`      | off           | Skip primality testing entirely |
 | `--build-only`        | off           | Fetch template and build one block, then exit |
+| `--q Q`               | --            | Build-only prime parameter `Q` (used with `--p` in local block assembly/debug flow). |
 | `--no-opreturn`       | off           | Omit OP_RETURN from coinbase |
 | `--force-solution`    | off           | Treat every candidate as valid (debug) |
 | `--keep-going`        | on            | Continue after a found block (default) |
@@ -1943,6 +1964,22 @@ bin/gap_miner \
 The header is selected automatically from `getblocktemplate`.
 When mining against wallets that use GBT+submitblock, set
 `--coinbase-script-hex` so accepted blocks are credited to your wallet.
+
+Example (read script from wallet first):
+
+```sh
+gapcoin-cli getaddressinfo YOUR_ADDRESS
+# copy .scriptPubKey and pass it to miner:
+bin/gap_miner ... --coinbase-script-hex <scriptPubKeyHex>
+```
+
+Post-submit sanity check:
+
+```sh
+gapcoin-cli getblock <accepted_block_hash> 2
+# coinbase vout[0].scriptPubKey.hex must equal your provided hex
+```
+
 Default `--sieve-size` (33 554 432) and `--sieve-primes` (900 000) match
 the original GapMiner and work well for most setups.
 

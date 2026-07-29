@@ -62,6 +62,9 @@ else
 endif
 
 ifdef WITH_CUDA
+ifdef WITH_OPENCL
+$(error WITH_CUDA and WITH_OPENCL cannot be enabled together)
+endif
 	GPU_BITS ?= 1024
 	GPU_NLIMBS := $(shell echo '$(GPU_BITS) / 64' | bc)
 	CFLAGS+=-DWITH_CUDA -DGPU_NLIMBS=$(GPU_NLIMBS)
@@ -89,6 +92,14 @@ else
 endif
 else
 	CUDA_OBJS=
+endif
+
+ifdef WITH_OPENCL
+	GPU_BITS ?= 1024
+	GPU_NLIMBS := $(shell echo '$(GPU_BITS) / 64' | bc)
+	CFLAGS+=-DWITH_OPENCL -DGPU_NLIMBS=$(GPU_NLIMBS)
+	CUDA_OBJS=$(SRCDIR)/gpu_fermat_opencl.o
+	LIBS+=-lOpenCL
 endif
 
 all: $(TARGET)

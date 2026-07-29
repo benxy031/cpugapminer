@@ -261,11 +261,99 @@ jobs:
           name: gap_miner-win64-cuda
           path: dist-cuda/
 
+  # ─────────────────────────── OpenCL build ───────────────────────────
+  build-opencl:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-gmp
+            mingw-w64-x86_64-curl
+            mingw-w64-x86_64-jansson
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-opencl-headers
+            mingw-w64-x86_64-opencl-icd-loader
+            make
+            bc
+
+      - name: Build OpenCL binary (single runtime-dispatch variant)
+        run: |
+          make -f Makefile.mingw clean
+          make -f Makefile.mingw WITH_RPC=1 WITH_OPENCL=1 GPU_BITS=1024 ARCH_FLAGS='-march=x86-64 -mtune=generic -msse2'
+
+      - name: Wheel sieve smoke test
+        run: |
+          ./bin/gap_miner.exe --wheel-sieve 210 --selftest
+
+      - name: Build and run sievegap unit test
+        run: |
+          make -f Makefile.mingw tests/test_sievegap.exe
+          ./tests/test_sievegap.exe
+
+      - name: Build gen_crt
+        run: make -f Makefile.mingw gen_crt
+
+      - name: Collect DLLs
+        run: |
+          mkdir -p dist-opencl
+          cp bin/gap_miner.exe dist-opencl/gap_miner.exe
+          cp bin/gen_crt.exe dist-opencl/
+          cp -r crt dist-opencl/ 2>/dev/null || true
+
+          # Auto-copy all transitive MinGW runtime DLL dependencies.
+          MINGW=/mingw64/bin
+
+          resolve_and_copy_deps() {
+            local queue=("$@")
+            local seen=""
+            while [ ${#queue[@]} -gt 0 ]; do
+              local pe="${queue[0]}"
+              queue=("${queue[@]:1}")
+              [ -f "$pe" ] || continue
+
+              while IFS= read -r dll; do
+                [ -n "$dll" ] || continue
+                case " $seen " in
+                  *" $dll "*) continue ;;
+                esac
+                seen="$seen $dll"
+
+                local src=""
+                if [ -f "$MINGW/$dll" ]; then
+                  src="$MINGW/$dll"
+                else
+                  continue
+                fi
+
+                cp -n "$src" dist-opencl/
+                queue+=("dist-opencl/$dll")
+              done < <(objdump -p "$pe" 2>/dev/null | sed -n 's/^[[:space:]]*DLL Name: //p')
+            done
+          }
+
+          resolve_and_copy_deps dist-opencl/gap_miner.exe dist-opencl/gen_crt.exe
+
+      - name: Upload OpenCL artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gap_miner-win64-opencl
+          path: dist-opencl/
+
   # ───────────────────────── Release publishing ─────────────────────────
   publish-release-assets:
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
-    needs: [build-cpu, build-cuda]
+    needs: [build-cpu, build-cuda, build-opencl]
     steps:
       - name: Download CPU artifact
         uses: actions/download-artifact@v4
@@ -279,9 +367,16 @@ jobs:
           name: gap_miner-win64-cuda
           path: release-assets/gap_miner-win64-cuda
 
+      - name: Download OpenCL artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: gap_miner-win64-opencl
+          path: release-assets/gap_miner-win64-opencl
+
       - name: Upload assets to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             release-assets/gap_miner-win64-cpu/**
             release-assets/gap_miner-win64-cuda/**
+            release-assets/gap_miner-win64-opencl/**
