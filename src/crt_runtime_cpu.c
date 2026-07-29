@@ -86,6 +86,15 @@ static inline int crt_runtime_effective_fermat_threads(
     return crt_fermat_threads;
 }
 
+static inline double crt_runtime_submit_target(double focus_target) {
+    double submit_target = (double)g_mining_target;
+    if (!(submit_target > 0.0))
+        submit_target = focus_target;
+    if (submit_target > focus_target)
+        submit_target = focus_target;
+    return submit_target;
+}
+
 static inline void crt_runtime_cleanup_tls_gmp(
     const struct crt_runtime_worker_ctx *ctx) {
     if (tls_gmp_inited) {
@@ -113,6 +122,7 @@ static int crt_runtime_prepare_solver_nonce(
         double target_local,
     struct crt_runtime_nonce_prepare *out,
     const struct crt_runtime_worker_ctx *ctx) {
+    double submit_target = crt_runtime_submit_target(target_local);
     if (!out)
         return 0;
 
@@ -135,11 +145,11 @@ static int crt_runtime_prepare_solver_nonce(
      * if gap_target / logbase_nonce < target, no gap in this window can
      * ever reach target merit, so the nonce is worthless. */
     if (g_crt_gap_target > 0 &&
-        (double)g_crt_gap_target / out->logbase_nonce < target_local)
+        (double)g_crt_gap_target / out->logbase_nonce < submit_target)
         return 0;
 
     uint64_t gap_scan_base = crt_gap_scan_for_nonce(
-        target_local, out->logbase_nonce,
+        submit_target, out->logbase_nonce,
         (uint64_t)g_crt_gap_target, g_crt_gap_scan_mode,
         g_crt_gap_scan_floor);
     out->gap_scan_nonce = gap_scan_base;
@@ -200,6 +210,7 @@ static void crt_runtime_process_solver_window(
         const char *rpc_user_local,
         const char *rpc_pass_local,
         const struct crt_runtime_worker_ctx *ctx) {
+    double submit_target = crt_runtime_submit_target(target_local);
     if (!surv || surv_cnt == 0) {
         mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
         return;
@@ -207,15 +218,16 @@ static void crt_runtime_process_solver_window(
 
     /* Producer-consumer path: score and queue windows for consumers. */
     if (crt_runtime_effective_fermat_threads(ctx) > 0) {
-        __sync_fetch_and_add(&stats_crt_solver_prod_windows_generated, 1);
+        __atomic_fetch_add(&stats_crt_solver_prod_windows_generated, 1,
+                           __ATOMIC_RELAXED);
 
-        uint64_t needed_gap_cs = (uint64_t)(target_local * logbase_nonce);
+        uint64_t needed_gap_cs = (uint64_t)(submit_target * logbase_nonce);
         if (needed_gap_cs < 2) needed_gap_cs = 2;
 
         if (surv_cnt < 2 ||
             surv[surv_cnt - 1] - surv[0] < needed_gap_cs) {
-            __sync_fetch_and_add(
-                &stats_crt_solver_prod_prefilter_span_drop, 1);
+            __atomic_fetch_add(&stats_crt_solver_prod_prefilter_span_drop, 1,
+                               __ATOMIC_RELAXED);
             mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
             return;
         }
@@ -229,8 +241,8 @@ static void crt_runtime_process_solver_window(
                     (uint64_t)crt_heap_count(),
                     (uint64_t)crt_heap_cap,
                     1.15)) {
-                __sync_fetch_and_add(
-                    &stats_crt_solver_prod_prefilter_density_drop, 1);
+                __atomic_fetch_add(&stats_crt_solver_prod_prefilter_density_drop,
+                                   1, __ATOMIC_RELAXED);
                 mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
                 return;
             }
@@ -239,17 +251,19 @@ static void crt_runtime_process_solver_window(
         double cs = compute_cramer_score(surv, surv_cnt,
                                          logbase_nonce,
                                          needed_gap_cs);
-        __sync_fetch_and_add(&stats_cramer_scored, 1);
-        __sync_fetch_and_add(&stats_cramer_score_sum_e9,
-            (uint64_t)(cs * 1e9));
+        __atomic_fetch_add(&stats_cramer_scored, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&stats_cramer_score_sum_e9,
+            (uint64_t)(cs * 1e9), __ATOMIC_RELAXED);
 
         /* Compare using the same normalised key the heap uses:
          * heap_key = cramer_score / sqrt(surv_cnt + 1). */
         double cs_key = cs / sqrt((double)(surv_cnt + 1));
         double heap_worst_sc = crt_heap_worst_score_advisory();
         if (heap_worst_sc >= 0.0 && cs_key <= heap_worst_sc) {
-            __sync_fetch_and_add(&stats_crt_heap_push_drop, 1);
-            __sync_fetch_and_add(&stats_cramer_heap_skip, 1);
+            __atomic_fetch_add(&stats_crt_heap_push_drop, 1,
+                               __ATOMIC_RELAXED);
+            __atomic_fetch_add(&stats_cramer_heap_skip, 1,
+                               __ATOMIC_RELAXED);
             struct timespec bt = {0, 200000L}; /* 200 us */
             nanosleep(&bt, NULL);
             mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
@@ -265,8 +279,11 @@ static void crt_runtime_process_solver_window(
             if (w->survivors)
                 memcpy(w->survivors, surv,
                        surv_cnt * sizeof(uint64_t));
-            else
+            else {
+                __atomic_fetch_add(&stats_crt_solver_prod_alloc_fail, 1,
+                                   __ATOMIC_RELAXED);
                 surv_cnt = 0;
+            }
             w->surv_cnt    = surv_cnt;
             w->cramer_score = cs;
             w->nonce       = nonce_cur;
@@ -274,8 +291,8 @@ static void crt_runtime_process_solver_window(
             w->logbase     = logbase_nonce;
             w->generation  = crt_heap_gen;
             if (crt_heap_push(w)) {
-                __sync_fetch_and_add(
-                    &stats_crt_solver_prod_windows_enqueued, 1);
+                __atomic_fetch_add(&stats_crt_solver_prod_windows_enqueued, 1,
+                                   __ATOMIC_RELAXED);
             } else {
                 struct timespec bt = {0, 200000L}; /* 200 us */
                 nanosleep(&bt, NULL);
@@ -287,10 +304,11 @@ static void crt_runtime_process_solver_window(
 
     /* Monolithic path: evaluate this window inline. */
     {
-        uint64_t ng = (uint64_t)(target_local * logbase_nonce);
+        uint64_t ng = (uint64_t)(submit_target * logbase_nonce);
         if (ng < 2) ng = 2;
         if (surv_cnt < 2 || surv[surv_cnt - 1] - surv[0] < ng) {
-            __sync_fetch_and_add(&stats_cramer_skipped, 1);
+            __atomic_fetch_add(&stats_cramer_skipped, 1,
+                               __ATOMIC_RELAXED);
             mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
             return;
         }
@@ -304,7 +322,7 @@ static void crt_runtime_process_solver_window(
             nonce_cur,
             cand_odd,
             logbase_nonce,
-            target_local,
+            submit_target,
             shift_local,
             nAdd,
             rpc_url_local,
@@ -316,14 +334,15 @@ static void crt_runtime_process_solver_window(
     {
         size_t cpu_tests = crt_bkscan_and_submit(
             surv, surv_cnt,
-            logbase_nonce, target_local,
+            logbase_nonce, submit_target,
             shift_local, nonce_cur,
             cand_odd, nAdd,
             rpc_url_local, rpc_user_local,
             rpc_pass_local,
             NULL, NULL);
-        __sync_fetch_and_add(&stats_crt_solver_mono_cpu_tests,
-                             (uint64_t)cpu_tests);
+        __atomic_fetch_add(&stats_crt_solver_mono_cpu_tests,
+                           (uint64_t)cpu_tests,
+                           __ATOMIC_RELAXED);
     }
 
     mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
@@ -517,7 +536,8 @@ crt_runtime_run_solver_nonce_step(
             size_t surv_cnt = 0;
             uint64_t *surv = sieve_range(gap_L, gap_R,
                                          &surv_cnt, NULL, 0);
-            __sync_fetch_and_add(&stats_sieved, gap_R - gap_L);
+            __atomic_fetch_add(&stats_sieved, gap_R - gap_L,
+                               __ATOMIC_RELAXED);
 
             crt_runtime_process_solver_window(
                 surv, surv_cnt,
@@ -651,12 +671,14 @@ int crt_runtime_cpu_try_run_consumer_loop(
 
         /* Discard stale items from previous template */
         if (w->generation != crt_heap_gen) {
-            __sync_fetch_and_add(&stats_crt_stale_drop, 1);
+            __atomic_fetch_add(&stats_crt_stale_drop, 1,
+                               __ATOMIC_RELAXED);
             crt_work_free(w);
             continue;
         }
 
-        __sync_fetch_and_add(&stats_crt_consumer_windows, 1);
+        __atomic_fetch_add(&stats_crt_consumer_windows, 1,
+                           __ATOMIC_RELAXED);
 
 #ifdef WITH_GPU_FERMAT
         if (crt_runtime_gpu_process_consumer_item(
@@ -687,8 +709,9 @@ int crt_runtime_cpu_try_run_consumer_loop(
                 rpc_url_local, rpc_user_local,
                 rpc_pass_local,
                 &w_primes, &w_qual);
-            __sync_fetch_and_add(&stats_crt_solver_consumer_cpu_tests,
-                                 (uint64_t)cpu_tests);
+            __atomic_fetch_add(&stats_crt_solver_consumer_cpu_tests,
+                               (uint64_t)cpu_tests,
+                               __ATOMIC_RELAXED);
             crt_score_roll_observe(w->cramer_score,
                                    (uint64_t)w->surv_cnt,
                                    (uint64_t)w_primes,

@@ -137,6 +137,19 @@ static void log_file_only(const char *fmt, ...) {
 #include <sys/time.h>
 #endif
 
+/* Rolling-window state for 30s rates/quality in periodic STATS output.
+   Kept local to this translation unit to avoid cross-TU LTO type drift. */
+#define RATE_RING_SLOTS 6
+struct rate_ring_slot {
+    uint64_t pairs;
+    uint64_t gaps;
+    uint64_t tested;
+    uint64_t ms;
+};
+static struct rate_ring_slot rate_ring[RATE_RING_SLOTS];
+static int rate_ring_idx = 0;
+static int rate_ring_full = 0;
+
 /* rpc timing/retry globals */
 static uint64_t last_submit_ms = 0;
 static int rpc_rate_ms = 0;
@@ -518,15 +531,20 @@ static void crt_score_roll_snapshot(struct crt_score_roll_snapshot *out) {
 #ifdef WITH_GPU_FERMAT
 static inline void crt_accum_record_batch(size_t batch_sz) {
     if (batch_sz <= 512) {
-        __sync_fetch_and_add(&stats_crt_gpu_accum_batch_le_512, 1);
+        __atomic_fetch_add(&stats_crt_gpu_accum_batch_le_512, 1,
+                           __ATOMIC_RELAXED);
     } else if (batch_sz <= 1024) {
-        __sync_fetch_and_add(&stats_crt_gpu_accum_batch_le_1024, 1);
+        __atomic_fetch_add(&stats_crt_gpu_accum_batch_le_1024, 1,
+                           __ATOMIC_RELAXED);
     } else if (batch_sz <= 2048) {
-        __sync_fetch_and_add(&stats_crt_gpu_accum_batch_le_2048, 1);
+        __atomic_fetch_add(&stats_crt_gpu_accum_batch_le_2048, 1,
+                           __ATOMIC_RELAXED);
     } else if (batch_sz <= 4096) {
-        __sync_fetch_and_add(&stats_crt_gpu_accum_batch_le_4096, 1);
+        __atomic_fetch_add(&stats_crt_gpu_accum_batch_le_4096, 1,
+                           __ATOMIC_RELAXED);
     } else {
-        __sync_fetch_and_add(&stats_crt_gpu_accum_batch_gt_4096, 1);
+        __atomic_fetch_add(&stats_crt_gpu_accum_batch_gt_4096, 1,
+                           __ATOMIC_RELAXED);
     }
 }
 #endif
@@ -926,6 +944,9 @@ static volatile double adaptive_presieve_dense_ratio = 1.08;
 static volatile double adaptive_presieve_floor_mult = 2.0;
 /* if nonzero, use the selectable wheel presieve backend. */
 static volatile int use_wheel_sieve = 0;
+/* non-CRT wheel presieve runtime telemetry */
+static volatile uint64_t stats_wheel_mps_bypass = 0; /* wheel requested, mpresieve used */
+static volatile uint64_t stats_wheel_tile_used = 0;  /* wheel tile path executed */
 /* if nonzero, use standalone sievegap module for non-CRT windows. */
 static volatile int use_sievegap = 0;
 /* Shared bootstrap seed for --partial-sieve-auto: the first thread that
@@ -1060,6 +1081,33 @@ static inline void log_extra_merit_sample(const char *source,
     tls_best_gap = 0;
     tls_best_target = 0.0;
     tls_best_source = NULL;
+}
+
+/* Last-gap proximity to submit threshold (target*logbase), scaled by 1e6.
+   1.0 means exactly on target, <1.0 means below target, >1.0 above target. */
+static volatile uint64_t stats_last_target_ratio_e6 = 0;
+
+static inline void update_last_gap_target_ratio(uint64_t gap,
+                                                double logbase,
+                                                double target_merit)
+{
+    if (gap < 2 || !(logbase > 1.0) || !(target_merit > 0.0)) {
+        stats_last_target_ratio_e6 = 0;
+        return;
+    }
+
+    double submit_gap = target_merit * logbase;
+    if (!(submit_gap > 0.0)) {
+        stats_last_target_ratio_e6 = 0;
+        return;
+    }
+
+    double ratio = (double)gap / submit_gap;
+    if (ratio < 0.0)
+        ratio = 0.0;
+    if (ratio > 1000.0)
+        ratio = 1000.0;
+    stats_last_target_ratio_e6 = (uint64_t)(ratio * 1000000.0 + 0.5);
 }
 
 #define PARTIAL_SIEVE_MIN_LIMIT     4000000ULL
@@ -2134,6 +2182,19 @@ static double resolve_scan_target(double submit_target, double scan_target_cfg) 
     return (scan_target_cfg > 0.0) ? scan_target_cfg : submit_target;
 }
 
+/* Effective submission threshold for this runtime context.
+   - focus_target: user-selected search focus (e.g. --target 28)
+   - g_mining_target: submit threshold derived from network policy
+   Returns the lower of both so we never drop submit-worthy gaps. */
+static inline double effective_submit_target(double focus_target) {
+    double submit_target = (double)g_mining_target;
+    if (!(submit_target > 0.0))
+        submit_target = focus_target;
+    if (submit_target > focus_target)
+        submit_target = focus_target;
+    return submit_target;
+}
+
 /* Log-only PGT observer for k=1 trend behavior.
    Uses the paper's prime-gap trend proxy: log^2(x) - 2*log(x)*log(log(x)).
    Called only when the global best gap is updated; this is not on hot paths. */
@@ -2182,15 +2243,32 @@ static double refresh_runtime_targets(int target_explicit,
                                       double *submit_target,
                                       double *scan_target_cfg,
                                       uint64_t ndiff) {
+    static double net_submit_target = 0.0;
+    static int net_floor_logged = 0;
+
     if (!submit_target || !scan_target_cfg)
         return 0.0;
 
-    if (!target_explicit && ndiff != 0) {
+    if (ndiff != 0) {
         double net_merit = ndiff_to_merit(ndiff);
-        if (fabs(*submit_target - net_merit) > 1e-12) {
+        net_submit_target = net_merit;
+        if (!target_explicit && fabs(*submit_target - net_merit) > 1e-12) {
             *submit_target = net_merit;
             log_msg("network difficulty: %.6f merit (nDifficulty=%llu)\n",
                     net_merit, (unsigned long long)ndiff);
+        }
+    }
+
+    /* When user pins --target above network floor, keep target as focus
+       threshold but submit from network threshold. */
+    double effective_submit = *submit_target;
+    if (target_explicit && net_submit_target > 0.0 &&
+        effective_submit > net_submit_target) {
+        effective_submit = net_submit_target;
+        if (!net_floor_logged) {
+            log_msg("target policy: focus target=%.6f, submit target(network)=%.6f\n",
+                    *submit_target, effective_submit);
+            net_floor_logged = 1;
         }
     }
 
@@ -2198,7 +2276,8 @@ static double refresh_runtime_targets(int target_explicit,
         *scan_target_cfg = *submit_target;
 
     double scan_target = resolve_scan_target(*submit_target, *scan_target_cfg);
-    g_mining_target = *submit_target;
+    g_focus_target = *submit_target;
+    g_mining_target = effective_submit;
     g_scan_target_runtime = scan_target;
 
     /* Live one-sided auto policy: if user did not set manual merit,
@@ -2554,15 +2633,21 @@ static void print_stats(void) {
        the ring isn't full yet (first 30s of mining). */
     int oldest = rate_ring_full ? rate_ring_idx : 0;
     uint64_t old_pairs = rate_ring[oldest].pairs;
+    uint64_t old_gaps  = rate_ring[oldest].gaps;
+    uint64_t old_tested = rate_ring[oldest].tested;
     uint64_t old_ms    = rate_ring[oldest].ms;
     double   window_dt = (old_ms > 0 && now > old_ms)
                          ? (double)(now - old_ms) / 1000.0 : 0.0;
     double   window_dp = (double)(stats_pairs - old_pairs);
+    double   window_dg = (double)(stats_gaps - old_gaps);
+    double   window_dtst = (double)(stats_tested - old_tested);
     double   pairs_rate = (window_dt > 0.5) ? window_dp / window_dt
                         : (elapsed > 0.001) ? (double)stats_pairs / elapsed
                         : 0.0;
     /* Advance ring */
     rate_ring[rate_ring_idx].pairs = stats_pairs;
+    rate_ring[rate_ring_idx].gaps = stats_gaps;
+    rate_ring[rate_ring_idx].tested = stats_tested;
     rate_ring[rate_ring_idx].ms    = now;
     rate_ring_idx = (rate_ring_idx + 1) % RATE_RING_SLOTS;
     if (rate_ring_idx == 0) rate_ring_full = 1;
@@ -2574,6 +2659,7 @@ static void print_stats(void) {
        Est = 1 / (pairs/s × e^(-target)).  Uses the rolling 30s rate
        for responsiveness. */
     double target_m = g_mining_target;
+    double focus_target_m = g_focus_target;
     double scan_target_m = g_scan_target_runtime;
     /* est= calibrated from observed gap rate when possible.
        Once we have qualifying gaps at target_m, use:
@@ -2611,6 +2697,35 @@ static void print_stats(void) {
         ? ((double)stats_primes_found * 1000000.0) / (double)stats_sieved : 0.0;
     double pairs_per_million = (stats_sieved > 0)
         ? ((double)stats_pairs * 1000000.0) / (double)stats_sieved : 0.0;
+    double qual_pairs_pct = (stats_pairs > 0)
+        ? (100.0 * (double)stats_gaps / (double)stats_pairs) : 0.0;
+    double qual_tested_ppm = (stats_tested > 0)
+        ? (1000000.0 * (double)stats_gaps / (double)stats_tested) : 0.0;
+    double qual_pairs_pct_30s = (window_dt > 0.5 && window_dp > 0.5)
+        ? (100.0 * window_dg / window_dp)
+        : qual_pairs_pct;
+    double qual_tested_ppm_30s = (window_dt > 0.5 && window_dtst > 0.5)
+        ? (1000000.0 * window_dg / window_dtst)
+        : qual_tested_ppm;
+    double last_target_ratio = (double)stats_last_target_ratio_e6 / 1000000.0;
+    double last_target_pct = 100.0 * last_target_ratio;
+    double miss_target_pct = (last_target_ratio < 1.0)
+        ? (100.0 * (1.0 - last_target_ratio))
+        : 0.0;
+    uint64_t wheel_bypass = stats_wheel_mps_bypass;
+    uint64_t wheel_tile = stats_wheel_tile_used;
+    uint64_t wheel_total = wheel_bypass + wheel_tile;
+    double wheel_bypass_pct = (wheel_total > 0)
+        ? (100.0 * (double)wheel_bypass / (double)wheel_total)
+        : 0.0;
+    char wheel_stats_buf[96] = "";
+    if (wheel_sieve_enabled()) {
+        snprintf(wheel_stats_buf, sizeof(wheel_stats_buf),
+                 "  wheel(non-crt): bypass=%llu tile=%llu bypass%%=%.1f",
+                 (unsigned long long)wheel_bypass,
+                 (unsigned long long)wheel_tile,
+                 wheel_bypass_pct);
+    }
     double false_gap_pct = ((stats_false_gaps + stats_gaps) > 0)
         ? (100.0 * (double)stats_false_gaps /
            (double)(stats_false_gaps + stats_gaps)) : 0.0;
@@ -2629,8 +2744,11 @@ static void print_stats(void) {
     double bm = stats_best_merit;
         log_msg("STATS: elapsed=%.1fs  sieved=%llu (%.0f/s)  tested=%llu (%.0f/s)  "
             "pps(pairs/s)=%.0f  primes/s=%.0f  primes=%llu (%.1f%%)  "
-            "gaps=%llu (%.3f/s)  built=%llu  submitted=%llu  accepted=%llu  "
-            "prob=%.2e/pair  est_model=%s  est_observed=%s (submit=%.4f scan=%.4f)  best=%.2f (gap=%llu)  last_gap=%llu  last_qual_gap=%llu",
+            "gaps=%llu (%.3f/s)  qual=%llu/%llu pairs (%.6f%%, %.3f ppm tested)  "
+            "qual30s=%.6f%% (%.3f ppm tested)  "
+            "%s  "
+            "built=%llu  submitted=%llu  accepted=%llu  "
+            "prob=%.2e/pair  est_model=%s  est_observed=%s (focus=%.4f submit=%.4f scan=%.4f)  best=%.2f (gap=%llu)  last_gap=%llu  last_qual_gap=%llu  last_vs_target=%.2f%% miss_target=%.2f%%",
             elapsed,
             (unsigned long long)stats_sieved,  sieve_rate,
             (unsigned long long)stats_tested,  test_rate,
@@ -2639,49 +2757,23 @@ static void print_stats(void) {
             (unsigned long long)stats_primes_found,
             (stats_tested > 0) ? 100.0 * (double)stats_primes_found / (double)stats_tested : 0.0,
             (unsigned long long)stats_gaps,    gap_rate,
+            (unsigned long long)stats_gaps,
+            (unsigned long long)stats_pairs,
+            qual_pairs_pct,
+            qual_tested_ppm,
+            qual_pairs_pct_30s,
+            qual_tested_ppm_30s,
+            wheel_stats_buf,
             (unsigned long long)stats_blocks,
             (unsigned long long)stats_submits,
             (unsigned long long)stats_success,
-            prob_pair, est_model_buf, est_observed_buf, target_m, scan_target_m,
+            prob_pair, est_model_buf, est_observed_buf,
+            focus_target_m, target_m, scan_target_m,
             bm, (unsigned long long)stats_best_gap,
             (unsigned long long)stats_last_gap,
-            (unsigned long long)stats_last_qual_gap);
-
-    {
-        uint64_t pgt_rec = stats_pgt_records_total;
-        uint64_t pgt_above_trend = stats_pgt_records_above_trend;
-        uint64_t pgt_above_cramer = stats_pgt_records_above_cramer;
-        uint64_t pgt_above_submit = stats_pgt_records_above_submit;
-        double last_vs_best = (stats_best_gap > 0)
-            ? ((double)stats_last_gap / (double)stats_best_gap)
-            : 0.0;
-        double last_vs_qual = (stats_last_qual_gap > 0)
-            ? ((double)stats_last_gap / (double)stats_last_qual_gap)
-            : 0.0;
-        double pgt_trend_pct = (pgt_rec > 0)
-            ? (100.0 * (double)pgt_above_trend / (double)pgt_rec)
-            : 0.0;
-        double pgt_cramer_pct = (pgt_rec > 0)
-            ? (100.0 * (double)pgt_above_cramer / (double)pgt_rec)
-            : 0.0;
-        double pgt_submit_pct = (pgt_rec > 0)
-            ? (100.0 * (double)pgt_above_submit / (double)pgt_rec)
-            : 0.0;
-        log_msg("  pgt: rec=%llu above_trend=%llu (%.1f%%) above_cramer=%llu (%.1f%%) above_submit=%llu (%.1f%%) last_gap=%llu last_trend=%.1f last_ratio=%.3f last_vs_submit=%.3f last_vs_best=%.3f last_vs_qual=%.3f",
-            (unsigned long long)pgt_rec,
-            (unsigned long long)pgt_above_trend,
-            pgt_trend_pct,
-            (unsigned long long)pgt_above_cramer,
-            pgt_cramer_pct,
-            (unsigned long long)pgt_above_submit,
-            pgt_submit_pct,
-            (unsigned long long)stats_pgt_last_gap,
-            (double)stats_pgt_last_trend_gap_e3 / 1000.0,
-            (double)stats_pgt_last_ratio_e3 / 1000.0,
-            (double)stats_pgt_last_submit_ratio_e3 / 1000.0,
-            last_vs_best,
-            last_vs_qual);
-    }
+            (unsigned long long)stats_last_qual_gap,
+            last_target_pct,
+            miss_target_pct);
 
     if (gmp_timing_enabled()) {
         uint64_t calls = atomic_load_explicit(&gmp_timing_calls, memory_order_relaxed);
@@ -2879,6 +2971,7 @@ static void print_stats(void) {
         if (use_stats_verbose) {
             uint64_t prod_gen = stats_crt_solver_prod_windows_generated;
             uint64_t prod_enq = stats_crt_solver_prod_windows_enqueued;
+            uint64_t prod_alloc_fail = stats_crt_solver_prod_alloc_fail;
             uint64_t pre_span_drop = stats_crt_solver_prod_prefilter_span_drop;
             uint64_t pre_den_drop = stats_crt_solver_prod_prefilter_density_drop;
             double enq_pct = (prod_gen > 0)
@@ -2891,11 +2984,12 @@ static void print_stats(void) {
                 (unsigned long long)stats_crt_solver_mono_gpu_tests,
                 (unsigned long long)stats_crt_solver_consumer_cpu_tests,
                 (unsigned long long)stats_crt_solver_consumer_gpu_tests);
-            log_msg("  phase1: producer generated=%llu enqueued=%llu consumed=%llu (enq %.1f%%) prefilter span=%llu density=%llu",
+            log_msg("  phase1: producer generated=%llu enqueued=%llu consumed=%llu (enq %.1f%%) alloc_fail=%llu prefilter span=%llu density=%llu",
                 (unsigned long long)prod_gen,
                 (unsigned long long)prod_enq,
                 (unsigned long long)stats_crt_consumer_windows,
                 enq_pct,
+                (unsigned long long)prod_alloc_fail,
                 (unsigned long long)pre_span_drop,
                 (unsigned long long)pre_den_drop);
             if (stats_crt_gpu_accum_flush_count > 0 ||
@@ -3638,7 +3732,8 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
         const uint8_t *nt = crt_solver_get_thread_tmpl(bit_size, &crt_skip_to);
         if (nt) {
             memcpy(bits, nt, bit_size);
-            __sync_fetch_and_add(&stats_crt_tmpl_hits, 1);
+            __atomic_fetch_add(&stats_crt_tmpl_hits, 1,
+                               __ATOMIC_RELAXED);
             goto sieve_main;
         }
         /* Fallback: presieve or zero (same as original path). */
@@ -3693,6 +3788,22 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
             }
         }
     } else if (use_wheel_sieve && g_crt_mode == CRT_MODE_NONE
+               && wheel_sieve_enabled() && h256
+               && g_mps_ready && tls_base_mod_p_ready && tls_base_mod_p
+               && small_primes_count > MPRESIEVE_SKIP_TO) {
+        /* Wheel factors are a strict subset of mpresieve coverage (3..163).
+         * Skip redundant wheel tiling and use mpresieve directly. */
+        uint64_t bm = (tls_base_mod_p[1] * 170170ULL
+                     + tls_base_mod_p[2] * 306306ULL
+                     + tls_base_mod_p[3] * 145860ULL
+                     + tls_base_mod_p[4] *  46410ULL
+                     + tls_base_mod_p[5] * 157080ULL
+                     + tls_base_mod_p[6] * 450450ULL)
+                     % PRESIEVE_2PERIOD;
+        mpresieve_tile(bits, bit_size, tls_base_mod_p, L, bm);
+        __atomic_fetch_add(&stats_wheel_mps_bypass, 1, __ATOMIC_RELAXED);
+        crt_skip_to = MPRESIEVE_SKIP_TO;
+    } else if (use_wheel_sieve && g_crt_mode == CRT_MODE_NONE
                && wheel_sieve_enabled() && h256) {
         /* When primorial alignment is active and the wheel size equals P#,
            (base+L) % P# = 1 every window, so start_bit = (1-1)/2 = 0.
@@ -3706,24 +3817,8 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
             sb = wheel_sieve_start_bit(base_mod_w, L);
         }
         wheel_sieve_tile(bits, bit_size, sb);
+        __atomic_fetch_add(&stats_wheel_tile_used, 1, __ATOMIC_RELAXED);
         crt_skip_to = (int)wheel_sieve_skip_to();
-        /* Extend composite removal to primes 3..163 by layering the
-         * multi-table presieve on top if base_mod_p is already cached.
-         * OR-merge is idempotent — overlap with wheel primes (3..19) is safe.
-         * Phase 1 then starts from prime index 38 instead of 8, skipping
-         * 30 extra primes that would otherwise be marked in the hot loop. */
-        if (g_mps_ready && tls_base_mod_p_ready && tls_base_mod_p
-                && small_primes_count > MPRESIEVE_SKIP_TO) {
-            uint64_t bm = (tls_base_mod_p[1] * 170170ULL
-                         + tls_base_mod_p[2] * 306306ULL
-                         + tls_base_mod_p[3] * 145860ULL
-                         + tls_base_mod_p[4] *  46410ULL
-                         + tls_base_mod_p[5] * 157080ULL
-                         + tls_base_mod_p[6] * 450450ULL)
-                         % PRESIEVE_2PERIOD;
-            mpresieve_tile(bits, bit_size, tls_base_mod_p, L, bm);
-            crt_skip_to = MPRESIEVE_SKIP_TO;
-        }
     } else if (g_mps_ready && tls_base_mod_p_ready && tls_base_mod_p
                && small_primes_count > MPRESIEVE_SKIP_TO) {
         /* Multi-table pre-sieve: covers primes 3..163 (~37 primes). */
@@ -6719,6 +6814,7 @@ static size_t crt_bkscan_and_submit(
     size_t *out_primes_found,
     size_t *out_qual_pairs)
 {
+    double submit_target = effective_submit_target(target);
     size_t total_tested = 0;
     size_t primes_found = 0;
 
@@ -6729,7 +6825,7 @@ static size_t crt_bkscan_and_submit(
     double   best_merit_loc = 0.0;
     uint64_t last_gap_local = 0;
 
-    __sync_fetch_and_add(&stats_crt_windows, 1);
+    __atomic_fetch_add(&stats_crt_windows, 1, __ATOMIC_RELAXED);
 
     /* Full backward scan from index 0.  backward_scan_segment internally
        does a forward scan to locate the first prime (~average 1/ln(N) tests),
@@ -6739,13 +6835,13 @@ static size_t crt_bkscan_and_submit(
        CRT windows are independent (fresh sieve each time) — no cross-window
        carry is needed here. */
     {
-        size_t needed_gap = (size_t)(target * logbase);
+        size_t needed_gap = (size_t)(submit_target * logbase);
         if (needed_gap < 2)
             needed_gap = 2;
 
         struct bkscan_result res;
         backward_scan_segment(surv, 0, surv_cnt,
-                              needed_gap, 0, logbase, target,
+                              needed_gap, 0, logbase, submit_target,
                               bn_candidate_is_prime, &res);
 
         total_tested  = res.tested;
@@ -6756,6 +6852,7 @@ static size_t crt_bkscan_and_submit(
         if (res.best_gap > 0) {
             last_gap_local = res.best_gap;
             stats_last_gap = res.best_gap;
+            update_last_gap_target_ratio(res.best_gap, logbase, target);
             log_extra_merit_sample("crt-cpu", res.best_merit,
                                    res.best_gap, target);
         }
@@ -6782,6 +6879,7 @@ static size_t crt_bkscan_and_submit(
     if (last_gap_local > 0) {
         stats_crt_consumer_last_gap = last_gap_local;
         stats_last_gap = last_gap_local;
+        update_last_gap_target_ratio(last_gap_local, logbase, target);
     }
 
     /* Submit qualifying gaps found in this window. */
@@ -6803,7 +6901,7 @@ static size_t crt_bkscan_and_submit(
             if (!mr_verify_cand()) continue;
         }
 
-        __sync_fetch_and_add(&stats_gaps, 1);
+        __atomic_fetch_add(&stats_gaps, 1, __ATOMIC_RELAXED);
         stats_last_qual_gap = gap;
         log_extra_merit_event("qual", "crt-cpu", merit, gap, target);
 
@@ -6833,7 +6931,7 @@ static size_t crt_bkscan_and_submit(
             submit_expect_seq = submit_snap.pass_seq;
             memset(blockhex, 0, sizeof(blockhex));
             if (assemble_mining_block_mpz(nonce, nAdd_prime, submit_expect_seq, blockhex)) {
-                __sync_fetch_and_add(&stats_blocks, 1);
+                __atomic_fetch_add(&stats_blocks, 1, __ATOMIC_RELAXED);
                 log_file_only("Built blockhex: %s\n", blockhex);
                 if (header_meets_target_hex(blockhex)) {
                     snprintf(submit_msg, sizeof(submit_msg),
@@ -6841,7 +6939,8 @@ static size_t crt_bkscan_and_submit(
                              merit, (unsigned long long)gap,
                              shift_v, (unsigned)nonce);
                     log_msg("%s\n", submit_msg);
-                    __sync_fetch_and_add(&stats_submits, 1);
+                    __atomic_fetch_add(&stats_submits, 1,
+                                       __ATOMIC_RELAXED);
                     submit_gap_block_common(blockhex, merit,
                                             rpc_url, rpc_user, rpc_pass,
                                             NULL, NULL, "");
@@ -6854,10 +6953,13 @@ static size_t crt_bkscan_and_submit(
         mpz_clear(nAdd_prime);
     }
 
-    __sync_fetch_and_add(&stats_tested, (uint64_t)total_tested);
-    __sync_fetch_and_add(&stats_primes_found, (uint64_t)primes_found);
+    __atomic_fetch_add(&stats_tested, (uint64_t)total_tested,
+                       __ATOMIC_RELAXED);
+    __atomic_fetch_add(&stats_primes_found, (uint64_t)primes_found,
+                       __ATOMIC_RELAXED);
     if (primes_found > 1)
-        __sync_fetch_and_add(&stats_pairs, (uint64_t)(primes_found - 1));
+        __atomic_fetch_add(&stats_pairs, (uint64_t)(primes_found - 1),
+                           __ATOMIC_RELAXED);
 
     if (out_primes_found)
         *out_primes_found = primes_found;
@@ -6879,9 +6981,10 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
                              size_t *out_primes_found,
                              size_t *out_qual_pairs,
                              uint64_t *out_max_gap) {
+    double submit_target = effective_submit_target(target);
     size_t qual_pairs = 0;
     uint64_t max_gap = 0;
-    __sync_fetch_and_add(&stats_crt_windows, 1);
+    __atomic_fetch_add(&stats_crt_windows, 1, __ATOMIC_RELAXED);
 
     /* GPU batches should preserve ascending offsets, but guard anyway.
        A rare ordering glitch can underflow (next - current) and produce
@@ -6909,7 +7012,8 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
         }
     }
 
-    __sync_fetch_and_add(&stats_primes_found, (uint64_t)prime_cnt);
+    __atomic_fetch_add(&stats_primes_found, (uint64_t)prime_cnt,
+                       __ATOMIC_RELAXED);
     if (prime_cnt < 2) {
         if (out_primes_found)
             *out_primes_found = prime_cnt;
@@ -6917,14 +7021,16 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
             *out_qual_pairs = 0;
         return;
     }
-    __sync_fetch_and_add(&stats_pairs, (uint64_t)(prime_cnt - 1));
+    __atomic_fetch_add(&stats_pairs, (uint64_t)(prime_cnt - 1),
+                       __ATOMIC_RELAXED);
     for (size_t i = 0; i + 1 < prime_cnt; i++) {
         uint64_t gap = primes[i + 1] - primes[i];
         if (gap > max_gap) max_gap = gap;
         double merit = (double)gap / logbase;
-        int best_needs_validation = (merit >= target) &&
+        int best_needs_validation = (merit >= submit_target) &&
             (use_crt_precision || use_mr_verify);
         stats_last_gap = gap;
+        update_last_gap_target_ratio(gap, logbase, target);
         stats_crt_consumer_last_gap = gap;
         if (gap > stats_crt_consumer_best_gap)
             stats_crt_consumer_best_gap = gap;
@@ -6935,7 +7041,7 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
             pgt_observe_record_gap(gap, logbase, target);
             log_extra_merit_event("best", "crt-gpu", merit, gap, target);
         }
-        if (merit < target) continue;
+        if (merit < submit_target) continue;
 
         /* Precision mode: only do strict primality checks on candidate
            gaps that already meet target length (gap-first verification). */
@@ -6944,13 +7050,15 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
 
             strict_tests++;
             if (!bn_candidate_is_prime(primes[i])) {
-                __sync_fetch_and_add(&stats_tested, strict_tests);
+                __atomic_fetch_add(&stats_tested, strict_tests,
+                                   __ATOMIC_RELAXED);
                 continue;
             }
 
             strict_tests++;
             if (!bn_candidate_is_prime(primes[i + 1])) {
-                __sync_fetch_and_add(&stats_tested, strict_tests);
+                __atomic_fetch_add(&stats_tested, strict_tests,
+                                   __ATOMIC_RELAXED);
                 continue;
             }
 
@@ -6964,10 +7072,12 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
                     break;
                 }
             }
-            __sync_fetch_and_add(&stats_tested, strict_tests);
+            __atomic_fetch_add(&stats_tested, strict_tests,
+                               __ATOMIC_RELAXED);
 
             if (split_gap) {
-                __sync_fetch_and_add(&stats_false_gaps, 1);
+                __atomic_fetch_add(&stats_false_gaps, 1,
+                                   __ATOMIC_RELAXED);
                 if (use_extra_verbose) {
                     log_file_only("[crt_precision] false gap rejected: gap=%llu split_at=+%llu\n",
                                   (unsigned long long)gap,
@@ -6998,7 +7108,7 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
         }
 
         stats_last_qual_gap = gap;
-        __sync_fetch_and_add(&stats_gaps, 1);
+        __atomic_fetch_add(&stats_gaps, 1, __ATOMIC_RELAXED);
         qual_pairs++;
         log_extra_merit_event("qual", "crt-gpu", merit, gap, target);
         mpz_t nAdd_prime;
@@ -7027,7 +7137,7 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
             submit_expect_seq = submit_snap.pass_seq;
             memset(blockhex, 0, sizeof(blockhex));
             if (assemble_mining_block_mpz(nonce, nAdd_prime, submit_expect_seq, blockhex)) {
-                __sync_fetch_and_add(&stats_blocks, 1);
+                __atomic_fetch_add(&stats_blocks, 1, __ATOMIC_RELAXED);
                 log_file_only("Built blockhex: %s\n", blockhex);
                 if (header_meets_target_hex(blockhex)) {
                     snprintf(submit_msg, sizeof(submit_msg),
@@ -7035,7 +7145,8 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
                              merit, (unsigned long long)gap,
                              shift_v, (unsigned)nonce);
                     log_msg("%s\n", submit_msg);
-                    __sync_fetch_and_add(&stats_submits, 1);
+                    __atomic_fetch_add(&stats_submits, 1,
+                                       __ATOMIC_RELAXED);
                     submit_gap_block_common(blockhex, merit,
                                             rpc_url, rpc_user, rpc_pass,
                                             NULL, NULL, "");
@@ -7374,8 +7485,10 @@ static void gpu_accum_collect(struct gpu_accum *a) {
     uint64_t t_collect0 = now_ms();
     int np = gpu_fermat_collect(a->ctx, slot, b->results, b->total);
     uint64_t t_collect_ms = now_ms() - t_collect0;
-    __sync_fetch_and_add(&stats_crt_gpu_accum_collect_count, 1);
-    __sync_fetch_and_add(&stats_crt_gpu_accum_collect_ms, t_collect_ms);
+    __atomic_fetch_add(&stats_crt_gpu_accum_collect_count, 1,
+                       __ATOMIC_RELAXED);
+    __atomic_fetch_add(&stats_crt_gpu_accum_collect_ms, t_collect_ms,
+                       __ATOMIC_RELAXED);
     a->ema_collect_ms = gpu_accum_ema_update(a->ema_collect_ms,
                                              (double)t_collect_ms);
 
@@ -7399,7 +7512,8 @@ static void gpu_accum_collect(struct gpu_accum *a) {
     for (size_t wi = 0; wi < b->win_count; wi++) {
         struct gpu_accum_win *w = &b->wins[wi];
         if (np < 0 || !w->surv) {
-            __sync_fetch_and_add(&stats_crt_windows, 1);
+            __atomic_fetch_add(&stats_crt_windows, 1,
+                               __ATOMIC_RELAXED);
             free(w->surv); w->surv = NULL;
             mpz_clear(w->base);
             mpz_clear(w->nAdd);
@@ -7477,13 +7591,16 @@ static void gpu_accum_flush(struct gpu_accum *a) {
      size_t observed_batch = b->total;
     crt_accum_record_batch(b->total);
 
-    __sync_fetch_and_add(&stats_gpu_flushes, 1);
-    __sync_fetch_and_add(&stats_gpu_batched, b->total);
+    __atomic_fetch_add(&stats_gpu_flushes, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&stats_gpu_batched, b->total,
+                       __ATOMIC_RELAXED);
     uint64_t t_flush0 = now_ms();
     int rc = gpu_fermat_submit(a->ctx, slot, b->limbs, b->total);
     uint64_t t_flush_ms = now_ms() - t_flush0;
-    __sync_fetch_and_add(&stats_crt_gpu_accum_flush_count, 1);
-    __sync_fetch_and_add(&stats_crt_gpu_accum_flush_ms, t_flush_ms);
+    __atomic_fetch_add(&stats_crt_gpu_accum_flush_count, 1,
+                       __ATOMIC_RELAXED);
+    __atomic_fetch_add(&stats_crt_gpu_accum_flush_ms, t_flush_ms,
+                       __ATOMIC_RELAXED);
     a->ema_flush_ms = gpu_accum_ema_update(a->ema_flush_ms,
                                            (double)t_flush_ms);
     if (rc < 0) {
@@ -7509,11 +7626,14 @@ static void gpu_accum_flush(struct gpu_accum *a) {
         a->threshold = (int)tuned;
         stats_crt_gpu_accum_threshold_last = (uint64_t)a->threshold;
         if (dir > 0)
-            __sync_fetch_and_add(&stats_crt_gpu_accum_tune_up, 1);
+            __atomic_fetch_add(&stats_crt_gpu_accum_tune_up, 1,
+                               __ATOMIC_RELAXED);
         else if (dir < 0)
-            __sync_fetch_and_add(&stats_crt_gpu_accum_tune_down, 1);
+            __atomic_fetch_add(&stats_crt_gpu_accum_tune_down, 1,
+                               __ATOMIC_RELAXED);
         else
-            __sync_fetch_and_add(&stats_crt_gpu_accum_tune_hold, 1);
+            __atomic_fetch_add(&stats_crt_gpu_accum_tune_hold, 1,
+                               __ATOMIC_RELAXED);
     }
 
     a->inflight = a->fill;
@@ -7739,6 +7859,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
                            const char *rpc_pass_local,
                            const char *rpc_method_local,
                            const char *rpc_sign_key_local) {
+    double submit_target = effective_submit_target(target_local);
     (void)header_local;     /* param kept for API compat; abort uses g_abort_pass */
     uint64_t lane_pairs_total = 0;
     uint64_t lane_pairs_same = 0;
@@ -7802,6 +7923,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
         }
         double merit   = (double)gap / logbase;
         stats_last_gap = gap;
+        update_last_gap_target_ratio(gap, logbase, target_local);
         log_extra_merit_sample("noncrt-cpu", merit, gap, target_local);
         /* Track best merit seen (lock-free: small races are harmless).
            Updated for ALL pairs so the stats display shows progress.
@@ -7813,7 +7935,7 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
             log_extra_merit_event("best", "noncrt-cpu", merit, gap,
                                   target_local);
         }
-        if (merit < target_local)
+        if (merit < submit_target)
             continue;
 
         if (track_lane_stats) {
@@ -8949,6 +9071,7 @@ static void *worker_fn(void *arg) {
             } else
 #endif
             if (use_smart) {
+                double submit_target_local = effective_submit_target(target_local);
             /* ======= COOPERATIVE BACKWARD-SCAN GAP MINING ==================
                Inspired by the original GapMiner's skip-ahead algorithm.
                Instead of testing ALL sieve survivors, jump ahead by
@@ -8992,7 +9115,7 @@ static void *worker_fn(void *arg) {
                 }
                 backward_scan_segment(pr, 0, cnt,
                                       needed_gap, one_sided_min_gap,
-                                      logbase, target_local,
+                                      logbase, submit_target_local,
                                       bn_candidate_is_prime,
                                       &res_w);
 
@@ -9019,7 +9142,8 @@ static void *worker_fn(void *arg) {
                     uint64_t xw_gap   = res_w.first_prime - carry_last_prime;
                     double   xw_merit = (double)xw_gap / logbase;
                     stats_last_gap = xw_gap;
-                    if (xw_merit < target_local && xw_merit > stats_best_merit) {
+                    update_last_gap_target_ratio(xw_gap, logbase, target_local);
+                    if (xw_merit < submit_target_local && xw_merit > stats_best_merit) {
                         stats_best_merit = xw_merit;
                         stats_best_gap   = xw_gap;
                         pgt_observe_record_gap(xw_gap, logbase, target_local);
@@ -9028,10 +9152,10 @@ static void *worker_fn(void *arg) {
                                               xw_gap,
                                               target_local);
                     }
-                    if (xw_merit >= target_local) {
+                    if (xw_merit >= submit_target_local) {
                         uint64_t xw_pair[2] = { carry_last_prime,
                                                 res_w.first_prime };
-                        if (scan_candidates(xw_pair, 2, target_local, logbase,
+                        if (scan_candidates(xw_pair, 2, submit_target_local, logbase,
                                             pass_seq_local,
                                             shift_local, header_local,
                                             rpc_url_local, rpc_user_local,
@@ -9066,6 +9190,8 @@ static void *worker_fn(void *arg) {
                     stats_crt_consumer_last_qual_gap = pair[1] - pair[0];
                     stats_last_qual_gap = pair[1] - pair[0];
                     stats_last_gap = pair[1] - pair[0];
+                    update_last_gap_target_ratio(pair[1] - pair[0], logbase,
+                                                 target_local);
                         if (scan_candidates(pair, 2,
                             target_local, logbase,
                             pass_seq_local,
@@ -9388,7 +9514,8 @@ int main(int argc, char **argv) {
         printf("      --primorial P     align each window to multiples of P#=2*3*5*...*P\n");
         printf("                        P must be prime, e.g. 13 (P#=30030) or 17 (P#=510510)\n");
         printf("                        ensures candidates coprime to all primes <= P\n");
-        printf("      --target T        minimum merit         (default: 20.0)\n");
+        printf("      --target T        focus merit threshold (default: 20.0)\n");
+        printf("                        if T is above network merit, miner still submits >= network merit\n");
         printf("      --scan-merit M    scan threshold for non-CRT CPU smart-scan stride.\n");
         printf("                        submit threshold remains --target (or network merit).\n");
         printf("                        M<=0 (or omitted) follows submit threshold automatically.\n");
@@ -10904,6 +11031,7 @@ int main(int argc, char **argv) {
                                     && cnt > (size_t)(smart_K_st * 4));
 
                 if (use_smart_st) {
+                    double submit_target_st = effective_submit_target(target);
                     /* --- Phase 1: sample every Kth survivor --------------- */
                     size_t p1n = (cnt + (size_t)smart_K_st - 1) / (size_t)smart_K_st;
                     uint64_t *sampled = NULL;
@@ -10938,7 +11066,7 @@ int main(int argc, char **argv) {
                     }
                     __atomic_fetch_add(&stats_tested, (uint64_t)p1n, __ATOMIC_RELAXED);
 
-                    size_t needed = (size_t)(scan_target_runtime * logbase);
+                    size_t needed = (size_t)(submit_target_st * logbase);
                     if (needed < 2) needed = 2;
 
                     /* Identify gap regions (boundaries only) */
@@ -11082,7 +11210,7 @@ int main(int argc, char **argv) {
                             && pr[0] - st_carry_last >= needed) {
                             uint64_t xw_pair[2] = { st_carry_last, pr[0] };
                             if (scan_candidates(xw_pair, 2,
-                                               target, logbase, st_pass_seq, shift,
+                                               submit_target_st, logbase, st_pass_seq, shift,
                                                header, rpc_url, rpc_user,
                                                rpc_pass, rpc_method,
                                                rpc_sign_key))
@@ -11103,7 +11231,7 @@ int main(int argc, char **argv) {
                             if (seg_cnt >= 2) {
                                 region_pairs_st += seg_cnt - 1;
                                 if (scan_candidates(pr + lo_idx, seg_cnt,
-                                                   target, logbase, st_pass_seq, shift,
+                                                   submit_target_st, logbase, st_pass_seq, shift,
                                                    header, rpc_url, rpc_user,
                                                    rpc_pass, rpc_method,
                                                    rpc_sign_key))

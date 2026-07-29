@@ -22,6 +22,7 @@ extern volatile uint64_t stats_crt_windows;
 extern volatile uint64_t stats_primes_found;
 extern uint64_t stats_start_ms;
 extern volatile double g_mining_target;
+extern volatile double g_focus_target;
 extern volatile double stats_best_merit;
 extern volatile uint64_t stats_best_gap;
 extern volatile uint64_t stats_last_gap;
@@ -86,6 +87,7 @@ extern volatile uint64_t stats_crt_solver_consumer_cpu_tests;
 extern volatile uint64_t stats_crt_solver_consumer_gpu_tests;
 extern volatile uint64_t stats_crt_solver_prod_windows_generated;
 extern volatile uint64_t stats_crt_solver_prod_windows_enqueued;
+extern volatile uint64_t stats_crt_solver_prod_alloc_fail;
 extern volatile uint64_t stats_crt_solver_prod_prefilter_span_drop;
 extern volatile uint64_t stats_crt_solver_prod_prefilter_density_drop;
 extern volatile uint64_t stats_crt_gpu_accum_flush_count;
@@ -117,17 +119,6 @@ extern volatile uint64_t stats_pgt_last_gap;            /* last record gap seen 
 extern volatile uint64_t stats_pgt_last_trend_gap_e3;   /* last trend gap, scaled ×1000 */
 extern volatile uint64_t stats_pgt_last_ratio_e3;       /* last gap/trend ratio, scaled ×1000 */
 extern volatile uint64_t stats_pgt_last_submit_ratio_e3;/* last gap/(target*logbase), scaled ×1000 */
-
-/* Rolling-window state used by print_stats(). */
-#define RATE_RING_SLOTS 6
-struct rate_ring_slot {
-    uint64_t pairs;
-    uint64_t ms;
-};
-
-extern struct rate_ring_slot rate_ring[RATE_RING_SLOTS];
-extern int rate_ring_idx;
-extern int rate_ring_full;
 
 /* Periodic stats thread control. */
 void start_stats_thread(void (*tick_fn)(void));

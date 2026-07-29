@@ -84,7 +84,8 @@ int crt_runtime_gpu_process_mono_window(
     struct gpu_accum *acc = crt_runtime_gpu_try_init_accum(ctx,
                                                            &g_mono_accum_rr);
     if (!acc)
-        __sync_fetch_and_add(&stats_crt_cuda_fb_no_accum, 1);
+        __atomic_fetch_add(&stats_crt_cuda_fb_no_accum, 1,
+                           __ATOMIC_RELAXED);
 
     if (acc) {
         ctx->ensure_gmp_tls();
@@ -118,13 +119,16 @@ int crt_runtime_gpu_process_mono_window(
                     rpc_user_local, rpc_pass_local);
             }
             if (add_rc < 0) {
-                __sync_fetch_and_add(&stats_crt_cuda_fb_add_fail, 1);
+                __atomic_fetch_add(&stats_crt_cuda_fb_add_fail, 1,
+                                   __ATOMIC_RELAXED);
                 return 0;
             }
 
-            __sync_fetch_and_add(&stats_tested, (uint64_t)surv_cnt);
-            __sync_fetch_and_add(&stats_crt_solver_mono_gpu_tests,
-                                 (uint64_t)surv_cnt);
+            __atomic_fetch_add(&stats_tested, (uint64_t)surv_cnt,
+                               __ATOMIC_RELAXED);
+            __atomic_fetch_add(&stats_crt_solver_mono_gpu_tests,
+                               (uint64_t)surv_cnt,
+                               __ATOMIC_RELAXED);
             if (add_rc == 1)
                 ctx->gpu_accum_flush(acc);
 
@@ -134,7 +138,8 @@ int crt_runtime_gpu_process_mono_window(
         /* Active GPU stride is too small for this nonce; let the caller
            fall back to the CPU CRT scan path so the window is still
            fully verified and submitted correctly. */
-        __sync_fetch_and_add(&stats_crt_cuda_fb_limb_mismatch, 1);
+          __atomic_fetch_add(&stats_crt_cuda_fb_limb_mismatch, 1,
+                                    __ATOMIC_RELAXED);
     }
 
     /* If the accumulator path is unavailable, fall back to the CPU CRT
@@ -160,7 +165,8 @@ int crt_runtime_gpu_process_consumer_item(
     struct gpu_accum *acc = crt_runtime_gpu_try_init_accum(ctx,
                                                            &g_cons_accum_rr);
     if (!acc) {
-        __sync_fetch_and_add(&stats_crt_cuda_fb_no_accum, 1);
+        __atomic_fetch_add(&stats_crt_cuda_fb_no_accum, 1,
+                           __ATOMIC_RELAXED);
         return 0;
     }
 
@@ -170,7 +176,8 @@ int crt_runtime_gpu_process_consumer_item(
     size_t nexp = 0;
     mpz_export(bl, &nexp, -1, 8, 0, 0, w->base);
     if (nexp > (size_t)gpu_al) {
-        __sync_fetch_and_add(&stats_crt_cuda_fb_limb_mismatch, 1);
+        __atomic_fetch_add(&stats_crt_cuda_fb_limb_mismatch, 1,
+                           __ATOMIC_RELAXED);
         return 0;
     }
 
@@ -199,13 +206,16 @@ int crt_runtime_gpu_process_consumer_item(
             rpc_user_local, rpc_pass_local);
     }
     if (add_rc < 0) {
-        __sync_fetch_and_add(&stats_crt_cuda_fb_add_fail, 1);
+        __atomic_fetch_add(&stats_crt_cuda_fb_add_fail, 1,
+                           __ATOMIC_RELAXED);
         return 0;
     }
 
-    __sync_fetch_and_add(&stats_tested, (uint64_t)w->surv_cnt);
-    __sync_fetch_and_add(&stats_crt_solver_consumer_gpu_tests,
-                         (uint64_t)w->surv_cnt);
+    __atomic_fetch_add(&stats_tested, (uint64_t)w->surv_cnt,
+                       __ATOMIC_RELAXED);
+    __atomic_fetch_add(&stats_crt_solver_consumer_gpu_tests,
+                       (uint64_t)w->surv_cnt,
+                       __ATOMIC_RELAXED);
     if (add_rc == 1)
         ctx->gpu_accum_flush(acc);
 

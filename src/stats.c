@@ -24,6 +24,7 @@ volatile uint64_t stats_crt_windows = 0;
 volatile uint64_t stats_primes_found = 0;
 uint64_t stats_start_ms = 0;
 volatile double g_mining_target = 20.0;
+volatile double g_focus_target = 20.0;
 volatile double stats_best_merit = 0.0;
 volatile uint64_t stats_best_gap = 0;
 volatile uint64_t stats_last_gap = 0;
@@ -87,6 +88,7 @@ volatile uint64_t stats_crt_solver_consumer_cpu_tests = 0;
 volatile uint64_t stats_crt_solver_consumer_gpu_tests = 0;
 volatile uint64_t stats_crt_solver_prod_windows_generated = 0;
 volatile uint64_t stats_crt_solver_prod_windows_enqueued = 0;
+volatile uint64_t stats_crt_solver_prod_alloc_fail = 0;
 volatile uint64_t stats_crt_solver_prod_prefilter_span_drop = 0;
 volatile uint64_t stats_crt_solver_prod_prefilter_density_drop = 0;
 volatile uint64_t stats_crt_gpu_accum_flush_count = 0;
@@ -114,10 +116,6 @@ volatile uint64_t stats_pgt_last_gap = 0;
 volatile uint64_t stats_pgt_last_trend_gap_e3 = 0;
 volatile uint64_t stats_pgt_last_ratio_e3 = 0;
 volatile uint64_t stats_pgt_last_submit_ratio_e3 = 0;
-
-struct rate_ring_slot rate_ring[RATE_RING_SLOTS];
-int rate_ring_idx = 0;
-int rate_ring_full = 0;
 
 #define STATS_INTERVAL_MS 5000
 

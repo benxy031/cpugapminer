@@ -2088,7 +2088,7 @@ python3 scripts/inspect_tx.py /tmp/gap_miner_block_<timestamp>.hex
 Every 5 s the miner prints a line like:
 
 ```
-STATS: elapsed=30.0s  sieved=5502926848 (183400328/s)  tested=8665707 (288809/s)  primes=1244781 (14.4%)  gaps=0 (0.000/s)  built=0  submitted=0  accepted=0  prob=8.74e-10/pair  est=22.4m (target=20.86)  best=9.77 (gap=2022)  last_gap=0  last_qual_gap=0  pgt: rec=0 above_trend=0 (0.0%) above_cramer=0 (0.0%) above_submit=0 (0.0%) last_gap=0 last_trend=0.0 last_ratio=0.000 last_vs_submit=0.000 last_vs_best=0.000 last_vs_qual=0.000
+STATS: elapsed=30.0s  sieved=5502926848 (183400328/s)  tested=8665707 (288809/s)  pps(pairs/s)=301122  primes/s=41493  primes=1244781 (14.4%)  gaps=2 (0.067/s)  qual=2/265411 pairs (0.000754%, 0.231 ppm tested)  qual30s=0.000754% (0.231 ppm tested)  built=2  submitted=1  accepted=1  prob=8.74e-10/pair  est_model=22.4m  est_observed=7.5m (submit=20.8600 scan=20.8600)  best=20.95 (gap=4340)  last_gap=4340  last_qual_gap=4340  last_vs_target=100.38% miss_target=0.00%
 ```
 
 | Field | Meaning |
@@ -2097,13 +2097,17 @@ STATS: elapsed=30.0s  sieved=5502926848 (183400328/s)  tested=8665707 (288809/s)
 | `tested` | Primality tests (Fermat / Miller-Rabin) actually run |
 | `primes` | Candidates that passed primality testing (with Fermat pass rate %) |
 | `gaps` | Gaps found whose merit ≥ `--target` |
+| `qual` | Qualified gap pairs over total pair candidates in the form `gaps/pairs`, with percent and `ppm tested` (`gaps` per million tested candidates). This is the fastest way to see end-to-end candidate quality. |
+| `qual30s` | Rolling qualification quality over the last ~30 seconds (same units as `qual`: percent and `ppm tested`). Useful for short-term quality drift and auto-tune impact. |
 | `built` | Full blocks assembled from a GBT template after a qualifying gap |
 | `submitted` | Blocks whose header hash also met the network `bits` difficulty and were sent to the node |
 | `accepted` | Node confirmed the block |
 | `prob` | Per-pair probability of a qualifying gap (`e^(-target)`, Cramér–Granville heuristic) |
-| `est` | Estimated time to find a qualifying gap at current rate.  For backward-scan, pairs/s is extrapolated from the Fermat pass rate (`primes / tested × total_survivors`), not counted directly — since the backward scan only tests ~5% of survivors, the extrapolation estimates how many consecutive prime pairs the full window contains. |
+| `est_model` | Model-based estimated time to next qualifying gap from current pair-rate and probability model. |
+| `est_observed` | Observed estimate from this run (`elapsed / gaps`) when at least one qualifying gap was seen. |
 | `best` | Best verified gap merit seen so far (from the sampling pass and qualifying-gap forward searches) |
-| `pgt` | Log-only prime-gap trend telemetry. `rec` counts best-gap updates seen by the observer; `above_trend` / `above_cramer` / `above_submit` count how many of those records exceeded the k=1 trend proxy, the Cramér `log^2(p)` ceiling, or the current submit threshold (`target × logbase`). `last_ratio` is `gap / trend`, `last_vs_submit` is `gap / (target × logbase)`, and `last_vs_best` / `last_vs_qual` compare the current `last_gap` against `best` and `last_qual_gap`. |
+| `last_vs_target` | How close the latest observed gap (`last_gap`) is to the current submit threshold (`target * logbase`). `100%` means exactly on target, `<100%` below target, `>100%` above target. |
+| `miss_target` | Target shortfall for `last_gap` when below threshold. Example: `miss_target=27%` means the latest gap is 27% shorter than the current target gap length. When `last_gap` is on/above target this is `0%`. |
 | `gpu_batch` | (CUDA only) Average candidates per GPU flush.  Higher = better GPU utilization.  Absent when not using `--cuda`. |
 | `pps` | Consecutive prime pairs per second, computed from the rolling ~30 s `pairs_rate`.  Directly comparable to GapMiner's `tests/s` field.  Note: GapMiner's `pps` field is a theoretical CRT-scaled estimate, not the actual measured rate. |
 | `gaplist` | (CRT producer-consumer only) Number of sieved windows waiting in the priority heap.  Ideal: saw-tooth oscillating between ~100 and ~3000.  Persistently 0 = fermat threads too fast / sieve-primes too low.  Persistently near 4096 = sieve too fast, add fermat threads or reduce sieve-primes. |
@@ -2124,7 +2128,8 @@ Getting to `submitted=0` requires clearing **two independent gates**:
 
 `gaps=0` after ~10 minutes at ~300 K tests/s and ~180 M sieved/s is completely
 normal.  The miner is working correctly if sieve and test rates are non-zero.
-The `est` field gives a running estimate of time to find a qualifying gap.
+`est_model` gives a model-based estimate from current rate, while
+`est_observed` (once gaps exist) reflects the observed interval in this run.
 
 ### Troubleshooting low rates
 
