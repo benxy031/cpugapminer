@@ -146,6 +146,19 @@ typedef struct {
     double scale;
 } Phase1Diag;
 
+typedef enum {
+    FITNESS_CANDIDATE = 0,
+    FITNESS_PROBABILITY = 1
+} FitnessMode;
+
+typedef struct {
+    FitnessMode mode;
+    double window_factor;
+    int window_cap;
+    double kernel_a;
+    double kernel_b;
+} FitnessConfig;
+
 static double position_weight(int d) {
     /* Positions coprime to small primes are harder to eliminate by
      * subsequent sieving (no small factor to anchor a residue test)
@@ -169,6 +182,8 @@ typedef struct {
     int   *offsets;       /* offsets[i] for PRIMES[i], 0 <= o < p_i    */
     int    n_candidates;  /* integer uncovered count (display/file out) */
     double w_score;       /* weighted fitness used for optimization     */
+    double opt_score;     /* future primary objective (mode-dependent)  */
+    double aux_score;     /* future diagnostic / tie-break score        */
 } Solution;
 
 static Phase1Diag phase1_diag(const int *offsets, int n_primes, int gap_size,
@@ -208,11 +223,37 @@ static bool solution_better(const Solution *a, const Solution *b) {
     return a->w_score < b->w_score;
 }
 
-static bool solution_better_metrics(int a_cnt, double a_w,
-                                    int b_cnt, double b_w) {
+static bool solution_better_mode(const Solution *a, const Solution *b,
+                                 const FitnessConfig *fc) {
+    if (fc->mode == FITNESS_PROBABILITY) {
+        if (a->opt_score != b->opt_score)
+            return a->opt_score < b->opt_score;
+        if (a->n_candidates != b->n_candidates)
+            return a->n_candidates < b->n_candidates;
+        return a->aux_score < b->aux_score;
+    }
+    if (a->n_candidates != b->n_candidates)
+        return a->n_candidates < b->n_candidates;
+    if (a->opt_score != b->opt_score)
+        return a->opt_score < b->opt_score;
+    return a->aux_score < b->aux_score;
+}
+
+static bool solution_better_metrics_mode(int a_cnt, double a_opt, double a_aux,
+                                         int b_cnt, double b_opt, double b_aux,
+                                         const FitnessConfig *fc) {
+    if (fc->mode == FITNESS_PROBABILITY) {
+        if (a_opt != b_opt)
+            return a_opt < b_opt;
+        if (a_cnt != b_cnt)
+            return a_cnt < b_cnt;
+        return a_aux < b_aux;
+    }
     if (a_cnt != b_cnt)
         return a_cnt < b_cnt;
-    return a_w < b_w;
+    if (a_opt != b_opt)
+        return a_opt < b_opt;
+    return a_aux < b_aux;
 }
 
 static bool solution_better_phase3(const Solution *a, const Phase1Diag *a_p1,
@@ -243,6 +284,19 @@ static double primorial_log2(int n) {
     return s;
 }
 
+static int fitness_window_size(int gap_size, const FitnessConfig *fc) {
+    int window = (int)ceil(fc->window_factor * (double)gap_size);
+    if (window < gap_size)
+        window = gap_size;
+    if (fc->window_cap > 0 && window > fc->window_cap)
+        window = fc->window_cap;
+    return window;
+}
+
+static double legacy_display_score(FitnessMode mode, double opt_score, double aux_score) {
+    return (mode == FITNESS_PROBABILITY) ? aux_score : opt_score;
+}
+
 static Solution sol_alloc(int n_primes, int gap_size) {
     Solution s;
     s.n_primes     = n_primes;
@@ -250,6 +304,8 @@ static Solution sol_alloc(int n_primes, int gap_size) {
     s.offsets      = (int *)malloc((size_t)n_primes * sizeof(int));
     s.n_candidates = INT_MAX;
     s.w_score      = 1e18;
+    s.opt_score    = 1e18;
+    s.aux_score    = 1e18;
     if (!s.offsets) { perror("malloc"); exit(1); }
     return s;
 }
@@ -259,6 +315,8 @@ static Solution sol_clone(const Solution *src) {
     memcpy(c.offsets, src->offsets, (size_t)src->n_primes * sizeof(int));
     c.n_candidates = src->n_candidates;
     c.w_score      = src->w_score;
+    c.opt_score    = src->opt_score;
+    c.aux_score    = src->aux_score;
     return c;
 }
 
@@ -270,10 +328,9 @@ static void sol_free(Solution *s) {
 /* ------------------------------------------------------------------ */
 /* Evaluate: count uncovered positions in [1, gap_size].              */
 /* Uses caller-owned buffer buf[0..gap_size] (uint8_t).               */
-/* If w_out is non-NULL, also computes weighted fitness score.         */
 /* ------------------------------------------------------------------ */
-static int evaluate(const int *offsets, int n_primes, int gap_size,
-                    uint8_t *buf, double *w_out) {
+static int evaluate_candidate(const int *offsets, int n_primes, int gap_size,
+                              uint8_t *buf, double *opt_out, double *aux_out) {
     memset(buf, 0, (size_t)(gap_size + 1));
     for (int i = 0; i < n_primes; i++) {
         int p = PRIMES[i];
@@ -303,10 +360,93 @@ static int evaluate(const int *offsets, int n_primes, int gap_size,
             run_len = 0;
         }
     }
-    if (w_out) *w_out = wt + CLUSTER_PENALTY_WEIGHT * cluster_penalty;
+    if (opt_out) *opt_out = wt + CLUSTER_PENALTY_WEIGHT * cluster_penalty;
+    if (aux_out) *aux_out = wt;
     return cnt;
 }
 
+static int evaluate_probability(const int *offsets, int n_primes, int gap_size,
+                                uint8_t *buf, uint8_t *buf_wide,
+                                const FitnessConfig *fc,
+                                double *opt_out, double *aux_out) {
+    int window = fitness_window_size(gap_size, fc);
+    uint8_t *owned_wide = NULL;
+    if (!buf_wide) {
+        owned_wide = (uint8_t *)calloc((size_t)(window + 1), 1);
+        if (!owned_wide) {
+            perror("calloc");
+            exit(1);
+        }
+        buf_wide = owned_wide;
+    }
+
+    memset(buf, 0, (size_t)(gap_size + 1));
+    memset(buf_wide, 0, (size_t)(window + 1));
+
+    for (int i = 0; i < n_primes; i++) {
+        int p = PRIMES[i];
+        int o = offsets[i] % p;
+        int start = (o ? o : p);
+        for (int d = start; d <= gap_size; d += p)
+            buf[d] = 1;
+        for (int d = start; d <= window; d += p)
+            buf_wide[d] = 1;
+    }
+
+    int cnt = 0;
+    double wt = 0.0;
+    double cluster_penalty = 0.0;
+    int prev_uncovered = 0;
+    int run_len = 0;
+    for (int d = 1; d <= gap_size; d++) {
+        if (!buf[d]) {
+            cnt++;
+            wt += position_weight(d);
+            if (prev_uncovered) {
+                run_len++;
+                cluster_penalty += 1.0 + 0.25 * (double)(run_len - 1);
+            } else {
+                run_len = 1;
+            }
+            prev_uncovered = 1;
+        } else {
+            prev_uncovered = 0;
+            run_len = 0;
+        }
+    }
+
+    double center = 0.5 * (double)gap_size;
+    double scale = (gap_size > 0) ? (double)gap_size : 1.0;
+    double score = 0.0;
+    for (int d = 1; d <= window; d++) {
+        if (buf_wide[d])
+            continue;
+        double t = fabs(((double)d - center) / scale);
+        score += exp(-fc->kernel_a * pow(t, fc->kernel_b));
+    }
+
+    if (opt_out) *opt_out = score;
+    if (aux_out) *aux_out = wt + CLUSTER_PENALTY_WEIGHT * cluster_penalty;
+
+    free(owned_wide);
+    return cnt;
+}
+
+static int evaluate_solution(const int *offsets, int n_primes, int gap_size,
+                             uint8_t *buf, uint8_t *buf_wide,
+                             const FitnessConfig *fc,
+                             double *opt_out, double *aux_out) {
+    if (fc && fc->mode == FITNESS_PROBABILITY) {
+        return evaluate_probability(offsets, n_primes, gap_size,
+                                    buf, buf_wide, fc,
+                                    opt_out, aux_out);
+    }
+    return evaluate_candidate(offsets, n_primes, gap_size,
+                              buf, opt_out, aux_out);
+}
+
+/* Legacy entrypoint preserved until all optimization paths are migrated to
+ * mode-aware evaluation/comparison. */
 /* ------------------------------------------------------------------ */
 /* Greedy algorithm: assign offsets one prime at a time, choosing the  */
 /* offset that covers the most currently-uncovered gap positions.      */
@@ -459,6 +599,35 @@ static int local_search_one(int *offsets, int n_primes, int gap_size,
     return changed;
 }
 
+static int local_search_one_probability(int *offsets, int n_primes, int gap_size,
+                                        int idx, uint8_t *buf, uint8_t *buf_wide,
+                                        const FitnessConfig *fc) {
+    int p = PRIMES[idx];
+    int best_o = (offsets[idx] > 0) ? offsets[idx] : 1;
+    int best_cnt = INT_MAX;
+    double best_opt = 1e18;
+    double best_aux = 1e18;
+
+    int original = offsets[idx];
+    for (int o = 1; o < p; o++) {
+        offsets[idx] = o;
+        double opt_score, aux_score;
+        int cnt = evaluate_solution(offsets, n_primes, gap_size,
+                                    buf, buf_wide, fc,
+                                    &opt_score, &aux_score);
+        if (solution_better_metrics_mode(cnt, opt_score, aux_score,
+                                         best_cnt, best_opt, best_aux, fc)) {
+            best_cnt = cnt;
+            best_opt = opt_score;
+            best_aux = aux_score;
+            best_o = o;
+        }
+    }
+
+    offsets[idx] = best_o;
+    return best_o != original;
+}
+
 /* ------------------------------------------------------------------ */
 /* Pair local search: jointly optimise two primes (idx_a, idx_b).     */
 /* For every candidate offset of prime a, finds the best offset of    */
@@ -528,6 +697,106 @@ static int local_search_pair(int *offsets, int n_primes, int gap_size,
     return changed;
 }
 
+static int local_search_pair_probability(int *offsets, int n_primes, int gap_size,
+                                         int idx_a, int idx_b,
+                                         uint8_t *buf, uint8_t *buf_wide,
+                                         const FitnessConfig *fc) {
+    int pa = PRIMES[idx_a], pb = PRIMES[idx_b];
+    int best_oa = (offsets[idx_a] > 0) ? offsets[idx_a] : 1;
+    int best_ob = (offsets[idx_b] > 0) ? offsets[idx_b] : 1;
+    int best_cnt = INT_MAX;
+    double best_opt = 1e18;
+    double best_aux = 1e18;
+    int original_a = offsets[idx_a];
+    int original_b = offsets[idx_b];
+
+    for (int oa = 1; oa < pa; oa++) {
+        offsets[idx_a] = oa;
+        for (int ob = 1; ob < pb; ob++) {
+            offsets[idx_b] = ob;
+            double opt_score, aux_score;
+            int cnt = evaluate_solution(offsets, n_primes, gap_size,
+                                        buf, buf_wide, fc,
+                                        &opt_score, &aux_score);
+            if (solution_better_metrics_mode(cnt, opt_score, aux_score,
+                                             best_cnt, best_opt, best_aux, fc)) {
+                best_cnt = cnt;
+                best_opt = opt_score;
+                best_aux = aux_score;
+                best_oa = oa;
+                best_ob = ob;
+            }
+        }
+    }
+
+    offsets[idx_a] = best_oa;
+    offsets[idx_b] = best_ob;
+    return best_oa != original_a || best_ob != original_b;
+}
+
+static int local_search_triple_probability(int *offsets, int n_primes, int gap_size,
+                                           int idx_a, int idx_b, int idx_c,
+                                           uint8_t *buf, uint8_t *buf_wide,
+                                           const FitnessConfig *fc) {
+    int pa = PRIMES[idx_a], pb = PRIMES[idx_b], pc = PRIMES[idx_c];
+    int best_oa = (offsets[idx_a] > 0) ? offsets[idx_a] : 1;
+    int best_ob = (offsets[idx_b] > 0) ? offsets[idx_b] : 1;
+    int best_oc = (offsets[idx_c] > 0) ? offsets[idx_c] : 1;
+    int best_cnt = INT_MAX;
+    double best_opt = 1e18;
+    double best_aux = 1e18;
+    int original_a = offsets[idx_a];
+    int original_b = offsets[idx_b];
+    int original_c = offsets[idx_c];
+
+    for (int oa = 1; oa < pa; oa++) {
+        offsets[idx_a] = oa;
+        for (int ob = 1; ob < pb; ob++) {
+            offsets[idx_b] = ob;
+            for (int oc = 1; oc < pc; oc++) {
+                offsets[idx_c] = oc;
+                double opt_score, aux_score;
+                int cnt = evaluate_solution(offsets, n_primes, gap_size,
+                                            buf, buf_wide, fc,
+                                            &opt_score, &aux_score);
+                if (solution_better_metrics_mode(cnt, opt_score, aux_score,
+                                                 best_cnt, best_opt, best_aux, fc)) {
+                    best_cnt = cnt;
+                    best_opt = opt_score;
+                    best_aux = aux_score;
+                    best_oa = oa;
+                    best_ob = ob;
+                    best_oc = oc;
+                }
+            }
+        }
+    }
+
+    offsets[idx_a] = best_oa;
+    offsets[idx_b] = best_ob;
+    offsets[idx_c] = best_oc;
+    return best_oa != original_a || best_ob != original_b || best_oc != original_c;
+}
+
+static int local_search_triple_sweep_probability(int *offsets, int n_primes, int gap_size,
+                                                 int fixed, int max_triplets,
+                                                 uint8_t *buf, uint8_t *buf_wide,
+                                                 const FitnessConfig *fc) {
+    int total = 0;
+    int seen = 0;
+    for (int i = fixed; i < n_primes && seen < max_triplets; i++) {
+        for (int j = i + 1; j < n_primes && seen < max_triplets; j++) {
+            for (int k = j + 1; k < n_primes && seen < max_triplets; k++) {
+                total += local_search_triple_probability(offsets, n_primes, gap_size,
+                                                         i, j, k,
+                                                         buf, buf_wide, fc);
+                seen++;
+            }
+        }
+    }
+    return total;
+}
+
 /* ------------------------------------------------------------------ */
 /* Full single-prime sweep: optimise every non-fixed prime in order,   */
 /* repeating until no offset changes.  Returns total changes made.     */
@@ -565,8 +834,6 @@ static int pair_search_sweep(int *offsets, int n_primes, int gap_size,
 }
 
 /* forward declarations (needed by evolve) */
-static int evaluate(const int *offsets, int n_primes, int gap_size,
-                    uint8_t *buf, double *w_out);
 static void greedy_solve(int *offsets, int n_primes, int gap_size,
                          uint8_t *buf, unsigned *rng);
 static int local_search_one(int *offsets, int n_primes, int gap_size,
@@ -603,15 +870,19 @@ typedef struct {
     int             fixed;
     int             nfree;
     unsigned        rng;
+    const FitnessConfig *fc;
     const Solution *pop;       /* read-only during child generation     */
     int             pop_size;
     int            *offsets;   /* output: child offsets                 */
     int             n_candidates;
+    double          opt_score;
+    double          aux_score;
     double          w_score;
     int             stale;     /* input: guides extra mutation          */
     int             mut_level; /* adaptive mutation intensity (0..4)    */
     int             max_gens;  /* input: stale threshold denominator    */
     uint8_t        *buf;       /* pre-allocated (gap_size+1) bytes      */
+    uint8_t        *buf_wide;  /* pre-allocated probability window buf   */
 } EvoChildArgs;
 
 static void *evo_child_fn(void *arg) {
@@ -623,10 +894,10 @@ static void *evo_child_fn(void *arg) {
     /* tournament select two parents */
     int ai = (int)(rand_r(&rng) % (unsigned)a->pop_size);
     int bi = (int)(rand_r(&rng) % (unsigned)a->pop_size);
-    int p1 = solution_better(&a->pop[ai], &a->pop[bi]) ? ai : bi;
+    int p1 = solution_better_mode(&a->pop[ai], &a->pop[bi], a->fc) ? ai : bi;
     ai = (int)(rand_r(&rng) % (unsigned)a->pop_size);
     bi = (int)(rand_r(&rng) % (unsigned)a->pop_size);
-    int p2 = solution_better(&a->pop[ai], &a->pop[bi]) ? ai : bi;
+    int p2 = solution_better_mode(&a->pop[ai], &a->pop[bi], a->fc) ? ai : bi;
 
     /* uniform crossover: fixed primes from p1, free primes random */
     int *child = a->offsets;
@@ -666,10 +937,24 @@ static void *evo_child_fn(void *arg) {
     }
 
     /* memetic core: bring child to the nearest local optimum */
-    local_search_sweep(child, np, gs, fixed, a->buf);
+    if (a->fc->mode == FITNESS_PROBABILITY) {
+        for (;;) {
+            int changed = 0;
+            for (int i = fixed; i < np; i++)
+                changed += local_search_one_probability(child, np, gs, i,
+                                                        a->buf, a->buf_wide,
+                                                        a->fc);
+            if (!changed) break;
+        }
+    } else {
+        local_search_sweep(child, np, gs, fixed, a->buf);
+    }
 
     /* evaluate */
-    a->n_candidates = evaluate(child, np, gs, a->buf, &a->w_score);
+    a->n_candidates = evaluate_solution(child, np, gs,
+                                        a->buf, a->buf_wide, a->fc,
+                                        &a->opt_score, &a->aux_score);
+    a->w_score = legacy_display_score(a->fc->mode, a->opt_score, a->aux_score);
 
     /* write back advanced RNG state so the next generation gets a
      * different seed even when reusing the same EvoChildArgs slot */
@@ -679,7 +964,8 @@ static void *evo_child_fn(void *arg) {
 }
 
 static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
-                   int fixed, int max_gens, unsigned *rng, int n_threads) {
+                   int fixed, int max_gens, unsigned *rng, int n_threads,
+                   const FitnessConfig *fc) {
     int nfree = n_primes - fixed;
 
     /* allocate per-thread state once; reuse across all generations */
@@ -693,23 +979,49 @@ static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
         wargs[t].fixed     = fixed;
         wargs[t].nfree     = nfree;
         wargs[t].rng       = *rng ^ ((unsigned)t * 2246822519u);
+        wargs[t].fc        = fc;
         wargs[t].pop       = pop;
         wargs[t].pop_size  = pop_size;
         wargs[t].max_gens  = max_gens;
         wargs[t].offsets   = (int     *)malloc((size_t)n_primes * sizeof(int));
         wargs[t].buf       = (uint8_t *)calloc((size_t)(gap_size + 1), 1);
-        if (!wargs[t].offsets || !wargs[t].buf) { perror("alloc"); exit(1); }
+        wargs[t].buf_wide  = NULL;
+        if (fc->mode == FITNESS_PROBABILITY) {
+            int window = fitness_window_size(gap_size, fc);
+            wargs[t].buf_wide = (uint8_t *)calloc((size_t)(window + 1), 1);
+        }
+        if (!wargs[t].offsets || !wargs[t].buf ||
+            (fc->mode == FITNESS_PROBABILITY && !wargs[t].buf_wide)) {
+            perror("alloc");
+            exit(1);
+        }
     }
 
     /* find initial best */
     int    best_ever_cnt = INT_MAX;
-    double best_ever_w   = 1e18;
+    double best_ever_opt = 1e18;
+    double best_ever_aux = 1e18;
+    int    best_ever_min_cnt = INT_MAX;
     for (int i = 0; i < pop_size; i++) {
-        if (solution_better_metrics(pop[i].n_candidates, pop[i].w_score,
-                                    best_ever_cnt, best_ever_w)) {
+        if (solution_better_metrics_mode(pop[i].n_candidates,
+                                         pop[i].opt_score,
+                                         pop[i].aux_score,
+                                         best_ever_cnt,
+                                         best_ever_opt,
+                                         best_ever_aux,
+                                         fc)) {
             best_ever_cnt = pop[i].n_candidates;
-            best_ever_w   = pop[i].w_score;
+            best_ever_opt = pop[i].opt_score;
+            best_ever_aux = pop[i].aux_score;
         }
+        if (pop[i].n_candidates < best_ever_min_cnt)
+            best_ever_min_cnt = pop[i].n_candidates;
+    }
+
+    if (fc->mode == FITNESS_PROBABILITY) {
+        fprintf(stderr,
+            "  evolution seed: obj-best=%d cand-min=%d\n",
+            best_ever_cnt, best_ever_min_cnt);
     }
 
     int stale = 0;
@@ -729,9 +1041,7 @@ static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
         /* find worst in population */
         int worst = 0;
         for (int i = 1; i < pop_size; i++) {
-            if (pop[i].n_candidates > pop[worst].n_candidates ||
-                (pop[i].n_candidates == pop[worst].n_candidates &&
-                 pop[i].w_score > pop[worst].w_score))
+            if (solution_better_mode(&pop[worst], &pop[i], fc))
                 worst = i;
         }
 
@@ -739,28 +1049,40 @@ static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
         bool any_improved = false;
         for (int t = 0; t < n_threads; t++) {
             EvoChildArgs *w = &wargs[t];
-            if (solution_better_metrics(w->n_candidates, w->w_score,
-                                        pop[worst].n_candidates,
-                                        pop[worst].w_score)) {
+            if (solution_better_metrics_mode(w->n_candidates,
+                                             w->opt_score,
+                                             w->aux_score,
+                                             pop[worst].n_candidates,
+                                             pop[worst].opt_score,
+                                             pop[worst].aux_score,
+                                             fc)) {
                 memcpy(pop[worst].offsets, w->offsets,
                        (size_t)n_primes * sizeof(int));
                 pop[worst].n_candidates = w->n_candidates;
+                pop[worst].opt_score    = w->opt_score;
+                pop[worst].aux_score    = w->aux_score;
                 pop[worst].w_score      = w->w_score;
                 /* re-find worst after each insertion */
                 worst = 0;
                 for (int i = 1; i < pop_size; i++) {
-                    if (pop[i].n_candidates > pop[worst].n_candidates ||
-                        (pop[i].n_candidates == pop[worst].n_candidates &&
-                         pop[i].w_score > pop[worst].w_score))
+                    if (solution_better_mode(&pop[worst], &pop[i], fc))
                         worst = i;
                 }
             }
-            if (solution_better_metrics(w->n_candidates, w->w_score,
-                                        best_ever_cnt, best_ever_w)) {
+            if (solution_better_metrics_mode(w->n_candidates,
+                                             w->opt_score,
+                                             w->aux_score,
+                                             best_ever_cnt,
+                                             best_ever_opt,
+                                             best_ever_aux,
+                                             fc)) {
                 best_ever_cnt = w->n_candidates;
-                best_ever_w   = w->w_score;
+                best_ever_opt = w->opt_score;
+                best_ever_aux = w->aux_score;
                 any_improved  = true;
             }
+            if (w->n_candidates < best_ever_min_cnt)
+                best_ever_min_cnt = w->n_candidates;
         }
 
         if (any_improved) {
@@ -777,9 +1099,16 @@ static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
 
         /* progress */
         if ((gen + 1) % 200 == 0 || gen == max_gens - 1) {
-            fprintf(stderr,
-                "\r  evolution: gen %d/%d  best=%d  stale=%d  lvl=%d     ",
-                gen + 1, max_gens, best_ever_cnt, stale, mut_level);
+            if (fc->mode == FITNESS_PROBABILITY) {
+                fprintf(stderr,
+                    "\r  evolution: gen %d/%d  obj-best=%d  cand-min=%d  stale=%d  lvl=%d     ",
+                    gen + 1, max_gens, best_ever_cnt, best_ever_min_cnt,
+                    stale, mut_level);
+            } else {
+                fprintf(stderr,
+                    "\r  evolution: gen %d/%d  best=%d  stale=%d  lvl=%d     ",
+                    gen + 1, max_gens, best_ever_cnt, stale, mut_level);
+            }
             fflush(stderr);
         }
 
@@ -792,6 +1121,7 @@ static void evolve(Solution *pop, int pop_size, int n_primes, int gap_size,
     for (int t = 0; t < n_threads; t++) {
         free(wargs[t].offsets);
         free(wargs[t].buf);
+        free(wargs[t].buf_wide);
     }
     free(wargs);
     free(tids);
@@ -808,6 +1138,7 @@ typedef struct {
     int          ctr_fixed;
     int          restarts;
     unsigned     seed;
+    const FitnessConfig *fc;
     Solution    *results;   /* pre-allocated array of keep_n solutions */
     int          keep_n;
     int          best_cnt;  /* best n_candidates seen by this thread   */
@@ -822,8 +1153,16 @@ static void *greedy_worker(void *arg) {
     unsigned rng = a->seed;
 
     uint8_t *buf = (uint8_t *)calloc((size_t)(gs + 1), 1);
+    uint8_t *buf_wide = NULL;
+    if (a->fc->mode == FITNESS_PROBABILITY) {
+        int window = fitness_window_size(gs, a->fc);
+        buf_wide = (uint8_t *)calloc((size_t)(window + 1), 1);
+    }
     int     *tmp = (int     *)malloc((size_t)np * sizeof(int));
-    if (!buf || !tmp) { perror("malloc"); exit(1); }
+    if (!buf || !tmp || (a->fc->mode == FITNESS_PROBABILITY && !buf_wide)) {
+        perror("malloc");
+        exit(1);
+    }
 
     int best_cnt = INT_MAX;
 
@@ -834,23 +1173,27 @@ static void *greedy_worker(void *arg) {
             kick_offsets(tmp, np, a->ctr_fixed, kicks, &rng);
             local_search_sweep(tmp, np, gs, a->ctr_fixed, buf);
         }
-        double w_nc;
-        int nc = evaluate(tmp, np, gs, buf, &w_nc);
+        double opt_nc, aux_nc;
+        int nc = evaluate_solution(tmp, np, gs, buf, buf_wide, a->fc,
+                       &opt_nc, &aux_nc);
+        double w_nc = legacy_display_score(a->fc->mode, opt_nc, aux_nc);
         if (nc < best_cnt) best_cnt = nc;
 
         /* insert into local result pool if better than worst */
         int worst = 0;
         for (int i = 1; i < a->keep_n; i++) {
-            if (a->results[i].n_candidates > a->results[worst].n_candidates ||
-                (a->results[i].n_candidates == a->results[worst].n_candidates &&
-                 a->results[i].w_score > a->results[worst].w_score))
+            if (solution_better_mode(&a->results[worst], &a->results[i], a->fc))
                 worst = i;
         }
-        if (solution_better_metrics(nc, w_nc,
-                                    a->results[worst].n_candidates,
-                                    a->results[worst].w_score)) {
+        if (solution_better_metrics_mode(nc, opt_nc, aux_nc,
+                                         a->results[worst].n_candidates,
+                                         a->results[worst].opt_score,
+                                         a->results[worst].aux_score,
+                                         a->fc)) {
             memcpy(a->results[worst].offsets, tmp, (size_t)np * sizeof(int));
             a->results[worst].n_candidates = nc;
+            a->results[worst].opt_score    = opt_nc;
+            a->results[worst].aux_score    = aux_nc;
             a->results[worst].w_score      = w_nc;
         }
 
@@ -858,6 +1201,7 @@ static void *greedy_worker(void *arg) {
     }
 
     a->best_cnt = best_cnt;
+    free(buf_wide);
     free(buf);
     free(tmp);
     return NULL;
@@ -873,6 +1217,7 @@ typedef struct {
     int       ils_fixed;
     int       rounds;
     unsigned  seed;
+    const FitnessConfig *fc;
     int      *start_offsets;   /* read-only: initial solution to start from */
     Solution  result;          /* best solution found by this thread */
 } ILSWorkerArgs;
@@ -885,14 +1230,35 @@ static void *ils_worker(void *arg) {
 
     uint8_t *buf  = (uint8_t *)calloc((size_t)(gs + 1), 1);
     uint8_t *buf2 = (uint8_t *)calloc((size_t)(gs + 1), 1);
+    uint8_t *buf_wide = NULL;
+    if (a->fc->mode == FITNESS_PROBABILITY) {
+        int window = fitness_window_size(gs, a->fc);
+        buf_wide = (uint8_t *)calloc((size_t)(window + 1), 1);
+    }
     int     *work = (int     *)malloc((size_t)np * sizeof(int));
-    if (!buf || !buf2 || !work) { perror("malloc"); exit(1); }
+    if (!buf || !buf2 || !work ||
+        (a->fc->mode == FITNESS_PROBABILITY && !buf_wide)) {
+        perror("malloc");
+        exit(1);
+    }
 
     /* start from a copy of the seed solution, already local-search refined */
     memcpy(work, a->start_offsets, (size_t)np * sizeof(int));
-    local_search_sweep(work, np, gs, a->ils_fixed, buf);
-    double best_w;
-    int best_cnt = evaluate(work, np, gs, buf, &best_w);
+    if (a->fc->mode == FITNESS_PROBABILITY) {
+        for (;;) {
+            int changed = 0;
+            for (int i = a->ils_fixed; i < np; i++)
+                changed += local_search_one_probability(work, np, gs, i,
+                                                        buf, buf_wide,
+                                                        a->fc);
+            if (!changed) break;
+        }
+    } else {
+        local_search_sweep(work, np, gs, a->ils_fixed, buf);
+    }
+    double best_opt, best_aux;
+    int best_cnt = evaluate_solution(work, np, gs, buf, buf_wide, a->fc,
+                                     &best_opt, &best_aux);
 
     int *best_offsets = (int *)malloc((size_t)np * sizeof(int));
     if (!best_offsets) { perror("malloc"); exit(1); }
@@ -915,18 +1281,39 @@ static void *ils_worker(void *arg) {
         /* also kick the weakest prime every 4th round for targeted repair */
         if ((r & 3) == 0) {
             int weak_idx = kick_weakest_prime(work, np, gs, a->ils_fixed, buf2, &rng);
-            if (weak_idx >= 0)
-                local_search_one(work, np, gs, weak_idx, buf);
+            if (weak_idx >= 0) {
+                if (a->fc->mode == FITNESS_PROBABILITY) {
+                    local_search_one_probability(work, np, gs, weak_idx,
+                                                 buf, buf_wide, a->fc);
+                } else {
+                    local_search_one(work, np, gs, weak_idx, buf);
+                }
+            }
         }
         /* fast local search only — pair_search_sweep runs once at chain end */
-        local_search_sweep(work, np, gs, a->ils_fixed, buf);
+        if (a->fc->mode == FITNESS_PROBABILITY) {
+            for (;;) {
+                int changed = 0;
+                for (int i = a->ils_fixed; i < np; i++)
+                    changed += local_search_one_probability(work, np, gs, i,
+                                                            buf, buf_wide,
+                                                            a->fc);
+                if (!changed) break;
+            }
+        } else {
+            local_search_sweep(work, np, gs, a->ils_fixed, buf);
+        }
 
-        double w_nc;
-        int nc = evaluate(work, np, gs, buf, &w_nc);
-        if (solution_better_metrics(nc, w_nc, best_cnt, best_w)) {
+        double opt_nc, aux_nc;
+        int nc = evaluate_solution(work, np, gs, buf, buf_wide, a->fc,
+                                   &opt_nc, &aux_nc);
+        if (solution_better_metrics_mode(nc, opt_nc, aux_nc,
+                                         best_cnt, best_opt, best_aux,
+                                         a->fc)) {
             memcpy(best_offsets, work, (size_t)np * sizeof(int));
             best_cnt = nc;
-            best_w   = w_nc;
+            best_opt = opt_nc;
+            best_aux = aux_nc;
             stale    = 0;
         } else {
             stale++;
@@ -936,16 +1323,40 @@ static void *ils_worker(void *arg) {
 
     /* pair_search_sweep once at chain end: polishes the best found without
        paying its cost on every round (~100x fewer pair-sweep calls total) */
-    pair_search_sweep(best_offsets, np, gs, a->ils_fixed, buf, buf2);
-    best_cnt = evaluate(best_offsets, np, gs, buf, &best_w);
+    if (a->fc->mode == FITNESS_PROBABILITY) {
+        int nfree = np - a->ils_fixed;
+        for (;;) {
+            int changed = 0;
+            for (int i = a->ils_fixed; i < np; i++)
+                for (int j = i + 1; j < np; j++)
+                    changed += local_search_pair_probability(best_offsets, np, gs,
+                                                             i, j,
+                                                             buf, buf_wide,
+                                                             a->fc);
+            if (!changed) break;
+        }
+        if (nfree >= 3) {
+            int max_triplets = 8;
+            local_search_triple_sweep_probability(best_offsets, np, gs,
+                                                  a->ils_fixed, max_triplets,
+                                                  buf, buf_wide, a->fc);
+        }
+    } else {
+        pair_search_sweep(best_offsets, np, gs, a->ils_fixed, buf, buf2);
+    }
+    best_cnt = evaluate_solution(best_offsets, np, gs, buf, buf_wide, a->fc,
+                                 &best_opt, &best_aux);
 
     a->result.offsets      = best_offsets;
     a->result.n_candidates = best_cnt;
-    a->result.w_score      = best_w;
+    a->result.opt_score    = best_opt;
+    a->result.aux_score    = best_aux;
+    a->result.w_score      = legacy_display_score(a->fc->mode, best_opt, best_aux);
     a->result.n_primes     = np;
     a->result.gap_size     = gs;
 
     free(work);
+    free(buf_wide);
     free(buf2);
     free(buf);
     return NULL;
@@ -956,7 +1367,8 @@ static void *ils_worker(void *arg) {
 /* ------------------------------------------------------------------ */
 static void write_crt_file(const char *path, const Solution *sol,
                            double merit, int shift,
-                           const Phase1Diag *p1) {
+                           const Phase1Diag *p1,
+                           const FitnessConfig *fc) {
     FILE *f = fopen(path, "w");
     if (!f) { perror(path); exit(1); }
 
@@ -966,6 +1378,19 @@ static void write_crt_file(const char *path, const Solution *sol,
     fprintf(f, "shift %d\n", shift);
     fprintf(f, "gap_target %d\n", sol->gap_size);
     fprintf(f, "n_candidates %d\n", sol->n_candidates);
+    fprintf(f, "# fitness_mode %s\n",
+            fc->mode == FITNESS_PROBABILITY ? "probability" : "candidate");
+    if (fc->mode == FITNESS_PROBABILITY) {
+        fprintf(f, "# probability_score %.9f\n", sol->opt_score);
+        fprintf(f, "# candidate_weighted_score %.9f\n", sol->aux_score);
+        fprintf(f, "# fitness_window_factor %.6f\n", fc->window_factor);
+        fprintf(f, "# fitness_window_cap %d\n", fc->window_cap);
+        fprintf(f, "# fitness_kernel_a %.6f\n", fc->kernel_a);
+        fprintf(f, "# fitness_kernel_b %.6f\n", fc->kernel_b);
+    } else {
+        fprintf(f, "# candidate_weighted_score %.9f\n", sol->opt_score);
+        fprintf(f, "# candidate_raw_weight_sum %.9f\n", sol->aux_score);
+    }
     if (p1) {
         fprintf(f, "# phase1_kernel exp(-a*|x/scale|^b)\n");
         fprintf(f, "# phase1_a %.6f\n", p1->a);
@@ -1004,6 +1429,14 @@ static void usage(const char *prog) {
         "  --ctr-range  R        Percent deviation from n_primes (default: 0)\n"
         "  --ctr-file   FILE     Output CRT file path (required)\n"
         "  --threads    N        Parallel threads for greedy+ILS (default: CPU count)\n"
+        "  --fitness-mode MODE  Optimization objective: candidate|probability (default: candidate)\n"
+        "  --fitness-window-factor F  Probability mode window factor W=ceil(F*gap) (default: 2.0)\n"
+        "  --fitness-window-cap N     Probability mode hard cap for W, 0=no cap (default: 0)\n"
+        "  --fitness-kernel-a A       Probability mode kernel parameter a (default: 5.8)\n"
+        "  --fitness-kernel-b B       Probability mode kernel parameter b (default: 3.3)\n"
+        "                           Probability mode also enables probability-aware\n"
+        "                           one-prime/pair local search plus a bounded\n"
+        "                           three-prime final polish pass.\n"
         "  --phase3             Enable hybrid selection (feature-gated; default: off)\n"
         "  --phase3-delta N     Candidate tolerance window for phase3 (default: 2)\n"
         "  --phase3-mean-eps E  Minimum phase1 mean improvement for phase3 (default: 0.0005)\n"
@@ -1037,6 +1470,13 @@ int main(int argc, char **argv) {
     int    ctr_range    = 0;
     char  *ctr_file     = NULL;
     int    n_threads    = 0;   /* 0 = auto-detect */
+    FitnessConfig fitness_cfg = {
+        FITNESS_CANDIDATE,
+        2.0,
+        0,
+        PHASE1_A_DEFAULT,
+        PHASE1_B_DEFAULT,
+    };
     bool   phase3_enabled = false;
     int    phase3_delta = 2;
     double phase3_mean_eps = 0.0005;
@@ -1053,6 +1493,11 @@ int main(int argc, char **argv) {
         {"ctr-range",      required_argument, NULL, 'r'},
         {"ctr-file",       required_argument, NULL, 'o'},
         {"threads",        required_argument, NULL, 'T'},
+        {"fitness-mode",   required_argument, NULL, 'F'},
+        {"fitness-window-factor", required_argument, NULL, 'W'},
+        {"fitness-window-cap", required_argument, NULL, 'c'},
+        {"fitness-kernel-a", required_argument, NULL, 'A'},
+        {"fitness-kernel-b", required_argument, NULL, 'B'},
         {"phase3",         no_argument,       NULL, 'P'},
         {"phase3-delta",   required_argument, NULL, 'd'},
         {"phase3-mean-eps",required_argument, NULL, 'q'},
@@ -1061,7 +1506,7 @@ int main(int argc, char **argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "Cp:m:b:s:ef:i:r:o:T:Pd:q:h",
+    while ((opt = getopt_long(argc, argv, "Cp:m:b:s:ef:i:r:o:T:F:W:c:A:B:Pd:q:h",
                               long_opts, NULL)) != -1) {
         switch (opt) {
         case 'C': /* --calc-ctr: accepted for compat, always active */ break;
@@ -1075,6 +1520,20 @@ int main(int argc, char **argv) {
         case 'r': ctr_range    = atoi(optarg); break;
         case 'o': ctr_file     = optarg;        break;
         case 'T': n_threads    = atoi(optarg); break;
+        case 'F':
+            if (strcmp(optarg, "candidate") == 0) {
+                fitness_cfg.mode = FITNESS_CANDIDATE;
+            } else if (strcmp(optarg, "probability") == 0) {
+                fitness_cfg.mode = FITNESS_PROBABILITY;
+            } else {
+                fprintf(stderr, "error: --fitness-mode must be candidate or probability\n");
+                return 1;
+            }
+            break;
+        case 'W': fitness_cfg.window_factor = atof(optarg); break;
+        case 'c': fitness_cfg.window_cap = atoi(optarg); break;
+        case 'A': fitness_cfg.kernel_a = atof(optarg); break;
+        case 'B': fitness_cfg.kernel_b = atof(optarg); break;
         case 'P': phase3_enabled = true;         break;
         case 'd': phase3_delta = atoi(optarg);   break;
         case 'q': phase3_mean_eps = atof(optarg); break;
@@ -1100,6 +1559,10 @@ int main(int argc, char **argv) {
     if (ctr_fixed > ctr_primes) ctr_fixed = ctr_primes;
     if (ctr_ivs < 2) ctr_ivs = 2;
     if (ctr_strength < 1) ctr_strength = 1;
+    if (fitness_cfg.window_factor < 1.0) fitness_cfg.window_factor = 1.0;
+    if (fitness_cfg.window_cap < 0) fitness_cfg.window_cap = 0;
+    if (fitness_cfg.kernel_a <= 0.0) fitness_cfg.kernel_a = PHASE1_A_DEFAULT;
+    if (fitness_cfg.kernel_b <= 0.0) fitness_cfg.kernel_b = PHASE1_B_DEFAULT;
     if (phase3_delta < 0) phase3_delta = 0;
     if (phase3_mean_eps < 0.0) phase3_mean_eps = 0.0;
 
@@ -1113,6 +1576,9 @@ int main(int argc, char **argv) {
     double prim_bits = primorial_log2(ctr_primes);
     int    shift     = (int)ceil(prim_bits) + ctr_bits;
     int    gap_size  = (int)ceil(ctr_merit * (256.0 + (double)shift) * log(2.0));
+    int    effective_ivs = ctr_ivs;
+    if (effective_ivs > ctr_strength)
+        effective_ivs = ctr_strength;
 
     fprintf(stderr, "CRT gap solver\n");
     fprintf(stderr, "  primes      : %d  (2 .. %d)\n",
@@ -1124,9 +1590,17 @@ int main(int argc, char **argv) {
     fprintf(stderr, "  gap target  : %d\n", gap_size);
     fprintf(stderr, "  strength    : %d  (greedy restarts)\n", ctr_strength);
     fprintf(stderr, "  threads     : %d\n", n_threads);
+        fprintf(stderr, "  fitness     : %s\n",
+            fitness_cfg.mode == FITNESS_PROBABILITY ? "probability" : "candidate");
+        if (fitness_cfg.mode == FITNESS_PROBABILITY) {
+        fprintf(stderr, "  fit-window  : factor=%.2f  cap=%d\n",
+            fitness_cfg.window_factor, fitness_cfg.window_cap);
+        fprintf(stderr, "  fit-kernel  : a=%.3f  b=%.3f\n",
+            fitness_cfg.kernel_a, fitness_cfg.kernel_b);
+        }
     if (ctr_evolution)
-        fprintf(stderr, "  evolution   : ivs=%d  fixed=%d\n",
-                ctr_ivs, ctr_fixed);
+        fprintf(stderr, "  evolution   : ivs=%d (effective=%d)  fixed=%d\n",
+                ctr_ivs, effective_ivs, ctr_fixed);
     if (ctr_range > 0)
         fprintf(stderr, "  range       : +/-%d%%  (primes %d..%d)\n",
                 ctr_range,
@@ -1180,7 +1654,14 @@ int main(int argc, char **argv) {
     global_best_phase1.scale      = 1.0;
 
     int greedy_best_cnt = INT_MAX;
+    int greedy_best_mode_cnt = INT_MAX;
+    double greedy_best_mode_opt = 1e18;
+    double greedy_best_mode_aux = 1e18;
     int phase_best_cnt  = INT_MAX;
+    int phase_best_mode_cnt = INT_MAX;
+    double phase_best_mode_opt = 1e18;
+    double phase_best_mode_aux = 1e18;
+    int phase_best_min_cnt = INT_MAX;
 
     for (int np = lo_np; np <= hi_np; np++) {
         double pb = primorial_log2(np);
@@ -1226,6 +1707,7 @@ int main(int argc, char **argv) {
             wargs[t].ctr_fixed      = ctr_fixed;
             wargs[t].restarts       = r_end - r_start;
             wargs[t].seed           = base_seed ^ ((unsigned)t * 2654435761u);
+            wargs[t].fc             = &fitness_cfg;
             wargs[t].keep_n         = pop_size;
             wargs[t].best_cnt       = INT_MAX;
             wargs[t].done_restarts  = &done_restarts;
@@ -1247,10 +1729,17 @@ int main(int argc, char **argv) {
                 for (int t = 0; t < actual_threads; t++)
                     if (wargs[t].best_cnt < display_best)
                         display_best = wargs[t].best_cnt;
-                fprintf(stderr,
-                    "\r  greedy: %d/%d restarts  best=%d candidates     ",
-                    done, ctr_strength,
-                    display_best < INT_MAX ? display_best : 0);
+                if (fitness_cfg.mode == FITNESS_PROBABILITY) {
+                    fprintf(stderr,
+                        "\r  greedy: %d/%d restarts  cand-min=%d     ",
+                        done, ctr_strength,
+                        display_best < INT_MAX ? display_best : 0);
+                } else {
+                    fprintf(stderr,
+                        "\r  greedy: %d/%d restarts  best=%d candidates     ",
+                        done, ctr_strength,
+                        display_best < INT_MAX ? display_best : 0);
+                }
                 fflush(stderr);
                 last_shown = done;
             }
@@ -1271,17 +1760,32 @@ int main(int argc, char **argv) {
                 if (src->n_candidates == INT_MAX) continue;
                 int worst = 0;
                 for (int j = 1; j < pop_size; j++)
-                    if (pop[j].n_candidates > pop[worst].n_candidates ||
-                        (pop[j].n_candidates == pop[worst].n_candidates &&
-                         pop[j].w_score > pop[worst].w_score))
+                    if (solution_better_mode(&pop[worst], &pop[j], &fitness_cfg))
                         worst = j;
-                if (solution_better_metrics(src->n_candidates, src->w_score,
-                                            pop[worst].n_candidates,
-                                            pop[worst].w_score)) {
+                if (solution_better_metrics_mode(src->n_candidates,
+                                                 src->opt_score,
+                                                 src->aux_score,
+                                                 pop[worst].n_candidates,
+                                                 pop[worst].opt_score,
+                                                 pop[worst].aux_score,
+                                                 &fitness_cfg)) {
                     memcpy(pop[worst].offsets, src->offsets,
                            (size_t)np * sizeof(int));
                     pop[worst].n_candidates = src->n_candidates;
+                    pop[worst].opt_score    = src->opt_score;
+                    pop[worst].aux_score    = src->aux_score;
                     pop[worst].w_score      = src->w_score;
+                }
+                if (solution_better_metrics_mode(src->n_candidates,
+                                                 src->opt_score,
+                                                 src->aux_score,
+                                                 greedy_best_mode_cnt,
+                                                 greedy_best_mode_opt,
+                                                 greedy_best_mode_aux,
+                                                 &fitness_cfg)) {
+                    greedy_best_mode_cnt = src->n_candidates;
+                    greedy_best_mode_opt = src->opt_score;
+                    greedy_best_mode_aux = src->aux_score;
                 }
             }
             for (int i = 0; i < pop_size; i++) sol_free(&thread_results[t][i]);
@@ -1313,8 +1817,8 @@ int main(int argc, char **argv) {
             if (gens < 1000)  gens = 1000;
             if (gens > 6000)  gens = 6000;
 
-            evolve(pop, pop_size, np, gs, adj_fixed, gens, &evo_rng,
-                   actual_threads);
+                 evolve(pop, pop_size, np, gs, adj_fixed, gens, &evo_rng,
+                     actual_threads, &fitness_cfg);
         }
 
         /* ---- Phase 3: Iterated Local Search (ILS), parallel ---- */
@@ -1325,7 +1829,7 @@ int main(int argc, char **argv) {
             /* find current best */
             int bi = 0;
             for (int i = 1; i < pop_size; i++)
-                if (solution_better(&pop[i], &pop[bi]))
+                if (solution_better_mode(&pop[i], &pop[bi], &fitness_cfg))
                     bi = i;
 
             int ils_fixed = ctr_fixed < np ? ctr_fixed : np;
@@ -1353,6 +1857,7 @@ int main(int argc, char **argv) {
                 ils_wargs[t].ils_fixed     = ils_fixed;
                 ils_wargs[t].rounds        = rounds_per_thread;
                 ils_wargs[t].seed          = ils_base_seed ^ ((unsigned)t * 1234567891u);
+                ils_wargs[t].fc            = &fitness_cfg;
                 ils_wargs[t].start_offsets = pop[start_idx].offsets;
                 ils_wargs[t].result.offsets = NULL;
                 pthread_create(&ils_tids[t], NULL, ils_worker, &ils_wargs[t]);
@@ -1371,12 +1876,18 @@ int main(int argc, char **argv) {
             for (int t = 0; t < actual_threads; t++) {
                 ILSWorkerArgs *w = &ils_wargs[t];
                 if (w->result.offsets &&
-                    solution_better_metrics(w->result.n_candidates,
-                                            w->result.w_score,
-                                            ils_best_cnt, pop[bi].w_score)) {
+                    solution_better_metrics_mode(w->result.n_candidates,
+                                                 w->result.opt_score,
+                                                 w->result.aux_score,
+                                                 ils_best_cnt,
+                                                 pop[bi].opt_score,
+                                                 pop[bi].aux_score,
+                                                 &fitness_cfg)) {
                     memcpy(pop[bi].offsets, w->result.offsets,
                            (size_t)np * sizeof(int));
                     pop[bi].n_candidates = w->result.n_candidates;
+                    pop[bi].opt_score    = w->result.opt_score;
+                    pop[bi].aux_score    = w->result.aux_score;
                     pop[bi].w_score      = w->result.w_score;
                     ils_best_cnt         = w->result.n_candidates;
                 }
@@ -1437,11 +1948,19 @@ int main(int argc, char **argv) {
             }
         } else {
             for (int i = 1; i < pop_size; i++)
-                if (solution_better(&pop[i], &pop[best_idx]))
+                if (solution_better_mode(&pop[i], &pop[best_idx], &fitness_cfg))
                     best_idx = i;
         }
 
         phase_best_cnt = pop[best_idx].n_candidates;
+        phase_best_mode_cnt = pop[best_idx].n_candidates;
+        phase_best_mode_opt = pop[best_idx].opt_score;
+        phase_best_mode_aux = pop[best_idx].aux_score;
+        phase_best_min_cnt = pop[0].n_candidates;
+        for (int i = 1; i < pop_size; i++) {
+            if (pop[i].n_candidates < phase_best_min_cnt)
+                phase_best_min_cnt = pop[i].n_candidates;
+        }
 
         /* Phase-2 shadow ranking: independently track highest phase1 score.
            This does NOT affect production best selection. */
@@ -1467,7 +1986,7 @@ int main(int argc, char **argv) {
                 better = 1;
             } else if (cand_diag.score_mean == shadow_diag.score_mean &&
                        cand_diag.score_raw == shadow_diag.score_raw &&
-                       solution_better(&pop[i], &pop[shadow_idx])) {
+                       solution_better_mode(&pop[i], &pop[shadow_idx], &fitness_cfg)) {
                 better = 1;
             }
             if (better) {
@@ -1482,7 +2001,7 @@ int main(int argc, char **argv) {
              shadow_diag.score_raw > phase1_shadow_diag.score_raw) ||
             (shadow_diag.score_mean == phase1_shadow_diag.score_mean &&
              shadow_diag.score_raw == phase1_shadow_diag.score_raw &&
-             solution_better(&pop[shadow_idx], &phase1_shadow_best))) {
+             solution_better_mode(&pop[shadow_idx], &phase1_shadow_best, &fitness_cfg))) {
             if (phase1_shadow_best.offsets) sol_free(&phase1_shadow_best);
             phase1_shadow_best = sol_clone(&pop[shadow_idx]);
             phase1_shadow_diag = shadow_diag;
@@ -1502,7 +2021,7 @@ int main(int argc, char **argv) {
                                                         phase3_delta,
                                                         phase3_mean_eps);
             } else {
-                replace_global = solution_better(&pop[best_idx], &global_best);
+                replace_global = solution_better_mode(&pop[best_idx], &global_best, &fitness_cfg);
             }
             if (replace_global) {
                 sol_free(&global_best);
@@ -1522,18 +2041,38 @@ int main(int argc, char **argv) {
     int    sh = (int)ceil(pb) + ctr_bits;
 
     fprintf(stderr, "\n========================================\n");
-    fprintf(stderr, "  greedy:    %d candidates\n", greedy_best_cnt);
-    fprintf(stderr, "  evolution: %d candidates\n", phase_best_cnt);
+    if (fitness_cfg.mode == FITNESS_PROBABILITY) {
+        fprintf(stderr, "  greedy (cand-min):    %d candidates\n", greedy_best_cnt);
+        fprintf(stderr, "  greedy (obj-best):    %d candidates\n", greedy_best_mode_cnt);
+        fprintf(stderr,
+                "  evolution (obj-best): %d candidates  [p=%.6f, aux=%.3f]\n",
+                phase_best_mode_cnt, phase_best_mode_opt, phase_best_mode_aux);
+        fprintf(stderr, "  evolution (cand-min): %d candidates\n", phase_best_min_cnt);
+    } else {
+        fprintf(stderr, "  greedy:    %d candidates\n", greedy_best_cnt);
+        fprintf(stderr, "  evolution: %d candidates\n", phase_best_cnt);
+    }
     fprintf(stderr, "  best:  %d candidates  (%d primes, shift=%d)\n",
             global_best.n_candidates, global_best.n_primes, sh);
     fprintf(stderr, "  uncovered ratio: %.2f%%\n",
             100.0 * (double)global_best.n_candidates
                    / (double)global_best.gap_size);
-    fprintf(stderr, "  weighted score:  %.3f  (mean w/cand: %.4f)\n",
-            global_best.w_score,
-            global_best.n_candidates > 0
-                ? global_best.w_score / (double)global_best.n_candidates
-                : 0.0);
+    fprintf(stderr, "  objective mode: %s\n",
+            fitness_cfg.mode == FITNESS_PROBABILITY ? "probability" : "candidate");
+    if (fitness_cfg.mode == FITNESS_PROBABILITY) {
+        fprintf(stderr, "  probability score: %.6f\n", global_best.opt_score);
+        fprintf(stderr, "  candidate weighted score: %.3f  (mean w/cand: %.4f)\n",
+                global_best.w_score,
+                global_best.n_candidates > 0
+                    ? global_best.w_score / (double)global_best.n_candidates
+                    : 0.0);
+    } else {
+        fprintf(stderr, "  candidate weighted score: %.3f  (mean w/cand: %.4f)\n",
+                global_best.w_score,
+                global_best.n_candidates > 0
+                    ? global_best.w_score / (double)global_best.n_candidates
+                    : 0.0);
+    }
     fprintf(stderr, "========================================\n");
 
     uint8_t *p1_buf = (uint8_t *)calloc((size_t)(global_best.gap_size + 1), 1);
@@ -1571,7 +2110,7 @@ int main(int argc, char **argv) {
                 PRIMES[i], global_best.offsets[i]);
 
     /* ---- Write output file ---- */
-    write_crt_file(ctr_file, &global_best, ctr_merit, sh, &p1);
+    write_crt_file(ctr_file, &global_best, ctr_merit, sh, &p1, &fitness_cfg);
 
     if (phase1_shadow_best.offsets)
         sol_free(&phase1_shadow_best);

@@ -553,6 +553,10 @@ void cgbn_fermat_kernel_t(cgbn_mem_t<BITS> *cands,
     int32_t  pos;
 
     cgbn_load    (env, N,    cands + id);
+    if ((cgbn_extract_bits_ui32(env, N, 0, 1) & 1u) == 0u) {
+        results[id] = 0;
+        return;
+    }
     cgbn_sub_ui32(env, e,    N, 1);
     cgbn_set_ui32(env, base, 2);
     np0 = cgbn_bn2mont(env, r, base, N);
@@ -613,6 +617,10 @@ void cgbn_fermat_kernel_soa_t(const uint64_t * __restrict__ cands_soa,
 
     __syncwarp();
     cgbn_load    (env, N,    &sh_n_mem[local_instance]);
+    if ((cgbn_extract_bits_ui32(env, N, 0, 1) & 1u) == 0u) {
+        results[id] = 0;
+        return;
+    }
     cgbn_sub_ui32(env, e,    N, 1);
     cgbn_set_ui32(env, base, 2);
     np0 = cgbn_bn2mont(env, r, base, N);
@@ -674,29 +682,41 @@ int fermat_block_size_for_al(int al)
     return 128;
 }
 
-template<int AL>
+template<int AL, bool SOA>
 static __host__ __forceinline__
 int fermat_block_size_for_kernel()
 {
-    static int cached = 0;
-    if (cached > 0) return cached;
+    enum { MAX_CACHE_DEVS = 32 };
+    static int cached[MAX_CACHE_DEVS] = {0};
+
+    int dev = 0;
+    cudaError_t err = cudaGetDevice(&dev);
+    if (err != cudaSuccess || dev < 0 || dev >= MAX_CACHE_DEVS)
+        return fermat_block_size_for_al(AL);
+
+    if (cached[dev] > 0) return cached[dev];
 
     int min_grid = 0;
     int block = 0;
-    cudaError_t err = cudaOccupancyMaxPotentialBlockSize(
-        &min_grid, &block, fermat_kernel_t<AL>, 0, 0);
+    if constexpr (SOA) {
+        err = cudaOccupancyMaxPotentialBlockSize(
+            &min_grid, &block, fermat_kernel_soa_t<AL>, 0, 0);
+    } else {
+        err = cudaOccupancyMaxPotentialBlockSize(
+            &min_grid, &block, fermat_kernel_t<AL>, 0, 0);
+    }
 
     if (err == cudaSuccess && block > 0) {
         /* Keep launch shape warp-aligned and conservative for heavy kernels. */
         block = (block / 32) * 32;
         if (block < 64)  block = 64;
         if (block > 256) block = 256;
-        cached = block;
+        cached[dev] = block;
     } else {
-        cached = fermat_block_size_for_al(AL);
+        cached[dev] = fermat_block_size_for_al(AL);
     }
 
-    return cached;
+    return cached[dev];
 }
 
 static __host__ __forceinline__ int cgbn_supports_al(int al)
@@ -815,7 +835,9 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
 
 #define FERMAT_DISPATCH(W) \
     do { \
-        int block = fermat_block_size_for_kernel<W>(); \
+        int block = use_soa_layout \
+            ? fermat_block_size_for_kernel<W, true>() \
+            : fermat_block_size_for_kernel<W, false>(); \
         int grid  = (int)((count + (uint32_t)block - 1u) / (uint32_t)block); \
         if (use_soa_layout) \
             fermat_kernel_soa_t<W><<<grid, block, 0, stream>>>(d_cands_soa, d_results, count); \
@@ -1054,6 +1076,64 @@ fail:
  *  Async double-buffered pipeline
  * ═══════════════════════════════════════════════════════════════════ */
 
+static int gpu_fermat_submit_locked(gpu_fermat_ctx *ctx, int slot,
+                                    const uint64_t *candidates,
+                                    size_t count)
+{
+    cudaError_t err = ensure_device(ctx->device_id);
+    if (err != cudaSuccess) return -1;
+
+    int active_limbs = __atomic_load_n(&ctx->active_limbs, __ATOMIC_RELAXED);
+    int cgbn_path = cgbn_supports_al(active_limbs);
+    int use_soa_scalar = !cgbn_path;
+    int use_soa_cgbn = cgbn_path && gpu_fermat_cgbn_soa_enabled();
+    int use_soa_layout = use_soa_scalar || use_soa_cgbn;
+
+    if (use_soa_layout) {
+        uint64_t *dst = ctx->h_cands_soa[slot];
+        const uint64_t *src = candidates;
+        int stride = active_limbs;
+        for (size_t i = 0; i < count; i++) {
+            size_t b = i * (size_t)stride;
+            for (int limb = 0; limb < stride; limb++)
+                dst[(size_t)limb * count + i] = src[b + (size_t)limb];
+        }
+
+        size_t soa_bytes = count * (size_t)stride * sizeof(uint64_t);
+        err = cudaMemcpyAsync(ctx->d_cands_soa[slot], ctx->h_cands_soa[slot],
+                              soa_bytes,
+                              cudaMemcpyHostToDevice, ctx->stream[slot]);
+        if (err != cudaSuccess) return -1;
+    } else {
+        int stride = active_limbs;
+        size_t bytes = count * (size_t)stride * sizeof(uint64_t);
+
+        memcpy(ctx->h_cands[slot], candidates, bytes);
+
+        err = cudaMemcpyAsync(ctx->d_cands[slot], ctx->h_cands[slot],
+                              bytes,
+                              cudaMemcpyHostToDevice, ctx->stream[slot]);
+        if (err != cudaSuccess) return -1;
+    }
+
+    err = launch_fermat(active_limbs, ctx->stream[slot],
+                        ctx->d_cands[slot], ctx->d_cands_soa[slot],
+                        ctx->d_results[slot], (uint32_t)count,
+                        use_soa_layout);
+    if (err != cudaSuccess) return -1;
+
+    err = cudaMemcpyAsync(ctx->h_results[slot], ctx->d_results[slot],
+                          count, cudaMemcpyDeviceToHost,
+                          ctx->stream[slot]);
+    if (err != cudaSuccess) return -1;
+
+    err = cudaEventRecord(ctx->event[slot], ctx->stream[slot]);
+    if (err != cudaSuccess) return -1;
+
+    ctx->pending[slot] = count;
+    return 0;
+}
+
 /* Non-blocking variant: returns -1 immediately if the slot is still busy.
    See header for full contract. */
 int gpu_fermat_submit_try(gpu_fermat_ctx *ctx, int slot,
@@ -1068,9 +1148,12 @@ int gpu_fermat_submit_try(gpu_fermat_ctx *ctx, int slot,
         pthread_mutex_unlock(&ctx->slot_mu[slot]);
         return -1;  /* slot busy — return without blocking */
     }
+    if (gpu_fermat_submit_locked(ctx, slot, candidates, count) < 0) {
+        pthread_mutex_unlock(&ctx->slot_mu[slot]);
+        return -1;
+    }
     pthread_mutex_unlock(&ctx->slot_mu[slot]);
-    /* Slot is free; delegate to the blocking submit which will not stall. */
-    return gpu_fermat_submit(ctx, slot, candidates, count);
+    return 0;
 }
 
 int gpu_fermat_submit(gpu_fermat_ctx *ctx, int slot,
@@ -1086,67 +1169,10 @@ int gpu_fermat_submit(gpu_fermat_ctx *ctx, int slot,
        kernel latency (~5-15 ms).  Never skips candidates. */
     while (ctx->pending[slot] != 0)
         pthread_cond_wait(&ctx->slot_cv[slot], &ctx->slot_mu[slot]);
-
-    cudaError_t err = ensure_device(ctx->device_id);
-    if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->slot_mu[slot]); return -1; }
-
-    int active_limbs = __atomic_load_n(&ctx->active_limbs, __ATOMIC_RELAXED);
-    int cgbn_path = cgbn_supports_al(active_limbs);
-    int use_soa_scalar = !cgbn_path;
-    int use_soa_cgbn = cgbn_path && gpu_fermat_cgbn_soa_enabled();
-    int use_soa_layout = use_soa_scalar || use_soa_cgbn;
-
-    if (use_soa_layout) {
-        /* Non-CGBN AL: AoS->SoA prepack for coalesced scalar kernel loads. */
-        uint64_t *dst = ctx->h_cands_soa[slot];
-        const uint64_t *src = candidates;
-        int stride = active_limbs;
-        for (size_t i = 0; i < count; i++) {
-            size_t b = i * (size_t)stride;
-            for (int limb = 0; limb < stride; limb++)
-                dst[(size_t)limb * count + i] = src[b + (size_t)limb];
-        }
-
-        size_t soa_bytes = count * (size_t)stride * sizeof(uint64_t);
-        err = cudaMemcpyAsync(ctx->d_cands_soa[slot], ctx->h_cands_soa[slot],
-                              soa_bytes,
-                              cudaMemcpyHostToDevice, ctx->stream[slot]);
-        if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->slot_mu[slot]); return -1; }
-    } else {
-        /* Use compact stride: callers now pack candidates at active_limbs
-           width instead of full NL.  This cuts CPU build time, memcpy, and
-           H2D transfer by NL/AL (e.g. 2.67x at shift=128). */
-        int stride = active_limbs;
-        size_t bytes = count * (size_t)stride * sizeof(uint64_t);
-
-        /* Copy candidates into pinned staging buffer.
-           After this memcpy the caller's buffer can be reused. */
-        memcpy(ctx->h_cands[slot], candidates, bytes);
-
-        /* Async H->D on stream[slot] */
-        err = cudaMemcpyAsync(ctx->d_cands[slot], ctx->h_cands[slot],
-                              bytes,
-                              cudaMemcpyHostToDevice, ctx->stream[slot]);
-        if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->slot_mu[slot]); return -1; }
+    if (gpu_fermat_submit_locked(ctx, slot, candidates, count) < 0) {
+        pthread_mutex_unlock(&ctx->slot_mu[slot]);
+        return -1;
     }
-
-    /* Launch kernel — CGBN for supported AL, scalar AoS/SoA otherwise. */
-    err = launch_fermat(active_limbs, ctx->stream[slot],
-                        ctx->d_cands[slot], ctx->d_cands_soa[slot],
-                        ctx->d_results[slot], (uint32_t)count,
-                        use_soa_layout);
-    if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->slot_mu[slot]); return -1; }
-
-    /* Async D→H on stream[slot] */
-    err = cudaMemcpyAsync(ctx->h_results[slot], ctx->d_results[slot],
-                          count, cudaMemcpyDeviceToHost,
-                          ctx->stream[slot]);
-    if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->slot_mu[slot]); return -1; }
-    /* Record an event when the D→H copy completes. */
-    err = cudaEventRecord(ctx->event[slot], ctx->stream[slot]);
-    if (err != cudaSuccess) { pthread_mutex_unlock(&ctx->slot_mu[slot]); return -1; }
-
-    ctx->pending[slot] = count;
     pthread_mutex_unlock(&ctx->slot_mu[slot]);
     return 0;
 }

@@ -23,8 +23,14 @@ int crt_gap_scan_mode_parse(const char *mode, int *out_mode);
 /* Fixed cpugapminer policy: max(2*gap_target, 10000). */
 uint64_t crt_gap_scan_fixed_window(uint64_t gap_target);
 
+/* Low-shift tweak for startup/template sizing.  The runtime per-nonce scan
+    policy remains unchanged; this only adjusts the initial/default window
+    used to size CRT buffers and logs. */
+uint64_t crt_gap_scan_fixed_window_for_shift(uint64_t gap_target, int shift);
+
 /* Startup/template window sizing for selected mode. */
 uint64_t crt_gap_scan_template_window(uint64_t gap_target,
+                                  int shift,
                           int mode,
                           uint64_t floor_value);
 

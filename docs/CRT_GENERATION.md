@@ -101,6 +101,11 @@ Where `N#` is the primorial (product of the first N primes).
 | `--ctr-fixed F` | Number of small primes frozen during evolution. Scale with prime count: 8 for ≤23, 10 for 24–33, 11 for 34–49, 12 for 50–73, 13 for 74–95, 14 for 96–118, 15 for 119+. |
 | `--ctr-ivs I` | Population size for evolution. Quick test: 20, production: **1 000**. |
 | `--ctr-range R` | Percent deviation from `--ctr-primes`. Explores nearby prime counts for potentially better results. |
+| `--fitness-mode MODE` | Optimisation objective. `candidate` keeps the existing behavior (`n_candidates` + weighted tie-break). `probability` minimises a kernel-weighted survivor mass over a wider window around the target gap. Default: `candidate`. |
+| `--fitness-window-factor F` | Probability mode only. Sets wide window `W = ceil(F * gap_target)`. Default: `2.0`. |
+| `--fitness-window-cap N` | Probability mode only. Optional hard cap for `W`; `0` means no cap. Default: `0`. |
+| `--fitness-kernel-a A` | Probability mode only. Kernel parameter `a` in `exp(-a * |x/scale|^b)`. Default: `5.8`. |
+| `--fitness-kernel-b B` | Probability mode only. Kernel parameter `b` in `exp(-a * |x/scale|^b)`. Default: `3.3`. |
 | `--phase3` | Enable feature-gated hybrid final selection (default: off). |
 | `--phase3-delta N` | Candidate tolerance window used by phase3 (default: 2). |
 | `--phase3-mean-eps E` | Minimum phase1 mean improvement required in phase3 comparisons (default: 0.0005). |
@@ -132,6 +137,42 @@ Interpretation:
 - `phase1_score_mean`: spatial quality metric among survivors (higher is better).
 - `phase2(shadow)` delta: how many candidates the phase1-best differs from
   production best.
+
+## Optional Probability Fitness Mode
+
+`gen_crt` can now run with a separate optimisation objective behind:
+
+```bash
+--fitness-mode probability
+```
+
+This does not change the output file format or runtime loader. It only changes
+how the search ranks candidate CRT offset sets internally.
+
+Current behavior:
+
+- `candidate` mode: default objective, preserves the traditional search order.
+- `probability` mode: minimises a kernel-weighted survivor score over a wider
+  interval `W`, where the default is `W = 2 * gap_target`.
+
+The current probability objective uses the surrogate kernel:
+
+```text
+score = sum exp(-a * |(x - center)/gap_target|^b)
+```
+
+over uncovered survivor positions in `[1, W]`, with defaults `a=5.8`, `b=3.3`.
+Lower score is better.
+
+Example:
+
+```bash
+./bin/gen_crt --calc-ctr \
+  --ctr-primes 15 --ctr-merit 22 --ctr-bits 4 \
+  --ctr-strength 10000 --ctr-evolution --ctr-fixed 8 --ctr-ivs 1000 \
+  --fitness-mode probability --fitness-window-factor 2.0 \
+  --ctr-file crt/crt_s64_m22_prob.txt
+```
 
 ## How to Calculate ctr-bits
 

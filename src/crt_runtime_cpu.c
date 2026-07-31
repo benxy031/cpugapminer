@@ -122,7 +122,6 @@ static int crt_runtime_prepare_solver_nonce(
         double target_local,
     struct crt_runtime_nonce_prepare *out,
     const struct crt_runtime_worker_ctx *ctx) {
-    double submit_target = crt_runtime_submit_target(target_local);
     if (!out)
         return 0;
 
@@ -145,11 +144,11 @@ static int crt_runtime_prepare_solver_nonce(
      * if gap_target / logbase_nonce < target, no gap in this window can
      * ever reach target merit, so the nonce is worthless. */
     if (g_crt_gap_target > 0 &&
-        (double)g_crt_gap_target / out->logbase_nonce < submit_target)
+        (double)g_crt_gap_target / out->logbase_nonce < target_local)
         return 0;
 
     uint64_t gap_scan_base = crt_gap_scan_for_nonce(
-        submit_target, out->logbase_nonce,
+        target_local, out->logbase_nonce,
         (uint64_t)g_crt_gap_target, g_crt_gap_scan_mode,
         g_crt_gap_scan_floor);
     out->gap_scan_nonce = gap_scan_base;
@@ -221,7 +220,7 @@ static void crt_runtime_process_solver_window(
         __atomic_fetch_add(&stats_crt_solver_prod_windows_generated, 1,
                            __ATOMIC_RELAXED);
 
-        uint64_t needed_gap_cs = (uint64_t)(submit_target * logbase_nonce);
+        uint64_t needed_gap_cs = (uint64_t)(target_local * logbase_nonce);
         if (needed_gap_cs < 2) needed_gap_cs = 2;
 
         if (surv_cnt < 2 ||
@@ -304,7 +303,7 @@ static void crt_runtime_process_solver_window(
 
     /* Monolithic path: evaluate this window inline. */
     {
-        uint64_t ng = (uint64_t)(submit_target * logbase_nonce);
+        uint64_t ng = (uint64_t)(target_local * logbase_nonce);
         if (ng < 2) ng = 2;
         if (surv_cnt < 2 || surv[surv_cnt - 1] - surv[0] < ng) {
             __atomic_fetch_add(&stats_cramer_skipped, 1,
@@ -663,6 +662,8 @@ int crt_runtime_cpu_try_run_consumer_loop(
     if (!(wa->crt_role == 1 && crt_fermat_threads > 0))
         return 0;
 
+    double submit_target = crt_runtime_submit_target(target_local);
+
     ensure_gmp_tls();
 
     while (keep_going && !g_abort_pass) {
@@ -684,7 +685,7 @@ int crt_runtime_cpu_try_run_consumer_loop(
         if (crt_runtime_gpu_process_consumer_item(
                 ctx,
                 w,
-                target_local,
+            submit_target,
                 shift_local,
                 rpc_url_local,
                 rpc_user_local,
@@ -703,7 +704,7 @@ int crt_runtime_cpu_try_run_consumer_loop(
             size_t w_primes = 0, w_qual = 0;
             size_t cpu_tests = crt_bkscan_and_submit(
                 w->survivors, w->surv_cnt,
-                w->logbase, target_local,
+                w->logbase, submit_target,
                 shift_local, w->nonce,
                 w->cand_odd, w->nAdd,
                 rpc_url_local, rpc_user_local,

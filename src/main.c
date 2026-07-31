@@ -396,9 +396,10 @@ struct crt_phase1_profile {
 
 static const struct crt_phase1_profile g_crt_phase1_profiles[] = {
     { 768, 5000000ULL, 300000ULL, 16384, 8192, 1 },
+    { 450, 4000000ULL, 300000ULL, 12288, 6144, 1 },
     { 384, 3000000ULL, 300000ULL, 8192,  4096, 1 },
     { 128, 2000000ULL, 500000ULL, 4096,  4096, 2 },
-    {   0, DEFAULT_SIEVE_PRIME_COUNT, DEFAULT_SIEVE_PRIME_COUNT, 2048, 2048, 2 },
+    {   0, 1000ULL, 1000ULL, 2048, 2048, 2 },
 };
 
 static const struct crt_phase1_profile *crt_phase1_pick_profile(int shift) {
@@ -1203,7 +1204,7 @@ static double auto_one_sided_skip_merit(int shift, double scan_target_runtime) {
 /* Number of edge-probe candidates per side when eliminating false-positive
    regions in the two-phase smart scan.  Higher values catch more false
    positives but cost more Fermat tests up-front.                            */
-#define EDGE_PROBE_N 5
+#define EDGE_PROBE_N 2
 
 /* ── CRT (Chinese Remainder Theorem) sieve support ──
    Supports two formats:
@@ -8402,7 +8403,8 @@ static void *worker_fn(void *arg) {
 #ifdef WITH_RPC
         int      tid_local     = wa->tid;
         uint64_t gap_scan_cfg  = crt_gap_scan_template_window(
-            (uint64_t)g_crt_gap_target, g_crt_gap_scan_mode,
+            (uint64_t)g_crt_gap_target, shift_local,
+            g_crt_gap_scan_mode,
             g_crt_gap_scan_floor);
 
         struct crt_runtime_worker_ctx rt_ctx;
@@ -8419,7 +8421,7 @@ static void *worker_fn(void *arg) {
            survivors, scan consecutive prime pairs for qualifying gaps.
            ═══════════════════════════════════════════════════════════ */
         if (crt_runtime_try_run_consumer_loop(
-            &rt_ctx, wa, crt_end, target_local, shift_local,
+            &rt_ctx, wa, crt_end, scan_target, shift_local,
                 rpc_url_local, rpc_user_local, rpc_pass_local)) {
             return NULL;
         }
@@ -8435,7 +8437,7 @@ static void *worker_fn(void *arg) {
             wa,
             tid_local,
             shift_local,
-            target_local,
+            scan_target,
             rpc_thread_local,
             rpc_url_local,
             rpc_user_local,
@@ -8725,6 +8727,7 @@ static void *worker_fn(void *arg) {
                 use_smart = 0;
 
             size_t needed_gap = 0;
+            double submit_target_local = effective_submit_target(target_local);
 #ifdef WITH_GPU_FERMAT
             size_t p1_cnt = 0, p1_wcap = 0;
 #endif
@@ -8827,20 +8830,15 @@ static void *worker_fn(void *arg) {
                     uint64_t *sampled_primes = p1_cands; /* reuse buffer */
                     size_t sp_cnt = sp;
 
-                    /* --- Gap analysis: identify candidate regions ----------
-                       Use target_local×logbase (not scan_target) as the
-                       region-detection threshold for the GPU path.  The GPU
-                       tests all non-sampled interior candidates regardless of
-                       --scan-merit, so the stride optimisation gives no benefit
-                       here.  Using the network-merit threshold ensures every
-                       qualifying gap in [target_local×lb, ∞) is fully verified
-                       by phase 2, which avoids false gaps that would occur when
-                       an interior prime falls on a sampled index inside the
-                       (now-larger) stride window.                            */
+                          /* --- Gap analysis: identify candidate regions ----------
+                              Use scan_target×logbase for region detection so GPU
+                              smart path follows the same focus/scan policy as CPU
+                              smart paths. Final submit filtering remains unchanged
+                              in scan_candidates via effective_submit_target().       */
                     size_t n_gap_regions = 0;
                     size_t gap_reg_cap = sp_cnt + 2;
-                    /* Region threshold: always network merit, not scan_merit */
-                    size_t gpu_rth = (size_t)(target_local * logbase);
+                    /* Region threshold: scan/focus merit. */
+                    size_t gpu_rth = needed_gap;
                     if (gpu_rth < 2) gpu_rth = 2;
                     size_t one_sided_gpu_min_gap = 0;
                     if (use_one_sided_skip && g_crt_mode == CRT_MODE_NONE) {
@@ -8936,7 +8934,7 @@ static void *worker_fn(void *arg) {
                             sampled_primes, sp_cnt,
                             gap_reg_lo, gap_reg_hi,
                             gpu_reg_alive, n_gap_regions,
-                            gpu_rth,          /* target_gap = target_local * logbase */
+                            gpu_rth,          /* target_gap = scan_target * logbase */
                             10,               /* chunk_n bucket used as baseline      */
                             0.7,              /* skip_thresh in sigma units           */
                             cli_rgm_cal_min   /* cal_min_samples                      */
@@ -9071,7 +9069,6 @@ static void *worker_fn(void *arg) {
             } else
 #endif
             if (use_smart) {
-                double submit_target_local = effective_submit_target(target_local);
             /* ======= COOPERATIVE BACKWARD-SCAN GAP MINING ==================
                Inspired by the original GapMiner's skip-ahead algorithm.
                Instead of testing ALL sieve survivors, jump ahead by
@@ -10169,7 +10166,8 @@ int main(int argc, char **argv) {
             log_msg("CRT gap-scan mode: fixed "
                     "(window=max(2*gap_target,10000)=%llu)\n",
                     (unsigned long long)crt_gap_scan_template_window(
-                        (uint64_t)g_crt_gap_target, g_crt_gap_scan_mode,
+                        (uint64_t)g_crt_gap_target, shift,
+                        g_crt_gap_scan_mode,
                         g_crt_gap_scan_floor));
         }
                 if (use_crt_gap_scan_adaptive) {
@@ -10617,7 +10615,8 @@ int main(int argc, char **argv) {
        single-thread use. */
     if (g_crt_mode == CRT_MODE_SOLVER && g_crt_gap_target > 0) {
         uint64_t gap_scan = crt_gap_scan_template_window(
-            (uint64_t)g_crt_gap_target, g_crt_gap_scan_mode,
+            (uint64_t)g_crt_gap_target, shift,
+            g_crt_gap_scan_mode,
             g_crt_gap_scan_floor);
         uint64_t crt_limit = gap_scan * 19;
         if (crt_limit > 500000) crt_limit = 500000;
@@ -10661,7 +10660,8 @@ int main(int argc, char **argv) {
         if (g_crt_solver_skip_to > 0 && g_crt_offsets && g_crt_prime_list
                 && g_crt_gap_target > 0) {
             int gsm = (int)crt_gap_scan_template_window(
-                (uint64_t)g_crt_gap_target, g_crt_gap_scan_mode,
+                (uint64_t)g_crt_gap_target, shift,
+                g_crt_gap_scan_mode,
                 g_crt_gap_scan_floor);
             /* adj = nAdd0(base=0) mod 2.
                base = h256<<shift is always even, so candidate = base+nAdd0-adj
@@ -10763,7 +10763,8 @@ int main(int argc, char **argv) {
         unsigned long long log_sieve_sz;
         if (g_crt_mode == CRT_MODE_SOLVER && g_crt_gap_target > 0) {
             log_sieve_sz = (unsigned long long)crt_gap_scan_template_window(
-                (uint64_t)g_crt_gap_target, g_crt_gap_scan_mode,
+                (uint64_t)g_crt_gap_target, shift,
+                g_crt_gap_scan_mode,
                 g_crt_gap_scan_floor);
         } else {
             log_sieve_sz = (unsigned long long)sieve_size;
@@ -10957,7 +10958,8 @@ int main(int argc, char **argv) {
             if (g_crt_mode == CRT_MODE_SOLVER && g_crt_primorial_mpz_init) {
 #ifdef WITH_RPC
                 uint64_t gap_scan_cfg = crt_gap_scan_template_window(
-                    (uint64_t)g_crt_gap_target, g_crt_gap_scan_mode,
+                    (uint64_t)g_crt_gap_target, shift,
+                    g_crt_gap_scan_mode,
                     g_crt_gap_scan_floor);
 
                 static int st_crt_logged = 0;
@@ -10994,7 +10996,7 @@ int main(int argc, char **argv) {
                     &st_wa,
                     0,
                     shift,
-                    target,
+                    scan_target_runtime,
                     0,
                     rpc_url,
                     rpc_user,
@@ -11066,7 +11068,7 @@ int main(int argc, char **argv) {
                     }
                     __atomic_fetch_add(&stats_tested, (uint64_t)p1n, __ATOMIC_RELAXED);
 
-                    size_t needed = (size_t)(submit_target_st * logbase);
+                    size_t needed = (size_t)(scan_target_runtime * logbase);
                     if (needed < 2) needed = 2;
 
                     /* Identify gap regions (boundaries only) */

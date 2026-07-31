@@ -54,7 +54,23 @@ uint64_t crt_gap_scan_fixed_window(uint64_t gap_target) {
     return gap_scan;
 }
 
+uint64_t crt_gap_scan_fixed_window_for_shift(uint64_t gap_target, int shift) {
+    uint64_t gap_scan = crt_gap_scan_fixed_window(gap_target);
+
+    if (shift > 0 && shift < 450 && gap_target > 0ULL) {
+        uint64_t low_shift_scan = gap_target + (gap_target / 2ULL)
+                                + (gap_target / 4ULL);
+        if (low_shift_scan < 10000ULL)
+            low_shift_scan = 10000ULL;
+        if (low_shift_scan < gap_scan)
+            gap_scan = low_shift_scan;
+    }
+
+    return gap_scan;
+}
+
 uint64_t crt_gap_scan_template_window(uint64_t gap_target,
+                                      int shift,
                                       int mode,
                                       uint64_t floor_value) {
     if (mode == CRT_GAP_SCAN_ORIGINAL) {
@@ -70,7 +86,7 @@ uint64_t crt_gap_scan_template_window(uint64_t gap_target,
             gap_scan = floor_scan;
         return gap_scan;
     }
-    return crt_gap_scan_fixed_window(gap_target);
+    return crt_gap_scan_fixed_window_for_shift(gap_target, shift);
 }
 
 uint64_t crt_gap_scan_for_nonce(double target_merit,

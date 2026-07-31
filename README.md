@@ -63,6 +63,9 @@ tools/
 docs/
   CRT_GENERATION.md - parameter reference for generating CRT files
                       (shifts 64–1024)
+  CRT_PHASE_WORKFLOW.md
+                    - end-to-end Phase A/2/3 workflow, selector/run-script
+                      generation, and full launch usage
 tests/
   test_rpc_json.c          - unit tests for rpc_json helpers
   test_wheel_sieve.c       - wheel presieve backend correctness tests
@@ -241,6 +244,10 @@ make gen_crt
 
 Produces `bin/gen_crt`.  See [docs/CRT_GENERATION.md](docs/CRT_GENERATION.md)
 for parameter tables and ready-to-use commands for shifts 64–1024.
+
+For the practical operations flow (evaluate existing CRT files, generate
+portfolio artifacts, auto-select by merit band, and full launch runner), see
+[docs/CRT_PHASE_WORKFLOW.md](docs/CRT_PHASE_WORKFLOW.md).
 
 ### Unit tests
 
