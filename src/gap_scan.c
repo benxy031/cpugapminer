@@ -6,6 +6,7 @@
 #include "gap_scan.h"
 
 #define ONE_SIDED_FORCE_FULLCHECK_EVERY 16U
+#define ONE_SIDED_FORCE_FULLCHECK_MIN_PROBE_STEPS 12U
 
 void backward_scan_segment(const uint64_t *pr, size_t lo, size_t hi,
                            size_t needed_gap, size_t one_sided_min_gap,
@@ -62,6 +63,7 @@ void backward_scan_segment(const uint64_t *pr, size_t lo, size_t hi,
             size_t gate_hi = hi;
             int gate_found_upper = 0;
             int force_fullcheck = 0;
+            size_t probe_steps = 0;
 
             /* Binary search: first index in pr[scan_from+1..hi-1] >= gate_pos */
             {
@@ -85,6 +87,7 @@ void backward_scan_segment(const uint64_t *pr, size_t lo, size_t hi,
                 if (prime_test(pr[j_gate])) {
                     upper_idx = j_gate; /* first prime beyond target_pos and before gate */
                     gate_found_upper = 1;
+                    probe_steps = j_gate - bhi;
                     break;
                 }
                 j_gate++;
@@ -93,8 +96,12 @@ void backward_scan_segment(const uint64_t *pr, size_t lo, size_t hi,
             if (gate_found_upper) {
                 res->one_sided_considered++;
                 /* Hybrid mode: periodically force full two-sided verification
-                   to reduce one-sided bias while keeping skip as default. */
-                if ((res->one_sided_considered % ONE_SIDED_FORCE_FULLCHECK_EVERY) != 0) {
+                   to reduce one-sided bias while keeping skip as default.
+                   Also force when the upper-prime probe had to scan a long
+                   stretch, because that window is sparse enough to justify
+                   the extra work. */
+                if (probe_steps < ONE_SIDED_FORCE_FULLCHECK_MIN_PROBE_STEPS &&
+                    (res->one_sided_considered % ONE_SIDED_FORCE_FULLCHECK_EVERY) != 0) {
                     /* Give-up/go-next: weak first-side signal. */
                     res->one_sided_skipped++;
                     start_nAdd = pr[upper_idx];

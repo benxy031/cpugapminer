@@ -446,6 +446,69 @@ Expected: ~889 candidates.
   --ctr-file crt/crt_s896_m22.txt
 ```
 
+### Shift 961 (merit 22)
+
+```bash
+./bin/gen_crt --calc-ctr \
+  --ctr-primes 124 --ctr-merit 22 --ctr-bits 8 \
+  --ctr-strength 10000 --ctr-evolution --ctr-fixed 15 --ctr-ivs 1000 \
+  --ctr-file crt/crt_s961_m22.txt
+```
+
+### Shift 968 (merit 22)
+
+```bash
+./bin/gen_crt --calc-ctr \
+  --ctr-primes 125 --ctr-merit 22 --ctr-bits 6 \
+  --ctr-strength 10000 --ctr-evolution --ctr-fixed 15 --ctr-ivs 1000 \
+  --ctr-file crt/crt_s968_m22.txt
+```
+
+### Shift 975 (merit 22)
+
+```bash
+./bin/gen_crt --calc-ctr \
+  --ctr-primes 126 --ctr-merit 22 --ctr-bits 4 \
+  --ctr-strength 10000 --ctr-evolution --ctr-fixed 15 --ctr-ivs 1000 \
+  --ctr-file crt/crt_s975_m22.txt
+```
+
+### Shift 980 (merit 22)
+
+```bash
+./bin/gen_crt --calc-ctr \
+  --ctr-primes 126 --ctr-merit 22 --ctr-bits 9 \
+  --ctr-strength 10000 --ctr-evolution --ctr-fixed 15 --ctr-ivs 1000 \
+  --ctr-file crt/crt_s980_m22.txt
+```
+
+### Shift 990 (merit 22)
+
+```bash
+./bin/gen_crt --calc-ctr \
+  --ctr-primes 128 --ctr-merit 22 --ctr-bits 0 \
+  --ctr-strength 10000 --ctr-evolution --ctr-fixed 15 --ctr-ivs 1000 \
+  --ctr-file crt/crt_s990_m22.txt
+```
+
+### Shift 995 (merit 22)
+
+```bash
+./bin/gen_crt --calc-ctr \
+  --ctr-primes 128 --ctr-merit 22 --ctr-bits 5 \
+  --ctr-strength 10000 --ctr-evolution --ctr-fixed 15 --ctr-ivs 1000 \
+  --ctr-file crt/crt_s995_m22.txt
+```
+
+### Shift 1001 (merit 22)
+
+```bash
+./bin/gen_crt --calc-ctr \
+  --ctr-primes 129 --ctr-merit 22 --ctr-bits 1 \
+  --ctr-strength 10000 --ctr-evolution --ctr-fixed 15 --ctr-ivs 1000 \
+  --ctr-file crt/crt_s1001_m22.txt
+```
+
 ### Shift 1024 (merit 21)
 
 ```bash

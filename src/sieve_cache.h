@@ -14,7 +14,7 @@
 #define DEFAULT_SIEVE_PRIME_COUNT 900000
 
 /* Trial-division pre-filter count above sieve prime limit. */
-#define TD_EXTRA_CNT 0
+#define TD_EXTRA_CNT 32
 
 extern uint64_t cli_sieve_prime_limit;
 extern uint64_t cli_sieve_prime_count;
@@ -26,7 +26,7 @@ extern size_t small_primes_cap;
 extern pthread_once_t small_primes_once;
 
 /* Extra TD primes slightly above sieve limit. */
-extern uint32_t td_extra_primes[TD_EXTRA_CNT];
+extern uint32_t td_extra_primes[];
 extern int td_extra_count;
 extern pthread_once_t td_extra_once;
 

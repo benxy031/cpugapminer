@@ -187,6 +187,11 @@ static inline uint64_t now_ns_mono(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
+static inline uint64_t elapsed_ns_since(uint64_t start_ns) {
+    uint64_t end_ns = now_ns_mono();
+    return (end_ns >= start_ns) ? (end_ns - start_ns) : 0ULL;
+}
+
 static int is_valid_hex_string(const char *s)
 {
     if (!s || !s[0])
@@ -224,9 +229,10 @@ static _Atomic uint64_t gmp_timing_cand_ns = 0;
 static _Atomic uint64_t gmp_timing_powm_ns = 0;
 static _Atomic uint64_t gmp_timing_mr_ns = 0;
 static _Atomic uint64_t gmp_timing_total_ns = 0;
-/* gap_verify tiny prefilter stats: how often it was checked and rejected. */
+/* Gap-verify tiny prefilter stats. */
 static _Atomic uint64_t gap_verify_pf_checks = 0;
 static _Atomic uint64_t gap_verify_pf_hits = 0;
+static _Atomic uint64_t gap_verify_pf_reorders = 0;
 /* GPU smart-scan telemetry (worker path only), log-file reporting only. */
 static volatile uint64_t stats_gpu_smart_regions_total = 0;
 static volatile uint64_t stats_gpu_smart_regions_pruned = 0;
@@ -235,7 +241,7 @@ static volatile uint64_t stats_gpu_smart_verified_primes = 0;
 static volatile uint64_t stats_gpu_smart_scanned_region_pairs = 0;
 
 /* Runtime toggle for gap_verify tiny prefilter.
-   Disabled by default; set CPUGAP_GAP_VERIFY_PREFILTER=1 to enable. */
+   Enabled by default; set CPUGAP_GAP_VERIFY_PREFILTER=0 to disable. */
 static int gap_verify_prefilter_enabled(void)
 {
     static int cached = -1;
@@ -244,7 +250,7 @@ static int gap_verify_prefilter_enabled(void)
 
     {
         const char *env = getenv("CPUGAP_GAP_VERIFY_PREFILTER");
-        cached = (env && *env && strcmp(env, "0") != 0) ? 1 : 0;
+        cached = (!env || !*env || strcmp(env, "0") != 0) ? 1 : 0;
     }
     return cached;
 }
@@ -1084,6 +1090,68 @@ static inline void log_extra_merit_sample(const char *source,
     tls_best_source = NULL;
 }
 
+static inline void update_last_gap_target_ratio(uint64_t gap,
+                                                double logbase,
+                                                double target_merit);
+static void pgt_observe_record_gap(uint64_t gap, double logbase,
+                                   double submit_target_merit);
+
+/* Display-only backscan telemetry probe.
+   Samples up to `sample_n` survivors from the current window, runs normal
+   primality checks on those sampled offsets, and updates best/last-gap stats
+   from the sampled prime stream. This does NOT affect the actual backscan or
+   any submit/qual counters. */
+static void backscan_stat_sample_probe(const uint64_t *pr, size_t cnt,
+                                       double logbase, double target_merit,
+                                       int sample_n) {
+    if (sample_n <= 1 || cnt < 2)
+        return;
+
+    size_t probe_n = (size_t)sample_n;
+    if (probe_n > cnt)
+        probe_n = cnt;
+    if (probe_n < 2)
+        return;
+
+    size_t step = (cnt + probe_n - 1) / probe_n;
+    if (step < 1)
+        step = 1;
+
+    size_t tested = 0;
+    int have_prev = 0;
+    uint64_t prev_prime = 0;
+
+    for (size_t j = 0; j < cnt && tested < probe_n; j += step) {
+        tested++;
+        if (!bn_candidate_is_prime(pr[j]))
+            continue;
+
+        if (have_prev) {
+            uint64_t gap = pr[j] - prev_prime;
+            double merit = (double)gap / logbase;
+
+            stats_last_gap = gap;
+            update_last_gap_target_ratio(gap, logbase, target_merit);
+
+            if (merit > stats_best_merit) {
+                stats_best_merit = merit;
+                stats_best_gap = gap;
+                pgt_observe_record_gap(gap, logbase, target_merit);
+                log_extra_merit_event("best", "noncrt-cpu-probe",
+                                      merit, gap, target_merit);
+            }
+            log_extra_merit_sample("noncrt-cpu-probe", merit, gap,
+                                   target_merit);
+        }
+
+        prev_prime = pr[j];
+        have_prev = 1;
+    }
+
+    if (tested > 0)
+        __atomic_fetch_add(&stats_tested, (uint64_t)tested, __ATOMIC_RELAXED);
+}
+
 /* Last-gap proximity to submit threshold (target*logbase), scaled by 1e6.
    1.0 means exactly on target, <1.0 means below target, >1.0 above target. */
 static volatile uint64_t stats_last_target_ratio_e6 = 0;
@@ -1129,6 +1197,10 @@ static inline void update_last_gap_target_ratio(uint64_t gap,
    K=1 disables sampling (test all survivors — the old behaviour).          */
 #define DEFAULT_SAMPLE_STRIDE 8
 static int cli_sample_stride = DEFAULT_SAMPLE_STRIDE;
+/* Optional display-only probe for CPU non-CRT backscan.
+    Samples up to N survivors so STATS can show early best/last_gap movement
+    without affecting the real backscan path. */
+static int cli_backscan_stat_sample = 0;
 
 enum {
     AUTO_TUNE_OBJECTIVE_SPEED = 0,
@@ -2634,14 +2706,10 @@ static void print_stats(void) {
        the ring isn't full yet (first 30s of mining). */
     int oldest = rate_ring_full ? rate_ring_idx : 0;
     uint64_t old_pairs = rate_ring[oldest].pairs;
-    uint64_t old_gaps  = rate_ring[oldest].gaps;
-    uint64_t old_tested = rate_ring[oldest].tested;
     uint64_t old_ms    = rate_ring[oldest].ms;
     double   window_dt = (old_ms > 0 && now > old_ms)
                          ? (double)(now - old_ms) / 1000.0 : 0.0;
     double   window_dp = (double)(stats_pairs - old_pairs);
-    double   window_dg = (double)(stats_gaps - old_gaps);
-    double   window_dtst = (double)(stats_tested - old_tested);
     double   pairs_rate = (window_dt > 0.5) ? window_dp / window_dt
                         : (elapsed > 0.001) ? (double)stats_pairs / elapsed
                         : 0.0;
@@ -2702,12 +2770,6 @@ static void print_stats(void) {
         ? (100.0 * (double)stats_gaps / (double)stats_pairs) : 0.0;
     double qual_tested_ppm = (stats_tested > 0)
         ? (1000000.0 * (double)stats_gaps / (double)stats_tested) : 0.0;
-    double qual_pairs_pct_30s = (window_dt > 0.5 && window_dp > 0.5)
-        ? (100.0 * window_dg / window_dp)
-        : qual_pairs_pct;
-    double qual_tested_ppm_30s = (window_dt > 0.5 && window_dtst > 0.5)
-        ? (1000000.0 * window_dg / window_dtst)
-        : qual_tested_ppm;
     double last_target_ratio = (double)stats_last_target_ratio_e6 / 1000000.0;
     double last_target_pct = 100.0 * last_target_ratio;
     double miss_target_pct = (last_target_ratio < 1.0)
@@ -2746,7 +2808,6 @@ static void print_stats(void) {
         log_msg("STATS: elapsed=%.1fs  sieved=%llu (%.0f/s)  tested=%llu (%.0f/s)  "
             "pps(pairs/s)=%.0f  primes/s=%.0f  primes=%llu (%.1f%%)  "
             "gaps=%llu (%.3f/s)  qual=%llu/%llu pairs (%.6f%%, %.3f ppm tested)  "
-            "qual30s=%.6f%% (%.3f ppm tested)  "
             "%s  "
             "built=%llu  submitted=%llu  accepted=%llu  "
             "prob=%.2e/pair  est_model=%s  est_observed=%s (focus=%.4f submit=%.4f scan=%.4f)  best=%.2f (gap=%llu)  last_gap=%llu  last_qual_gap=%llu  last_vs_target=%.2f%% miss_target=%.2f%%",
@@ -2762,8 +2823,6 @@ static void print_stats(void) {
             (unsigned long long)stats_pairs,
             qual_pairs_pct,
             qual_tested_ppm,
-            qual_pairs_pct_30s,
-            qual_tested_ppm_30s,
             wheel_stats_buf,
             (unsigned long long)stats_blocks,
             (unsigned long long)stats_submits,
@@ -2784,6 +2843,10 @@ static void print_stats(void) {
             uint64_t cand_ns = atomic_load_explicit(&gmp_timing_cand_ns, memory_order_relaxed);
             uint64_t powm_ns = atomic_load_explicit(&gmp_timing_powm_ns, memory_order_relaxed);
             uint64_t mr_ns = atomic_load_explicit(&gmp_timing_mr_ns, memory_order_relaxed);
+            if (td_ns > total_ns) td_ns = total_ns;
+            if (cand_ns > total_ns) cand_ns = total_ns;
+            if (powm_ns > total_ns) powm_ns = total_ns;
+            if (mr_ns > total_ns) mr_ns = total_ns;
             uint64_t other_ns = total_ns;
             if (td_ns < other_ns) other_ns -= td_ns; else other_ns = 0;
             if (cand_ns < other_ns) other_ns -= cand_ns; else other_ns = 0;
@@ -3124,13 +3187,15 @@ static void print_stats(void) {
     {
         uint64_t pf_checks = atomic_load_explicit(&gap_verify_pf_checks, memory_order_relaxed);
         uint64_t pf_hits = atomic_load_explicit(&gap_verify_pf_hits, memory_order_relaxed);
+        uint64_t pf_reorders = atomic_load_explicit(&gap_verify_pf_reorders, memory_order_relaxed);
         double pf_hit_pct = (pf_checks > 0)
             ? (100.0 * (double)pf_hits / (double)pf_checks)
             : 0.0;
-        log_msg("  gap_verify_prefilter: checks=%llu hits=%llu (%.2f%%)",
+        log_msg("  gap_verify_prefilter(qual-only, pre-submit): checks=%llu hits=%llu (%.2f%%) reorders=%llu",
                 (unsigned long long)pf_checks,
                 (unsigned long long)pf_hits,
-                pf_hit_pct);
+                pf_hit_pct,
+                (unsigned long long)pf_reorders);
     }
     if (use_partial_sieve_auto)
         log_msg("  partial_auto=on windows=%llu activations=%llu adjusts=%llu limit=%llu avg=%llu",
@@ -5919,6 +5984,70 @@ static __thread uint32_t tls_prime_cache_gen[PRIME_CACHE_WAYS][PRIME_CACHE_SETS]
 static __thread uint8_t  tls_prime_cache_victim[PRIME_CACHE_SETS];
 static __thread uint32_t tls_prime_cache_epoch = 1;
 
+/* Compile-time gated adaptive TD ordering.
+    Some builds set TD_EXTRA_CNT=0, in which case the extended TD table is
+    disabled entirely and this learner must stay out of the binary. */
+#if TD_EXTRA_CNT > 0
+/* Adaptive TD ordering for bn_candidate_is_prime().
+   We keep the same checks, but reorder the extended trial-division primes
+   based on recent rejection hits so hot divisors are tried earlier for the
+   current base/region. */
+static __thread uint8_t  tls_td_extra_order[TD_EXTRA_CNT];
+static __thread uint16_t tls_td_extra_score[TD_EXTRA_CNT];
+static __thread uint16_t tls_td_extra_rejects = 0;
+static __thread uint16_t tls_td_extra_depth_ema = 0;
+static __thread uint8_t  tls_td_extra_order_ready = 0;
+
+static inline void td_extra_order_reset(void) {
+    for (int i = 0; i < td_extra_count; i++) {
+        tls_td_extra_order[i] = (uint8_t)i;
+        tls_td_extra_score[i] = 0;
+    }
+    tls_td_extra_rejects = 0;
+    tls_td_extra_depth_ema = 0;
+    tls_td_extra_order_ready = 1;
+}
+
+static inline void td_extra_order_rebuild(void) {
+    for (int i = 1; i < td_extra_count; i++) {
+        uint8_t idx = tls_td_extra_order[i];
+        uint16_t score = tls_td_extra_score[idx];
+        int j = i - 1;
+        while (j >= 0) {
+            uint8_t prev = tls_td_extra_order[j];
+            uint16_t prev_score = tls_td_extra_score[prev];
+            if (prev_score > score)
+                break;
+            if (prev_score == score && td_extra_primes[prev] <= td_extra_primes[idx])
+                break;
+            tls_td_extra_order[j + 1] = prev;
+            j--;
+        }
+        tls_td_extra_order[j + 1] = idx;
+    }
+
+    /* Light decay keeps the order responsive to the current base/region. */
+    for (int i = 0; i < td_extra_count; i++)
+        tls_td_extra_score[i] -= (uint16_t)(tls_td_extra_score[i] >> 3);
+
+    tls_td_extra_rejects = 0;
+}
+
+static inline void td_extra_order_note_hit(int idx, int depth) {
+    if ((uint16_t)depth > tls_td_extra_depth_ema)
+        tls_td_extra_depth_ema = (uint16_t)depth;
+    else
+        tls_td_extra_depth_ema = (uint16_t)((tls_td_extra_depth_ema * 7u + (uint16_t)depth) >> 3);
+
+    uint16_t boost = (uint16_t)(1u + ((unsigned int)depth >> 3));
+    uint32_t score = (uint32_t)tls_td_extra_score[idx] + boost;
+    tls_td_extra_score[idx] = (score > UINT16_MAX) ? UINT16_MAX : (uint16_t)score;
+
+    if (++tls_td_extra_rejects >= (uint16_t)(64u + (tls_td_extra_depth_ema >> 2)))
+        td_extra_order_rebuild();
+}
+#endif
+
 static inline uint32_t prime_cache_slot(uint64_t offset) {
      uint64_t h = offset * 11400714819323198485ull;
      return (uint32_t)((h >> (64 - PRIME_CACHE_BITS)) & PRIME_CACHE_MASK);
@@ -5961,6 +6090,9 @@ static inline void prime_cache_invalidate_base(void) {
     tls_cand_last_valid = 0;
     tls_cand_limbs_valid = 0;
     tls_cand_limbs_nl = 0;
+#if TD_EXTRA_CNT > 0
+    tls_td_extra_order_ready = 0;
+#endif
     tls_prime_cache_epoch++;
     if (tls_prime_cache_epoch == 0) {
         memset(tls_prime_cache_gen, 0, sizeof(tls_prime_cache_gen));
@@ -6301,10 +6433,67 @@ static int mr_verify_cand(void) {
 }
 
 /* Tiny small-prime prefilter used only by gap_verify's dense odd scan.
-   Reuses cached base_mod_p residues and checks a handful of very small odd
-   primes before calling bn_candidate_is_prime(). Returns 1 if composite. */
+    Reuses cached base_mod_p residues and checks a handful of very small odd
+    primes before calling bn_candidate_is_prime(). Returns 1 if composite. */
 #define GAP_VERIFY_PREFILTER_FIRST_IDX   1   /* skip prime 2 */
 #define GAP_VERIFY_PREFILTER_PRIME_COUNT 12  /* primes 3..41 */
+
+static __thread uint8_t  tls_gap_verify_pf_order[GAP_VERIFY_PREFILTER_PRIME_COUNT];
+static __thread uint16_t tls_gap_verify_pf_score[GAP_VERIFY_PREFILTER_PRIME_COUNT];
+static __thread uint16_t tls_gap_verify_pf_rejects = 0;
+static __thread uint16_t tls_gap_verify_pf_depth_ema = 0;
+static __thread uint8_t  tls_gap_verify_pf_order_ready = 0;
+
+static inline void gap_verify_pf_order_reset(void) {
+    for (int i = 0; i < GAP_VERIFY_PREFILTER_PRIME_COUNT; i++) {
+        tls_gap_verify_pf_order[i] = (uint8_t)i;
+        tls_gap_verify_pf_score[i] = 0;
+    }
+    tls_gap_verify_pf_rejects = 0;
+    tls_gap_verify_pf_depth_ema = 0;
+    tls_gap_verify_pf_order_ready = 1;
+}
+
+static inline void gap_verify_pf_order_rebuild(void) {
+    for (int i = 1; i < GAP_VERIFY_PREFILTER_PRIME_COUNT; i++) {
+        uint8_t idx = tls_gap_verify_pf_order[i];
+        uint16_t score = tls_gap_verify_pf_score[idx];
+        int j = i - 1;
+        while (j >= 0) {
+            uint8_t prev = tls_gap_verify_pf_order[j];
+            uint16_t prev_score = tls_gap_verify_pf_score[prev];
+            if (prev_score > score)
+                break;
+            if (prev_score == score && small_primes_cache[prev + GAP_VERIFY_PREFILTER_FIRST_IDX] <=
+                                       small_primes_cache[idx + GAP_VERIFY_PREFILTER_FIRST_IDX])
+                break;
+            tls_gap_verify_pf_order[j + 1] = prev;
+            j--;
+        }
+        tls_gap_verify_pf_order[j + 1] = idx;
+    }
+
+    for (int i = 0; i < GAP_VERIFY_PREFILTER_PRIME_COUNT; i++)
+        tls_gap_verify_pf_score[i] -= (uint16_t)(tls_gap_verify_pf_score[i] >> 3);
+
+    tls_gap_verify_pf_rejects = 0;
+    atomic_fetch_add_explicit(&gap_verify_pf_reorders, 1, memory_order_relaxed);
+}
+
+static inline void gap_verify_pf_note_hit(int idx, int depth) {
+    if ((uint16_t)depth > tls_gap_verify_pf_depth_ema)
+        tls_gap_verify_pf_depth_ema = (uint16_t)depth;
+    else
+        tls_gap_verify_pf_depth_ema = (uint16_t)((tls_gap_verify_pf_depth_ema * 7u + (uint16_t)depth) >> 3);
+
+    uint16_t boost = (uint16_t)(1u + ((unsigned int)depth >> 2));
+    uint32_t score = (uint32_t)tls_gap_verify_pf_score[idx] + boost;
+    tls_gap_verify_pf_score[idx] = (score > UINT16_MAX) ? UINT16_MAX : (uint16_t)score;
+
+    if (++tls_gap_verify_pf_rejects >= (uint16_t)(24u + (tls_gap_verify_pf_depth_ema >> 2)))
+        gap_verify_pf_order_rebuild();
+}
+
 static inline int gap_verify_smallprime_reject(uint64_t offset) {
     if (!gap_verify_prefilter_enabled())
         return 0;
@@ -6312,13 +6501,19 @@ static inline int gap_verify_smallprime_reject(uint64_t offset) {
     if (!tls_base_mod_p_ready || !tls_base_mod_p || !small_primes_cache)
         return 0;
 
+    if (!tls_gap_verify_pf_order_ready)
+        gap_verify_pf_order_reset();
+
     atomic_fetch_add_explicit(&gap_verify_pf_checks, 1, memory_order_relaxed);
 
     size_t end = GAP_VERIFY_PREFILTER_FIRST_IDX + GAP_VERIFY_PREFILTER_PRIME_COUNT;
     if (end > small_primes_count)
         end = small_primes_count;
 
-    for (size_t i = GAP_VERIFY_PREFILTER_FIRST_IDX; i < end; i++) {
+    for (int ord = 0; ord < GAP_VERIFY_PREFILTER_PRIME_COUNT; ord++) {
+        size_t i = GAP_VERIFY_PREFILTER_FIRST_IDX + (size_t)tls_gap_verify_pf_order[ord];
+        if (i >= end)
+            continue;
         uint32_t p = (uint32_t)small_primes_cache[i];
         uint32_t off_mod_p = (offset < (uint64_t)p)
                            ? (uint32_t)offset
@@ -6327,6 +6522,7 @@ static inline int gap_verify_smallprime_reject(uint64_t offset) {
         uint32_t rem = (sum >= p) ? (sum - p) : sum;
         if (rem == 0) {
             atomic_fetch_add_explicit(&gap_verify_pf_hits, 1, memory_order_relaxed);
+            gap_verify_pf_note_hit((int)tls_gap_verify_pf_order[ord], ord);
             return 1;
         }
     }
@@ -6357,9 +6553,33 @@ static int bn_candidate_is_prime(uint64_t offset) {
        Use a comparison + conditional subtract instead of two 64-bit divides. */
     if (timing_enabled)
         t_td0 = now_ns_mono();
+#if TD_EXTRA_CNT > 0
+    if (!tls_td_extra_order_ready)
+        td_extra_order_reset();
+    for (int i = 0; i < td_extra_count; i++) {
+        int ord = (int)tls_td_extra_order[i];
+        uint32_t p   = td_extra_primes[ord];
+        /* off_mod_p = offset % p; skip division when offset < p (CRT common case) */
+        uint32_t off_mod_p = (offset < (uint64_t)p) ? (uint32_t)offset
+                                                      : (uint32_t)(offset % p);
+        uint32_t sum = tls_td_residues[ord] + off_mod_p;
+        uint32_t rem = sum >= p ? sum - p : sum;
+        if (rem == 0) {
+            td_extra_order_note_hit(ord, i);
+            prime_cache_store(offset, 0);
+            if (timing_enabled) {
+                atomic_fetch_add_explicit(&gmp_timing_td_ns,
+                    elapsed_ns_since(t_td0), memory_order_relaxed);
+                atomic_fetch_add_explicit(&gmp_timing_total_ns,
+                    elapsed_ns_since(t_total0), memory_order_relaxed);
+                atomic_fetch_add_explicit(&gmp_timing_calls, 1, memory_order_relaxed);
+            }
+            return 0;
+        }
+    }
+#else
     for (int i = 0; i < td_extra_count; i++) {
         uint32_t p   = td_extra_primes[i];
-        /* off_mod_p = offset % p; skip division when offset < p (CRT common case) */
         uint32_t off_mod_p = (offset < (uint64_t)p) ? (uint32_t)offset
                                                       : (uint32_t)(offset % p);
         uint32_t sum = tls_td_residues[i] + off_mod_p;
@@ -6368,17 +6588,18 @@ static int bn_candidate_is_prime(uint64_t offset) {
             prime_cache_store(offset, 0);
             if (timing_enabled) {
                 atomic_fetch_add_explicit(&gmp_timing_td_ns,
-                    now_ns_mono() - t_td0, memory_order_relaxed);
+                    elapsed_ns_since(t_td0), memory_order_relaxed);
                 atomic_fetch_add_explicit(&gmp_timing_total_ns,
-                    now_ns_mono() - t_total0, memory_order_relaxed);
+                    elapsed_ns_since(t_total0), memory_order_relaxed);
                 atomic_fetch_add_explicit(&gmp_timing_calls, 1, memory_order_relaxed);
             }
             return 0;
         }
     }
+#endif
     if (timing_enabled)
         atomic_fetch_add_explicit(&gmp_timing_td_ns,
-            now_ns_mono() - t_td0, memory_order_relaxed);
+            elapsed_ns_since(t_td0), memory_order_relaxed);
 
     if (timing_enabled)
         t_cand0 = now_ns_mono();
@@ -6416,7 +6637,7 @@ static int bn_candidate_is_prime(uint64_t offset) {
     tls_cand_last_valid  = 1;
     if (timing_enabled)
         atomic_fetch_add_explicit(&gmp_timing_cand_ns,
-            now_ns_mono() - t_cand0, memory_order_relaxed);
+            elapsed_ns_since(t_cand0), memory_order_relaxed);
 
     int is_prime;
     if (use_crt_precision && g_crt_mode == CRT_MODE_SOLVER) {
@@ -6428,7 +6649,7 @@ static int bn_candidate_is_prime(uint64_t offset) {
                           crt_precision_rounds_effective()) > 0);
         if (timing_enabled)
             atomic_fetch_add_explicit(&gmp_timing_mr_ns,
-                now_ns_mono() - t_mr0, memory_order_relaxed);
+                elapsed_ns_since(t_mr0), memory_order_relaxed);
     } else if (use_cpu_fermat) {
         /* Custom CPU Montgomery multiply path (--cpu-fermat).
            Extracts candidate limbs from tls_cand_mpz into a uint64_t array
@@ -6491,7 +6712,7 @@ static int bn_candidate_is_prime(uint64_t offset) {
         mpz_powm(tls_res_mpz, tls_two_mpz, tls_mr_d, tls_cand_mpz);
         if (timing_enabled)
             atomic_fetch_add_explicit(&gmp_timing_powm_ns,
-                now_ns_mono() - t_powm0, memory_order_relaxed);
+                elapsed_ns_since(t_powm0), memory_order_relaxed);
         if (mpz_cmp_ui(tls_res_mpz, 1) == 0 ||
             mpz_cmp(tls_res_mpz, tls_mr_nm1) == 0) {
             is_prime = 1;
@@ -6516,7 +6737,7 @@ static int bn_candidate_is_prime(uint64_t offset) {
             is_prime = mr_verify_cand_s(s);
             if (timing_enabled)
                 atomic_fetch_add_explicit(&gmp_timing_mr_ns,
-                    now_ns_mono() - t_mr0, memory_order_relaxed);
+                    elapsed_ns_since(t_mr0), memory_order_relaxed);
         }
     } else if (use_fast_fermat) {
         /* Raw base-2 Fermat test: 2^(n-1) mod n == 1?
@@ -6529,7 +6750,7 @@ static int bn_candidate_is_prime(uint64_t offset) {
         mpz_powm(tls_res_mpz, tls_two_mpz, tls_exp_mpz, tls_cand_mpz);
         if (timing_enabled)
             atomic_fetch_add_explicit(&gmp_timing_powm_ns,
-                now_ns_mono() - t_powm0, memory_order_relaxed);
+                elapsed_ns_since(t_powm0), memory_order_relaxed);
         is_prime = (mpz_cmp_ui(tls_res_mpz, 1) == 0);
         /* MR base-3 verification catches Fermat pseudoprimes */
         if (is_prime && use_mr_verify) {
@@ -6538,7 +6759,7 @@ static int bn_candidate_is_prime(uint64_t offset) {
             is_prime = mr_verify_cand();
             if (timing_enabled)
                 atomic_fetch_add_explicit(&gmp_timing_mr_ns,
-                    now_ns_mono() - t_mr0, memory_order_relaxed);
+                    elapsed_ns_since(t_mr0), memory_order_relaxed);
         }
     } else {
         /* Probable-prime: cli_mr_rounds MR rounds (default 2; old = 10).
@@ -6549,13 +6770,13 @@ static int bn_candidate_is_prime(uint64_t offset) {
         is_prime = (mpz_probab_prime_p(tls_cand_mpz, cli_mr_rounds) > 0);
         if (timing_enabled)
             atomic_fetch_add_explicit(&gmp_timing_mr_ns,
-                now_ns_mono() - t_mr0, memory_order_relaxed);
+                elapsed_ns_since(t_mr0), memory_order_relaxed);
     }
 
     prime_cache_store(offset, is_prime);
     if (timing_enabled) {
         atomic_fetch_add_explicit(&gmp_timing_total_ns,
-            now_ns_mono() - t_total0, memory_order_relaxed);
+            elapsed_ns_since(t_total0), memory_order_relaxed);
         atomic_fetch_add_explicit(&gmp_timing_calls, 1, memory_order_relaxed);
     }
     return is_prime;
@@ -8042,7 +8263,6 @@ static int scan_candidates(uint64_t *pr, size_t cnt, double target_local,
                         (unsigned long long)prev);
                 continue;
             }
-            SC_SET_CAND_U64(q);
             tls_cand_last_valid = 0;
             if (!mr_verify_cand()) {
                 log_msg("[mr_verify] pseudoprime at gap end nAdd=%llu\n",
@@ -8721,8 +8941,13 @@ static void *worker_fn(void *arg) {
                Pre-allocate phase-1 buffers BEFORE unlocking the mutex so
                the fallback path can still set up coop normally.             */
             int smart_K = cli_sample_stride;
-            int use_smart = (smart_K > 1 && !no_primality
+                int use_smart = (smart_K > 1 && !no_primality && cnt > 8);
+#ifdef WITH_GPU_FERMAT
+            if (g_gpu_count > 0) {
+                use_smart = (smart_K > 1 && !no_primality
                              && cnt > (size_t)(smart_K * 4));
+            }
+#endif
             if (skip_dense_window)
                 use_smart = 0;
 
@@ -9115,6 +9340,11 @@ static void *worker_fn(void *arg) {
                                       logbase, submit_target_local,
                                       bn_candidate_is_prime,
                                       &res_w);
+
+                if (cli_backscan_stat_sample > 1)
+                    backscan_stat_sample_probe(pr, cnt, logbase,
+                                               target_local,
+                                               cli_backscan_stat_sample);
 
                 if (one_sided_min_gap > 0 && res_w.one_sided_considered > 0) {
                     __atomic_fetch_add(&stats_noncrt_onesided_intervals,
@@ -9540,6 +9770,7 @@ int main(int argc, char **argv) {
         printf("      --gpu-smart-telemetry  write GPU smart-scan coverage telemetry to log file\n");
         printf("      --no-gpu-smart-telemetry  disable GPU smart-scan coverage telemetry\n");
         printf("      --sample-stride K smart scan: test every Kth survivor (default: 8, 1=off)\n");
+        printf("      --backscan-stat-sample N  CPU non-CRT backscan telemetry probe: sample up to N survivors for early best/last_gap display only\n");
         printf("      --auto-tune       non-CRT auto-tune sample-stride + sieve-limit every N seconds\n");
         printf("      --auto-tune-interval N  auto-tune interval in seconds (default: 30)\n");
         printf("      --auto-tune-objective MODE  speed|balanced|quality (default: balanced)\n");
@@ -9837,6 +10068,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--sample-stride") && i+1<argc) {
             cli_sample_stride = atoi(argv[++i]);
             if (cli_sample_stride < 1) cli_sample_stride = 1;
+        }
+        else if (!strcmp(argv[i],"--backscan-stat-sample") && i+1<argc) {
+            cli_backscan_stat_sample = atoi(argv[++i]);
+            if (cli_backscan_stat_sample < 0)
+                cli_backscan_stat_sample = 0;
         }
         else if (!strcmp(argv[i],"--auto-tune")) {
             use_auto_tune = 1;
@@ -10775,6 +11011,10 @@ int main(int argc, char **argv) {
                 small_primes_count > 0 ? (unsigned long long)small_primes_cache[small_primes_count-1] : 0ULL);
         log_msg("merit thresholds: submit=%.4f  scan=%.4f\n",
             target, scan_target_runtime);
+        if (cli_backscan_stat_sample > 1) {
+            log_msg("backscan stat sample: N=%d (display-only probe for non-CRT CPU backscan best/last_gap)\n",
+                    cli_backscan_stat_sample);
+        }
         if (use_one_sided_skip) {
             log_msg("one-sided skip: enabled (non-CRT CPU bkscan + GPU smart), merit>=%.2f on first side (%s)\n",
                 one_sided_skip_merit,

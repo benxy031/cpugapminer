@@ -18,12 +18,14 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QSpinBox>
 #include <QStatusBar>
 #include <QTabWidget>
+#include <QToolTip>
 #include <QTableWidget>
 #include <QTableWidgetItem>
 #include <QTimer>
@@ -50,8 +52,8 @@ QString shortHash(const QString &hash) {
     return hash.left(10) + "..." + hash.right(10);
 }
 
-QString fixed4(double v) {
-    return QString::number(v, 'f', 4);
+QString fixed6(double v) {
+    return QString::number(v, 'f', 6);
 }
 
 QString formatHashrate(double hps) {
@@ -75,6 +77,7 @@ public:
 
     explicit MiniDiffHashChart(QWidget *parent = nullptr) : QWidget(parent) {
         setMinimumHeight(160);
+        setMouseTracking(true);
     }
 
     void addSample(double difficulty, double hashrate) {
@@ -84,8 +87,21 @@ public:
         update();
     }
 
+    void addMeritSample(qint64 time, double merit, int gap) {
+        if (time <= 0 || merit <= 0.0) return;
+        meritSamples_.append({time, merit, gap});
+        while (meritSamples_.size() > 240) meritSamples_.removeFirst();
+        update();
+    }
+
     void clearSamples() {
         samples_.clear();
+        meritSamples_.clear();
+        update();
+    }
+
+    void clearMeritSamples() {
+        meritSamples_.clear();
         update();
     }
 
@@ -108,6 +124,69 @@ public:
     }
 
 protected:
+    void mouseMoveEvent(QMouseEvent *event) override {
+        if (mode_ == Mode::TimeTrend && !meritSamples_.isEmpty()) {
+            const int left = 52;
+            const int right = 14;
+            const int top = 12;
+            const int bottom = 30;
+            const QRect plot = rect().adjusted(left, top, -right, -bottom);
+            if (plot.isValid()) {
+                qint64 minTime = meritSamples_.first().time;
+                qint64 maxTime = meritSamples_.first().time;
+                double minMerit = meritSamples_.first().merit;
+                double maxMerit = meritSamples_.first().merit;
+                for (const auto &sample : meritSamples_) {
+                    minTime = std::min(minTime, sample.time);
+                    maxTime = std::max(maxTime, sample.time);
+                    minMerit = std::min(minMerit, sample.merit);
+                    maxMerit = std::max(maxMerit, sample.merit);
+                }
+                const qint64 span = std::max(maxTime - minTime, 1LL);
+                const double meritSpan = std::max(maxMerit - minMerit, 1e-9);
+
+                int hitIndex = -1;
+                for (int i = 0; i < meritSamples_.size(); ++i) {
+                    const auto &sample = meritSamples_[i];
+                    const qreal x = plot.left() + static_cast<qreal>(sample.time - minTime) / static_cast<qreal>(span) * plot.width();
+                    const double meritNorm = (sample.merit - minMerit) / meritSpan;
+                    const qreal y = plot.bottom() - (0.12 * plot.height() + meritNorm * (0.78 * plot.height()));
+                    const int dotSize = std::clamp(static_cast<int>(std::lround(2.2 + std::sqrt(std::max(sample.merit, 1.0)) * 0.7)), 2, 10);
+                    const qreal dx = event->position().x() - x;
+                    const qreal dy = event->position().y() - y;
+                    if (dx * dx + dy * dy <= dotSize * dotSize + 6) {
+                        hitIndex = i;
+                        break;
+                    }
+                }
+
+                if (hitIndex >= 0) {
+                    const auto &sample = meritSamples_[hitIndex];
+                    const QString tip = QString("Gap: %1\nMerit: %2\nTime: %3")
+                                            .arg(sample.gap)
+                                            .arg(fixed6(sample.merit))
+                                            .arg(QDateTime::fromSecsSinceEpoch(sample.time).toString(Qt::ISODate));
+                    QToolTip::showText(event->globalPosition().toPoint(), tip, this);
+                    hoveredIndex_ = hitIndex;
+                    update();
+                    return;
+                }
+            }
+        }
+
+        hoveredIndex_ = -1;
+        QToolTip::hideText();
+        update();
+        QWidget::mouseMoveEvent(event);
+    }
+
+    void leaveEvent(QEvent *event) override {
+        hoveredIndex_ = -1;
+        QToolTip::hideText();
+        update();
+        QWidget::leaveEvent(event);
+    }
+
     void paintEvent(QPaintEvent *) override {
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing, true);
@@ -133,9 +212,9 @@ protected:
         p.setPen(QColor(130, 145, 165));
         p.drawRect(plot);
 
-        if (samples_.isEmpty()) {
+        if (samples_.isEmpty() && meritSamples_.isEmpty()) {
             p.setPen(QColor(175, 185, 200));
-            p.drawText(plot, Qt::AlignCenter, "Waiting for live difficulty/hashrate samples...");
+            p.drawText(plot, Qt::AlignCenter, "Waiting for chart samples...");
             p.drawText(8, plot.center().y(), "Hashrate");
             p.drawText(plot.center().x() - 28, rect().bottom() - 8, "Difficulty");
             return;
@@ -330,6 +409,63 @@ protected:
             return;
         }
 
+        if (mode_ == Mode::TimeTrend && !meritSamples_.isEmpty()) {
+            qint64 minTime = meritSamples_.first().time;
+            qint64 maxTime = meritSamples_.first().time;
+            double minMerit = meritSamples_.first().merit;
+            double maxMerit = meritSamples_.first().merit;
+            for (const auto &sample : meritSamples_) {
+                minTime = std::min(minTime, sample.time);
+                maxTime = std::max(maxTime, sample.time);
+                minMerit = std::min(minMerit, sample.merit);
+                maxMerit = std::max(maxMerit, sample.merit);
+            }
+            const qint64 span = std::max(maxTime - minTime, 1LL);
+            const double meritSpan = std::max(maxMerit - minMerit, 1e-9);
+
+            p.setPen(QColor(175, 185, 200));
+            p.drawText(6, plot.top() + 6, "Merit dots");
+            p.drawText(plot.left(), rect().bottom() - 8, "Old");
+            p.drawText(plot.right() - 24, rect().bottom() - 8, "Now");
+            p.drawText(plot.center().x() - 18, rect().bottom() - 8, "Time");
+
+            for (int i = 0; i <= 4; ++i) {
+                const double meritVal = maxMerit - (static_cast<double>(i) / 4.0) * meritSpan;
+                const int y = plot.top() + (plot.height() * i) / 4;
+                p.drawText(6, y + 4, fixed6(meritVal));
+            }
+            p.drawText(6, plot.top() + 16, "Merit");
+
+            const int legendY = plot.top() + 6;
+            const int legendX = plot.right() - 86;
+            p.setPen(QColor(175, 185, 200));
+            p.drawText(legendX, legendY + 4, "size = merit");
+            for (int i = 0; i < 3; ++i) {
+                const int size = 3 + i * 2;
+                const int lx = legendX + 2;
+                const int ly = legendY + 16 + i * 8;
+                p.setBrush(QColor(255, 186, 76, 210));
+                p.setPen(QColor(255, 120, 0));
+                p.drawEllipse(QPoint(lx, ly), size, size);
+            }
+
+            for (int i = 0; i < meritSamples_.size(); ++i) {
+                const auto &sample = meritSamples_[i];
+                const qreal x = plot.left() + static_cast<qreal>(sample.time - minTime) / static_cast<qreal>(span) * plot.width();
+                const double meritNorm = (sample.merit - minMerit) / meritSpan;
+                const qreal y = plot.bottom() - (0.12 * plot.height() + meritNorm * (0.78 * plot.height()));
+                const int dotSize = std::clamp(static_cast<int>(std::lround(2.0 + std::sqrt(std::max(sample.merit, 1.0)) * 0.55)), 2, 8);
+                const bool isHovered = (hoveredIndex_ == i);
+                p.setBrush(isHovered ? QColor(255, 240, 120, 230) : QColor(255, 186, 76, 215));
+                p.setPen(isHovered ? QColor(255, 180, 60) : QColor(255, 120, 0));
+                p.drawEllipse(QPointF(x, y), dotSize, dotSize);
+            }
+
+            p.setPen(QColor(175, 185, 200));
+            p.drawLine(plot.left(), plot.bottom(), plot.right(), plot.bottom());
+            return;
+        }
+
         double minDiff = samples_.first().x();
         double maxDiff = samples_.first().x();
         double minHash = samples_.first().y();
@@ -382,6 +518,13 @@ private:
     Mode mode_ = Mode::ClassicDualAxis;
     bool showSamples_ = true;
     QVector<QPointF> samples_;
+    struct MeritPoint {
+        qint64 time = 0;
+        double merit = 0.0;
+        int gap = 0;
+    };
+    QVector<MeritPoint> meritSamples_;
+    int hoveredIndex_ = -1;
 };
 }
 
@@ -527,7 +670,7 @@ void MainWindow::setupUi() {
     chartModeCombo_ = new QComboBox(chainBox);
     chartModeCombo_->addItem("Classic Dual Axis (5d)");
     chartModeCombo_->addItem("Difficulty vs Hashrate");
-    chartModeCombo_->addItem("Trend Through Time");
+    chartModeCombo_->addItem("Merit Dots (time)");
     chartModeCombo_->setCurrentIndex(0);
     chainForm->addRow("Graph Mode", chartModeCombo_);
     chartSamplesToggle_ = new QCheckBox("Show Samples", chainBox);
@@ -816,7 +959,8 @@ void MainWindow::fetchBlockByHeight(int height, int remaining) {
                                 auto *shiftItem = new QTableWidgetItem(QString::number(shift));
 
                                 const double merit = b.value("merit").toDouble();
-                                auto *meritItem = new QTableWidgetItem(fixed4(merit));
+                                auto *meritItem = new QTableWidgetItem(QString("● %1").arg(fixed6(merit)));
+                                meritItem->setToolTip(QString("Merit: %1").arg(fixed6(merit)));
 
                                 const int gap = b.value("gaplen").toInt();
                                 auto *recordItem = new QTableWidgetItem("-");
@@ -830,6 +974,11 @@ void MainWindow::fetchBlockByHeight(int height, int remaining) {
                                 blocksTable_->setItem(row, 4, recordItem);
                                 blocksTable_->setItem(row, 5, timeItem);
                                 blocksTable_->setItem(row, 6, txItem);
+
+                                if (diffHashChart_) {
+                                    auto *chart = static_cast<MiniDiffHashChart *>(diffHashChart_);
+                                    chart->addMeritSample(ts, merit, gap);
+                                }
 
                                 applyRecordBadge(row, gap, merit);
 
@@ -1266,19 +1415,23 @@ void MainWindow::applyRecordBadge(int row, int gap, double merit) {
 
     if (gap <= 0) {
         recordItem->setText("-");
+        recordItem->setToolTip("No gap data");
         return;
     }
 
     if (!recordMeritByGap_.contains(gap)) {
         recordItem->setText("n/a");
+        recordItem->setToolTip(QString("No record found for gap %1").arg(gap));
         return;
     }
 
     const double rec = recordMeritByGap_.value(gap);
     const double delta = merit - rec;
     if (delta > 0.0) {
-        recordItem->setText(QString("REC +%1").arg(fixed4(delta)));
+        recordItem->setText(QString("REC +%1").arg(fixed6(delta)));
     } else {
-        recordItem->setText(QString("-%1").arg(fixed4(-delta)));
+        recordItem->setText(QString("-%1").arg(fixed6(-delta)));
     }
+    recordItem->setToolTip(QString("Merit: %1\nRecord: %2\nDelta: %3")
+                                .arg(fixed6(merit), fixed6(rec), fixed6(delta)));
 }
