@@ -95,6 +95,51 @@ static inline double crt_runtime_submit_target(double focus_target) {
     return submit_target;
 }
 
+/* Compute the prefilter needed gap for a window, but clamp it to what is
+ * actually reachable by odd offsets in the current [L, R) sieve interval. */
+static inline uint64_t crt_runtime_needed_gap_for_window(
+        double target_merit,
+        double logbase_nonce,
+        uint64_t gap_L,
+        uint64_t gap_R) {
+    uint64_t needed_gap = (uint64_t)(target_merit * logbase_nonce);
+    if (needed_gap < 2)
+        needed_gap = 2;
+
+    /* Match sieve_range odd-boundary handling. */
+    if ((gap_L & 1ULL) == 0ULL)
+        gap_L++;
+    if ((gap_R & 1ULL) == 0ULL)
+        gap_R++;
+
+    uint64_t max_reachable_gap = 2;
+    if (gap_R > gap_L + 2ULL)
+        max_reachable_gap = gap_R - gap_L - 2ULL;
+
+    if (needed_gap > max_reachable_gap)
+        needed_gap = max_reachable_gap;
+    return needed_gap;
+}
+
+static inline void crt_runtime_observe_needed_gap(uint64_t needed_gap) {
+    __atomic_fetch_add(&stats_crt_needed_gap_samples, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&stats_crt_needed_gap_sum, needed_gap,
+                       __ATOMIC_RELAXED);
+
+    uint64_t prev = __atomic_load_n(&stats_crt_needed_gap_max,
+                                    __ATOMIC_RELAXED);
+    while (needed_gap > prev) {
+        if (__atomic_compare_exchange_n(&stats_crt_needed_gap_max,
+                                        &prev,
+                                        needed_gap,
+                                        0,
+                                        __ATOMIC_RELAXED,
+                                        __ATOMIC_RELAXED)) {
+            break;
+        }
+    }
+}
+
 static inline void crt_runtime_cleanup_tls_gmp(
     const struct crt_runtime_worker_ctx *ctx) {
     if (tls_gmp_inited) {
@@ -202,6 +247,8 @@ static void crt_runtime_process_solver_window(
         uint32_t nonce_cur,
         int cand_odd,
         double logbase_nonce,
+        uint64_t gap_L,
+        uint64_t gap_R,
         double target_local,
         int shift_local,
         mpz_t nAdd,
@@ -210,6 +257,9 @@ static void crt_runtime_process_solver_window(
         const char *rpc_pass_local,
         const struct crt_runtime_worker_ctx *ctx) {
     double submit_target = crt_runtime_submit_target(target_local);
+    uint64_t needed_gap_cs = crt_runtime_needed_gap_for_window(
+        target_local, logbase_nonce, gap_L, gap_R);
+    crt_runtime_observe_needed_gap(needed_gap_cs);
     if (!surv || surv_cnt == 0) {
         mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
         return;
@@ -219,9 +269,6 @@ static void crt_runtime_process_solver_window(
     if (crt_runtime_effective_fermat_threads(ctx) > 0) {
         __atomic_fetch_add(&stats_crt_solver_prod_windows_generated, 1,
                            __ATOMIC_RELAXED);
-
-        uint64_t needed_gap_cs = (uint64_t)(target_local * logbase_nonce);
-        if (needed_gap_cs < 2) needed_gap_cs = 2;
 
         if (surv_cnt < 2 ||
             surv[surv_cnt - 1] - surv[0] < needed_gap_cs) {
@@ -303,9 +350,7 @@ static void crt_runtime_process_solver_window(
 
     /* Monolithic path: evaluate this window inline. */
     {
-        uint64_t ng = (uint64_t)(target_local * logbase_nonce);
-        if (ng < 2) ng = 2;
-        if (surv_cnt < 2 || surv[surv_cnt - 1] - surv[0] < ng) {
+        if (surv_cnt < 2 || surv[surv_cnt - 1] - surv[0] < needed_gap_cs) {
             __atomic_fetch_add(&stats_cramer_skipped, 1,
                                __ATOMIC_RELAXED);
             mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
@@ -542,6 +587,7 @@ crt_runtime_run_solver_nonce_step(
                 surv, surv_cnt,
                 nonce_cur, cand_odd,
                 logbase_nonce,
+                gap_L, gap_R,
                 target_local, shift_local,
                 nAdd,
                 rpc_url_local, rpc_user_local, rpc_pass_local,

@@ -9,6 +9,14 @@
 #include <math.h>
 #include <string.h>
 
+/* Fast ceil(raw) for positive finite doubles in (0, UINT64_MAX).
+ * Avoids libm ceil() in hot per-nonce sizing paths while preserving
+ * the exact integer result for values representable in uint64_t. */
+static inline uint64_t ceil_pos_double_to_u64(double raw) {
+    uint64_t whole = (uint64_t)raw;
+    return ((double)whole < raw) ? (whole + 1ULL) : whole;
+}
+
 static uint64_t gap_scan_floor_or_default(uint64_t floor_value) {
     uint64_t floor_scan = floor_value > 0ULL
         ? floor_value : CRT_GAP_SCAN_FLOOR_DEFAULT;
@@ -99,7 +107,7 @@ uint64_t crt_gap_scan_for_nonce(double target_merit,
         uint64_t gap_scan = 0;
 
         if (raw > 0.0 && raw < (double)UINT64_MAX)
-            gap_scan = (uint64_t)ceil(raw);
+            gap_scan = ceil_pos_double_to_u64(raw);
 
         if (gap_scan < 8ULL)
             gap_scan = 8ULL;
@@ -126,7 +134,7 @@ uint64_t crt_gap_scan_for_nonce(double target_merit,
     if (logbase > 0.0 && target_merit > 0.0) {
         double raw = target_merit * logbase * 2.0;
         if (raw >= 1.0) {
-            uint64_t capped = (uint64_t)ceil(raw);
+            uint64_t capped = ceil_pos_double_to_u64(raw);
             if (capped < 10000ULL) capped = 10000ULL;
             if (capped < fixed)
                 return capped;

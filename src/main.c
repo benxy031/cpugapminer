@@ -1255,6 +1255,41 @@ static volatile double one_sided_skip_merit = ONE_SIDED_SKIP_MERIT_DEFAULT;
 static volatile int one_sided_skip_merit_user_set = 0;
 static volatile int g_shift_runtime = 20;
 
+/* Aggregated one-sided adaptive cadence telemetry (non-CRT, CPU backscan).
+    Stored locally in main.c because it is runtime observability only. */
+static volatile uint64_t stats_noncrt_onesided_every_sum = 0;
+static volatile uint64_t stats_noncrt_onesided_every_min = UINT64_MAX;
+static volatile uint64_t stats_noncrt_onesided_every_max = 0;
+static inline void update_onesided_every_extrema(size_t every_v)
+{
+    uint64_t val = (uint64_t)every_v;
+    uint64_t prev = __atomic_load_n(&stats_noncrt_onesided_every_min,
+                                    __ATOMIC_RELAXED);
+    while (val < prev) {
+        if (__atomic_compare_exchange_n(&stats_noncrt_onesided_every_min,
+                                        &prev,
+                                        val,
+                                        0,
+                                        __ATOMIC_RELAXED,
+                                        __ATOMIC_RELAXED)) {
+            break;
+        }
+    }
+
+    prev = __atomic_load_n(&stats_noncrt_onesided_every_max,
+                           __ATOMIC_RELAXED);
+    while (val > prev) {
+        if (__atomic_compare_exchange_n(&stats_noncrt_onesided_every_max,
+                                        &prev,
+                                        val,
+                                        0,
+                                        __ATOMIC_RELAXED,
+                                        __ATOMIC_RELAXED)) {
+            break;
+        }
+    }
+}
+
 static double auto_one_sided_skip_merit(int shift, double scan_target_runtime) {
     double base = (scan_target_runtime > 0.0)
         ? scan_target_runtime
@@ -2929,15 +2964,30 @@ static void print_stats(void) {
             uint64_t oi = stats_noncrt_onesided_intervals;
             uint64_t os = stats_noncrt_onesided_skipped;
             uint64_t of = stats_noncrt_onesided_fullcheck;
+            uint64_t oes = __atomic_load_n(&stats_noncrt_onesided_every_sum,
+                                           __ATOMIC_RELAXED);
+            uint64_t oemin = __atomic_load_n(&stats_noncrt_onesided_every_min,
+                                             __ATOMIC_RELAXED);
+            uint64_t oemax = __atomic_load_n(&stats_noncrt_onesided_every_max,
+                                             __ATOMIC_RELAXED);
             double skip_pct = 100.0 * (double)os / (double)oi;
             double full_pct = 100.0 * (double)of / (double)oi;
-            log_msg("  one-sided(non-crt): intervals=%llu skipped=%llu (%.1f%%) fullcheck=%llu (%.1f%%)",
+            double oe_avg = (oi > 0)
+                ? ((double)oes / (double)oi)
+                : 0.0;
+            if (oemin == UINT64_MAX)
+                oemin = 0;
+            log_msg("  one-sided(non-crt): intervals=%llu skipped=%llu (%.1f%%) fullcheck=%llu (%.1f%%) cadence(avg/min/max)=%.2f/%llu/%llu",
                 (unsigned long long)oi,
                 (unsigned long long)os,
                 skip_pct,
                 (unsigned long long)of,
-                full_pct);
+                full_pct,
+                oe_avg,
+                (unsigned long long)oemin,
+                (unsigned long long)oemax);
         }
+
     }
 
     /* ── CRT-specific stats ── */
@@ -3071,6 +3121,11 @@ static void print_stats(void) {
             uint64_t prod_alloc_fail = stats_crt_solver_prod_alloc_fail;
             uint64_t pre_span_drop = stats_crt_solver_prod_prefilter_span_drop;
             uint64_t pre_den_drop = stats_crt_solver_prod_prefilter_density_drop;
+            uint64_t ng_samples = stats_crt_needed_gap_samples;
+            uint64_t ng_sum = stats_crt_needed_gap_sum;
+            uint64_t ng_max = stats_crt_needed_gap_max;
+            double ng_avg = (ng_samples > 0)
+                ? ((double)ng_sum / (double)ng_samples) : 0.0;
             double enq_pct = (prod_gen > 0)
                 ? (100.0 * (double)prod_enq / (double)prod_gen) : 0.0;
             struct crt_score_roll_snapshot score_snap;
@@ -3081,14 +3136,16 @@ static void print_stats(void) {
                 (unsigned long long)stats_crt_solver_mono_gpu_tests,
                 (unsigned long long)stats_crt_solver_consumer_cpu_tests,
                 (unsigned long long)stats_crt_solver_consumer_gpu_tests);
-            log_msg("  phase1: producer generated=%llu enqueued=%llu consumed=%llu (enq %.1f%%) alloc_fail=%llu prefilter span=%llu density=%llu",
+            log_msg("  phase1: producer generated=%llu enqueued=%llu consumed=%llu (enq %.1f%%) alloc_fail=%llu prefilter span=%llu density=%llu needed_gap(avg/max)=%.1f/%llu",
                 (unsigned long long)prod_gen,
                 (unsigned long long)prod_enq,
                 (unsigned long long)stats_crt_consumer_windows,
                 enq_pct,
                 (unsigned long long)prod_alloc_fail,
                 (unsigned long long)pre_span_drop,
-                (unsigned long long)pre_den_drop);
+                (unsigned long long)pre_den_drop,
+                ng_avg,
+                (unsigned long long)ng_max);
             if (stats_crt_gpu_accum_flush_count > 0 ||
                 stats_crt_gpu_accum_collect_count > 0 ||
                 stats_crt_cuda_fb_no_accum > 0 ||
@@ -9397,6 +9454,27 @@ static void *worker_fn(void *arg) {
                     __atomic_fetch_add(&stats_noncrt_onesided_fullcheck,
                                        (uint64_t)res_w.one_sided_fullcheck,
                                        __ATOMIC_RELAXED);
+                    __atomic_fetch_add(&stats_noncrt_onesided_every_sum,
+                                       res_w.one_sided_fullcheck_every_sum,
+                                       __ATOMIC_RELAXED);
+                    if (res_w.one_sided_fullcheck_every_min > 0)
+                        update_onesided_every_extrema(
+                            res_w.one_sided_fullcheck_every_min);
+                    if (res_w.one_sided_fullcheck_every_max > 0)
+                        update_onesided_every_extrema(
+                            res_w.one_sided_fullcheck_every_max);
+
+                    if (use_extra_verbose &&
+                        res_w.one_sided_fullcheck_every_min > 0) {
+                        double every_avg =
+                            (double)res_w.one_sided_fullcheck_every_sum /
+                            (double)res_w.one_sided_considered;
+                        log_file_only("one-sided adaptive cadence: avg=%.2f min=%zu max=%zu considered=%zu\n",
+                                      every_avg,
+                                      res_w.one_sided_fullcheck_every_min,
+                                      res_w.one_sided_fullcheck_every_max,
+                                      res_w.one_sided_considered);
+                    }
                 }
 
                 /* Cross-window carry: gap from previous window's last confirmed

@@ -22,6 +22,9 @@ struct bkscan_result {
     size_t   one_sided_considered; /* intervals evaluated by one-sided gate   */
     size_t   one_sided_skipped;    /* intervals skipped (give-up/go-next)     */
     size_t   one_sided_fullcheck;  /* intervals that kept full two-sided scan */
+    uint64_t one_sided_fullcheck_every_sum; /* sum of adaptive cadence values */
+    size_t   one_sided_fullcheck_every_min; /* min adaptive cadence used */
+    size_t   one_sided_fullcheck_every_max; /* max adaptive cadence used */
     uint64_t qual_pairs[64][2];  /* [start_nAdd, end_nAdd] qualifying pairs  */
     size_t   qual_cnt;           /* number of qualifying gaps found          */
 };

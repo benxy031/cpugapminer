@@ -7,6 +7,51 @@
 
 #define ONE_SIDED_FORCE_FULLCHECK_EVERY 16U
 #define ONE_SIDED_FORCE_FULLCHECK_MIN_PROBE_STEPS 12U
+#define ONE_SIDED_FORCE_FULLCHECK_MIN_EVERY 4U
+#define ONE_SIDED_FORCE_FULLCHECK_MAX_EVERY 24U
+
+/* Adapt one-sided cadence to local gate geometry and observed skip trend.
+ * Narrow gate bands carry weaker signal, so force fullcheck more often. */
+static inline unsigned one_sided_fullcheck_every_adaptive(
+        size_t needed_gap,
+        size_t one_sided_min_gap,
+        const struct bkscan_result *res) {
+    unsigned every = ONE_SIDED_FORCE_FULLCHECK_EVERY;
+    size_t gate_band = 0;
+
+    if (one_sided_min_gap > needed_gap)
+        gate_band = one_sided_min_gap - needed_gap;
+
+    if (needed_gap > 0) {
+        if (gate_band <= (needed_gap >> 2))
+            every = 4;
+        else if (gate_band <= (needed_gap >> 1))
+            every = 8;
+        else if (gate_band <= needed_gap)
+            every = 12;
+        else
+            every = 20;
+    }
+
+    if (res && res->one_sided_considered >= 32) {
+        size_t considered = res->one_sided_considered;
+        size_t skipped = res->one_sided_skipped;
+        size_t skip_pct = (considered > 0)
+            ? ((skipped * 100U) / considered)
+            : 0U;
+
+        if (skip_pct >= 85U && every > 6U)
+            every -= 2U;
+        else if (skip_pct <= 45U && every < 22U)
+            every += 2U;
+    }
+
+    if (every < ONE_SIDED_FORCE_FULLCHECK_MIN_EVERY)
+        every = ONE_SIDED_FORCE_FULLCHECK_MIN_EVERY;
+    if (every > ONE_SIDED_FORCE_FULLCHECK_MAX_EVERY)
+        every = ONE_SIDED_FORCE_FULLCHECK_MAX_EVERY;
+    return every;
+}
 
 void backward_scan_segment(const uint64_t *pr, size_t lo, size_t hi,
                            size_t needed_gap, size_t one_sided_min_gap,
@@ -23,6 +68,9 @@ void backward_scan_segment(const uint64_t *pr, size_t lo, size_t hi,
     res->one_sided_considered = 0;
     res->one_sided_skipped = 0;
     res->one_sided_fullcheck = 0;
+    res->one_sided_fullcheck_every_sum = 0;
+    res->one_sided_fullcheck_every_min = 0;
+    res->one_sided_fullcheck_every_max = 0;
     res->qual_cnt    = 0;
     if (lo >= hi || !prime_test) return;
 
@@ -95,13 +143,22 @@ void backward_scan_segment(const uint64_t *pr, size_t lo, size_t hi,
 
             if (gate_found_upper) {
                 res->one_sided_considered++;
+                unsigned fullcheck_every = one_sided_fullcheck_every_adaptive(
+                    needed_gap, one_sided_min_gap, res);
+                res->one_sided_fullcheck_every_sum += (uint64_t)fullcheck_every;
+                if (res->one_sided_fullcheck_every_min == 0 ||
+                    (size_t)fullcheck_every < res->one_sided_fullcheck_every_min) {
+                    res->one_sided_fullcheck_every_min = (size_t)fullcheck_every;
+                }
+                if ((size_t)fullcheck_every > res->one_sided_fullcheck_every_max)
+                    res->one_sided_fullcheck_every_max = (size_t)fullcheck_every;
                 /* Hybrid mode: periodically force full two-sided verification
                    to reduce one-sided bias while keeping skip as default.
                    Also force when the upper-prime probe had to scan a long
                    stretch, because that window is sparse enough to justify
                    the extra work. */
                 if (probe_steps < ONE_SIDED_FORCE_FULLCHECK_MIN_PROBE_STEPS &&
-                    (res->one_sided_considered % ONE_SIDED_FORCE_FULLCHECK_EVERY) != 0) {
+                    (res->one_sided_considered % (size_t)fullcheck_every) != 0) {
                     /* Give-up/go-next: weak first-side signal. */
                     res->one_sided_skipped++;
                     start_nAdd = pr[upper_idx];
