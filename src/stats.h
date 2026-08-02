@@ -12,6 +12,7 @@
 /* Shared mining/statistics state.
  * Defined in stats.c and consumed by main.c and mining routines. */
 extern volatile uint64_t stats_sieved;
+extern volatile uint64_t stats_sieve_survivors;
 extern volatile uint64_t stats_tested;
 extern volatile uint64_t stats_gaps;
 extern volatile uint64_t stats_pairs;

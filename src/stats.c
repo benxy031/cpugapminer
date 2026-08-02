@@ -14,6 +14,7 @@
 #include <time.h>
 
 volatile uint64_t stats_sieved = 0;
+volatile uint64_t stats_sieve_survivors = 0;
 volatile uint64_t stats_tested = 0;
 volatile uint64_t stats_gaps = 0;
 volatile uint64_t stats_pairs = 0;

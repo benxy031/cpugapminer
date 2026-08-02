@@ -2399,6 +2399,20 @@ struct noncrt_autotune_state {
 
 static struct noncrt_autotune_state g_noncrt_autotune = {0};
 
+static int noncrt_autotune_find_profile(const struct noncrt_autotune_state *st,
+                                        int stride,
+                                        uint64_t sieve_limit)
+{
+    if (!st)
+        return -1;
+    for (int i = 0; i < st->prof_n; i++) {
+        if (st->prof[i].stride == stride &&
+            st->prof[i].sieve_limit == sieve_limit)
+            return i;
+    }
+    return -1;
+}
+
 static uint64_t approx_prime_count_from_limit(uint64_t limit)
 {
     if (limit < 64ULL)
@@ -2504,15 +2518,26 @@ static void noncrt_autotune_tick(uint64_t now_ms,
 
         st->prof_n = 0;
         noncrt_autotune_add_profile(st, cli_sample_stride, base_limit);
-        noncrt_autotune_add_profile(st, 2, base_limit / 2);
-        noncrt_autotune_add_profile(st, 2, base_limit);
-        noncrt_autotune_add_profile(st, 2, base_limit * 2);
-        noncrt_autotune_add_profile(st, 3, base_limit / 2);
-        noncrt_autotune_add_profile(st, 3, base_limit);
-        noncrt_autotune_add_profile(st, 3, base_limit * 2);
-        noncrt_autotune_add_profile(st, 4, base_limit / 2);
+        /* Empirical ladder from bench_stride runs: throughput usually peaks
+           around stride 4..6, while larger strides reduce tested/s and pps.
+           Explore that band first, then wider fallbacks. */
+        noncrt_autotune_add_profile(st, 5, base_limit);
         noncrt_autotune_add_profile(st, 4, base_limit);
+        noncrt_autotune_add_profile(st, 6, base_limit);
+        noncrt_autotune_add_profile(st, 3, base_limit);
+        noncrt_autotune_add_profile(st, 7, base_limit);
+        noncrt_autotune_add_profile(st, 2, base_limit);
+        noncrt_autotune_add_profile(st, 8, base_limit);
+        noncrt_autotune_add_profile(st, 9, base_limit);
+        noncrt_autotune_add_profile(st, 10, base_limit);
+        noncrt_autotune_add_profile(st, 12, base_limit);
+
+        /* Keep a small sieve-limit perturbation set only around the likely
+           best stride band to avoid exploding profile count/noise. */
+        noncrt_autotune_add_profile(st, 5, base_limit / 2);
+        noncrt_autotune_add_profile(st, 5, base_limit * 2);
         noncrt_autotune_add_profile(st, 4, base_limit * 2);
+        noncrt_autotune_add_profile(st, 6, base_limit * 2);
 
         st->exploring = 1;
         st->exploit_left = 0;
@@ -2532,12 +2557,17 @@ static void noncrt_autotune_tick(uint64_t now_ms,
         st->initialized = 1;
 
         if (st->prof_n > 0) {
-            noncrt_autotune_apply_profile(&st->prof[0]);
+            int start_idx = noncrt_autotune_find_profile(st, 5, clamp_sieve_limit(base_limit));
+            if (start_idx < 0)
+                start_idx = 0;
+            st->eval_idx = start_idx;
+            st->best_idx = start_idx;
+            noncrt_autotune_apply_profile(&st->prof[start_idx]);
             log_msg("auto-tune: enabled objective=%s interval=%ds start_profile stride=%d sieve_limit=%llu\n",
                     auto_tune_objective_name(cli_auto_tune_objective),
                     cli_auto_tune_interval_sec,
-                    st->prof[0].stride,
-                    (unsigned long long)st->prof[0].sieve_limit);
+                    st->prof[start_idx].stride,
+                    (unsigned long long)st->prof[start_idx].sieve_limit);
         }
         return;
     }
@@ -2792,6 +2822,9 @@ static void print_stats(void) {
     double false_gap_pct = ((stats_false_gaps + stats_gaps) > 0)
         ? (100.0 * (double)stats_false_gaps /
            (double)(stats_false_gaps + stats_gaps)) : 0.0;
+    double sieve_keep_odd_pct = (stats_sieved > 0)
+        ? (200.0 * (double)stats_sieve_survivors / (double)stats_sieved)
+        : 0.0;
 
     uint64_t sieve_limit_for_model = cli_sieve_prime_limit;
     if (use_partial_sieve_auto && g_crt_mode == CRT_MODE_NONE &&
@@ -3181,8 +3214,9 @@ static void print_stats(void) {
         log_msg("  pool=%lu/%lu", (unsigned long)s_acc, (unsigned long)(s_acc + s_rej));
     }
 #endif
-    log_msg("  cpu: surv/Msieved=%.1f  pairs/Msieved=%.1f  false_gaps=%llu (%.2f%%)",
-            surv_per_million, pairs_per_million,
+        log_msg("  cpu: surv/Msieved=%.1f  keep(odd)=%.2f%%  pairs/Msieved=%.1f  false_gaps=%llu (%.2f%%)",
+            surv_per_million, sieve_keep_odd_pct,
+            pairs_per_million,
             (unsigned long long)stats_false_gaps, false_gap_pct);
     {
         uint64_t pf_checks = atomic_load_explicit(&gap_verify_pf_checks, memory_order_relaxed);
@@ -3724,13 +3758,16 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
     if (use_sievegap && g_crt_mode == CRT_MODE_NONE) {
         int have_cache = (tls_base_mod_p_ready && tls_base_mod_p &&
                           tls_base_mod_p_cap >= small_primes_count);
-        return sievegap_run_range(L, R, out_count,
-                                  h256, shift,
-                                  small_primes_cache, small_primes_count,
-                                  (uint64_t)cli_sieve_prime_limit,
-                                  have_cache ? tls_base_mod_p : NULL,
-                                  have_cache,
-                                  tls_gpu_base_mod_p_gen);
+        uint64_t *pr = sievegap_run_range(L, R, out_count,
+                                          h256, shift,
+                                          small_primes_cache, small_primes_count,
+                                          (uint64_t)cli_sieve_prime_limit,
+                                          have_cache ? tls_base_mod_p : NULL,
+                                          have_cache,
+                                          tls_gpu_base_mod_p_gen);
+        if (out_count && *out_count > 0)
+            __atomic_fetch_add(&stats_sieve_survivors, (uint64_t)(*out_count), __ATOMIC_RELAXED);
+        return pr;
     }
 
     uint64_t seg_size = (R - L) / 2 + 1;
@@ -4480,6 +4517,8 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
         }
         tls_last_out = out_cnt;
         *out_count = out_cnt;
+        if (out_cnt > 0)
+            __atomic_fetch_add(&stats_sieve_survivors, (uint64_t)out_cnt, __ATOMIC_RELAXED);
         return tls_pr;
     }
 #endif /* !WITH_CRT_GPU_CONSUMER */
@@ -4535,6 +4574,8 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
     }
     tls_last_out = out_cnt;
     *out_count = out_cnt;
+    if (out_cnt > 0)
+        __atomic_fetch_add(&stats_sieve_survivors, (uint64_t)out_cnt, __ATOMIC_RELAXED);
     return tls_pr;
 }
 
