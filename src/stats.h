@@ -72,6 +72,15 @@ extern volatile uint64_t stats_noncrt_lane_qual_unexpected;
 extern volatile uint64_t stats_noncrt_onesided_intervals;      /* one-sided gate decisions in non-CRT bkscan */
 extern volatile uint64_t stats_noncrt_onesided_skipped;        /* intervals skipped by give-up/go-next */
 extern volatile uint64_t stats_noncrt_onesided_fullcheck;      /* intervals kept for full two-sided check */
+extern volatile uint64_t stats_noncrt_needed_gap_samples;      /* non-CRT smart windows sampled for needed_gap */
+extern volatile uint64_t stats_noncrt_needed_gap_sum;          /* sum of non-CRT needed_gap values */
+extern volatile uint64_t stats_noncrt_needed_gap_max;          /* max non-CRT needed_gap value */
+extern volatile uint64_t stats_noncrt_cpu_needed_gap_samples;  /* CPU non-CRT smart windows sampled for needed_gap */
+extern volatile uint64_t stats_noncrt_cpu_needed_gap_sum;      /* sum of CPU non-CRT needed_gap values */
+extern volatile uint64_t stats_noncrt_cpu_needed_gap_max;      /* max CPU non-CRT needed_gap value */
+extern volatile uint64_t stats_noncrt_gpu_needed_gap_samples;  /* GPU non-CRT smart windows sampled for needed_gap */
+extern volatile uint64_t stats_noncrt_gpu_needed_gap_sum;      /* sum of GPU non-CRT needed_gap values */
+extern volatile uint64_t stats_noncrt_gpu_needed_gap_max;      /* max GPU non-CRT needed_gap value */
 extern volatile uint64_t stats_crt_heap_push_ok;
 extern volatile uint64_t stats_crt_heap_push_replace;
 extern volatile uint64_t stats_crt_heap_push_drop;

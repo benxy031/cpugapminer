@@ -1260,6 +1260,58 @@ static volatile int g_shift_runtime = 20;
 static volatile uint64_t stats_noncrt_onesided_every_sum = 0;
 static volatile uint64_t stats_noncrt_onesided_every_min = UINT64_MAX;
 static volatile uint64_t stats_noncrt_onesided_every_max = 0;
+
+static inline void update_noncrt_needed_gap_stats(uint64_t needed_gap,
+                                                   int is_gpu_path)
+{
+    __atomic_fetch_add(&stats_noncrt_needed_gap_samples, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&stats_noncrt_needed_gap_sum, needed_gap, __ATOMIC_RELAXED);
+    uint64_t prev = __atomic_load_n(&stats_noncrt_needed_gap_max,
+                                    __ATOMIC_RELAXED);
+    while (needed_gap > prev) {
+        if (__atomic_compare_exchange_n(&stats_noncrt_needed_gap_max,
+                                        &prev,
+                                        needed_gap,
+                                        0,
+                                        __ATOMIC_RELAXED,
+                                        __ATOMIC_RELAXED)) {
+            break;
+        }
+    }
+
+    if (is_gpu_path) {
+        __atomic_fetch_add(&stats_noncrt_gpu_needed_gap_samples, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&stats_noncrt_gpu_needed_gap_sum, needed_gap, __ATOMIC_RELAXED);
+        prev = __atomic_load_n(&stats_noncrt_gpu_needed_gap_max,
+                               __ATOMIC_RELAXED);
+        while (needed_gap > prev) {
+            if (__atomic_compare_exchange_n(&stats_noncrt_gpu_needed_gap_max,
+                                            &prev,
+                                            needed_gap,
+                                            0,
+                                            __ATOMIC_RELAXED,
+                                            __ATOMIC_RELAXED)) {
+                break;
+            }
+        }
+    } else {
+        __atomic_fetch_add(&stats_noncrt_cpu_needed_gap_samples, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&stats_noncrt_cpu_needed_gap_sum, needed_gap, __ATOMIC_RELAXED);
+        prev = __atomic_load_n(&stats_noncrt_cpu_needed_gap_max,
+                               __ATOMIC_RELAXED);
+        while (needed_gap > prev) {
+            if (__atomic_compare_exchange_n(&stats_noncrt_cpu_needed_gap_max,
+                                            &prev,
+                                            needed_gap,
+                                            0,
+                                            __ATOMIC_RELAXED,
+                                            __ATOMIC_RELAXED)) {
+                break;
+            }
+        }
+    }
+}
+
 static inline void update_onesided_every_extrema(size_t every_v)
 {
     uint64_t val = (uint64_t)every_v;
@@ -2959,6 +3011,27 @@ static void print_stats(void) {
                 a2_q,
                 a4_q,
                 unk_q);
+        }
+        {
+            uint64_t ng_s = stats_noncrt_needed_gap_samples;
+            uint64_t ng_sum = stats_noncrt_needed_gap_sum;
+            uint64_t ng_max = stats_noncrt_needed_gap_max;
+            uint64_t ng_cpu_s = stats_noncrt_cpu_needed_gap_samples;
+            uint64_t ng_cpu_sum = stats_noncrt_cpu_needed_gap_sum;
+            uint64_t ng_cpu_max = stats_noncrt_cpu_needed_gap_max;
+            uint64_t ng_gpu_s = stats_noncrt_gpu_needed_gap_samples;
+            uint64_t ng_gpu_sum = stats_noncrt_gpu_needed_gap_sum;
+            uint64_t ng_gpu_max = stats_noncrt_gpu_needed_gap_max;
+            double ng_avg = (ng_s > 0) ? ((double)ng_sum / (double)ng_s) : 0.0;
+            double ng_cpu_avg = (ng_cpu_s > 0) ? ((double)ng_cpu_sum / (double)ng_cpu_s) : 0.0;
+            double ng_gpu_avg = (ng_gpu_s > 0) ? ((double)ng_gpu_sum / (double)ng_gpu_s) : 0.0;
+            log_msg("  noncrt: needed_gap(avg/max)=%.1f/%llu cpu(avg/max)=%.1f/%llu gpu(avg/max)=%.1f/%llu",
+                ng_avg,
+                (unsigned long long)ng_max,
+                ng_cpu_avg,
+                (unsigned long long)ng_cpu_max,
+                ng_gpu_avg,
+                (unsigned long long)ng_gpu_max);
         }
         if (stats_noncrt_onesided_intervals > 0) {
             uint64_t oi = stats_noncrt_onesided_intervals;
@@ -9049,6 +9122,12 @@ static void *worker_fn(void *arg) {
             if (skip_dense_window)
                 use_smart = 0;
 
+#ifdef WITH_GPU_FERMAT
+            int noncrt_gpu_smart_path = (g_gpu_count > 0);
+#else
+            int noncrt_gpu_smart_path = 0;
+#endif
+
             size_t needed_gap = 0;
             double submit_target_local = effective_submit_target(target_local);
 #ifdef WITH_GPU_FERMAT
@@ -9088,6 +9167,10 @@ static void *worker_fn(void *arg) {
                     }
                 }
 #endif
+
+                if (use_smart)
+                    update_noncrt_needed_gap_stats((uint64_t)needed_gap,
+                                                   noncrt_gpu_smart_path);
             }
 
             /* --- set up cooperative Fermat and unlock mutex (once) ------- */
