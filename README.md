@@ -72,6 +72,9 @@ tests/
   test_wheel_compare.c     - wheel vs baseline presieve consistency checks
   test_crt_runtime_policy.c - CRT runtime policy tests (adaptive/backpressure)
 scripts/
+  bench_gpu_sieve_ab.sh
+                    - A/B runner for non-CRT GPU-sieve env profiles
+                      (A0/A1/B1/A2/A3), default 120s per profile
   inspect_tx.py     - Python utility to decode raw block/transaction hex
                       files written to /tmp by the miner
 crt/
@@ -418,6 +421,7 @@ bin/gap_miner \
   --crt-file crt/crt_s512_m22.txt
 ```
 
+
 ## Recent changes (May 2026)
 
 ### CGBN cooperative Fermat kernel (May 2026)
@@ -552,9 +556,9 @@ remain on the CPU.
 - `kernel_compute_k0`: first full pass computes first-hit residues `k0[j]`;
   subsequent windows use incremental cached updates when possible
 - direct packed-bitmap mark path (`kernel_mark_composites_bits` and fused
-  incremental variant) is the default fast path in bitmap mode
-- legacy scratch+pack path (`kernel_mark_composites` + `kernel_pack_bits`)
-  is still available as a runtime fallback/diagnostic path
+  incremental variant) and legacy scratch+pack (`kernel_mark_composites` +
+  `kernel_pack_bits`) are selected at runtime by a lightweight heuristic
+  based on window/prime-slice shape
 - `kernel_compact_survivors`: try to compact Phase 2 survivors into a fixed-cap
   `uint32_t` list before falling back to bitmap mode
 
@@ -566,8 +570,9 @@ remain on the CPU.
    extraction.
 4. If the compact survivor count fits in `GPU_SIEVE_SURV_CAP`, the GPU returns
    survivor positions directly.
-5. Otherwise the GPU runs bitmap mode. By default it marks directly into
-  packed `d_bits`; optional diagnostic mode can force legacy scratch+pack.
+5. Otherwise the GPU runs bitmap mode. Runtime chooses direct-bits vs
+  scratch+pack automatically; `GPU_SIEVE_DIRECT_BITS=0` keeps the B1-style
+  scratch+pack default, while `GPU_SIEVE_DIRECT_BITS=1` forces direct-bits.
 6. Bitmap mode downloads `d_bits`, and the CPU OR-merges that bitmap into `bits[]`.
 7. CPU applies the Phase 3 CRT filter, then turns the final bitmap (or the
    compact survivor list intersected with `bits[]`) into the `tls_pr[]`
@@ -613,9 +618,30 @@ buffers are sized from the finalized CLI values at startup, not hardcoded.
 | `GPU_SIEVE_POOL` | pooled contexts per selected CUDA device (default `3`, max `4`) |
 | `GPU_SIEVE_TIMING` | enable per-stage CUDA timing collection |
 | `GPU_SIEVE_TIMING_SERIAL` | diagnostic mode: serialize GPU sieve calls for cleaner timing attribution (not for production throughput runs) |
-| `GPU_SIEVE_DIRECT_BITS` | bitmap mode selector: default `1` (direct packed-bit marking), set `0` to force legacy scratch+pack path |
+| `GPU_SIEVE_DIRECT_BITS` | bitmap mode override: default `0` (B1-tuned default), set `1` to force direct packed-bit marking |
+| `GPU_SIEVE_MIN_PH2` | minimum Phase-2 prime count required before GPU offload (default `16384`) |
+| `GPU_SIEVE_MIN_SEGMENT` | minimum odd-candidate segment length required before GPU offload (default `262144`) |
 | `GPU_SIEVE_CLEAR_KERNEL` | diagnostic mode: replace `cudaMemsetAsync` clear with a simple clear kernel (`1`=on); default off |
 | `GPU_SIEVE_SURV_CAP` | compact survivor cap before bitmap fallback |
+
+### Non-CRT GPU-sieve A/B tuning defaults (Aug 2026)
+
+Recent 120s A/B runs on non-CRT GPU-sieve profiles (`A0/A1/B1/A2/A3`) showed
+the best `tested/s` and `pps` with the B1 profile. The runtime default was
+updated accordingly:
+
+- `GPU_SIEVE_DIRECT_BITS=0` by default (scratch+pack favored unless overridden)
+- GPU offload gate defaults:
+  - `GPU_SIEVE_MIN_PH2=16384`
+  - `GPU_SIEVE_MIN_SEGMENT=262144`
+
+Use the automation script for local re-validation on your hardware:
+
+```sh
+DURATION_SEC=120 \
+MINER_ARGS="--header abtest --shift 46 --threads 3 --cuda --fast-euler --sieve-primes 900000 --sieve-size 33554432 --gpu-sieve" \
+./scripts/bench_gpu_sieve_ab.sh
+```
 
 **New stats fields** (visible in STATS output when GPU sieve is active):
 
@@ -663,8 +689,8 @@ Operational note:
 
 - `GPU_SIEVE_TIMING_SERIAL=1` and `GPU_SIEVE_CLEAR_KERNEL=1` are intended for
   diagnostics only. Keep them disabled for normal mining runs.
-- `GPU_SIEVE_DIRECT_BITS` is enabled by default and is currently the preferred
-  production bitmap path.
+- `GPU_SIEVE_DIRECT_BITS` is disabled by default (B1-tuned). Set
+  `GPU_SIEVE_DIRECT_BITS=1` only for targeted A/B checks on your hardware.
 
 **Performance note:**
 

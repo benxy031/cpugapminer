@@ -39,15 +39,6 @@ static __thread uint32_t *tls_surv_buf     = NULL;
 static __thread uint32_t  tls_surv_count   = 0;
 static __thread size_t    tls_surv_buf_cap = 0; /* in entries */
 
-static int cmp_u32_asc(const void *a, const void *b)
-{
-    uint32_t x = *(const uint32_t *)a;
-    uint32_t y = *(const uint32_t *)b;
-    if (x < y) return -1;
-    if (x > y) return 1;
-    return 0;
-}
-
 /* Parameters captured at gpu_sieve_init() time; used for lazy per-thread alloc. */
 static size_t g_gpu_seg_cap    = 0;
 static size_t g_gpu_primes_cap = 0;
@@ -334,15 +325,6 @@ int gpu_sieve_mark_segment_batch(
             if (tls_surv_buf && g_gpu_sieve_ctx[idx][slot].h_surv_pinned) {
                 memcpy(tls_surv_buf, g_gpu_sieve_ctx[idx][slot].h_surv_pinned,
                        (size_t)sc * sizeof(uint32_t));
-                if (sc > 1) {
-                    qsort(tls_surv_buf, (size_t)sc, sizeof(uint32_t), cmp_u32_asc);
-                    uint32_t w = 1;
-                    for (uint32_t i = 1; i < sc; i++) {
-                        if (tls_surv_buf[i] != tls_surv_buf[w - 1])
-                            tls_surv_buf[w++] = tls_surv_buf[i];
-                    }
-                    sc = w;
-                }
                 tls_surv_count = sc;
             } else {
                 rc = 0; /* copy failed; treat as bitmap mode (h_bits may be stale) */

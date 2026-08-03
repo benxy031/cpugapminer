@@ -82,7 +82,7 @@ static int gpu_sieve_timing_serial_enabled(void)
 static std::mutex g_gpu_sieve_timing_serial_mu;
 
 /* Runtime A/B switch for the direct packed-bitmap mark path.
- * Default ON; set GPU_SIEVE_DIRECT_BITS=0 to force scratch+pack fallback. */
+ * Default OFF (B1); set GPU_SIEVE_DIRECT_BITS=1 to force direct-bits path. */
 static int gpu_sieve_direct_bits_enabled(void)
 {
     static int cached = -1;
@@ -90,7 +90,7 @@ static int gpu_sieve_direct_bits_enabled(void)
         return cached;
     {
         const char *v = getenv("GPU_SIEVE_DIRECT_BITS");
-        cached = (!v || !*v || strcmp(v, "0") != 0) ? 1 : 0;
+        cached = (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
     }
     return cached;
 }
@@ -186,6 +186,58 @@ static int gpu_sieve_should_try_compact(
 
     double est_surv = (double)segment_len * keep;
     return est_surv <= (double)survivors_cap * 2.0;
+}
+
+/* Auto-select direct packed-bitmap marking versus scratch+pack path.
+ *
+ * Direct bits avoids kernel_pack_bits and writes packed output directly, but
+ * it relies on atomic OR and can lose on contention-heavy prime ranges.
+ * Use a density/shape heuristic to keep direct bits for lighter workloads and
+ * prefer scratch+pack when expected mark pressure is high. */
+static int gpu_sieve_should_use_direct_bits(
+    size_t segment_len,
+    const uint64_t *h_primes,
+    int n_primes)
+{
+    if (!gpu_sieve_direct_bits_enabled())
+        return 0;
+    if (!h_primes || n_primes <= 0)
+        return 0;
+
+    uint64_t pmin = h_primes[0];
+    uint64_t pmax = h_primes[n_primes - 1];
+    if (pmin < 3 || pmax <= pmin)
+        return (segment_len <= 131072u);
+
+    /* Short windows benefit more from skipping pack, even at moderate density. */
+    if (segment_len <= 131072u)
+        return 1;
+
+    /* Very small pmin tends to create strong atomic contention. */
+    if (pmin < 1024u)
+        return 0;
+
+    double lpmin = log((double)pmin);
+    double lpmax = log((double)pmax);
+    if (!(lpmin > 0.0) || !(lpmax > lpmin))
+        return 0;
+
+    /* Mertens-style estimate: sum_{p in [pmin,pmax]} 1/p ≈ log(log pmax/log pmin).
+     * Approximate mark density as 1-exp(-sum 1/p). */
+    double invp_sum = log(lpmax / lpmin);
+    if (!(invp_sum >= 0.0))
+        invp_sum = 0.0;
+    double est_density = 1.0 - exp(-invp_sum);
+
+    /* For dense windows, scratch+pack is usually more stable than atomic OR. */
+    if (est_density >= 0.18)
+        return 0;
+
+    /* Tiny prime batches are good direct-bit candidates on larger windows too. */
+    if (n_primes <= 4096)
+        return 1;
+
+    return 1;
 }
 
 /* Simple CUDA error check (inline) */
@@ -1065,7 +1117,8 @@ int gpu_sieve_mark_batch(
     try_compact = has_surv_buf &&
         (use_phase1_compact || gpu_sieve_should_try_compact(
             segment_len, ctx->survivors_cap, h_primes, n_primes));
-    direct_bitmap_path = !try_compact && gpu_sieve_direct_bits_enabled();
+    direct_bitmap_path = !try_compact &&
+        gpu_sieve_should_use_direct_bits(segment_len, h_primes, n_primes);
 
     if (timing) cudaEventRecord(ev1, stream); /* ev0..ev1 = upload/setup before clear */
 

@@ -323,6 +323,53 @@ static int gpu_sieve_merge_timing_enabled(void)
     cached = (env && *env && strcmp(env, "0") != 0) ? 1 : 0;
     return cached;
 }
+
+/* Skip GPU Phase-2 offload when the batch is too small to amortize overhead.
+ * Defaults are conservative and can be tuned via env variables. */
+static int gpu_sieve_offload_min_ph2(void)
+{
+    static int cached = -1;
+    if (cached >= 0)
+        return cached;
+    cached = 16384;
+    {
+        const char *env = getenv("GPU_SIEVE_MIN_PH2");
+        if (env && *env) {
+            int v = atoi(env);
+            if (v >= 0)
+                cached = v;
+        }
+    }
+    return cached;
+}
+
+static size_t gpu_sieve_offload_min_segment(void)
+{
+    static size_t cached = 0;
+    if (cached != 0)
+        return cached;
+    cached = 262144u;
+    {
+        const char *env = getenv("GPU_SIEVE_MIN_SEGMENT");
+        if (env && *env) {
+            unsigned long long v = strtoull(env, NULL, 10);
+            if (v > 0)
+                cached = (size_t)v;
+        }
+    }
+    return cached;
+}
+
+static int gpu_sieve_should_offload(size_t segment_len, int n_ph2)
+{
+    if (n_ph2 <= 0)
+        return 0;
+    if (n_ph2 < gpu_sieve_offload_min_ph2())
+        return 0;
+    if (segment_len < gpu_sieve_offload_min_segment())
+        return 0;
+    return 1;
+}
 #endif
 
 /* Cramér-model score for a sieve window.
@@ -4350,7 +4397,8 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
                 ph2_end++;
             int n_ph2 = (int)(ph2_end - split_idx);
 
-            if (g_gpu_sieve_enable && n_ph2 > 0 && have_cache) {
+            if (g_gpu_sieve_enable && have_cache &&
+                gpu_sieve_should_offload((size_t)seg_size, n_ph2)) {
                 /* GPU sieve requires base_mod_p to be cached for this block.
                  * k0 is now computed on-device; we only pass the base_mod_p
                  * slice and the window bounds as scalars. */
