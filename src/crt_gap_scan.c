@@ -100,6 +100,7 @@ uint64_t crt_gap_scan_template_window(uint64_t gap_target,
 uint64_t crt_gap_scan_for_nonce(double target_merit,
                                 double logbase,
                                 uint64_t gap_target,
+                                int shift,
                                 int mode,
                                 uint64_t floor_value) {
     if (mode == CRT_GAP_SCAN_ORIGINAL || mode == CRT_GAP_SCAN_ORIG_FLOOR) {
@@ -130,7 +131,7 @@ uint64_t crt_gap_scan_for_nonce(double target_merit,
      * ceil(2 × target_merit × logbase) so sieve work scales with the
      * nonce's actual merit potential while preserving the 2× coverage
      * factor.  Nonces at or above the design logbase are unaffected. */
-    uint64_t fixed = crt_gap_scan_fixed_window(gap_target);
+    uint64_t fixed = crt_gap_scan_fixed_window_for_shift(gap_target, shift);
     if (logbase > 0.0 && target_merit > 0.0) {
         double raw = target_merit * logbase * 2.0;
         if (raw >= 1.0) {

@@ -223,9 +223,14 @@ static inline void cpu_moddbl_n(uint64_t *a, const uint64_t *n, int nl)
 }
 
 /* r = R mod n,  R = 2^(64*nl).
- * Finds topbit of n via __builtin_clzll, computes r = 2^topbit − n,
- * then doubles (64*nl − 1 − topbit) more times.  Same algorithm as
- * compute_rmodn_t<AL> in the CUDA kernel. */
+ *
+ * Start from r = 2^topbit, where topbit is the highest set bit in n.
+ * Since n is odd and has bit topbit set, 2^topbit < n, so this seed is
+ * already a valid reduced value in [0, n). Then double exactly
+ * (64*nl - topbit) times modulo n to reach 2^(64*nl) mod n.
+ *
+ * Do not subtract n from the seed: that underflows in unsigned limb
+ * arithmetic when 2^topbit < n and corrupts the representation. */
 static inline void cpu_rmodn_n(uint64_t *r, const uint64_t *n, int nl)
 {
     /* nlimbs is significant-limb count; top limb is non-zero. */
@@ -233,13 +238,12 @@ static inline void cpu_rmodn_n(uint64_t *r, const uint64_t *n, int nl)
     int top_bit_in_limb = 63 - __builtin_clzll(n[top_limb]);
     int topbit = top_limb * 64 + top_bit_in_limb;
 
-    /* r = 2^topbit (single bit) */
+    /* r = 2^topbit (single bit), guaranteed < n */
     for (int i = 0; i < nl; i++) r[i] = 0;
     r[top_limb] = (uint64_t)1 << top_bit_in_limb;
-    /* r = 2^topbit − n */
-    cpu_sub_n(r, r, n, nl);
-    /* double (64*nl − 1 − topbit) more times → r = R mod n */
-    int remaining = 64 * nl - 1 - topbit;
+
+    /* double (64*nl - topbit) times -> r = R mod n */
+    int remaining = 64 * nl - topbit;
     for (int i = 0; i < remaining; i++)
         cpu_moddbl_n(r, n, nl);
 }
@@ -1065,7 +1069,12 @@ static inline void cpu_window_cfg_init_once(void) {
 }
 
 /* Adaptive CPU window policy by active limb count.
- * Small NL: lower precompute pressure; large NL: fewer multiplies per bit. */
+ *
+ * Default to the exact-NL 4-bit path: this codebase has dedicated per-NL
+ * specializations for win=4, while win=3/5 routes through a generic dynwin
+ * loop. In practice the specialized win=4 path is consistently better for
+ * end-to-end miner throughput on this target. Keep env override support so
+ * experiments can still force 3/5 when needed. */
 static inline int cpu_window_bits_for_nlimbs(int nlimbs) {
     cpu_window_cfg_init_once();
 
@@ -1074,9 +1083,8 @@ static inline int cpu_window_bits_for_nlimbs(int nlimbs) {
         g_cpu_window_override <= FERMAT_WIN_MAX) {
         w = g_cpu_window_override;
     } else {
-        if (nlimbs <= 4) w = 3;
-        else if (nlimbs <= 12) w = 4;
-        else w = 5;
+        (void)nlimbs;
+        w = FERMAT_WIN;
     }
 
     if (g_cpu_window_log && nlimbs > 0 && nlimbs <= 31) {
@@ -1092,6 +1100,146 @@ static inline int cpu_window_bits_for_nlimbs(int nlimbs) {
     }
 
     return w;
+}
+
+static inline int cpu_find_msb_n(const uint64_t *a, int nlimbs)
+{
+    int top = nlimbs - 1;
+    while (top > 0 && a[top] == 0)
+        top--;
+    return top * 64 + 63 - __builtin_clzll(a[top]);
+}
+
+static int cpu_pow2_window_from_precomp(uint64_t *res,
+                                        const primality_exact_precomp_t *precomp,
+                                        const uint64_t *exp,
+                                        int msb)
+{
+    int nlimbs = precomp->nlimbs;
+    const uint64_t *n = precomp->n;
+    uint64_t ninv = precomp->ninv;
+
+    memcpy(res, precomp->base_m, (size_t)nlimbs * sizeof(uint64_t));
+    int bit = msb - 1;
+    while (bit >= 0) {
+        if (bit < FERMAT_WIN - 1) {
+            MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, nlimbs);
+            if ((exp[bit >> 6] >> (bit & 63)) & 1u)
+                MONTMUL_EXACT_DISPATCH(res, res, precomp->base_m, n, ninv, nlimbs);
+            bit--;
+        } else {
+            uint32_t w = cpu_get_bits4(exp, bit - (FERMAT_WIN - 1));
+            if (w == 0) {
+                MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, nlimbs);
+                MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, nlimbs);
+                MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, nlimbs);
+                MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, nlimbs);
+                bit -= FERMAT_WIN;
+            } else {
+                int z = __builtin_ctz(w);
+                int sq = FERMAT_WIN - z;
+                for (int step = 0; step < sq; step++)
+                    MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, nlimbs);
+                MONTMUL_EXACT_DISPATCH(res, res, precomp->win[(w >> z) >> 1], n, ninv, nlimbs);
+                for (int step = 0; step < z; step++)
+                    MONTSQR_EXACT_DISPATCH(res, res, res, n, ninv, nlimbs);
+                bit -= FERMAT_WIN;
+            }
+        }
+    }
+    return 1;
+}
+
+int primality_exact_precomp_init(primality_exact_precomp_t *precomp,
+                                 const uint64_t *n, int nlimbs)
+{
+    uint64_t one_m[FERMAT_CPU_MAX_LIMBS];
+    uint64_t base2_m[FERMAT_CPU_MAX_LIMBS];
+
+    if (!precomp || !n)
+        return 0;
+    if (nlimbs <= 0 || nlimbs > FERMAT_CPU_MAX_LIMBS)
+        return 0;
+    if (nlimbs == 1 || (n[0] & 1u) == 0)
+        return 0;
+
+    memset(precomp, 0, sizeof(*precomp));
+    precomp->nlimbs = nlimbs;
+    precomp->win_bits = cpu_window_bits_for_nlimbs(nlimbs);
+    if (precomp->win_bits != FERMAT_WIN)
+        return 0;
+
+    memcpy(precomp->n, n, (size_t)nlimbs * sizeof(uint64_t));
+    precomp->ninv = mont_ninv(n[0]);
+
+    cpu_rmodn_n(one_m, n, nlimbs);
+    memcpy(precomp->base_m, one_m, (size_t)nlimbs * sizeof(uint64_t));
+    cpu_moddbl_n(precomp->base_m, n, nlimbs);
+
+    memcpy(precomp->win[0], precomp->base_m, (size_t)nlimbs * sizeof(uint64_t));
+    MONTSQR_EXACT_DISPATCH(base2_m, precomp->base_m, precomp->base_m,
+                           precomp->n, precomp->ninv, nlimbs);
+    for (int idx = 1; idx < FERMAT_PRECOMP_WIN_ODD_COUNT; idx++)
+        MONTMUL_EXACT_DISPATCH(precomp->win[idx], precomp->win[idx - 1], base2_m,
+                               precomp->n, precomp->ninv, nlimbs);
+
+    memcpy(precomp->fermat_exp, n, (size_t)nlimbs * sizeof(uint64_t));
+    precomp->fermat_exp[0] -= 1;
+    memcpy(precomp->nm1, precomp->fermat_exp, (size_t)nlimbs * sizeof(uint64_t));
+    precomp->fermat_msb = cpu_find_msb_n(precomp->fermat_exp, nlimbs);
+
+    memcpy(precomp->euler_exp, precomp->nm1, (size_t)nlimbs * sizeof(uint64_t));
+    for (int idx = 0; idx < nlimbs - 1; idx++)
+        precomp->euler_exp[idx] = (precomp->euler_exp[idx] >> 1) |
+                                  (precomp->euler_exp[idx + 1] << 63);
+    precomp->euler_exp[nlimbs - 1] >>= 1;
+    precomp->euler_msb = cpu_find_msb_n(precomp->euler_exp, nlimbs);
+    return 1;
+}
+
+int fermat_test_cpu_nlimbs_precomp(const primality_exact_precomp_t *precomp)
+{
+    uint64_t res[FERMAT_CPU_MAX_LIMBS];
+    uint64_t one[FERMAT_CPU_MAX_LIMBS] = {1};
+
+    if (!precomp || precomp->nlimbs <= 1 || precomp->win_bits != FERMAT_WIN)
+        return 0;
+
+    cpu_pow2_window_from_precomp(res, precomp, precomp->fermat_exp, precomp->fermat_msb);
+    MONTMUL_EXACT_DISPATCH(res, res, one, precomp->n, precomp->ninv, precomp->nlimbs);
+    if (res[0] != 1)
+        return 0;
+    for (int idx = 1; idx < precomp->nlimbs; idx++)
+        if (res[idx] != 0)
+            return 0;
+    return 1;
+}
+
+int euler_test_cpu_nlimbs_precomp(const primality_exact_precomp_t *precomp)
+{
+    uint64_t res[FERMAT_CPU_MAX_LIMBS];
+    uint64_t one[FERMAT_CPU_MAX_LIMBS] = {1};
+
+    if (!precomp || precomp->nlimbs <= 1 || precomp->win_bits != FERMAT_WIN)
+        return 0;
+
+    cpu_pow2_window_from_precomp(res, precomp, precomp->euler_exp, precomp->euler_msb);
+    MONTMUL_EXACT_DISPATCH(res, res, one, precomp->n, precomp->ninv, precomp->nlimbs);
+    if (res[0] == 1) {
+        int ok = 1;
+        for (int idx = 1; idx < precomp->nlimbs; idx++) {
+            if (res[idx] != 0) {
+                ok = 0;
+                break;
+            }
+        }
+        if (ok)
+            return 1;
+    }
+    for (int idx = 0; idx < precomp->nlimbs; idx++)
+        if (res[idx] != precomp->nm1[idx])
+            return 0;
+    return 1;
 }
 
 static int fermat_test_cpu_nlimbs_dynwin(const uint64_t *n, int nlimbs, int win_bits)
@@ -1400,6 +1548,69 @@ static int fermat_test_cpu_nlimbs_##NL(const uint64_t *n) \
     return 1; \
 }
 
+/* Tuned exact-NL variants for the hot 40..160 shift band.
+ * These call the exact montmul/sqr helpers directly, bypassing the runtime
+ * MONTMUL_EXACT_DISPATCH / MONTSQR_EXACT_DISPATCH checks on every multiply. */
+#define DECL_FERMAT_EXACT_TUNED(NL, MONTFN, SQRFN) \
+__attribute__((noinline)) \
+static int fermat_test_cpu_nlimbs_##NL(const uint64_t *n) \
+{ \
+    if ((n[0] & 1) == 0) return 0; \
+    if ((NL) == 1) return fermat_u64_exact(n[0]); \
+    uint64_t ninv = mont_ninv(n[0]); \
+    uint64_t one_m[NL], base_m[NL], base2_m[NL]; \
+    uint64_t win[FERMAT_WINSZ / 2][NL]; \
+    cpu_rmodn_n(one_m, n, (NL)); \
+    memcpy(base_m, one_m, (NL) * sizeof(uint64_t)); \
+    cpu_moddbl_n(base_m, n, (NL)); \
+    memcpy(win[0], base_m, (NL) * sizeof(uint64_t)); \
+    SQRFN(base2_m, base_m, base_m, n, ninv); \
+    for (int _w = 1; _w < FERMAT_WINSZ / 2; _w++) \
+        MONTFN(win[_w], win[_w-1], base2_m, n, ninv); \
+    uint64_t e[NL]; \
+    memcpy(e, n, (NL) * sizeof(uint64_t)); \
+    e[0] -= 1; \
+    int top = (NL) - 1; \
+    while (top > 0 && e[top] == 0) top--; \
+    int msb = top * 64 + 63 - __builtin_clzll(e[top]); \
+    uint64_t res[NL]; \
+    memcpy(res, base_m, (NL) * sizeof(uint64_t)); \
+    int bit = msb - 1; \
+    while (bit >= 0) { \
+        if (bit < FERMAT_WIN - 1) { \
+            SQRFN(res, res, res, n, ninv); \
+            if ((e[bit >> 6] >> (bit & 63)) & 1) \
+                MONTFN(res, res, base_m, n, ninv); \
+            bit--; \
+        } else { \
+            uint32_t w = cpu_get_bits4(e, bit - (FERMAT_WIN - 1)); \
+            if (w == 0) { \
+                SQRFN(res, res, res, n, ninv); \
+                SQRFN(res, res, res, n, ninv); \
+                SQRFN(res, res, res, n, ninv); \
+                SQRFN(res, res, res, n, ninv); \
+                bit -= FERMAT_WIN; \
+            } else { \
+                int z = __builtin_ctz(w); \
+                int sq = FERMAT_WIN - z; \
+                for (int _s = 0; _s < sq; _s++) \
+                    SQRFN(res, res, res, n, ninv); \
+                MONTFN(res, res, win[(w >> z) >> 1], n, ninv); \
+                for (int _s = 0; _s < z; _s++) \
+                    SQRFN(res, res, res, n, ninv); \
+                bit -= FERMAT_WIN; \
+            } \
+        } \
+    } \
+    uint64_t one[NL]; \
+    memset(one, 0, (NL) * sizeof(uint64_t)); \
+    one[0] = 1; \
+    MONTFN(res, res, one, n, ninv); \
+    if (res[0] != 1) return 0; \
+    for (int i = 1; i < (NL); i++) if (res[i] != 0) return 0; \
+    return 1; \
+}
+
 DECL_FERMAT_EXACT(2)
 DECL_FERMAT_EXACT(3)
 DECL_FERMAT_EXACT(4)
@@ -1638,6 +1849,78 @@ static int euler_test_cpu_nlimbs_##NL(const uint64_t *n) \
     one_conv[0] = 1; \
     MONTMUL_EXACT_DISPATCH(res, res, one_conv, n, ninv, (NL)); \
     /* Accept iff res == 1 or res == n-1 */ \
+    if (res[0] == 1) { \
+        int ok = 1; \
+        for (int _i = 1; _i < (NL); _i++) if (res[_i]) { ok = 0; break; } \
+        if (ok) return 1; \
+    } \
+    uint64_t nm1[NL], one_std[NL]; \
+    memset(one_std, 0, (NL) * sizeof(uint64_t)); \
+    one_std[0] = 1; \
+    cpu_sub_n(nm1, n, one_std, (NL)); \
+    int eq = 1; \
+    for (int _i = 0; _i < (NL); _i++) if (res[_i] != nm1[_i]) { eq = 0; break; } \
+    return eq; \
+}
+
+#define DECL_EULER_EXACT_TUNED(NL, MONTFN, SQRFN) \
+__attribute__((noinline)) \
+static int euler_test_cpu_nlimbs_##NL(const uint64_t *n) \
+{ \
+    if ((n[0] & 1) == 0) return 0; \
+    if ((NL) == 1) return euler_u64(n[0]); \
+    uint64_t ninv = mont_ninv(n[0]); \
+    uint64_t one_m[NL], base_m[NL], base2_m[NL]; \
+    uint64_t win[FERMAT_WINSZ / 2][NL]; \
+    cpu_rmodn_n(one_m, n, (NL)); \
+    memcpy(base_m, one_m, (NL) * sizeof(uint64_t)); \
+    cpu_moddbl_n(base_m, n, (NL)); \
+    memcpy(win[0], base_m, (NL) * sizeof(uint64_t)); \
+    SQRFN(base2_m, base_m, base_m, n, ninv); \
+    for (int _w = 1; _w < FERMAT_WINSZ / 2; _w++) \
+        MONTFN(win[_w], win[_w-1], base2_m, n, ninv); \
+    uint64_t e[NL]; \
+    memcpy(e, n, (NL) * sizeof(uint64_t)); \
+    e[0] -= 1; \
+    for (int _i = 0; _i < (NL) - 1; _i++) \
+        e[_i] = (e[_i] >> 1) | (e[_i + 1] << 63); \
+    e[(NL) - 1] >>= 1; \
+    int top = (NL) - 1; \
+    while (top > 0 && e[top] == 0) top--; \
+    int msb = top * 64 + 63 - __builtin_clzll(e[top]); \
+    uint64_t res[NL]; \
+    memcpy(res, base_m, (NL) * sizeof(uint64_t)); \
+    int bit = msb - 1; \
+    while (bit >= 0) { \
+        if (bit < FERMAT_WIN - 1) { \
+            SQRFN(res, res, res, n, ninv); \
+            if ((e[bit >> 6] >> (bit & 63)) & 1) \
+                MONTFN(res, res, base_m, n, ninv); \
+            bit--; \
+        } else { \
+            uint32_t w = cpu_get_bits4(e, bit - (FERMAT_WIN - 1)); \
+            if (w == 0) { \
+                SQRFN(res, res, res, n, ninv); \
+                SQRFN(res, res, res, n, ninv); \
+                SQRFN(res, res, res, n, ninv); \
+                SQRFN(res, res, res, n, ninv); \
+                bit -= FERMAT_WIN; \
+            } else { \
+                int z = __builtin_ctz(w); \
+                int sq = FERMAT_WIN - z; \
+                for (int _s = 0; _s < sq; _s++) \
+                    SQRFN(res, res, res, n, ninv); \
+                MONTFN(res, res, win[(w >> z) >> 1], n, ninv); \
+                for (int _s = 0; _s < z; _s++) \
+                    SQRFN(res, res, res, n, ninv); \
+                bit -= FERMAT_WIN; \
+            } \
+        } \
+    } \
+    uint64_t one_conv[NL]; \
+    memset(one_conv, 0, (NL) * sizeof(uint64_t)); \
+    one_conv[0] = 1; \
+    MONTFN(res, res, one_conv, n, ninv); \
     if (res[0] == 1) { \
         int ok = 1; \
         for (int _i = 1; _i < (NL); _i++) if (res[_i]) { ok = 0; break; } \

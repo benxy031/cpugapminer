@@ -350,44 +350,48 @@ static double compute_cramer_score(const uint64_t *surv, size_t n,
     double q = 1.0 - p;
     double score = 0.0;
 
-    /* Precompute q^i for i in [0, n] to avoid repeated pow() calls. */
-    double *qpow = (double *)malloc((n + 1) * sizeof(double));
-    if (!qpow)
-        return 0.0;
-    qpow[0] = 1.0;
-    for (size_t i = 1; i <= n; i++)
-        qpow[i] = qpow[i - 1] * q;
+    /* Invariant for each j: qmin == q^(j-r-1), qrp1 == q^(r+1). */
+    double qmin = 1.0;
+    double qrp1 = q;
+    double inv_q = 1.0 / q;
 
     /* Two-pointer: r = largest index with surv[r] <= surv[j] - needed_gap.
      * r is non-decreasing as j increases (thresh = surv[j]-needed_gap grows). */
     size_t r = 0;
     for (size_t j = 1; j < n; j++) {
+        if (j > 1)
+            qmin *= q;
+
         if (surv[j] < needed_gap)
             continue;
         uint64_t thresh = surv[j] - needed_gap;
 
         /* Advance r while the next candidate still qualifies (and r+1 < j). */
-        while (r + 1 < j && surv[r + 1] <= thresh)
+        while (r + 1 < j && surv[r + 1] <= thresh) {
             r++;
+            qrp1 *= q;
+            qmin *= inv_q;
+        }
 
         /* surv[r] might still be > thresh (nothing qualifies yet). */
         if (surv[r] > thresh)
             continue;
 
-        size_t r_j    = r;
-        size_t min_exp = j - r_j - 1;   /* interior survivors in tightest pair */
-        /* sum_{i=0}^{r_j} q^(j-i-1) = q^(j-r_j-1) * (1-q^(r_j+1)) / p */
-        double qmin = qpow[min_exp];
-        double qrp1 = qpow[r_j + 1];
-        score += qmin * (1.0 - qrp1) / p;
+        /* sum_{i=0}^{r} q^(j-i-1) = q^(j-r-1) * (1-q^(r+1)) / p */
+        score += qmin * (1.0 - qrp1);
     }
 
-    free(qpow);
     /* Multiply by the Hardy-Littlewood correction factor C_{needed_gap}/C_2.
      * For gaps divisible by small odd primes, this boosts the score by the
      * factor by which such gaps occur more often than gaps of size 2 would,
      * making the Cramér score reflect the true gap-type probability under HL. */
-    return p * p * score * gap_dist_hl_ratio_large(needed_gap);
+    static __thread uint64_t tls_hl_gap = 0;
+    static __thread double tls_hl_ratio = 1.0;
+    if (tls_hl_gap != needed_gap) {
+        tls_hl_gap = needed_gap;
+        tls_hl_ratio = gap_dist_hl_ratio_large(needed_gap);
+    }
+    return p * score * tls_hl_ratio;
 }
 
 /* Phase 1 defaults by shift band for CRT solver mode. */
@@ -1019,6 +1023,15 @@ static volatile uint64_t stats_crt_gpu_accum_tune_hold = 0;
 static volatile uint64_t stats_crt_gpu_accum_threshold_last = 0;
 #endif
 static volatile int use_cpu_fermat = 0;  /* use custom CPU Montgomery multiply instead of GMP mpz_powm */
+static volatile int use_cpu_dual_test_live = 0; /* convenience live mode: cpu-fermat + mr-verify */
+static volatile int use_cpu_dual_test_shadow = 0; /* sampled shadow Euler+Fermat via precompute API */
+static volatile uint64_t stats_cpu_dual_shadow_seen = 0;
+static volatile uint64_t stats_cpu_dual_shadow_samples = 0;
+static volatile uint64_t stats_cpu_dual_shadow_init_fail = 0;
+static volatile uint64_t stats_cpu_dual_shadow_mismatch = 0;
+static volatile uint64_t stats_cpu_dual_shadow_dual_disagree = 0;
+static volatile uint64_t stats_cpu_dual_shadow_ns = 0;
+#define CPU_DUAL_TEST_SHADOW_SAMPLE_MASK 1023u
 static volatile int use_mr_verify = 0;   /* MR base-3 verify Fermat survivors */
 /* Sieve window size published by main before launching worker threads.
    Used by set_base_bn() to precompute tls_sieve_mod_p[i] = sieve_size % p[i]. */
@@ -2983,6 +2996,24 @@ static void print_stats(void) {
                     (double)mr_ns * pct,
                     (double)other_ns * pct);
         }
+    }
+
+    if (use_cpu_dual_test_shadow) {
+        uint64_t seen = __atomic_load_n(&stats_cpu_dual_shadow_seen, __ATOMIC_RELAXED);
+        uint64_t samples = __atomic_load_n(&stats_cpu_dual_shadow_samples, __ATOMIC_RELAXED);
+        uint64_t init_fail = __atomic_load_n(&stats_cpu_dual_shadow_init_fail, __ATOMIC_RELAXED);
+        uint64_t mismatch = __atomic_load_n(&stats_cpu_dual_shadow_mismatch, __ATOMIC_RELAXED);
+        uint64_t disagree = __atomic_load_n(&stats_cpu_dual_shadow_dual_disagree, __ATOMIC_RELAXED);
+        uint64_t total_ns = __atomic_load_n(&stats_cpu_dual_shadow_ns, __ATOMIC_RELAXED);
+        double avg_us = (samples > 0) ? ((double)total_ns / (double)samples / 1000.0) : 0.0;
+        log_msg("  cpu_dual_shadow: seen=%llu sampled=%llu init_fail=%llu avg=%.3fus mismatch=%llu dual_disagree=%llu sample=1/%u",
+                (unsigned long long)seen,
+                (unsigned long long)samples,
+                (unsigned long long)init_fail,
+                avg_us,
+                (unsigned long long)mismatch,
+                (unsigned long long)disagree,
+                (unsigned)(CPU_DUAL_TEST_SHADOW_SAMPLE_MASK + 1u));
     }
 
     if (g_crt_mode == CRT_MODE_NONE && use_stats_verbose) {
@@ -6828,8 +6859,9 @@ static int bn_candidate_is_prime(uint64_t offset) {
            euler_test_cpu_nlimbs / fermat_test_cpu_nlimbs instead of GMP.
            Bypasses GMP's mpz_powm entirely; ~2× faster than GMP when the
            ADX code path is active (MULX+ADCX/ADOX dual carry chains).
-           Note: mr_verify is not applied here — the Euler/Fermat test is
-           already the primary filter; use --mr-verify only with GMP paths. */
+           When --mr-verify is enabled, a passing CPU Euler/Fermat result is
+           followed by a live base-3 Miller-Rabin confirm-on-pass step on the
+           same candidate via mr_verify_cand(). */
         int have_cached_limbs = 0;
         if (tls_cand_limbs_valid && offset >= tls_cand_limbs_last_offset) {
             uint64_t delta = offset - tls_cand_limbs_last_offset;
@@ -6861,6 +6893,45 @@ static int bn_candidate_is_prime(uint64_t offset) {
             is_prime = euler_test_cpu_nlimbs(tls_cand_limbs, cpu_nl);
         else
             is_prime = fermat_test_cpu_nlimbs(tls_cand_limbs, cpu_nl);
+
+        if (use_cpu_dual_test_shadow) {
+            uint64_t seen = __atomic_add_fetch(&stats_cpu_dual_shadow_seen, 1, __ATOMIC_RELAXED);
+            if ((seen & (uint64_t)CPU_DUAL_TEST_SHADOW_SAMPLE_MASK) == 0u) {
+                primality_exact_precomp_t shadow_precomp;
+                uint64_t t_shadow0 = now_ns_mono();
+                if (primality_exact_precomp_init(&shadow_precomp, tls_cand_limbs, cpu_nl)) {
+                    int shadow_euler = euler_test_cpu_nlimbs_precomp(&shadow_precomp);
+                    int shadow_fermat = fermat_test_cpu_nlimbs_precomp(&shadow_precomp);
+                    int chosen_shadow = use_fast_euler ? shadow_euler : shadow_fermat;
+                    __atomic_fetch_add(&stats_cpu_dual_shadow_samples, 1, __ATOMIC_RELAXED);
+                    __atomic_fetch_add(&stats_cpu_dual_shadow_ns,
+                                       elapsed_ns_since(t_shadow0), __ATOMIC_RELAXED);
+                    if (chosen_shadow != is_prime) {
+                        __atomic_fetch_add(&stats_cpu_dual_shadow_mismatch, 1, __ATOMIC_RELAXED);
+                        if (use_extra_verbose) {
+                            log_file_only("[cpu-dual-shadow] mismatch offset=%llu chosen=%d shadow=%d nl=%d\n",
+                                          (unsigned long long)offset,
+                                          is_prime,
+                                          chosen_shadow,
+                                          cpu_nl);
+                        }
+                    }
+                    if (shadow_euler != shadow_fermat)
+                        __atomic_fetch_add(&stats_cpu_dual_shadow_dual_disagree, 1, __ATOMIC_RELAXED);
+                } else {
+                    __atomic_fetch_add(&stats_cpu_dual_shadow_init_fail, 1, __ATOMIC_RELAXED);
+                }
+            }
+        }
+
+        if (is_prime && use_mr_verify) {
+            if (timing_enabled)
+                t_mr0 = now_ns_mono();
+            is_prime = mr_verify_cand();
+            if (timing_enabled)
+                atomic_fetch_add_explicit(&gmp_timing_mr_ns,
+                    elapsed_ns_since(t_mr0), memory_order_relaxed);
+        }
     } else if (use_fast_euler) {
         /* Strong base-2 Miller-Rabin (single round).
            Write n-1 = 2^s * d with d odd.  Compute x = 2^d mod n, then
@@ -9956,6 +10027,10 @@ int main(int argc, char **argv) {
       printf("      --no-fast-euler   disable fast-euler, use full Miller-Rabin\n");
         printf("      --cpu-fermat      use custom CPU Montgomery multiply instead of GMP mpz_powm\n");
         printf("                        combines with --fast-euler (default) or --fast-fermat\n");
+        printf("      --cpu-dual-test-live  convenience live mode: enables --cpu-fermat + --mr-verify\n");
+        printf("                        uses active CPU test first, then base-3 MR confirm-on-pass\n");
+        printf("      --cpu-dual-test-shadow  sampled shadow: run Euler+Fermat on same candidate\n");
+        printf("                        via precompute API and log cost; no effect on primality decision\n");
         printf("      --partial-sieve-auto  adaptive non-CRT sieve-prime limiting (opt-in)\n");
         printf("      --partial-sieve       alias for --partial-sieve-auto\n");
         printf("      --adaptive-presieve   skip dense non-CRT windows after presieve\n");
@@ -9988,7 +10063,8 @@ int main(int argc, char **argv) {
         printf("      --rgm-state-file F  persist RGM baseline across restarts: load on startup,\n");
         printf("                        save on clean exit.  Run once with --sample-stride 1 to build.\n");
         printf("      --mr-rounds N     Miller-Rabin rounds for primality  (default: 2)\n");
-        printf("      --mr-verify       MR base-3 verify Fermat/GPU survivors (catches pseudoprimes)\n");
+        printf("      --mr-verify       MR base-3 confirm-on-pass for fast primality paths\n");
+        printf("                        applies to CPU Montgomery, GMP Fermat, and GPU survivors\n");
         printf("      --crt-file FILE   load CRT sieve file (binary template or text gap-solver)\n");
         printf("      --crt-gap-scan MODE  CRT solver gap window: fixed|original|original-floor (default: fixed)\n");
         printf("      --crt-gap-scan-floor N  FLOOR used by original-floor mode (default: 10000)\n");
@@ -10119,6 +10195,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--no-fast-euler")) use_fast_euler = 0;
         else if (!strcmp(argv[i],"--cpu-fermat")) use_cpu_fermat = 1;
         else if (!strcmp(argv[i],"--no-cpu-fermat")) use_cpu_fermat = 0;
+        else if (!strcmp(argv[i],"--cpu-dual-test-live")) { use_cpu_dual_test_live = 1; use_cpu_fermat = 1; use_mr_verify = 1; }
+        else if (!strcmp(argv[i],"--cpu-dual-test-shadow")) use_cpu_dual_test_shadow = 1;
         else if (!strcmp(argv[i],"--partial-sieve-auto") || !strcmp(argv[i],"--partial-sieve")) use_partial_sieve_auto = 1;
         else if (!strcmp(argv[i],"--adaptive-presieve")) use_adaptive_presieve = 1;
         else if (!strcmp(argv[i],"--sievegap")) use_sievegap = 1;
@@ -11255,6 +11333,13 @@ int main(int argc, char **argv) {
             log_msg("CPU Montgomery multiply: portable CIOS path active (--cpu-fermat); %s\n",
                     cpu_test_name);
         }
+        if (use_cpu_dual_test_live) {
+            log_msg("CPU dual-test live: enabled (--cpu-dual-test-live => --cpu-fermat + --mr-verify)\n");
+        }
+        if (use_cpu_dual_test_shadow) {
+            log_msg("CPU dual-test shadow: sampled Euler+Fermat via precompute API enabled (--cpu-dual-test-shadow, sample=1/%u)\n",
+                    (unsigned)(CPU_DUAL_TEST_SHADOW_SAMPLE_MASK + 1u));
+        }
     }
     if (use_sievegap) {
         log_msg("sievegap: standalone non-CRT mode enabled (legacy presieve/wheel path bypassed)\n");
@@ -12062,6 +12147,23 @@ int main(int argc, char **argv) {
         free((char*)header);
         header = NULL;
         header_owned = 0;
+    }
+    if (use_cpu_dual_test_shadow) {
+        uint64_t seen = __atomic_load_n(&stats_cpu_dual_shadow_seen, __ATOMIC_RELAXED);
+        uint64_t samples = __atomic_load_n(&stats_cpu_dual_shadow_samples, __ATOMIC_RELAXED);
+        uint64_t init_fail = __atomic_load_n(&stats_cpu_dual_shadow_init_fail, __ATOMIC_RELAXED);
+        uint64_t mismatch = __atomic_load_n(&stats_cpu_dual_shadow_mismatch, __ATOMIC_RELAXED);
+        uint64_t disagree = __atomic_load_n(&stats_cpu_dual_shadow_dual_disagree, __ATOMIC_RELAXED);
+        uint64_t total_ns = __atomic_load_n(&stats_cpu_dual_shadow_ns, __ATOMIC_RELAXED);
+        double avg_us = (samples > 0) ? ((double)total_ns / (double)samples / 1000.0) : 0.0;
+        log_msg("cpu_dual_shadow final: seen=%llu sampled=%llu init_fail=%llu avg=%.3fus mismatch=%llu dual_disagree=%llu sample=1/%u\n",
+                (unsigned long long)seen,
+                (unsigned long long)samples,
+                (unsigned long long)init_fail,
+                avg_us,
+                (unsigned long long)mismatch,
+                (unsigned long long)disagree,
+                (unsigned)(CPU_DUAL_TEST_SHADOW_SAMPLE_MASK + 1u));
     }
     if (!keep_going) {
         printf("Done, no qualifying gaps found in tried adders.\n");

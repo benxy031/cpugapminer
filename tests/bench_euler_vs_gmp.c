@@ -138,6 +138,10 @@ static void bench_shift(int shift, int iters)
 
         int r_euler_cpu  = euler_test_cpu_nlimbs(cands[i], nlimbs);
         int r_fermat_cpu = fermat_test_cpu_nlimbs(cands[i], nlimbs);
+        primality_exact_precomp_t precomp;
+        int have_precomp = primality_exact_precomp_init(&precomp, cands[i], nlimbs);
+        int r_euler_pre = have_precomp ? euler_test_cpu_nlimbs_precomp(&precomp) : r_euler_cpu;
+        int r_fermat_pre = have_precomp ? fermat_test_cpu_nlimbs_precomp(&precomp) : r_fermat_cpu;
         int r_gmp_euler  = gmp_fast_euler(z);
         int r_gmp_fermat = gmp_fast_fermat(z);
 
@@ -154,6 +158,12 @@ static void bench_shift(int shift, int iters)
             if (mismatches <= 3)
                 gmp_printf("  MISMATCH[fermat] i=%d  fermat_cpu=%d gmp_fermat=%d  n=%Zx\n",
                            i, r_fermat_cpu, r_gmp_fermat, z);
+        }
+        if (r_euler_pre != r_euler_cpu || r_fermat_pre != r_fermat_cpu) {
+            mismatches++;
+            if (mismatches <= 3)
+                gmp_printf("  MISMATCH[precomp] i=%d euler_pre=%d euler=%d fermat_pre=%d fermat=%d n=%Zx\n",
+                           i, r_euler_pre, r_euler_cpu, r_fermat_pre, r_fermat_cpu, z);
         }
         /* euler_cpu vs fermat_cpu (must agree on primes; composites may differ) */
         if (r_euler_cpu && !r_fermat_cpu) {
@@ -176,6 +186,28 @@ static void bench_shift(int shift, int iters)
         sink += fermat_test_cpu_nlimbs(cands[i], nlimbs);
     double t_fermat_cpu = now_sec() - t0;
 
+    /* ── benchmark paired Euler+Fermat on same candidate (baseline) ───── */
+    t0 = now_sec();
+    for (int i = 0; i < iters; i++) {
+        sink += euler_test_cpu_nlimbs(cands[i], nlimbs);
+        sink += fermat_test_cpu_nlimbs(cands[i], nlimbs);
+    }
+    double t_pair_plain = now_sec() - t0;
+
+    /* ── benchmark paired cached-precompute Euler+Fermat ───────────────── */
+    t0 = now_sec();
+    primality_exact_precomp_t precomp;
+    for (int i = 0; i < iters; i++) {
+        if (primality_exact_precomp_init(&precomp, cands[i], nlimbs)) {
+            sink += euler_test_cpu_nlimbs_precomp(&precomp);
+            sink += fermat_test_cpu_nlimbs_precomp(&precomp);
+        } else {
+            sink += euler_test_cpu_nlimbs(cands[i], nlimbs);
+            sink += fermat_test_cpu_nlimbs(cands[i], nlimbs);
+        }
+    }
+    double t_pair_precomp = now_sec() - t0;
+
     /* ── benchmark GMP fast-euler ────────────────────────────────────── */
     t0 = now_sec();
     for (int i = 0; i < iters; i++) {
@@ -196,12 +228,15 @@ static void bench_shift(int shift, int iters)
 
     double us_euler_cpu  = t_euler_cpu  * 1e6 / iters;
     double us_fermat_cpu = t_fermat_cpu * 1e6 / iters;
+    double us_pair_plain = t_pair_plain * 1e6 / iters;
+    double us_pair_precomp = t_pair_precomp * 1e6 / iters;
     double us_gmp_euler  = t_gmp_euler  * 1e6 / iters;
     double us_gmp_fermat = t_gmp_fermat * 1e6 / iters;
 
     /* speedup of euler_cpu vs gmp_euler */
     double speedup_e = us_gmp_euler / us_euler_cpu;
     double speedup_f = us_gmp_fermat / us_fermat_cpu;
+    double pair_gain = us_pair_plain / us_pair_precomp;
 
     printf("shift=%-4d  bits=%-5d  nlimbs=%-2d  "
            "euler_cpu=%6.2fus  gmp_euler=%6.2fus  speedup=%5.2fx  |  "
@@ -211,6 +246,9 @@ static void bench_shift(int shift, int iters)
            us_euler_cpu, us_gmp_euler, speedup_e,
            us_fermat_cpu, us_gmp_fermat, speedup_f,
            mismatches ? "*** MISMATCH ***" : "OK");
+
+    printf("              pair_plain=%6.2fus  pair_precomp=%6.2fus  pair_gain=%5.2fx\n",
+           us_pair_plain, us_pair_precomp, pair_gain);
 
     mpz_clear(z);
     free(cands);

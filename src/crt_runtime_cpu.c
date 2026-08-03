@@ -194,7 +194,7 @@ static int crt_runtime_prepare_solver_nonce(
 
     uint64_t gap_scan_base = crt_gap_scan_for_nonce(
         target_local, out->logbase_nonce,
-        (uint64_t)g_crt_gap_target, g_crt_gap_scan_mode,
+        (uint64_t)g_crt_gap_target, shift_local, g_crt_gap_scan_mode,
         g_crt_gap_scan_floor);
     out->gap_scan_nonce = gap_scan_base;
 

@@ -157,6 +157,7 @@ typedef struct {
     int window_cap;
     double kernel_a;
     double kernel_b;
+    int candidate_guard;
 } FitnessConfig;
 
 static double position_weight(int d) {
@@ -171,6 +172,89 @@ static double position_weight(int d) {
         if (d % WEIGHT_PRIMES[i] == 0)   /* divisible → discount */
             w *= (1.0 - 1.0 / WEIGHT_PRIMES[i]);
     return w;
+}
+
+typedef struct {
+    double *vals;
+    int cap;
+} PosWeightCache;
+
+static __thread PosWeightCache tls_pos_weight = { NULL, 0 };
+
+static double *position_weight_table_get(int gap_size) {
+    if (gap_size <= 0)
+        return NULL;
+
+    if (tls_pos_weight.cap < gap_size + 1) {
+        double *nv = (double *)realloc(tls_pos_weight.vals,
+                                       (size_t)(gap_size + 1) * sizeof(double));
+        if (!nv) {
+            perror("realloc");
+            exit(1);
+        }
+        tls_pos_weight.vals = nv;
+        tls_pos_weight.cap = gap_size + 1;
+    }
+
+    tls_pos_weight.vals[0] = 0.0;
+    for (int d = 1; d <= gap_size; d++)
+        tls_pos_weight.vals[d] = position_weight(d);
+
+    return tls_pos_weight.vals;
+}
+
+typedef struct {
+    double *vals;
+    int cap;
+    int gap_size;
+    int window;
+    double a;
+    double b;
+    int valid;
+} ProbKernelCache;
+
+static __thread ProbKernelCache tls_prob_kernel = {
+    NULL, 0, 0, 0, 0.0, 0.0, 0
+};
+
+static double *probability_kernel_get(int gap_size, int window,
+                                      const FitnessConfig *fc) {
+    if (!fc || window <= 0)
+        return NULL;
+
+    if (tls_prob_kernel.valid &&
+        tls_prob_kernel.gap_size == gap_size &&
+        tls_prob_kernel.window == window &&
+        tls_prob_kernel.a == fc->kernel_a &&
+        tls_prob_kernel.b == fc->kernel_b) {
+        return tls_prob_kernel.vals;
+    }
+
+    if (tls_prob_kernel.cap < window + 1) {
+        double *nv = (double *)realloc(tls_prob_kernel.vals,
+                                       (size_t)(window + 1) * sizeof(double));
+        if (!nv) {
+            perror("realloc");
+            exit(1);
+        }
+        tls_prob_kernel.vals = nv;
+        tls_prob_kernel.cap = window + 1;
+    }
+
+    double center = 0.5 * (double)gap_size;
+    double scale = (gap_size > 0) ? (double)gap_size : 1.0;
+    tls_prob_kernel.vals[0] = 0.0;
+    for (int d = 1; d <= window; d++) {
+        double t = fabs(((double)d - center) / scale);
+        tls_prob_kernel.vals[d] = exp(-fc->kernel_a * pow(t, fc->kernel_b));
+    }
+
+    tls_prob_kernel.gap_size = gap_size;
+    tls_prob_kernel.window = window;
+    tls_prob_kernel.a = fc->kernel_a;
+    tls_prob_kernel.b = fc->kernel_b;
+    tls_prob_kernel.valid = 1;
+    return tls_prob_kernel.vals;
 }
 
 /* ------------------------------------------------------------------ */
@@ -226,6 +310,10 @@ static bool solution_better(const Solution *a, const Solution *b) {
 static bool solution_better_mode(const Solution *a, const Solution *b,
                                  const FitnessConfig *fc) {
     if (fc->mode == FITNESS_PROBABILITY) {
+        if (a->n_candidates + fc->candidate_guard < b->n_candidates)
+            return true;
+        if (b->n_candidates + fc->candidate_guard < a->n_candidates)
+            return false;
         if (a->opt_score != b->opt_score)
             return a->opt_score < b->opt_score;
         if (a->n_candidates != b->n_candidates)
@@ -243,6 +331,10 @@ static bool solution_better_metrics_mode(int a_cnt, double a_opt, double a_aux,
                                          int b_cnt, double b_opt, double b_aux,
                                          const FitnessConfig *fc) {
     if (fc->mode == FITNESS_PROBABILITY) {
+        if (a_cnt + fc->candidate_guard < b_cnt)
+            return true;
+        if (b_cnt + fc->candidate_guard < a_cnt)
+            return false;
         if (a_opt != b_opt)
             return a_opt < b_opt;
         if (a_cnt != b_cnt)
@@ -331,6 +423,8 @@ static void sol_free(Solution *s) {
 /* ------------------------------------------------------------------ */
 static int evaluate_candidate(const int *offsets, int n_primes, int gap_size,
                               uint8_t *buf, double *opt_out, double *aux_out) {
+    double *wtab = position_weight_table_get(gap_size);
+
     memset(buf, 0, (size_t)(gap_size + 1));
     for (int i = 0; i < n_primes; i++) {
         int p = PRIMES[i];
@@ -347,7 +441,7 @@ static int evaluate_candidate(const int *offsets, int n_primes, int gap_size,
     for (int d = 1; d <= gap_size; d++) {
         if (!buf[d]) {
             cnt++;
-            wt += position_weight(d);
+            wt += wtab[d];
             if (prev_uncovered) {
                 run_len++;
                 cluster_penalty += 1.0 + 0.25 * (double)(run_len - 1);
@@ -370,6 +464,8 @@ static int evaluate_probability(const int *offsets, int n_primes, int gap_size,
                                 const FitnessConfig *fc,
                                 double *opt_out, double *aux_out) {
     int window = fitness_window_size(gap_size, fc);
+    double *wtab = position_weight_table_get(gap_size);
+    double *ktab = probability_kernel_get(gap_size, window, fc);
     uint8_t *owned_wide = NULL;
     if (!buf_wide) {
         owned_wide = (uint8_t *)calloc((size_t)(window + 1), 1);
@@ -401,7 +497,7 @@ static int evaluate_probability(const int *offsets, int n_primes, int gap_size,
     for (int d = 1; d <= gap_size; d++) {
         if (!buf[d]) {
             cnt++;
-            wt += position_weight(d);
+            wt += wtab[d];
             if (prev_uncovered) {
                 run_len++;
                 cluster_penalty += 1.0 + 0.25 * (double)(run_len - 1);
@@ -415,14 +511,11 @@ static int evaluate_probability(const int *offsets, int n_primes, int gap_size,
         }
     }
 
-    double center = 0.5 * (double)gap_size;
-    double scale = (gap_size > 0) ? (double)gap_size : 1.0;
     double score = 0.0;
     for (int d = 1; d <= window; d++) {
         if (buf_wide[d])
             continue;
-        double t = fabs(((double)d - center) / scale);
-        score += exp(-fc->kernel_a * pow(t, fc->kernel_b));
+        score += ktab[d];
     }
 
     if (opt_out) *opt_out = score;
@@ -1387,6 +1480,7 @@ static void write_crt_file(const char *path, const Solution *sol,
         fprintf(f, "# fitness_window_cap %d\n", fc->window_cap);
         fprintf(f, "# fitness_kernel_a %.6f\n", fc->kernel_a);
         fprintf(f, "# fitness_kernel_b %.6f\n", fc->kernel_b);
+        fprintf(f, "# fitness_candidate_guard %d\n", fc->candidate_guard);
     } else {
         fprintf(f, "# candidate_weighted_score %.9f\n", sol->opt_score);
         fprintf(f, "# candidate_raw_weight_sum %.9f\n", sol->aux_score);
@@ -1434,6 +1528,8 @@ static void usage(const char *prog) {
         "  --fitness-window-cap N     Probability mode hard cap for W, 0=no cap (default: 0)\n"
         "  --fitness-kernel-a A       Probability mode kernel parameter a (default: 5.8)\n"
         "  --fitness-kernel-b B       Probability mode kernel parameter b (default: 3.3)\n"
+        "  --fitness-candidate-guard G  Probability mode candidate-count guard-band\n"
+        "                              (default: 2; larger prefers fewer candidates)\n"
         "                           Probability mode also enables probability-aware\n"
         "                           one-prime/pair local search plus a bounded\n"
         "                           three-prime final polish pass.\n"
@@ -1476,6 +1572,7 @@ int main(int argc, char **argv) {
         0,
         PHASE1_A_DEFAULT,
         PHASE1_B_DEFAULT,
+        2,
     };
     bool   phase3_enabled = false;
     int    phase3_delta = 2;
@@ -1498,6 +1595,7 @@ int main(int argc, char **argv) {
         {"fitness-window-cap", required_argument, NULL, 'c'},
         {"fitness-kernel-a", required_argument, NULL, 'A'},
         {"fitness-kernel-b", required_argument, NULL, 'B'},
+        {"fitness-candidate-guard", required_argument, NULL, 'G'},
         {"phase3",         no_argument,       NULL, 'P'},
         {"phase3-delta",   required_argument, NULL, 'd'},
         {"phase3-mean-eps",required_argument, NULL, 'q'},
@@ -1506,7 +1604,7 @@ int main(int argc, char **argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "Cp:m:b:s:ef:i:r:o:T:F:W:c:A:B:Pd:q:h",
+    while ((opt = getopt_long(argc, argv, "Cp:m:b:s:ef:i:r:o:T:F:W:c:A:B:G:Pd:q:h",
                               long_opts, NULL)) != -1) {
         switch (opt) {
         case 'C': /* --calc-ctr: accepted for compat, always active */ break;
@@ -1534,6 +1632,7 @@ int main(int argc, char **argv) {
         case 'c': fitness_cfg.window_cap = atoi(optarg); break;
         case 'A': fitness_cfg.kernel_a = atof(optarg); break;
         case 'B': fitness_cfg.kernel_b = atof(optarg); break;
+        case 'G': fitness_cfg.candidate_guard = atoi(optarg); break;
         case 'P': phase3_enabled = true;         break;
         case 'd': phase3_delta = atoi(optarg);   break;
         case 'q': phase3_mean_eps = atof(optarg); break;
@@ -1563,6 +1662,7 @@ int main(int argc, char **argv) {
     if (fitness_cfg.window_cap < 0) fitness_cfg.window_cap = 0;
     if (fitness_cfg.kernel_a <= 0.0) fitness_cfg.kernel_a = PHASE1_A_DEFAULT;
     if (fitness_cfg.kernel_b <= 0.0) fitness_cfg.kernel_b = PHASE1_B_DEFAULT;
+    if (fitness_cfg.candidate_guard < 0) fitness_cfg.candidate_guard = 0;
     if (phase3_delta < 0) phase3_delta = 0;
     if (phase3_mean_eps < 0.0) phase3_mean_eps = 0.0;
 
@@ -1597,6 +1697,8 @@ int main(int argc, char **argv) {
             fitness_cfg.window_factor, fitness_cfg.window_cap);
         fprintf(stderr, "  fit-kernel  : a=%.3f  b=%.3f\n",
             fitness_cfg.kernel_a, fitness_cfg.kernel_b);
+        fprintf(stderr, "  fit-guard   : cand-guard=%d\n",
+            fitness_cfg.candidate_guard);
         }
     if (ctr_evolution)
         fprintf(stderr, "  evolution   : ivs=%d (effective=%d)  fixed=%d\n",
