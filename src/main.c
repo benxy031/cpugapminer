@@ -10679,12 +10679,21 @@ int main(int argc, char **argv) {
                     "(window=max(target*ln(start),%llu), set by --crt-gap-scan-floor)\n",
                     (unsigned long long)g_crt_gap_scan_floor);
         } else {
-            log_msg("CRT gap-scan mode: fixed "
-                    "(window=max(2*gap_target,10000)=%llu)\n",
-                    (unsigned long long)crt_gap_scan_template_window(
-                        (uint64_t)g_crt_gap_target, shift,
-                        g_crt_gap_scan_mode,
-                        g_crt_gap_scan_floor));
+            if (shift > 0 && shift < 450) {
+                log_msg("CRT gap-scan mode: fixed "
+                        "(window=max(1.75*gap_target,10000)=%llu; low-shift policy)\n",
+                        (unsigned long long)crt_gap_scan_template_window(
+                            (uint64_t)g_crt_gap_target, shift,
+                            g_crt_gap_scan_mode,
+                            g_crt_gap_scan_floor));
+            } else {
+                log_msg("CRT gap-scan mode: fixed "
+                        "(window=max(2*gap_target,10000)=%llu)\n",
+                        (unsigned long long)crt_gap_scan_template_window(
+                            (uint64_t)g_crt_gap_target, shift,
+                            g_crt_gap_scan_mode,
+                            g_crt_gap_scan_floor));
+            }
         }
                 if (use_crt_gap_scan_adaptive) {
                     log_msg("CRT gap-scan adaptive: enabled (drop>=%.1f%% or fill>=%.1f%% => x%.2f, wait>=%.1f%% and fill<=%.1f%% => x%.2f)\n",
