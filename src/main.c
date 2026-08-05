@@ -1372,6 +1372,27 @@ static inline void update_noncrt_needed_gap_stats(uint64_t needed_gap,
     }
 }
 
+static inline void observe_noncrt_target_region(int is_gpu_path, int hit_target)
+{
+    __atomic_fetch_add(&stats_noncrt_target_regions_total, 1, __ATOMIC_RELAXED);
+    if (hit_target)
+        __atomic_fetch_add(&stats_noncrt_target_regions_hit, 1, __ATOMIC_RELAXED);
+
+    if (is_gpu_path) {
+        __atomic_fetch_add(&stats_noncrt_gpu_target_regions_total, 1, __ATOMIC_RELAXED);
+        if (hit_target) {
+            __atomic_fetch_add(&stats_noncrt_gpu_target_regions_hit, 1,
+                               __ATOMIC_RELAXED);
+        }
+    } else {
+        __atomic_fetch_add(&stats_noncrt_cpu_target_regions_total, 1, __ATOMIC_RELAXED);
+        if (hit_target) {
+            __atomic_fetch_add(&stats_noncrt_cpu_target_regions_hit, 1,
+                               __ATOMIC_RELAXED);
+        }
+    }
+}
+
 static inline void update_onesided_every_extrema(size_t every_v)
 {
     uint64_t val = (uint64_t)every_v;
@@ -3111,6 +3132,30 @@ static void print_stats(void) {
                 ng_gpu_avg,
                 (unsigned long long)ng_gpu_max);
         }
+        {
+            uint64_t rt = stats_noncrt_target_regions_total;
+            uint64_t rh = stats_noncrt_target_regions_hit;
+            uint64_t rtc = stats_noncrt_cpu_target_regions_total;
+            uint64_t rhc = stats_noncrt_cpu_target_regions_hit;
+            uint64_t rtg = stats_noncrt_gpu_target_regions_total;
+            uint64_t rhg = stats_noncrt_gpu_target_regions_hit;
+            double hit_pct = (rt > 0)
+                ? (100.0 * (double)rh / (double)rt) : 0.0;
+            double hit_cpu_pct = (rtc > 0)
+                ? (100.0 * (double)rhc / (double)rtc) : 0.0;
+            double hit_gpu_pct = (rtg > 0)
+                ? (100.0 * (double)rhg / (double)rtg) : 0.0;
+            log_msg("  noncrt: target_regions checked=%llu qual-hit=%llu (%.1f%%) cpu checked=%llu qual-hit=%llu (%.1f%%) gpu checked=%llu qual-hit=%llu (%.1f%%)",
+                (unsigned long long)rt,
+                (unsigned long long)rh,
+                hit_pct,
+                (unsigned long long)rtc,
+                (unsigned long long)rhc,
+                hit_cpu_pct,
+                (unsigned long long)rtg,
+                (unsigned long long)rhg,
+                hit_gpu_pct);
+        }
         if (stats_noncrt_onesided_intervals > 0) {
             uint64_t oi = stats_noncrt_onesided_intervals;
             uint64_t os = stats_noncrt_onesided_skipped;
@@ -3250,6 +3295,22 @@ static void print_stats(void) {
                 (unsigned long long)pop_ok,
                 wait_pct,
                 (unsigned long long)stale);
+            if (use_crt_gap_scan_adaptive) {
+                uint64_t adapt_checks = stats_crt_gap_scan_adapt_checks;
+                uint64_t adapt_shrink = stats_crt_gap_scan_adapt_shrink;
+                uint64_t adapt_grow = stats_crt_gap_scan_adapt_grow;
+                uint64_t adapt_hold = stats_crt_gap_scan_adapt_hold;
+                uint64_t adapt_ratio_sum = stats_crt_gap_scan_adapt_ratio_sum_e6;
+                double adapt_ratio_avg = (adapt_checks > 0)
+                    ? ((double)adapt_ratio_sum / (double)adapt_checks) * 1e-6
+                    : 0.0;
+                log_msg("  gap-scan adaptive: checks=%llu shrink=%llu grow=%llu hold=%llu avg_ratio=%.3f",
+                    (unsigned long long)adapt_checks,
+                    (unsigned long long)adapt_shrink,
+                    (unsigned long long)adapt_grow,
+                    (unsigned long long)adapt_hold,
+                    adapt_ratio_avg);
+            }
             if (use_stats_verbose) {
                 uint64_t cs_n   = stats_cramer_scored;
                 uint64_t cs_sum = stats_cramer_score_sum_e9;
@@ -3275,10 +3336,22 @@ static void print_stats(void) {
             uint64_t ng_samples = stats_crt_needed_gap_samples;
             uint64_t ng_sum = stats_crt_needed_gap_sum;
             uint64_t ng_max = stats_crt_needed_gap_max;
+            uint64_t tw = stats_crt_target_windows_total;
+            uint64_t th = stats_crt_target_windows_hit;
+            uint64_t tw_cpu = stats_crt_cpu_target_windows_total;
+            uint64_t th_cpu = stats_crt_cpu_target_windows_hit;
+            uint64_t tw_gpu = stats_crt_gpu_target_windows_total;
+            uint64_t th_gpu = stats_crt_gpu_target_windows_hit;
             double ng_avg = (ng_samples > 0)
                 ? ((double)ng_sum / (double)ng_samples) : 0.0;
             double enq_pct = (prod_gen > 0)
                 ? (100.0 * (double)prod_enq / (double)prod_gen) : 0.0;
+            double hit_pct = (tw > 0)
+                ? (100.0 * (double)th / (double)tw) : 0.0;
+            double hit_cpu_pct = (tw_cpu > 0)
+                ? (100.0 * (double)th_cpu / (double)tw_cpu) : 0.0;
+            double hit_gpu_pct = (tw_gpu > 0)
+                ? (100.0 * (double)th_gpu / (double)tw_gpu) : 0.0;
             struct crt_score_roll_snapshot score_snap;
             crt_score_roll_snapshot(&score_snap);
 
@@ -3297,6 +3370,16 @@ static void print_stats(void) {
                 (unsigned long long)pre_den_drop,
                 ng_avg,
                 (unsigned long long)ng_max);
+            log_msg("  phase1: target_windows checked=%llu qual-hit=%llu (%.1f%%) cpu checked=%llu qual-hit=%llu (%.1f%%) gpu checked=%llu qual-hit=%llu (%.1f%%)",
+                (unsigned long long)tw,
+                (unsigned long long)th,
+                hit_pct,
+                (unsigned long long)tw_cpu,
+                (unsigned long long)th_cpu,
+                hit_cpu_pct,
+                (unsigned long long)tw_gpu,
+                (unsigned long long)th_gpu,
+                hit_gpu_pct);
             if (stats_crt_gpu_accum_flush_count > 0 ||
                 stats_crt_gpu_accum_collect_count > 0 ||
                 stats_crt_cuda_fb_no_accum > 0 ||
@@ -8051,6 +8134,16 @@ static void gpu_accum_collect(struct gpu_accum *a) {
                          w->nAdd, w->shift, w->target,
                          w->rpc_url, w->rpc_user, w->rpc_pass,
                          &w_primes, &w_qual, &w_max_gap);
+        __atomic_fetch_add(&stats_crt_target_windows_total, 1,
+                           __ATOMIC_RELAXED);
+        __atomic_fetch_add(&stats_crt_gpu_target_windows_total, 1,
+                           __ATOMIC_RELAXED);
+        if (w_qual > 0) {
+            __atomic_fetch_add(&stats_crt_target_windows_hit, 1,
+                               __ATOMIC_RELAXED);
+            __atomic_fetch_add(&stats_crt_gpu_target_windows_hit, 1,
+                               __ATOMIC_RELAXED);
+        }
         if (w->cramer_score > 0.0) {
             double needed_gap = w->logbase * w->target;
             double gap_ratio = (needed_gap > 0.0 && w_max_gap > 0)
@@ -9531,6 +9624,8 @@ static void *worker_fn(void *arg) {
                             size_t seg_cnt = (hi_idx > lo_idx) ? hi_idx - lo_idx : 0;
                             if (seg_cnt >= 2) {
                                 region_pairs += seg_cnt - 1;
+                                uint64_t gaps_before = __atomic_load_n(&stats_gaps,
+                                                                        __ATOMIC_RELAXED);
                                 if (scan_candidates(pr + lo_idx, seg_cnt,
                                                     target_local, logbase,
                                                     pass_seq_local,
@@ -9539,6 +9634,10 @@ static void *worker_fn(void *arg) {
                                                     rpc_pass_local, rpc_method_local,
                                                     rpc_sign_key_local))
                                     found_block = 1;
+                                uint64_t gaps_after = __atomic_load_n(&stats_gaps,
+                                                                       __ATOMIC_RELAXED);
+                                observe_noncrt_target_region(1,
+                                    (gaps_after > gaps_before) ? 1 : 0);
                             }
                         }
                         if (sp_cnt > 0 && p1_cnt > 0) {
@@ -9640,6 +9739,7 @@ static void *worker_fn(void *arg) {
                                       logbase, submit_target_local,
                                       bn_candidate_is_prime,
                                       &res_w);
+                observe_noncrt_target_region(0, (res_w.qual_cnt > 0) ? 1 : 0);
 
                 if (cli_backscan_stat_sample > 1)
                     backscan_stat_sample_probe(pr, cnt, logbase,
@@ -11192,7 +11292,8 @@ int main(int argc, char **argv) {
             g_crt_gap_scan_mode,
             g_crt_gap_scan_floor);
         uint64_t crt_limit = gap_scan * 19;
-        if (crt_limit > 500000) crt_limit = 500000;
+        if (crt_limit > 500000)
+            crt_limit = 500000;
         if (cli_sieve_prime_limit > crt_limit) {
             const char *mlabel = (crt_fermat_threads == 0)
                                  ? "monolithic" : "producer-consumer";
@@ -11816,12 +11917,23 @@ int main(int argc, char **argv) {
                             size_t seg_cnt = (hi_idx > lo_idx) ? hi_idx - lo_idx : 0;
                             if (seg_cnt >= 2) {
                                 region_pairs_st += seg_cnt - 1;
+                                uint64_t gaps_before = __atomic_load_n(&stats_gaps,
+                                                                        __ATOMIC_RELAXED);
                                 if (scan_candidates(pr + lo_idx, seg_cnt,
                                                    submit_target_st, logbase, st_pass_seq, shift,
                                                    header, rpc_url, rpc_user,
                                                    rpc_pass, rpc_method,
                                                    rpc_sign_key))
                                     return 0;
+                                uint64_t gaps_after = __atomic_load_n(&stats_gaps,
+                                                                       __ATOMIC_RELAXED);
+#ifdef WITH_GPU_FERMAT
+                                observe_noncrt_target_region((g_gpu_count > 0) ? 1 : 0,
+                                    (gaps_after > gaps_before) ? 1 : 0);
+#else
+                                observe_noncrt_target_region(0,
+                                    (gaps_after > gaps_before) ? 1 : 0);
+#endif
                             }
                         }
                         /* ETA pair compensation */

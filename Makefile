@@ -80,7 +80,22 @@ all: $(TARGET)
 
 TEST_CFLAGS=$(filter-out -DWITH_CUDA -DWITH_OPENCL,$(CFLAGS))
 
-test: tests/test_rpc_json tests/test_wheel_sieve tests/test_wheel_compare tests/test_crt_runtime_policy tests/test_sievegap
+test-core: tests/test_rpc_json tests/test_wheel_sieve tests/test_wheel_compare tests/test_crt_runtime_policy tests/test_sievegap
+
+test-differential: test-core tests/test_differential_crt_gap_scan
+	./tests/test_sievegap
+	./tests/test_wheel_compare
+	./tests/test_differential_crt_gap_scan
+
+test-boundary: tests/test_boundary_crt_gap_scan
+	./tests/test_boundary_crt_gap_scan
+
+test-replay: tests/test_replay_sievegap
+	bash scripts/validate_replay_corpus.sh --check
+
+test-all: test-differential test-boundary test-replay
+
+test: test-all
 
 tests/test_rpc_json: $(SRCDIR)/rpc_json.c tests/test_rpc_json.c
 	$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $(SRCDIR)/rpc_json.c tests/test_rpc_json.c -ljansson
@@ -96,6 +111,15 @@ tests/test_crt_runtime_policy: $(SRCDIR)/crt_runtime.c tests/test_crt_runtime_po
 
 tests/test_sievegap: $(SRCDIR)/sievegap.c $(SRCDIR)/uint256_utils.c tests/test_sievegap.c
 	$(CC) $(TEST_CFLAGS) -I$(SRCDIR) -o $@ $(SRCDIR)/sievegap.c $(SRCDIR)/uint256_utils.c tests/test_sievegap.c -lcrypto -lm
+
+tests/test_differential_crt_gap_scan: $(SRCDIR)/crt_gap_scan.c tests/test_differential_crt_gap_scan.c
+	$(CC) $(TEST_CFLAGS) -I$(SRCDIR) -o $@ $(SRCDIR)/crt_gap_scan.c tests/test_differential_crt_gap_scan.c -lm
+
+tests/test_boundary_crt_gap_scan: $(SRCDIR)/crt_gap_scan.c tests/test_boundary_crt_gap_scan.c
+	$(CC) $(TEST_CFLAGS) -I$(SRCDIR) -o $@ $(SRCDIR)/crt_gap_scan.c tests/test_boundary_crt_gap_scan.c -lm
+
+tests/test_replay_sievegap: $(SRCDIR)/sievegap.c $(SRCDIR)/uint256_utils.c tests/test_replay_sievegap.c
+	$(CC) $(TEST_CFLAGS) -I$(SRCDIR) -o $@ $(SRCDIR)/sievegap.c $(SRCDIR)/uint256_utils.c tests/test_replay_sievegap.c -lcrypto -lm
 
 tests/bench_sievegap: $(SRCDIR)/sievegap.c $(SRCDIR)/uint256_utils.c tests/bench_sievegap.c
 	$(CC) -O3 $(TEST_CFLAGS) -I$(SRCDIR) -o $@ $(SRCDIR)/sievegap.c $(SRCDIR)/uint256_utils.c tests/bench_sievegap.c -lcrypto -lm
@@ -147,4 +171,4 @@ gen_crt: $(BINDIR) tools/gen_crt.c
 gen_crt_exhaust: $(BINDIR) tools/gen_crt_exhaust.c
 	$(CC) -O3 -std=c11 -Wall -Wextra -march=native -o $(BINDIR)/gen_crt_exhaust tools/gen_crt_exhaust.c -lgmp -lm
 
-.PHONY: all clean gen_crt gen_crt_exhaust
+.PHONY: all clean gen_crt gen_crt_exhaust test test-core test-differential test-boundary test-replay test-all

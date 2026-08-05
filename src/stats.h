@@ -81,6 +81,12 @@ extern volatile uint64_t stats_noncrt_cpu_needed_gap_max;      /* max CPU non-CR
 extern volatile uint64_t stats_noncrt_gpu_needed_gap_samples;  /* GPU non-CRT smart windows sampled for needed_gap */
 extern volatile uint64_t stats_noncrt_gpu_needed_gap_sum;      /* sum of GPU non-CRT needed_gap values */
 extern volatile uint64_t stats_noncrt_gpu_needed_gap_max;      /* max GPU non-CRT needed_gap value */
+extern volatile uint64_t stats_noncrt_target_regions_total;    /* smart-scan regions/windows checked against submit target */
+extern volatile uint64_t stats_noncrt_target_regions_hit;      /* smart-scan regions/windows with >=1 qualifying target gap */
+extern volatile uint64_t stats_noncrt_cpu_target_regions_total;
+extern volatile uint64_t stats_noncrt_cpu_target_regions_hit;
+extern volatile uint64_t stats_noncrt_gpu_target_regions_total;
+extern volatile uint64_t stats_noncrt_gpu_target_regions_hit;
 extern volatile uint64_t stats_crt_heap_push_ok;
 extern volatile uint64_t stats_crt_heap_push_replace;
 extern volatile uint64_t stats_crt_heap_push_drop;
@@ -103,6 +109,17 @@ extern volatile uint64_t stats_crt_solver_prod_prefilter_density_drop;
 extern volatile uint64_t stats_crt_needed_gap_samples;
 extern volatile uint64_t stats_crt_needed_gap_sum;
 extern volatile uint64_t stats_crt_needed_gap_max;
+extern volatile uint64_t stats_crt_target_windows_total;       /* CRT windows checked in final gap scan */
+extern volatile uint64_t stats_crt_target_windows_hit;         /* CRT windows with >=1 qualifying target gap */
+extern volatile uint64_t stats_crt_cpu_target_windows_total;
+extern volatile uint64_t stats_crt_cpu_target_windows_hit;
+extern volatile uint64_t stats_crt_gpu_target_windows_total;
+extern volatile uint64_t stats_crt_gpu_target_windows_hit;
+extern volatile uint64_t stats_crt_gap_scan_adapt_checks;
+extern volatile uint64_t stats_crt_gap_scan_adapt_shrink;
+extern volatile uint64_t stats_crt_gap_scan_adapt_grow;
+extern volatile uint64_t stats_crt_gap_scan_adapt_hold;
+extern volatile uint64_t stats_crt_gap_scan_adapt_ratio_sum_e6;
 extern volatile uint64_t stats_crt_gpu_accum_flush_count;
 extern volatile uint64_t stats_crt_gpu_accum_flush_ms;
 extern volatile uint64_t stats_crt_gpu_accum_collect_count;

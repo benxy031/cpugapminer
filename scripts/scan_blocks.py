@@ -81,7 +81,7 @@ def fetch_records(url=MERITS_URL):
 # RPC helpers
 # --------------------------------------------------------------------------
 
-DEFAULT_CONF = os.path.expanduser("~/.gapcoin/gapcoin.conf")
+DEFAULT_CONF = os.path.expanduser("~/.gapcoin2606/gapcoin.conf")
 
 def load_conf(path=DEFAULT_CONF):
     conf = {}

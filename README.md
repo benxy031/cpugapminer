@@ -66,15 +66,28 @@ docs/
   CRT_PHASE_WORKFLOW.md
                     - end-to-end Phase A/2/3 workflow, selector/run-script
                       generation, and full launch usage
+  TEST_INFRASTRUCTURE.md
+                    - staged correctness test policy
+                      (differential, boundary, replay-corpus)
 tests/
   test_rpc_json.c          - unit tests for rpc_json helpers
   test_wheel_sieve.c       - wheel presieve backend correctness tests
   test_wheel_compare.c     - wheel vs baseline presieve consistency checks
   test_crt_runtime_policy.c - CRT runtime policy tests (adaptive/backpressure)
+  test_differential_crt_gap_scan.c
+                    - differential invariants for CRT gap-scan template/runtime
+  test_boundary_crt_gap_scan.c
+                    - boundary tests for CRT gap-scan sizing and mode parsing
+  test_replay_sievegap.c
+                    - deterministic replay validation for sievegap survivor sets
+  corpus/sievegap_replay_cases.tsv
+                    - pinned replay corpus used by staged replay tests
 scripts/
   bench_gpu_sieve_ab.sh
                     - A/B runner for non-CRT GPU-sieve env profiles
                       (A0/A1/B1/A2/A3), default 120s per profile
+  validate_replay_corpus.sh
+                    - replay corpus validator / expectation regenerator
   inspect_tx.py     - Python utility to decode raw block/transaction hex
                       files written to /tmp by the miner
 crt/
@@ -252,14 +265,17 @@ For the practical operations flow (evaluate existing CRT files, generate
 portfolio artifacts, auto-select by merit band, and full launch runner), see
 [docs/CRT_PHASE_WORKFLOW.md](docs/CRT_PHASE_WORKFLOW.md).
 
+For staged correctness testing policy and replay-corpus workflow, see
+[docs/TEST_INFRASTRUCTURE.md](docs/TEST_INFRASTRUCTURE.md).
+
 ### Unit tests
 
 ```sh
-make test
-./tests/test_rpc_json
-./tests/test_wheel_sieve
-./tests/test_wheel_compare
-./tests/test_crt_runtime_policy
+make test-differential
+make test-boundary
+make test-replay
+# or run all staged correctness gates:
+make test-all
 ```
 
 ## Quick start
@@ -684,6 +700,20 @@ lane(non-crt,qual): pairs=... same=... alt+2=... alt+4=... unexpected=...
 Small `lane(non-crt,qual)` sample sizes are not statistically meaningful. For
 example, `pairs=1 alt+4=100%` only means the single qualifying gap in that
 sample happened to be of the `1 mod 6 -> 5 mod 6` type.
+
+With `--stats-verbose`, target telemetry lines may also appear:
+
+```
+noncrt: target_regions hit=H/T (...) cpu=Hc/Tc (...) gpu=Hg/Tg (...)
+phase1: target_windows hit=H/T (...) cpu=Hc/Tc (...) gpu=Hg/Tg (...)
+```
+
+- `noncrt: target_regions` now prints `checked=...` first, then `qual-hit=...`.
+  `checked` is the number of regions/windows examined against the target
+  threshold; `qual-hit` is the subset that produced at least one qualifying gap.
+- `phase1: target_windows` uses the same pattern for CRT windows that reached
+  final gap scanning (CPU or GPU consumer/monolithic path).
+- `cpu`/`gpu` splits are per execution path; totals are aggregate across both.
 
 Operational note:
 
@@ -1921,7 +1951,7 @@ presieve tile period, making it cache-neutral. All other P values
 | `--adaptive-presieve-min-survivors N` | 2048 | Absolute minimum survivors required before adaptive skip can trigger.  Useful as a stability guard during warmup or at small shifts. |
 | `--wheel-sieve N`     | 0 (disabled)  | Select wheel-presieve backend for non-CRT runs.  Supported values: `30`, `210`, `2310`, `30030`, `510510`, `9699690`. |
 | `-e` / `--extra-verbose` | off       | Write detailed `--partial-sieve-auto` adjustments to the log file only. |
-| `--stats-verbose`     | off           | Include detailed CRT phase telemetry (`cramer`, `phase1`, accumulator histograms, score calibration) in periodic STATS output.  Default output stays concise. |
+| `--stats-verbose`     | off           | Include detailed non-CRT and CRT phase telemetry in periodic STATS output.  This includes needed-gap summaries, target-region hit ratios (`noncrt: target_regions ...`), and CRT target-window hit ratios (`phase1: target_windows ...`) in addition to existing `cramer`/`phase1` accumulator lines.  Default output stays concise. |
 | `--rgm-cal-min N`     | 50000         | Minimum baseline sample count before RGM region-scoring telemetry becomes active. |
 | `--rgm-state-file FILE` | --          | Persist/restore RGM baseline state across restarts. |
 | `--crt-file FILE`     | --            | Load a CRT sieve file (binary `.bin` or text `.txt`).  Text files enable CRT-aligned mining; binary files enable template tiling. |
@@ -1929,7 +1959,7 @@ presieve tile period, making it cache-neutral. All other P values
 | `--crt-gpu-consumer` | off | Experimental CRT producer-consumer mode: route consumer windows through the GPU accumulator path when `--cuda` is active. |
 | `--crt-gap-scan MODE` | `fixed` | CRT solver gap-window policy for text `--crt-file` runs.  `fixed=max(2*gap_target,10000)`, `original=ceil(target*ln(start))` (clamped to `[8,gap_target]`), `original-floor=max(original,FLOOR)`.  Aliases: `orig`, `dynamic`, `orig-floor`, `dynamic-floor`, `hybrid`. |
 | `--crt-gap-scan-floor N` | 10000 | Floor used by `--crt-gap-scan original-floor`.  Can also be set inline via `--crt-gap-scan original-floor=N`.  Ignored by other CRT gap-scan modes. |
-| `--crt-gap-scan-adaptive` | off | Adapt CRT runtime gap-scan window from heap-pressure telemetry (`drop%`, fill, wait) during solver execution. |
+| `--crt-gap-scan-adaptive` | off | Adapt CRT runtime gap-scan window from heap-pressure telemetry (`drop%`, fill, wait) during solver execution.  Periodic STATS output shows `gap-scan adaptive: checks=... shrink=... grow=... hold=... avg_ratio=...` when this mode is active. |
 | `--crt-precision` / `--no-crt-precision` | off | Accuracy-first CRT solver mode: uses stricter probable-prime checks in CRT paths. |
 | `--crt-precision-rounds N` | 8 | Number of probable-prime rounds used by `--crt-precision` strict CRT checks (minimum 2). |
 | `--crt-auto-split`    | off           | Enable pass-level adaptive sieve/fermat thread split in CRT solver producer-consumer mode. |
@@ -2144,6 +2174,7 @@ STATS: elapsed=30.0s  sieved=5502926848 (183400328/s)  tested=8665707 (288809/s)
 | `gpu_batch` | (CUDA only) Average candidates per GPU flush.  Higher = better GPU utilization.  Absent when not using `--cuda`. |
 | `pps` | Consecutive prime pairs per second, computed from the rolling ~30 s `pairs_rate`.  Directly comparable to GapMiner's `tests/s` field.  Note: GapMiner's `pps` field is a theoretical CRT-scaled estimate, not the actual measured rate. |
 | `gaplist` | (CRT producer-consumer only) Number of sieved windows waiting in the priority heap.  Ideal: saw-tooth oscillating between ~100 and ~3000.  Persistently 0 = fermat threads too fast / sieve-primes too low.  Persistently near 4096 = sieve too fast, add fermat threads or reduce sieve-primes. |
+| `gap-scan adaptive` | (CRT producer-consumer only, `--crt-gap-scan-adaptive`) How often the runtime shrank, grew, or held the per-nonce gap window, plus `avg_ratio` = average adjusted-window / base-window. This is the quickest way to see whether the heap-pressure policy is actually moving the window. |
 
 ### Why `gaps=0` and `submitted=0` are normal early on
 

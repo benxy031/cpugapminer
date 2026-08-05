@@ -17,7 +17,8 @@
 /* Human-readable mode label for logs. */
 const char *crt_gap_scan_mode_name(int mode);
 
-/* Parse CLI mode name: fixed|original (aliases: orig,dynamic). */
+/* Parse CLI mode name: fixed|original
+   (aliases: orig,dynamic,orig-floor,dynamic-floor,hybrid). */
 int crt_gap_scan_mode_parse(const char *mode, int *out_mode);
 
 /* Fixed cpugapminer policy: max(2*gap_target, 10000). */

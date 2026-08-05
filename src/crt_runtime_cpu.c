@@ -165,8 +165,8 @@ static int crt_runtime_prepare_solver_nonce(
         const uint8_t hdr80_for_nonce[80],
         int shift_local,
         double target_local,
-    struct crt_runtime_nonce_prepare *out,
-    const struct crt_runtime_worker_ctx *ctx) {
+        struct crt_runtime_nonce_prepare *out,
+        const struct crt_runtime_worker_ctx *ctx) {
     if (!out)
         return 0;
 
@@ -202,7 +202,7 @@ static int crt_runtime_prepare_solver_nonce(
         uint64_t adaptive_cap = (gap_scan_base <= UINT64_MAX / 2ULL)
             ? (gap_scan_base * 2ULL)
             : UINT64_MAX;
-        out->gap_scan_nonce = crt_runtime_adaptive_gap_scan_window(
+        uint64_t adaptive_window = crt_runtime_adaptive_gap_scan_window(
             gap_scan_base,
             g_crt_gap_scan_floor,
             adaptive_cap,
@@ -214,6 +214,25 @@ static int crt_runtime_prepare_solver_nonce(
             stats_crt_heap_pop_ok,
             stats_crt_heap_waits,
             &g_crt_gap_scan_adapt_cfg);
+        out->gap_scan_nonce = adaptive_window;
+
+        __atomic_fetch_add(&stats_crt_gap_scan_adapt_checks, 1,
+                           __ATOMIC_RELAXED);
+        if (adaptive_window < gap_scan_base) {
+            __atomic_fetch_add(&stats_crt_gap_scan_adapt_shrink, 1,
+                               __ATOMIC_RELAXED);
+        } else if (adaptive_window > gap_scan_base) {
+            __atomic_fetch_add(&stats_crt_gap_scan_adapt_grow, 1,
+                               __ATOMIC_RELAXED);
+        } else {
+            __atomic_fetch_add(&stats_crt_gap_scan_adapt_hold, 1,
+                               __ATOMIC_RELAXED);
+        }
+
+        uint64_t ratio_e6 = (uint64_t)(((double)adaptive_window * 1000000.0) /
+                                       (double)gap_scan_base + 0.5);
+        __atomic_fetch_add(&stats_crt_gap_scan_adapt_ratio_sum_e6, ratio_e6,
+                           __ATOMIC_RELAXED);
     }
 
     if (__sync_bool_compare_and_swap(
@@ -350,7 +369,8 @@ static void crt_runtime_process_solver_window(
 
     /* Monolithic path: evaluate this window inline. */
     {
-        if (surv_cnt < 2 || surv[surv_cnt - 1] - surv[0] < needed_gap_cs) {
+        if (surv_cnt < 2 ||
+            surv[surv_cnt - 1] - surv[0] < needed_gap_cs) {
             __atomic_fetch_add(&stats_cramer_skipped, 1,
                                __ATOMIC_RELAXED);
             mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
@@ -376,6 +396,7 @@ static void crt_runtime_process_solver_window(
     }
 #endif
     {
+        size_t w_primes = 0, w_qual = 0;
         size_t cpu_tests = crt_bkscan_and_submit(
             surv, surv_cnt,
             logbase_nonce, submit_target,
@@ -383,10 +404,20 @@ static void crt_runtime_process_solver_window(
             cand_odd, nAdd,
             rpc_url_local, rpc_user_local,
             rpc_pass_local,
-            NULL, NULL);
+            &w_primes, &w_qual);
         __atomic_fetch_add(&stats_crt_solver_mono_cpu_tests,
                            (uint64_t)cpu_tests,
                            __ATOMIC_RELAXED);
+        __atomic_fetch_add(&stats_crt_target_windows_total, 1,
+                           __ATOMIC_RELAXED);
+        __atomic_fetch_add(&stats_crt_cpu_target_windows_total, 1,
+                           __ATOMIC_RELAXED);
+        if (w_qual > 0) {
+            __atomic_fetch_add(&stats_crt_target_windows_hit, 1,
+                               __ATOMIC_RELAXED);
+            __atomic_fetch_add(&stats_crt_cpu_target_windows_hit, 1,
+                               __ATOMIC_RELAXED);
+        }
     }
 
     mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
@@ -759,6 +790,16 @@ int crt_runtime_cpu_try_run_consumer_loop(
             __atomic_fetch_add(&stats_crt_solver_consumer_cpu_tests,
                                (uint64_t)cpu_tests,
                                __ATOMIC_RELAXED);
+            __atomic_fetch_add(&stats_crt_target_windows_total, 1,
+                               __ATOMIC_RELAXED);
+            __atomic_fetch_add(&stats_crt_cpu_target_windows_total, 1,
+                               __ATOMIC_RELAXED);
+            if (w_qual > 0) {
+                __atomic_fetch_add(&stats_crt_target_windows_hit, 1,
+                                   __ATOMIC_RELAXED);
+                __atomic_fetch_add(&stats_crt_cpu_target_windows_hit, 1,
+                                   __ATOMIC_RELAXED);
+            }
             crt_score_roll_observe(w->cramer_score,
                                    (uint64_t)w->surv_cnt,
                                    (uint64_t)w_primes,
