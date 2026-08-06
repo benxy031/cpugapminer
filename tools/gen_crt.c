@@ -148,7 +148,8 @@ typedef struct {
 
 typedef enum {
     FITNESS_CANDIDATE = 0,
-    FITNESS_PROBABILITY = 1
+    FITNESS_PROBABILITY = 1,
+    FITNESS_MAX_RUN = 2
 } FitnessMode;
 
 typedef struct {
@@ -320,6 +321,15 @@ static bool solution_better_mode(const Solution *a, const Solution *b,
             return a->n_candidates < b->n_candidates;
         return a->aux_score < b->aux_score;
     }
+    if (fc->mode == FITNESS_MAX_RUN) {
+        /* Primary: maximise max_run (opt = -max_run, so minimise opt). */
+        if (a->opt_score != b->opt_score)
+            return a->opt_score < b->opt_score;
+        /* Tie-break: fewer candidates (less Fermat work). */
+        if (a->n_candidates != b->n_candidates)
+            return a->n_candidates < b->n_candidates;
+        return a->aux_score < b->aux_score;
+    }
     if (a->n_candidates != b->n_candidates)
         return a->n_candidates < b->n_candidates;
     if (a->opt_score != b->opt_score)
@@ -335,6 +345,13 @@ static bool solution_better_metrics_mode(int a_cnt, double a_opt, double a_aux,
             return true;
         if (b_cnt + fc->candidate_guard < a_cnt)
             return false;
+        if (a_opt != b_opt)
+            return a_opt < b_opt;
+        if (a_cnt != b_cnt)
+            return a_cnt < b_cnt;
+        return a_aux < b_aux;
+    }
+    if (fc->mode == FITNESS_MAX_RUN) {
         if (a_opt != b_opt)
             return a_opt < b_opt;
         if (a_cnt != b_cnt)
@@ -386,7 +403,9 @@ static int fitness_window_size(int gap_size, const FitnessConfig *fc) {
 }
 
 static double legacy_display_score(FitnessMode mode, double opt_score, double aux_score) {
-    return (mode == FITNESS_PROBABILITY) ? aux_score : opt_score;
+    if (mode == FITNESS_PROBABILITY) return aux_score;
+    if (mode == FITNESS_MAX_RUN)     return -opt_score; /* display as positive run length */
+    return opt_score;
 }
 
 static Solution sol_alloc(int n_primes, int gap_size) {
@@ -456,6 +475,41 @@ static int evaluate_candidate(const int *offsets, int n_primes, int gap_size,
     }
     if (opt_out) *opt_out = wt + CLUSTER_PENALTY_WEIGHT * cluster_penalty;
     if (aux_out) *aux_out = wt;
+    return cnt;
+}
+
+/* Evaluate: maximise the longest run of consecutive uncovered ODD positions.
+ * opt_out = -(max_run), aux_out = n_candidates (lower = fewer tests). */
+static int evaluate_max_run(const int *offsets, int n_primes, int gap_size,
+                            uint8_t *buf, double *opt_out, double *aux_out)
+{
+    memset(buf, 0, (size_t)(gap_size + 1));
+    for (int i = 0; i < n_primes; i++) {
+        int p = PRIMES[i];
+        int o = offsets[i] % p;
+        for (int d = (o ? o : p); d <= gap_size; d += p)
+            buf[d] = 1;
+    }
+    int cnt = 0;
+    /* Collect uncovered positions, then find max spacing between consecutive ones.
+     * max_spacing = the largest gap between two consecutive uncovered positions;
+     * both endpoints are candidate primes and everything between is definite composite,
+     * so this directly measures the largest achievable prime gap in the window. */
+    int max_spacing = 0;
+    int prev_uncov = -1;
+    for (int d = 1; d <= gap_size; d++) {
+        if (!buf[d]) {
+            cnt++;
+            if (prev_uncov >= 0) {
+                int spacing = d - prev_uncov;
+                if (spacing > max_spacing) max_spacing = spacing;
+            }
+            prev_uncov = d;
+        }
+    }
+    /* Negate so the optimizer (minimising opt_score) maximises the spacing. */
+    if (opt_out) *opt_out = -(double)max_spacing;
+    if (aux_out) *aux_out = (double)cnt;
     return cnt;
 }
 
@@ -533,6 +587,10 @@ static int evaluate_solution(const int *offsets, int n_primes, int gap_size,
         return evaluate_probability(offsets, n_primes, gap_size,
                                     buf, buf_wide, fc,
                                     opt_out, aux_out);
+    }
+    if (fc && fc->mode == FITNESS_MAX_RUN) {
+        return evaluate_max_run(offsets, n_primes, gap_size,
+                                buf, opt_out, aux_out);
     }
     return evaluate_candidate(offsets, n_primes, gap_size,
                               buf, opt_out, aux_out);
@@ -1623,8 +1681,10 @@ int main(int argc, char **argv) {
                 fitness_cfg.mode = FITNESS_CANDIDATE;
             } else if (strcmp(optarg, "probability") == 0) {
                 fitness_cfg.mode = FITNESS_PROBABILITY;
+            } else if (strcmp(optarg, "max-run") == 0) {
+                fitness_cfg.mode = FITNESS_MAX_RUN;
             } else {
-                fprintf(stderr, "error: --fitness-mode must be candidate or probability\n");
+                fprintf(stderr, "error: --fitness-mode must be candidate, probability or max-run\n");
                 return 1;
             }
             break;
@@ -1691,7 +1751,8 @@ int main(int argc, char **argv) {
     fprintf(stderr, "  strength    : %d  (greedy restarts)\n", ctr_strength);
     fprintf(stderr, "  threads     : %d\n", n_threads);
         fprintf(stderr, "  fitness     : %s\n",
-            fitness_cfg.mode == FITNESS_PROBABILITY ? "probability" : "candidate");
+            fitness_cfg.mode == FITNESS_PROBABILITY ? "probability" :
+            fitness_cfg.mode == FITNESS_MAX_RUN     ? "max-run" : "candidate");
         if (fitness_cfg.mode == FITNESS_PROBABILITY) {
         fprintf(stderr, "  fit-window  : factor=%.2f  cap=%d\n",
             fitness_cfg.window_factor, fitness_cfg.window_cap);
@@ -2160,13 +2221,21 @@ int main(int argc, char **argv) {
             100.0 * (double)global_best.n_candidates
                    / (double)global_best.gap_size);
     fprintf(stderr, "  objective mode: %s\n",
-            fitness_cfg.mode == FITNESS_PROBABILITY ? "probability" : "candidate");
+            fitness_cfg.mode == FITNESS_PROBABILITY ? "probability" :
+            fitness_cfg.mode == FITNESS_MAX_RUN     ? "max-run" : "candidate");
     if (fitness_cfg.mode == FITNESS_PROBABILITY) {
         fprintf(stderr, "  probability score: %.6f\n", global_best.opt_score);
         fprintf(stderr, "  candidate weighted score: %.3f  (mean w/cand: %.4f)\n",
                 global_best.w_score,
                 global_best.n_candidates > 0
                     ? global_best.w_score / (double)global_best.n_candidates
+                    : 0.0);
+    } else if (fitness_cfg.mode == FITNESS_MAX_RUN) {
+        fprintf(stderr, "  max gap spacing: %d  (gap_size=%d, ratio=%.3f)\n",
+                (int)(-global_best.opt_score),
+                global_best.gap_size,
+                global_best.gap_size > 0
+                    ? (-global_best.opt_score) / (double)global_best.gap_size
                     : 0.0);
     } else {
         fprintf(stderr, "  candidate weighted score: %.3f  (mean w/cand: %.4f)\n",
