@@ -140,37 +140,6 @@ static inline void crt_runtime_observe_needed_gap(uint64_t needed_gap) {
     }
 }
 
-/* Monolithic CRT low-score gate.
- *
- * Uses a conservative floor against a thread-local EMA of the same
- * normalised key used by the producer heap (cs/sqrt(surv_cnt+1)).
- *
- * Env override:
- *   CPUGAP_CRT_MONO_SCORE_EMA_FLOOR=<float>
- *     - default: 0.20
- *     - 0.0 disables this gate entirely
- */
-double crt_runtime_mono_score_ema_floor_mult_pub(void);
-double crt_runtime_mono_score_ema_floor_mult_pub(void)
-{
-    static int inited = 0;
-    static double v = 0.20;
-    if (!inited) {
-        const char *e = getenv("CPUGAP_CRT_MONO_SCORE_EMA_FLOOR");
-        if (e && *e) {
-            char *endp = NULL;
-            double t = strtod(e, &endp);
-            if (endp != e && isfinite(t)) {
-                if (t < 0.0) t = 0.0;
-                if (t > 1.0) t = 1.0;
-                v = t;
-            }
-        }
-        inited = 1;
-    }
-    return v;
-}
-
 static inline void crt_runtime_cleanup_tls_gmp(
     const struct crt_runtime_worker_ctx *ctx) {
     if (tls_gmp_inited) {
@@ -414,39 +383,6 @@ static void crt_runtime_process_solver_window(
         __atomic_fetch_add(&stats_cramer_scored, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&stats_cramer_score_sum_e9,
             (uint64_t)(cs * 1e9), __ATOMIC_RELAXED);
-
-        /* Reuse producer normalisation in mono mode too. */
-        double cs_key = cs / sqrt((double)(surv_cnt + 1));
-
-        /* Conservative EMA gate for mono CRT: skip only windows that are
-         * far below the current thread's rolling quality baseline. */
-        static __thread double tls_mono_cs_key_ema = 0.0;
-        static __thread uint64_t tls_mono_cs_seen = 0;
-        const double alpha = 0.05;
-        const double floor_mult = crt_runtime_mono_score_ema_floor_mult_pub();
-
-        int drop_low_score = 0;
-        if (floor_mult > 0.0 &&
-            tls_mono_cs_seen >= 64 &&
-            tls_mono_cs_key_ema > 0.0) {
-            double floor = tls_mono_cs_key_ema * floor_mult;
-            if (cs_key < floor)
-                drop_low_score = 1;
-        }
-
-        if (tls_mono_cs_seen == 0)
-            tls_mono_cs_key_ema = cs_key;
-        else
-            tls_mono_cs_key_ema = (1.0 - alpha) * tls_mono_cs_key_ema +
-                                  alpha * cs_key;
-        tls_mono_cs_seen++;
-
-        if (drop_low_score) {
-            __atomic_fetch_add(&stats_cramer_skipped, 1,
-                               __ATOMIC_RELAXED);
-            mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
-            return;
-        }
     }
 
 #ifdef WITH_GPU_FERMAT

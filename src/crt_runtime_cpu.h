@@ -35,8 +35,4 @@ int crt_runtime_cpu_try_run_consumer_loop(
     const char *rpc_user_local,
     const char *rpc_pass_local);
 
-/* Returns the effective EMA floor multiplier for monolithic CRT score gating.
- * 0.0 means the gate is disabled (env CPUGAP_CRT_MONO_SCORE_EMA_FLOOR=0). */
-double crt_runtime_mono_score_ema_floor_mult_pub(void);
-
 #endif

@@ -16,7 +16,7 @@ struct bkscan_result {
     size_t   tested;             /* Fermat tests performed                   */
     size_t   primes_found;       /* primes discovered (jumps + 1)            */
     double   best_merit;         /* best verified gap merit seen             */
-    uint64_t best_gap;           /* best verified gap size                   */
+    uint64_t best_gap;           /* best verified gap size (qualifying path) */
     uint64_t first_prime;        /* first prime found in segment (0=none)    */
     uint64_t last_prime;         /* last prime found in segment  (0=none)    */
     size_t   one_sided_considered; /* intervals evaluated by one-sided gate   */
