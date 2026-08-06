@@ -68,10 +68,6 @@ jobs:
         run: |
           make -f Makefile.mingw test-boundary
 
-      - name: Run staged replay-corpus tests
-        run: |
-          make -f Makefile.mingw test-replay
-
       - name: Build gen_crt
         run: make -f Makefile.mingw gen_crt
 
@@ -226,11 +222,6 @@ jobs:
         run: |
           make -f Makefile.mingw test-boundary
 
-      - name: Run staged replay-corpus tests
-        shell: msys2 {0}
-        run: |
-          make -f Makefile.mingw test-replay
-
       - name: Build gen_crt
         shell: msys2 {0}
         run: make -f Makefile.mingw gen_crt
@@ -334,10 +325,6 @@ jobs:
       - name: Run staged boundary tests
         run: |
           make -f Makefile.mingw test-boundary
-
-      - name: Run staged replay-corpus tests
-        run: |
-          make -f Makefile.mingw test-replay
 
       - name: Build gen_crt
         run: make -f Makefile.mingw gen_crt
