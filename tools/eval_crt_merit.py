@@ -193,6 +193,10 @@ def evaluate_file(
     return out
 
 
+def crt_is_eligible_for_merit(crt: CRTFile, merit: float) -> bool:
+    return crt.merit + 1e-12 >= merit
+
+
 def geometric_mean(values: Iterable[float], floor: float = 1e-300) -> float:
     vals = list(values)
     if not vals:
@@ -667,7 +671,13 @@ def main() -> int:
 
     ranking = []
     for f in files:
-        probs = [x.prob for x in evals[f.path]]
+        probs = [
+            x.prob
+            for mi, x in enumerate(evals[f.path])
+            if crt_is_eligible_for_merit(f, merits[mi])
+        ]
+        if not probs:
+            continue
         gm = geometric_mean(probs)
         ranking.append((gm, f))
 
@@ -704,9 +714,16 @@ def main() -> int:
     for mi, m in enumerate(merits):
         row = []
         for f in files:
+            if not crt_is_eligible_for_merit(f, m):
+                continue
             ev = evals[f.path][mi]
             row.append((ev.prob, f, ev))
         row.sort(key=lambda x: x[0], reverse=True)
+        if not row:
+            winners.append("")
+            winner_probs.append(0.0)
+            print(f"m={m:>5.2f}  G={merit_to_gap(m, files[0].shift if args.shift == 0 else args.shift):>6}  no eligible CRT files")
+            continue
         top = row[: max(1, args.top_per_merit)]
         winners.append(short_name(row[0][1].path))
         winner_probs.append(row[0][0])

@@ -27,7 +27,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-corpus="$repo_root/tests/corpus/sievegap_replay_cases.tsv"
+corpus_rel="tests/corpus/sievegap_replay_cases.tsv"
+corpus="$repo_root/$corpus_rel"
+
+# Run from repository root so relative paths are stable across local and CI
+# invocations. This also avoids passing POSIX absolute paths to MinGW-native
+# binaries on Windows, where fopen() may not resolve them.
+cd "$repo_root"
 
 if [[ -n "$bin_override" ]]; then
   bin="$bin_override"
@@ -42,10 +48,10 @@ fi
 
 if [[ "$mode" == "regen" ]]; then
   tmp="$(mktemp)"
-  "$bin" --generate "$corpus" > "$tmp"
+  "$bin" --generate "$corpus_rel" > "$tmp"
   mv "$tmp" "$corpus"
   echo "Regenerated replay corpus expectations: $corpus"
   exit 0
 fi
 
-"$bin" "$corpus"
+"$bin" "$corpus_rel"

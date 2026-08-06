@@ -360,10 +360,13 @@ static size_t gpu_sieve_offload_min_segment(void)
     return cached;
 }
 
-static int gpu_sieve_should_offload(size_t segment_len, int n_ph2)
+static int gpu_sieve_should_offload(size_t segment_len, int n_ph2,
+                                    int force_crt_mono)
 {
     if (n_ph2 <= 0)
         return 0;
+    if (force_crt_mono)
+        return 1;
     if (n_ph2 < gpu_sieve_offload_min_ph2())
         return 0;
     if (segment_len < gpu_sieve_offload_min_segment())
@@ -431,14 +434,109 @@ static double compute_cramer_score(const uint64_t *surv, size_t n,
     /* Multiply by the Hardy-Littlewood correction factor C_{needed_gap}/C_2.
      * For gaps divisible by small odd primes, this boosts the score by the
      * factor by which such gaps occur more often than gaps of size 2 would,
-     * making the Cramér score reflect the true gap-type probability under HL. */
+     * making the Cramér score reflect the true gap-type probability under HL.
+     *
+     * Also apply a conservative Cramér-Granville damping term exp(-beta*r),
+     * where r = needed_gap / logbase^2. This penalizes very aggressive target
+     * gaps whose rarity is underestimated by an independence-only model. */
     static __thread uint64_t tls_hl_gap = 0;
     static __thread double tls_hl_ratio = 1.0;
     if (tls_hl_gap != needed_gap) {
         tls_hl_gap = needed_gap;
         tls_hl_ratio = gap_dist_hl_ratio_large(needed_gap);
     }
-    return p * score * tls_hl_ratio;
+
+    double cg_ratio = (double)needed_gap / (logbase * logbase);
+    if (cg_ratio < 0.0)
+        cg_ratio = 0.0;
+    if (cg_ratio > 1.0)
+        cg_ratio = 1.0;
+    const double cg_beta = 2.2;
+    double cg_damp = exp(-cg_beta * cg_ratio);
+
+    return p * score * tls_hl_ratio * cg_damp;
+}
+
+/* Non-CRT smart-window score gate.
+ *
+ * Uses the same score family as CRT (compute_cramer_score) and a conservative
+ * per-thread EMA floor on the normalized key cs/sqrt(survivors+1).
+ *
+ * Env override:
+ *   CPUGAP_NONCRT_SCORE_EMA_FLOOR=<float>
+ *     - default: 0.20
+ *     - 0.0 disables this gate
+ */
+static double noncrt_score_ema_floor_mult(void)
+{
+    static int inited = 0;
+    static double v = 0.20;
+    if (!inited) {
+        const char *e = getenv("CPUGAP_NONCRT_SCORE_EMA_FLOOR");
+        if (e && *e) {
+            char *endp = NULL;
+            double t = strtod(e, &endp);
+            if (endp != e && isfinite(t)) {
+                if (t < 0.0) t = 0.0;
+                if (t > 1.0) t = 1.0;
+                v = t;
+            }
+        }
+        inited = 1;
+    }
+    return v;
+}
+
+static int noncrt_score_window_should_skip(const uint64_t *surv,
+                                           size_t surv_cnt,
+                                           double logbase,
+                                           uint64_t needed_gap,
+                                           int is_gpu_path)
+{
+    if (!surv || surv_cnt < 2 || logbase <= 1.0 || needed_gap < 2)
+        return 0;
+
+    const double floor_mult = noncrt_score_ema_floor_mult();
+    if (floor_mult <= 0.0)
+        return 0;
+
+    double cs = compute_cramer_score(surv, surv_cnt, logbase, needed_gap);
+    __atomic_fetch_add(&stats_cramer_scored, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&stats_cramer_score_sum_e9,
+        (uint64_t)(cs * 1e9), __ATOMIC_RELAXED);
+
+    double cs_key = cs / sqrt((double)(surv_cnt + 1));
+    const double alpha = 0.05;
+
+    static __thread double tls_noncrt_cs_key_ema_cpu = 0.0;
+    static __thread uint64_t tls_noncrt_cs_seen_cpu = 0;
+    static __thread double tls_noncrt_cs_key_ema_gpu = 0.0;
+    static __thread uint64_t tls_noncrt_cs_seen_gpu = 0;
+
+    double *ema = is_gpu_path ? &tls_noncrt_cs_key_ema_gpu
+                              : &tls_noncrt_cs_key_ema_cpu;
+    uint64_t *seen = is_gpu_path ? &tls_noncrt_cs_seen_gpu
+                                 : &tls_noncrt_cs_seen_cpu;
+
+    int drop_low_score = 0;
+    if (*seen >= 64 && *ema > 0.0) {
+        double floor = (*ema) * floor_mult;
+        if (cs_key < floor)
+            drop_low_score = 1;
+    }
+
+    if (*seen == 0)
+        *ema = cs_key;
+    else
+        *ema = (1.0 - alpha) * (*ema) + alpha * cs_key;
+    (*seen)++;
+
+    if (drop_low_score) {
+        __atomic_fetch_add(&stats_cramer_skipped, 1, __ATOMIC_RELAXED);
+        return 1;
+    }
+
+    return 0;
 }
 
 /* Phase 1 defaults by shift band for CRT solver mode. */
@@ -1007,6 +1105,8 @@ static volatile uint64_t stats_wheel_mps_bypass = 0; /* wheel requested, mpresie
 static volatile uint64_t stats_wheel_tile_used = 0;  /* wheel tile path executed */
 /* if nonzero, use standalone sievegap module for non-CRT windows. */
 static volatile int use_sievegap = 0;
+/* if nonzero, user explicitly requested --gpu-sieve. */
+static volatile int cli_gpu_sieve_explicit_on = 0;
 /* Shared bootstrap seed for --partial-sieve-auto: the first thread that
    stabilizes at a good sieve-prime limit writes it here so subsequent
    threads skip the slow span-based bootstrap.  0 = not yet set.
@@ -4481,7 +4581,10 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
             int n_ph2 = (int)(ph2_end - split_idx);
 
             if (g_gpu_sieve_enable && have_cache &&
-                gpu_sieve_should_offload((size_t)seg_size, n_ph2)) {
+                gpu_sieve_should_offload((size_t)seg_size, n_ph2,
+                                         g_crt_mode == CRT_MODE_SOLVER &&
+                                         crt_fermat_threads == 0 &&
+                                         cli_gpu_sieve_explicit_on)) {
                 /* GPU sieve requires base_mod_p to be cached for this block.
                  * k0 is now computed on-device; we only pass the base_mod_p
                  * slice and the window bounds as scalars. */
@@ -8262,6 +8365,7 @@ static void sha256_hex(const char *s, char out[65]) {
     out[64]='\0';
 }
 #include "crt_runtime_worker.h"
+#include "crt_runtime_cpu.h"
 
 /* ══════════════════════════════════════════════════════════════════════
    CRT Gap-Solver Mining Helpers
@@ -9339,6 +9443,7 @@ static void *worker_fn(void *arg) {
 #else
             int noncrt_gpu_smart_path = 0;
 #endif
+            int skip_low_score_window = 0;
 
             size_t needed_gap = 0;
             double submit_target_local = effective_submit_target(target_local);
@@ -9357,6 +9462,12 @@ static void *worker_fn(void *arg) {
                     uint64_t span = pr[cnt - 1] - pr[0];
                     if (needed_gap >= (size_t)span)
                         use_smart = 0;
+                }
+
+                if (use_smart && g_crt_mode == CRT_MODE_NONE) {
+                    skip_low_score_window = noncrt_score_window_should_skip(
+                        pr, cnt, logbase, (uint64_t)needed_gap,
+                        noncrt_gpu_smart_path);
                 }
 #ifdef WITH_GPU_FERMAT
                 /* GPU smart-scan still needs sampled candidates */
@@ -9400,7 +9511,7 @@ static void *worker_fn(void *arg) {
             } else
 #endif
             {
-            if (use_smart || skip_dense_window) {
+            if (use_smart || skip_dense_window || skip_low_score_window) {
                 /* Backward-scan (CPU) / GPU smart-scan: serial algorithm.
                    The backward scan is inherently sequential (each jump
                    depends on the previous prime found).  Helper sieves
@@ -9426,7 +9537,7 @@ static void *worker_fn(void *arg) {
             pthread_mutex_unlock(&psc.mu);       /* exactly once per window */
             }
 
-            if (skip_dense_window) {
+            if (skip_dense_window || skip_low_score_window) {
                 /* Carry is unknown across a skipped dense window. */
                 carry_last_prime = 0;
                 continue;
@@ -10264,7 +10375,6 @@ int main(int argc, char **argv) {
     int target_explicit = 0;  /* set to 1 if user passes --target */
     int scan_target_explicit = 0; /* set to 1 if user passes --scan-merit > 0 */
     int cli_sieve_explicit = 0; /* set to 1 if user passes --sieve-primes */
-    int cli_gpu_sieve_explicit_on = 0; /* set to 1 only when user passes --gpu-sieve */
     int cli_heap_explicit = 0;  /* set to 1 if user passes --heap */
     unsigned int cli_wheel_sieve = 0;
     const char *rpc_url = NULL, *rpc_user = NULL, *rpc_pass = NULL, *rpc_method = "getwork";
@@ -11394,13 +11504,15 @@ int main(int argc, char **argv) {
            primes_cap = small_primes_count + 64  (Phase-2 primes after split) */
         size_t gpu_seg_cap    = (size_t)(sieve_size / 2 + 1) + 64;
         size_t gpu_primes_cap = (small_primes_count > 0 ? small_primes_count : 1200000) + 64;
-        /* CRT windows are tiny (sieve_size <= gap_scan, typically ~16k).
-         * GPU sieve dispatch overhead (~0.5ms/call) completely dominates
-         * over the negligible kernel work, making it 40-45x slower than
-         * CPU-only sieve.  Auto-disable regardless of --gpu-sieve flag. */
-        if (g_gpu_sieve_enable && g_crt_mode != CRT_MODE_NONE) {
-            log_msg("GPU sieve: auto-disabled in CRT mode (window=%d too small for GPU dispatch)\n",
-                    sieve_size);
+        /* Allow GPU sieve only for CRT monolithic mode when the user has
+         * explicitly requested it with --gpu-sieve.  Producer/consumer CRT
+         * still stays on CPU sieve because the GPU dispatch overhead would
+         * otherwise dominate the small per-window solver path. */
+        if (g_gpu_sieve_enable && g_crt_mode == CRT_MODE_SOLVER &&
+            crt_fermat_threads == 0 && cli_gpu_sieve_explicit_on) {
+            log_msg("GPU sieve: enabled in CRT monolithic mode (--gpu-sieve); CPU threads still do phase-1 work, GPU offloads phase-2 marking\n");
+        } else if (g_gpu_sieve_enable && g_crt_mode != CRT_MODE_NONE) {
+            log_msg("GPU sieve: disabled in CRT mode unless CRT is monolithic and --gpu-sieve was passed\n");
             g_gpu_sieve_enable = 0;
         }
         if (g_gpu_sieve_enable) {
@@ -11522,6 +11634,20 @@ int main(int argc, char **argv) {
             (unsigned long long)adaptive_presieve_min_survivors,
                 (unsigned)ADAPTIVE_PRESIEVE_WARMUP_WIN,
                 (unsigned)ADAPTIVE_PRESIEVE_COOLDOWN_WIN);
+    {
+        double noncrt_ema_floor = noncrt_score_ema_floor_mult();
+        double crt_mono_ema_floor = crt_runtime_mono_score_ema_floor_mult_pub();
+        if (noncrt_ema_floor > 0.0)
+            log_msg("score gate (non-CRT smart): active  floor=%.2f (CPUGAP_NONCRT_SCORE_EMA_FLOOR; warmup 64 windows)\n",
+                    noncrt_ema_floor);
+        else
+            log_msg("score gate (non-CRT smart): disabled  (CPUGAP_NONCRT_SCORE_EMA_FLOOR=0)\n");
+        if (crt_mono_ema_floor > 0.0)
+            log_msg("score gate (CRT mono):      active  floor=%.2f (CPUGAP_CRT_MONO_SCORE_EMA_FLOOR; warmup 64 windows)\n",
+                    crt_mono_ema_floor);
+        else
+            log_msg("score gate (CRT mono):      disabled  (CPUGAP_CRT_MONO_SCORE_EMA_FLOOR=0)\n");
+    }
     if (use_extra_verbose)
         log_file_only("extra verbose enabled (-e/--extra-verbose): live merit events + partial-sieve-auto details\n");
     if (use_stats_verbose)
@@ -11718,7 +11844,36 @@ int main(int argc, char **argv) {
                                     && cnt > (size_t)(smart_K_st * 4));
 
                 if (use_smart_st) {
+                    int noncrt_gpu_smart_path_st =
+#ifdef WITH_GPU_FERMAT
+                        (g_gpu_count > 0);
+#else
+                        0;
+#endif
                     double submit_target_st = effective_submit_target(target);
+                    size_t needed = (size_t)(scan_target_runtime * logbase);
+                    if (needed < 2) needed = 2;
+
+                    if (cnt >= 2) {
+                        uint64_t span = pr[cnt - 1] - pr[0];
+                        if (needed >= (size_t)span)
+                            use_smart_st = 0;
+                    }
+
+                    if (use_smart_st) {
+                        update_noncrt_needed_gap_stats((uint64_t)needed,
+                                                       noncrt_gpu_smart_path_st);
+                    }
+
+                    if (use_smart_st && g_crt_mode == CRT_MODE_NONE) {
+                        if (noncrt_score_window_should_skip(
+                                pr, cnt, logbase, (uint64_t)needed,
+                                noncrt_gpu_smart_path_st)) {
+                            st_carry_last = 0;
+                            continue;
+                        }
+                    }
+
                     /* --- Phase 1: sample every Kth survivor --------------- */
                     size_t p1n = (cnt + (size_t)smart_K_st - 1) / (size_t)smart_K_st;
                     uint64_t *sampled = NULL;
@@ -11752,9 +11907,6 @@ int main(int argc, char **argv) {
                         }
                     }
                     __atomic_fetch_add(&stats_tested, (uint64_t)p1n, __ATOMIC_RELAXED);
-
-                    size_t needed = (size_t)(scan_target_runtime * logbase);
-                    if (needed < 2) needed = 2;
 
                     /* Identify gap regions (boundaries only) */
                     size_t n_greg_st = 0;

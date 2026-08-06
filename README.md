@@ -6,6 +6,11 @@ searches for large prime gaps and builds blocks via live `getblocktemplate`
 offloads Fermat primality testing to NVIDIA GPUs.  Every JSON-RPC POST and
 every raw block byte sequence is saved to `/tmp` for forensic inspection.
 
+In CRT monolithic mode, `--gpu-sieve` can additionally offload the phase-2
+composite marking path.  This does not replace CPU threads entirely; it only
+reduces the CPU work per sieve window.  CRT producer/consumer mode still keeps
+GPU sieve disabled.
+
 ## Repository layout
 
 ```
@@ -86,6 +91,14 @@ scripts/
   bench_gpu_sieve_ab.sh
                     - A/B runner for non-CRT GPU-sieve env profiles
                       (A0/A1/B1/A2/A3), default 120s per profile
+  estimate_crt_merit30.py
+                    - ranks existing CRT files by estimated difficulty of
+                      finding a merit-30 gap using the current CRT model;
+                      skips CRT files whose header merit is below the target
+  high_merit_crt_selector.py
+                    - multi-model merit-30+ CRT ranking (Cramer base model +
+                      Hardy-Littlewood factor + Cramer-Granville rarity/cost
+                      penalties) with recommended launch commands
   validate_replay_corpus.sh
                     - replay corpus validator / expectation regenerator
   inspect_tx.py     - Python utility to decode raw block/transaction hex
@@ -265,6 +278,17 @@ For the practical operations flow (evaluate existing CRT files, generate
 portfolio artifacts, auto-select by merit band, and full launch runner), see
 [docs/CRT_PHASE_WORKFLOW.md](docs/CRT_PHASE_WORKFLOW.md).
 
+For merit-30+ campaign ranking from current CRT files, run:
+
+```sh
+/usr/bin/python3 scripts/high_merit_crt_selector.py \
+  --merit-min 30 --merit-max 36 --merit-step 1 \
+  --top 5 --out docs/HIGH_MERIT_CAMPAIGN_REPORT_2026-08-05.md
+```
+
+This produces a markdown report with per-merit rankings and recommended
+`bin/gap_miner` command lines.
+
 For staged correctness testing policy and replay-corpus workflow, see
 [docs/TEST_INFRASTRUCTURE.md](docs/TEST_INFRASTRUCTURE.md).
 
@@ -439,6 +463,46 @@ bin/gap_miner \
 
 
 ## Recent changes (May 2026)
+
+### CRT queue scoring refinement (Aug 2026)
+
+CRT producer window scoring now applies two theoretical corrections before
+heap prioritization:
+
+- Hardy-Littlewood gap factor `C_g/C_2 = prod_{p odd | g} (p-1)/(p-2)`
+- Cramér-Granville rarity damping `exp(-beta * g/log(x)^2)` with `beta=2.2`
+
+Practical effect: windows with structurally favorable gap divisibility still
+get a boost, but very aggressive high-gap targets are damped so queue ordering
+is less optimistic under the independence-only Cramér model.
+
+The same score family is now also used in monolithic CRT mode via a
+conservative per-thread EMA floor gate on the normalised key
+`cramer_score / sqrt(survivors+1)`. Very low-score windows (well below each
+thread's rolling baseline after warmup) are skipped before expensive boundary
+testing.
+
+The same EMA score gate is now applied in non-CRT smart-scan mode for both
+CPU and GPU paths, using the same normalized key and warmup behavior.
+
+Environment override:
+
+- `CPUGAP_CRT_MONO_SCORE_EMA_FLOOR` (default `0.20`)
+  - `0` disables mono low-score gating
+  - valid range: `0..1`
+- `CPUGAP_NONCRT_SCORE_EMA_FLOOR` (default `0.20`)
+  - `0` disables non-CRT low-score gating (CPU + GPU smart paths)
+  - valid range: `0..1`
+
+Examples:
+
+```sh
+# Disable non-CRT score gating
+CPUGAP_NONCRT_SCORE_EMA_FLOOR=0 bin/gap_miner --shift 512 --threads 8
+
+# More selective non-CRT gating
+CPUGAP_NONCRT_SCORE_EMA_FLOOR=0.30 bin/gap_miner --shift 512 --threads 8
+```
 
 ### CGBN cooperative Fermat kernel (May 2026)
 
