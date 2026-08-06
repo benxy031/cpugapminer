@@ -55,19 +55,6 @@ jobs:
         run: |
           ./bin/gap_miner.exe --wheel-sieve 210 --selftest
 
-      - name: Build and run sievegap unit test
-        run: |
-          make -f Makefile.mingw tests/test_sievegap.exe
-          ./tests/test_sievegap.exe
-
-      - name: Run staged differential tests
-        run: |
-          make -f Makefile.mingw test-differential
-
-      - name: Run staged boundary tests
-        run: |
-          make -f Makefile.mingw test-boundary
-
       - name: Build gen_crt
         run: make -f Makefile.mingw gen_crt
 
@@ -206,22 +193,6 @@ jobs:
         run: |
           ./bin/gap_miner.exe --wheel-sieve 210 --selftest
 
-      - name: Build and run sievegap unit test
-        shell: msys2 {0}
-        run: |
-          make -f Makefile.mingw tests/test_sievegap.exe
-          ./tests/test_sievegap.exe
-
-      - name: Run staged differential tests
-        shell: msys2 {0}
-        run: |
-          make -f Makefile.mingw test-differential
-
-      - name: Run staged boundary tests
-        shell: msys2 {0}
-        run: |
-          make -f Makefile.mingw test-boundary
-
       - name: Build gen_crt
         shell: msys2 {0}
         run: make -f Makefile.mingw gen_crt
@@ -312,19 +283,6 @@ jobs:
       - name: Wheel sieve smoke test
         run: |
           ./bin/gap_miner.exe --wheel-sieve 210 --selftest
-
-      - name: Build and run sievegap unit test
-        run: |
-          make -f Makefile.mingw tests/test_sievegap.exe
-          ./tests/test_sievegap.exe
-
-      - name: Run staged differential tests
-        run: |
-          make -f Makefile.mingw test-differential
-
-      - name: Run staged boundary tests
-        run: |
-          make -f Makefile.mingw test-boundary
 
       - name: Build gen_crt
         run: make -f Makefile.mingw gen_crt

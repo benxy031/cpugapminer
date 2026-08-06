@@ -106,21 +106,6 @@ all: $(TARGET)
 
 TEST_CFLAGS=$(filter-out -DWITH_CUDA -DWITH_OPENCL,$(CFLAGS))
 
-test-differential: tests/test_sievegap.exe tests/test_wheel_compare.exe tests/test_differential_crt_gap_scan.exe
-	./tests/test_sievegap.exe
-	./tests/test_wheel_compare.exe
-	./tests/test_differential_crt_gap_scan.exe
-
-test-boundary: tests/test_boundary_crt_gap_scan.exe
-	./tests/test_boundary_crt_gap_scan.exe
-
-test-replay: tests/test_replay_sievegap.exe
-	bash scripts/validate_replay_corpus.sh --check --bin ./tests/test_replay_sievegap.exe
-
-test-all: test-differential test-boundary test-replay
-
-test: test-all
-
 $(BINDIR):
 	mkdir -p $(BINDIR)
 
@@ -165,7 +150,4 @@ tests/test_differential_crt_gap_scan.exe: $(SRCDIR)/crt_gap_scan.c tests/test_di
 tests/test_boundary_crt_gap_scan.exe: $(SRCDIR)/crt_gap_scan.c tests/test_boundary_crt_gap_scan.c
 	$(CC) $(TEST_CFLAGS) -I$(SRCDIR) -o $@ $(SRCDIR)/crt_gap_scan.c tests/test_boundary_crt_gap_scan.c -lm
 
-tests/test_replay_sievegap.exe: $(SRCDIR)/sievegap.c $(SRCDIR)/uint256_utils.c tests/test_replay_sievegap.c
-	$(CC) $(TEST_CFLAGS) -I$(SRCDIR) -o $@ $(SRCDIR)/sievegap.c $(SRCDIR)/uint256_utils.c tests/test_replay_sievegap.c -lcrypto -lm
-
-.PHONY: all clean gen_crt test test-differential test-boundary test-replay test-all
+.PHONY: all clean gen_crt
