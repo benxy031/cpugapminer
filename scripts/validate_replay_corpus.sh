@@ -48,10 +48,12 @@ fi
 
 if [[ "$mode" == "regen" ]]; then
   tmp="$(mktemp)"
-  "$bin" --generate "$corpus_rel" > "$tmp"
+  "$bin" --generate "$corpus" > "$tmp"
   mv "$tmp" "$corpus"
   echo "Regenerated replay corpus expectations: $corpus"
   exit 0
 fi
 
-"$bin" "$corpus_rel"
+# Pass the absolute path so MinGW-native binaries (which resolve relative
+# paths from their own working directory, not the shell's) can open the file.
+"$bin" "$corpus"
