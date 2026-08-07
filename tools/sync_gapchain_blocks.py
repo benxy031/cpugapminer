@@ -169,12 +169,12 @@ def fetch_block_with_retry(rpc, height, retries=5, delay=1):
 
 def sync_range(conn, rpc, start, end):
     total = 0
-    # The wallet RPC exposes network mining power via getnetworkminingpower;
-    # we use that value for the primesps column because the block payload itself
-    # does not include a dedicated primesps field.
-    mining_power = rpc("getnetworkminingpower")
     for height in range(start, end + 1):
         block = fetch_block_with_retry(rpc, height)
+        # Fetch network mining power per block so primesps reflects the
+        # network state at each height instead of one stale snapshot
+        # reused across the whole synced range.
+        mining_power = rpc("getnetworkminingpower")
         store_block(conn, block, mining_power)
         conn.commit()
         total += 1

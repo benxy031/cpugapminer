@@ -365,11 +365,21 @@ static int gpu_sieve_should_offload(size_t segment_len, int n_ph2,
 {
     if (n_ph2 <= 0)
         return 0;
+    /* Segment-size floor is a hard kernel-launch-efficiency constraint, not
+       a policy preference: a tiny window (e.g. low-shift CRT gap-scan
+       windows, ~10000 candidates) pays disproportionate GPU launch/transfer
+       overhead regardless of how many Phase-2 primes there are.  Measured
+       at shift=64 (crt_s64_m22.txt, --cuda 0 --gpu-sieve): forcing offload
+       on a 10000-candidate window collapsed throughput from ~2.1M to
+       ~1.25M tested/s (-41%) once --sieve-primes pushed n_ph2 above 0.
+       force_crt_mono (explicit --gpu-sieve in CRT monolithic mode) still
+       bypasses the min_ph2 "is it worth it" heuristic, but must not bypass
+       this floor. */
+    if (segment_len < gpu_sieve_offload_min_segment())
+        return 0;
     if (force_crt_mono)
         return 1;
     if (n_ph2 < gpu_sieve_offload_min_ph2())
-        return 0;
-    if (segment_len < gpu_sieve_offload_min_segment())
         return 0;
     return 1;
 }
@@ -472,7 +482,24 @@ static const struct crt_phase1_profile g_crt_phase1_profiles[] = {
     { 450, 4000000ULL, 300000ULL, 12288, 6144, 1 },
     { 384, 3000000ULL, 300000ULL, 8192,  4096, 1 },
     { 128, 2000000ULL, 500000ULL, 4096,  4096, 2 },
-    {   0, 1000ULL, 1000ULL, 2048, 2048, 2 },
+    /* Low shift (0-127): at these shifts the sieve window (gap-scan
+       template) is small (~10000), so Phase-1/2 direct bitmap marking
+       of many "medium" primes costs more per window than deferring
+       that work to the O(1)-per-prime-per-window Phase-3 CRT filter.
+       Measured (CPU, monolithic, --no-gpu-sieve, false_gaps=0 at all
+       levels): sieve-primes=100 beats the old flat default of 1000 by
+       +12% to +17% tested/s across crt_s25_m21 (shift=26),
+       crt_s64_m22 (shift=64) and crt_s110_m21 (shift=110); throughput
+       keeps improving further below 100 but 100 keeps a safety margin
+       above every CRT file's own prime set (g_crt_max_prime) tested so
+       far.
+       GPU sieve value re-tested separately (--cuda 0 --gpu-sieve,
+       crt_s64_m22, shift=64): unlike the CPU path this has a genuine
+       peak around 100 (2.61M tested/s), degrading both above (1000 ->
+       2.24M) and below (50 -> 2.41M, 25 -> 2.27M) — likely GPU kernel
+       launch/occupancy overhead dominating at very low prime counts.
+       So sieve_primes_gpu is also lowered to 100 here. */
+    {   0, 100ULL, 100ULL, 2048, 2048, 2 },
 };
 
 static const struct crt_phase1_profile *crt_phase1_pick_profile(int shift) {
@@ -1175,15 +1202,20 @@ static void pgt_observe_record_gap(uint64_t gap, double logbase,
                                    double submit_target_merit);
 
 /* Display-only backscan telemetry probe.
-   Samples up to `sample_n` survivors from the current window, runs normal
-   primality checks on those sampled offsets, and updates best/last-gap stats
-   from the sampled prime stream. This does NOT affect the actual backscan or
-   any submit/qual counters. */
+   Tests up to `sample_n` survivors CONTIGUOUSLY from the start of the
+   window (no stride skipping) so any gap measured is a genuine
+   consecutive-prime gap; a strided sample would skip untested survivors
+   between two "sampled" primes, which could themselves be prime and would
+   silently inflate the reported gap. Only covers a prefix of the window,
+   not the whole thing. Does NOT affect the actual backscan or submit/qual
+   counters. */
 static void backscan_stat_sample_probe(const uint64_t *pr, size_t cnt,
                                        double logbase, double target_merit,
-                                       int sample_n) {
+                                       int sample_n, const char *source_tag) {
     if (sample_n <= 1 || cnt < 2)
         return;
+    if (!source_tag)
+        source_tag = "cpu-probe";
 
     size_t probe_n = (size_t)sample_n;
     if (probe_n > cnt)
@@ -1191,15 +1223,11 @@ static void backscan_stat_sample_probe(const uint64_t *pr, size_t cnt,
     if (probe_n < 2)
         return;
 
-    size_t step = (cnt + probe_n - 1) / probe_n;
-    if (step < 1)
-        step = 1;
-
     size_t tested = 0;
     int have_prev = 0;
     uint64_t prev_prime = 0;
 
-    for (size_t j = 0; j < cnt && tested < probe_n; j += step) {
+    for (size_t j = 0; j < probe_n; j++) {
         tested++;
         if (!bn_candidate_is_prime(pr[j]))
             continue;
@@ -1215,10 +1243,10 @@ static void backscan_stat_sample_probe(const uint64_t *pr, size_t cnt,
                 stats_best_merit = merit;
                 stats_best_gap = gap;
                 pgt_observe_record_gap(gap, logbase, target_merit);
-                log_extra_merit_event("best", "noncrt-cpu-probe",
+                log_extra_merit_event("best", source_tag,
                                       merit, gap, target_merit);
             }
-            log_extra_merit_sample("noncrt-cpu-probe", merit, gap,
+            log_extra_merit_sample(source_tag, merit, gap,
                                    target_merit);
         }
 
@@ -1275,10 +1303,16 @@ static inline void update_last_gap_target_ratio(uint64_t gap,
    K=1 disables sampling (test all survivors — the old behaviour).          */
 #define DEFAULT_SAMPLE_STRIDE 8
 static int cli_sample_stride = DEFAULT_SAMPLE_STRIDE;
-/* Optional display-only probe for CPU non-CRT backscan.
+/* Display-only probe for CPU backscan (non-CRT and CRT-mono/consumer).
     Samples up to N survivors so STATS can show early best/last_gap movement
     without affecting the real backscan path. */
-static int cli_backscan_stat_sample = 0;
+#define DEFAULT_BACKSCAN_STAT_SAMPLE 64
+static int cli_backscan_stat_sample = DEFAULT_BACKSCAN_STAT_SAMPLE;
+/* Opt-in: parallelize backward_scan_segment's rare forward gap-closing scan
+   (non-CRT only) using a small per-worker assist-thread pool. 0 disables
+   (default, no behavior change); N = assist threads per worker (capped at
+   FORWARD_ASSIST_MAX_THREADS). Experimental. */
+static int cli_backscan_parallel_forward = 0;
 
 enum {
     AUTO_TUNE_OBJECTIVE_SPEED = 0,
@@ -1505,6 +1539,40 @@ static int            g_crt_gap_scan_mode = CRT_GAP_SCAN_FIXED;
 static uint64_t       g_crt_gap_scan_floor = CRT_GAP_SCAN_FLOOR_DEFAULT;
 static volatile int   g_crt_gap_scan_runtime_logged = 0;
 
+/* Experimental (2026-08-06, docs/CRT_LOW_SHIFT_PERFORMANCE_PLAN.md section 4,
+ * option B): extend crt_end from 2^shift to 2^(shift+bonus), i.e. scan
+ * `2^bonus` times more windows per nonce before moving to the next nonce.
+ * A prior blind attempt at this caused false gaps in production and was
+ * reverted; this env-gated bonus exists ONLY to re-diagnose that regression
+ * under controlled, fixed-header, RGM/gap_dist-monitored conditions. Off
+ * (bonus=0, i.e. unchanged behavior) unless CRT_END_SHIFT_BONUS is set. */
+static int crt_end_shift_bonus(void) {
+    static int cached = -1;
+    if (cached >= 0)
+        return cached;
+    cached = 0;
+    const char *env = getenv("CRT_END_SHIFT_BONUS");
+    if (env && *env) {
+        int v = atoi(env);
+        if (v > 0 && v < 64)
+            cached = v;
+    }
+    return cached;
+}
+
+/* Set crt_end = 2^(shift + crt_end_shift_bonus()); logs once at first use. */
+static void crt_set_end_mpz(mpz_t crt_end, int shift) {
+    int bonus = crt_end_shift_bonus();
+    static volatile int logged = 0;
+    if (bonus > 0 && !__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED)) {
+        log_msg("EXPERIMENTAL: CRT_END_SHIFT_BONUS=%d active — crt_end="
+                "2^%d instead of 2^%d (windows/nonce x%d). See "
+                "docs/CRT_LOW_SHIFT_PERFORMANCE_PLAN.md section 4.\n",
+                bonus, shift + bonus, shift, 1 << bonus);
+    }
+    mpz_ui_pow_ui(crt_end, 2, (unsigned long)(shift + bonus));
+}
+
 /* ── Generic pre-sieve template for primes {3,5,7,11,13,17} ──
    Marks composites of these 6 smallest odd primes in a bitmap with
    period = 3×5×7×11×13×17 = 255255 positions (~31 KB).  Tiled into the
@@ -1622,6 +1690,7 @@ static __thread int       tls_crt_filt_ready = 0;
 static void   build_crt_filter_table(uint64_t filter_limit);
 static void   crt_filter_init_residues(void);
 static inline void crt_filter_step_residues(void);
+static inline void crt_residue_selfcheck_window(void);
 
 /* Load a legacy binary CRT file (CRT1 format, ≤10 primes).
    File format: 4-byte magic "CRT1", uint32 n_primes, uint64 primorial,
@@ -3201,6 +3270,10 @@ static void print_stats(void) {
                 (unsigned long long)oemin,
                 (unsigned long long)oemax);
         }
+        if (stats_noncrt_backscan_parallel_forward_hits > 0) {
+            log_msg("  backscan-parallel-forward(non-crt): hits=%llu",
+                (unsigned long long)stats_noncrt_backscan_parallel_forward_hits);
+        }
 
     }
 
@@ -3223,19 +3296,44 @@ static void print_stats(void) {
            scaling the tail probability for the higher merit target.
            Fallback: pure Cramér model before any gaps have been found. */
         char crt_est_buf[64] = "n/a";
+        int  crt_est_calibrated = 0;
         if (g_crt_merit > 0) {
             double crt_est_sec = 0.0;
             if (stats_gaps > 0 && elapsed > 0.001 &&
                 target_m > 0.0 && g_crt_merit > target_m) {
                 double avg_gap_sec = elapsed / (double)stats_gaps;
                 crt_est_sec = avg_gap_sec * exp(g_crt_merit - target_m);
+                crt_est_calibrated = 1;
             } else if (pairs_rate > 0) {
+                /* Uncalibrated fallback: naive per-pair Cramér tail model
+                   (1/(pairs_rate*e^-merit)) ignoring the CRT pre-selection
+                   boost. Known to be systematically too pessimistic (often
+                   by orders of magnitude) — only used until the first real
+                   qualifying gap at target_m lets the calibrated branch
+                   above take over. Marked with a leading '~' so it is not
+                   mistaken for a calibrated estimate. */
                 double crt_prob = exp(-g_crt_merit);
                 if (crt_prob > 0)
                     crt_est_sec = 1.0 / (pairs_rate * crt_prob);
             }
-            if (crt_est_sec > 0.0)
-                format_est(crt_est_buf, sizeof(crt_est_buf), crt_est_sec);
+            if (crt_est_sec > 0.0) {
+                if (crt_est_calibrated) {
+                    format_est(crt_est_buf, sizeof(crt_est_buf), crt_est_sec);
+                } else {
+                    static int crt_est_uncalibrated_note_printed = 0;
+                    if (!crt_est_uncalibrated_note_printed) {
+                        log_msg("crt_est note: '~' prefix means an uncalibrated "
+                                "pre-first-gap estimate (naive per-pair Cramer "
+                                "tail model, ignores the CRT pre-selection boost "
+                                "and can be off by orders of magnitude); it is "
+                                "replaced by an observed-rate estimate once a "
+                                "real qualifying gap (qual>0) has been seen");
+                        crt_est_uncalibrated_note_printed = 1;
+                    }
+                    crt_est_buf[0] = '~';
+                    format_est(crt_est_buf + 1, sizeof(crt_est_buf) - 1, crt_est_sec);
+                }
+            }
         }
         double tpw = (crt_w > 0) ? (double)stats_crt_tmpl_hits / (double)crt_w : 0.0;
         uint64_t hp_ok = stats_crt_heap_push_ok;
@@ -3340,9 +3438,12 @@ static void print_stats(void) {
                     (unsigned long long)stats_cramer_skipped,
                     (unsigned long long)stats_cramer_heap_skip);
             }
-        } else if (use_stats_verbose && stats_cramer_skipped > 0) {
-            log_msg("  cramer: skip_span=%llu",
-                (unsigned long long)stats_cramer_skipped);
+        } else if (use_stats_verbose &&
+                   (stats_cramer_skipped > 0 ||
+                    stats_cramer_mono_score_skip > 0)) {
+            log_msg("  cramer: skip_span=%llu skip_score=%llu",
+                (unsigned long long)stats_cramer_skipped,
+                (unsigned long long)stats_cramer_mono_score_skip);
         }
 
         if (use_stats_verbose) {
@@ -4603,6 +4704,7 @@ static uint64_t* sieve_range(uint64_t L, uint64_t R, size_t *out_count,
        of binary-searching the extracted survivor array O(log S).       */
     if (tls_crt_filt_ready && g_crt_filter_count > 0) {
         if (L_is_one) {
+            crt_residue_selfcheck_window();
             /* CRT solver mode (L=1): linear scan with merged residue step.
                Each prime marks at most 1 bit per window and advances its
                residue by pmod in one pass — no separate step call needed.  */
@@ -6708,6 +6810,86 @@ done:
                 (unsigned long long)filter_limit);
 }
 
+/* Diagnostic (docs/CRT_LOW_SHIFT_PERFORMANCE_PLAN.md section 4, option B):
+ * recompute a small, rotating sample of CRT-filter and sieve-prime residues
+ * fresh via mpz_fdiv_ui(tls_base_mpz, p) and compare against the
+ * incrementally-tracked tls_crt_filt_rmod[]/tls_base_mod_p[] values for the
+ * CURRENT window. tls_base_mpz is advanced by exact GMP addition every
+ * window, so any mismatch here is unambiguous evidence of a bug in the
+ * incremental residue-stepping — used to re-diagnose the false-gap
+ * regression from the prior blind `crt_end` extension attempt without
+ * waiting on rare real qualifying-merit events. Off by default (adds a
+ * handful of mpz_fdiv_ui calls per window); enable with
+ * CRT_RESIDUE_SELFCHECK=1. Samples rotate across the whole prime table
+ * over successive windows so a long run exercises full coverage. */
+static int crt_residue_selfcheck_enabled(void) {
+    static int cached = -1;
+    if (cached >= 0)
+        return cached;
+    const char *env = getenv("CRT_RESIDUE_SELFCHECK");
+    cached = (env && *env && strcmp(env, "0") != 0) ? 1 : 0;
+    return cached;
+}
+
+static __thread uint64_t tls_selfcheck_filt_rot = 0;
+static __thread uint64_t tls_selfcheck_sieve_rot = 0;
+static __thread uint64_t tls_selfcheck_windows = 0;
+static __thread uint64_t tls_selfcheck_mismatches = 0;
+
+static inline void crt_residue_selfcheck_window(void) {
+    if (!crt_residue_selfcheck_enabled())
+        return;
+    tls_selfcheck_windows++;
+
+    if (tls_crt_filt_ready && g_crt_filter_count > 0) {
+        size_t n = g_crt_filter_count;
+        size_t check_n = n < 4 ? n : 4;
+        for (size_t k = 0; k < check_n; k++) {
+            size_t i = (size_t)((tls_selfcheck_filt_rot + k) % n);
+            uint32_t expect = (uint32_t)mpz_fdiv_ui(
+                tls_base_mpz, (unsigned long)g_crt_filter_primes[i]);
+            uint32_t got = tls_crt_filt_rmod[i];
+            if (expect != got) {
+                tls_selfcheck_mismatches++;
+                log_msg("CRT-SELFCHECK MISMATCH (filter prime): idx=%zu p=%u"
+                        " tracked=%u fresh=%u window#=%llu\n",
+                        i, g_crt_filter_primes[i], got, expect,
+                        (unsigned long long)tls_selfcheck_windows);
+            }
+        }
+        tls_selfcheck_filt_rot = (tls_selfcheck_filt_rot + check_n) % (n ? n : 1);
+    }
+
+    if (tls_base_mod_p && small_primes_cache && small_primes_count > 0) {
+        size_t n = small_primes_count;
+        size_t check_n = n < 4 ? n : 4;
+        for (size_t k = 0; k < check_n; k++) {
+            size_t i = (size_t)((tls_selfcheck_sieve_rot + k) % n);
+            uint64_t expect = mpz_fdiv_ui(
+                tls_base_mpz, (unsigned long)small_primes_cache[i]);
+            uint64_t got = tls_base_mod_p[i];
+            if (expect != got) {
+                tls_selfcheck_mismatches++;
+                log_msg("CRT-SELFCHECK MISMATCH (sieve prime): idx=%zu p=%llu"
+                        " tracked=%llu fresh=%llu window#=%llu\n",
+                        i, (unsigned long long)small_primes_cache[i],
+                        (unsigned long long)got, (unsigned long long)expect,
+                        (unsigned long long)tls_selfcheck_windows);
+            }
+        }
+        tls_selfcheck_sieve_rot = (tls_selfcheck_sieve_rot + check_n) % (n ? n : 1);
+    }
+
+    if ((tls_selfcheck_windows % 20000) == 0) {
+        log_msg("CRT-SELFCHECK: windows_checked=%llu mismatches=%llu"
+                " (filter_rot=%llu sieve_rot=%llu)\n",
+                (unsigned long long)tls_selfcheck_windows,
+                (unsigned long long)tls_selfcheck_mismatches,
+                (unsigned long long)tls_selfcheck_filt_rot,
+                (unsigned long long)tls_selfcheck_sieve_rot);
+    }
+}
+
 /*  Per-thread: compute base mod p for every filter prime.  Called once
  *  after set_base_bn() establishes tls_base_mpz for a new nonce.         */
 static void crt_filter_init_residues(void) {
@@ -7458,7 +7640,16 @@ static size_t crt_bkscan_and_submit(
         struct bkscan_result res;
         backward_scan_segment(surv, 0, surv_cnt,
                               needed_gap, 0, logbase, submit_target,
-                              bn_candidate_is_prime, &res);
+                              bn_candidate_is_prime, NULL, NULL, &res);
+
+        /* Display-only: backward_scan_segment only records best/last_gap
+           when it happens to hit the forward-jump ("no backward prime")
+           branch, which is rare for CRT high-merit targets -> best/last_gap
+           can stay 0 for a long time otherwise. */
+        if (cli_backscan_stat_sample > 1)
+            backscan_stat_sample_probe(surv, surv_cnt, logbase, target,
+                                       cli_backscan_stat_sample,
+                                       "crt-cpu-probe");
 
         total_tested  = res.tested;
         primes_found  = res.primes_found;
@@ -8896,6 +9087,150 @@ static void *presieve_helper_fn(void *arg) {
     return NULL;
 }
 
+/* ── Non-CRT backscan forward gap-closing scan: opt-in thread assist ──
+   backward_scan_segment()'s rare "forward gap-closing" branch (entered
+   only when the backward side found no prime at all, i.e. a genuinely
+   large local gap) is otherwise a plain sequential linear scan.  Each
+   candidate's Fermat test is independent, so this is embarrassingly
+   parallel — but bn_candidate_is_prime() relies on thread-local base
+   state (tls_base_mpz/tls_base_mod_p) that is expensive to (re)compute,
+   so ephemeral per-call threads would be far too costly.  Instead this
+   pool is created ONCE per worker thread (same lifetime as the presieve
+   helper) and reused via a lightweight spin-wait handshake for every rare
+   forward scan.  Non-CRT only.
+
+   IMPORTANT: the worker's mining base (h256/shift) is NOT stable for the
+   pool's whole lifetime — it changes both when the worker picks its first
+   valid nonce and again every time it advances to the next nonce (see
+   nonces_owned handling in worker_fn).  The pool therefore owns a private
+   COPY of h256 (never a pointer into the worker's mutable stack array,
+   which previously caused a data race + permanently stale TLS base in the
+   pool threads once the base changed) and a base_epoch counter that the
+   worker bumps via forward_assist_pool_set_base() whenever h256/shift
+   change; pool threads re-run set_base_bn() before the next round whenever
+   they observe a new epoch. */
+#define FORWARD_ASSIST_MAX_THREADS 4
+#define FORWARD_ASSIST_MIN_RANGE   256U /* below this, sequential is cheaper */
+
+struct forward_assist_pool {
+    int              nthreads;      /* active pool threads (0 = disabled) */
+    pthread_t        threads[FORWARD_ASSIST_MAX_THREADS];
+    volatile int     round;         /* bumped to hand off a new range      */
+    volatile int     done_count;    /* pool threads finished this round    */
+    volatile int     shutdown;
+    const uint64_t  *pr;
+    size_t           from, hi;
+    gap_prime_test_fn prime_test;
+    volatile size_t  next_idx;      /* shared atomic work cursor           */
+    volatile size_t  found_idx;     /* smallest confirmed prime (=hi none) */
+    volatile uint64_t tested_total;
+    uint8_t          h256[32];      /* owned copy — never alias the caller's array */
+    int              shift;
+    volatile int     base_epoch;    /* bumped whenever h256/shift change   */
+};
+
+/* Update the pool's mining base and signal pool threads to re-run
+ * set_base_bn() before their next round.  Must be called from the worker
+ * thread only when no round is in flight (i.e. not concurrently with
+ * noncrt_forward_scan_assist()). */
+static void forward_assist_pool_set_base(struct forward_assist_pool *pool,
+                                         const uint8_t h256[32], int shift) {
+    if (!pool || pool->nthreads <= 0)
+        return;
+    memcpy(pool->h256, h256, 32);
+    pool->shift = shift;
+    __sync_synchronize();
+    __sync_fetch_and_add(&pool->base_epoch, 1);
+}
+
+/* Pull indices from the shared cursor and keep only the smallest prime
+ * found; safe to run from multiple threads (including the calling worker
+ * thread itself) concurrently over the same pool. */
+static void forward_assist_run_slice(struct forward_assist_pool *pool) {
+    uint64_t local_tested = 0;
+    for (;;) {
+        size_t cur_found = pool->found_idx;
+        size_t idx = __sync_fetch_and_add(&pool->next_idx, 1);
+        if (idx >= pool->hi || idx >= cur_found)
+            break;
+        local_tested++;
+        if (pool->prime_test(pool->pr[idx])) {
+            size_t cur;
+            do {
+                cur = pool->found_idx;
+                if (idx >= cur) break;
+            } while (!__sync_bool_compare_and_swap(&pool->found_idx, cur, idx));
+            break;
+        }
+    }
+    __sync_fetch_and_add(&pool->tested_total, local_tested);
+}
+
+static void *forward_assist_thread_fn(void *arg) {
+    struct forward_assist_pool *pool = arg;
+    int last_round = 0;
+    int last_base_epoch = -1; /* force an initial set_base_bn before round 1 */
+    for (;;) {
+        while (pool->round == last_round && !pool->shutdown)
+            __asm__ volatile("pause" ::: "memory");
+        if (pool->shutdown) break;
+        last_round = pool->round;
+        if (pool->base_epoch != last_base_epoch) {
+            set_base_bn(pool->h256, pool->shift);
+            last_base_epoch = pool->base_epoch;
+        }
+        forward_assist_run_slice(pool);
+        __sync_fetch_and_add(&pool->done_count, 1);
+    }
+    return NULL;
+}
+
+/* gap_forward_scan_assist_fn implementation: dispatch a round to the pool
+ * (plus the calling thread itself) when the range is large enough to be
+ * worth the coordination cost; otherwise fall back to a plain sequential
+ * scan inline (identical to backward_scan_segment's default behavior). */
+static int noncrt_forward_scan_assist(void *ctxp, const uint64_t *pr,
+                                      size_t from, size_t hi,
+                                      gap_prime_test_fn prime_test,
+                                      size_t *out_idx, size_t *out_tested) {
+    struct forward_assist_pool *pool = ctxp;
+
+    if (!pool || pool->nthreads <= 0 || (hi - from) < FORWARD_ASSIST_MIN_RANGE) {
+        size_t tested = 0;
+        for (size_t j = from; j < hi; j++) {
+            tested++;
+            if (prime_test(pr[j])) {
+                *out_idx = j;
+                *out_tested = tested;
+                return 1;
+            }
+        }
+        *out_idx = hi;
+        *out_tested = tested;
+        return 0;
+    }
+
+    pool->pr = pr;
+    pool->from = from;
+    pool->hi = hi;
+    pool->prime_test = prime_test;
+    pool->next_idx = from;
+    pool->found_idx = hi;
+    pool->tested_total = 0;
+    pool->done_count = 0;
+    __sync_synchronize();
+    __sync_fetch_and_add(&pool->round, 1); /* wake pool threads */
+
+    forward_assist_run_slice(pool); /* calling thread also participates */
+
+    while (pool->done_count < pool->nthreads)
+        __asm__ volatile("pause" ::: "memory");
+
+    *out_idx = pool->found_idx;
+    *out_tested = (size_t)pool->tested_total;
+    return pool->found_idx < hi;
+}
+
 #ifdef WITH_RPC
 static void crt_runtime_init_worker_ctx(
         struct crt_runtime_worker_ctx *ctx,
@@ -9038,7 +9373,7 @@ static void *worker_fn(void *arg) {
         /* crt_end = 2^shift  (upper bound for nAdd) */
         mpz_t crt_end;
         mpz_init(crt_end);
-        mpz_ui_pow_ui(crt_end, 2, (unsigned long)shift_local);
+        crt_set_end_mpz(crt_end, shift_local);
 
         /* ═══════════════════════════════════════════════════════════
            FERMAT CONSUMER THREAD  (producer-consumer mode only)
@@ -9110,6 +9445,14 @@ static void *worker_fn(void *arg) {
     psc.shift = shift_local;
     pthread_create(&psc.thread, NULL, presieve_helper_fn, &psc);
 
+    /* Optional forward gap-closing assist pool (non-CRT only, opt-in).
+       Thread launch is deferred until AFTER the first-valid-nonce search
+       below finalizes h256_local/shift_local, so the pool's initial base
+       copy (set via forward_assist_pool_set_base()) is never raced against
+       that mutation. */
+    struct forward_assist_pool fwd_pool;
+    memset(&fwd_pool, 0, sizeof(fwd_pool));
+
 #ifdef WITH_RPC
     /* Initialise here (not as static=0) so the first poll fires shortly after
        the worker STARTS, not immediately.  A static zero means now_ms()-0
@@ -9159,6 +9502,22 @@ static void *worker_fn(void *arg) {
             }
             start_nonce += (uint32_t)wa->nthreads;
             if (start_nonce < (uint32_t)wa->tid) { nonces_owned = 0; break; } /* wraparound */
+        }
+    }
+
+    /* Launch the forward-assist pool (if enabled) now that h256_local holds
+       this thread's final starting base — see comment above fwd_pool decl. */
+    if (cli_backscan_parallel_forward > 0 && g_crt_mode == CRT_MODE_NONE) {
+        memcpy(fwd_pool.h256, h256_local, 32);
+        fwd_pool.shift = shift_local;
+        int want = cli_backscan_parallel_forward;
+        if (want > FORWARD_ASSIST_MAX_THREADS)
+            want = FORWARD_ASSIST_MAX_THREADS;
+        for (int t = 0; t < want; t++) {
+            if (pthread_create(&fwd_pool.threads[t], NULL,
+                               forward_assist_thread_fn, &fwd_pool) != 0)
+                break;
+            fwd_pool.nthreads++;
         }
     }
 
@@ -9730,11 +10089,11 @@ static void *worker_fn(void *arg) {
                (1/prime_density of sieve survivors) and jumps ahead,
                skipping thousands of survivors in dense prime clusters.
 
-               Threading: the window is split into overlapping LEFT and
-               RIGHT segments.  Worker processes LEFT, helper processes
-               RIGHT (after finishing sieve).  Overlap ensures no gap
-               straddling the boundary is missed.  Qualifying gaps from
-               both segments are submitted.  ~1.5× speedup on HT CPUs.
+               Threading: the scan itself is single-threaded and covers the
+               whole window in one backward_scan_segment() call (cooperative
+               Fermat is disabled for this window, psc.coop.active=0). The
+               helper thread's only concurrent work is sieving the NEXT
+               window ahead, overlapping sieve time with this scan.
                ==============================================================*/
 
                 /* --- Full backward scan from start of window ---
@@ -9760,13 +10119,21 @@ static void *worker_fn(void *arg) {
                                       needed_gap, one_sided_min_gap,
                                       logbase, submit_target_local,
                                       bn_candidate_is_prime,
+                                      (fwd_pool.nthreads > 0) ? noncrt_forward_scan_assist : NULL,
+                                      (fwd_pool.nthreads > 0) ? &fwd_pool : NULL,
                                       &res_w);
                 observe_noncrt_target_region(0, (res_w.qual_cnt > 0) ? 1 : 0);
+
+                if (res_w.forward_parallel_hits > 0)
+                    __atomic_fetch_add(&stats_noncrt_backscan_parallel_forward_hits,
+                                       (uint64_t)res_w.forward_parallel_hits,
+                                       __ATOMIC_RELAXED);
 
                 if (cli_backscan_stat_sample > 1)
                     backscan_stat_sample_probe(pr, cnt, logbase,
                                                target_local,
-                                               cli_backscan_stat_sample);
+                                               cli_backscan_stat_sample,
+                                               "noncrt-cpu-probe");
 
                 if (one_sided_min_gap > 0 && res_w.one_sided_considered > 0) {
                     __atomic_fetch_add(&stats_noncrt_onesided_intervals,
@@ -10055,6 +10422,7 @@ static void *worker_fn(void *arg) {
                 nonce_local = next_nonce;
                 for (int k = 0; k < 32; k++) h256_local[k] = sha_raw[31 - k];
                 set_base_bn(h256_local, shift_local);
+                forward_assist_pool_set_base(&fwd_pool, h256_local, shift_local);
                 logbase = uint256_log_approx(h256_local, shift_local);
                 psc.h256 = h256_local;
                 carry_last_prime = 0; /* new nonce = new candidate space */
@@ -10133,6 +10501,14 @@ worker_done:
     pthread_mutex_destroy(&psc.mu);
     pthread_cond_destroy(&psc.cv_go);
     pthread_cond_destroy(&psc.cv_done);
+
+    /* Shut down forward gap-closing assist pool, if any. */
+    if (fwd_pool.nthreads > 0) {
+        __sync_synchronize();
+        fwd_pool.shutdown = 1;
+        for (int t = 0; t < fwd_pool.nthreads; t++)
+            pthread_join(fwd_pool.threads[t], NULL);
+    }
 
     /* Release this worker's own TLS sieve buffers and GMP state.
        Without this, every pass (new block) leaks ~103 MB per worker:
@@ -10217,7 +10593,8 @@ int main(int argc, char **argv) {
         printf("      --gpu-smart-telemetry  write GPU smart-scan coverage telemetry to log file\n");
         printf("      --no-gpu-smart-telemetry  disable GPU smart-scan coverage telemetry\n");
         printf("      --sample-stride K smart scan: test every Kth survivor (default: 8, 1=off)\n");
-        printf("      --backscan-stat-sample N  CPU non-CRT backscan telemetry probe: sample up to N survivors for early best/last_gap display only\n");
+        printf("      --backscan-stat-sample N  CPU backscan telemetry probe (non-CRT and CRT-mono/consumer): test the first N survivors contiguously for early best/last_gap display only (default: %d, N<=1 disables)\n", DEFAULT_BACKSCAN_STAT_SAMPLE);
+        printf("      --backscan-parallel-forward N  EXPERIMENTAL, non-CRT only: use N assist threads per worker (max %d) to parallelize backward_scan_segment's rare forward gap-closing scan (default: 0, disabled)\n", FORWARD_ASSIST_MAX_THREADS);
         printf("      --auto-tune       non-CRT auto-tune sample-stride + sieve-limit every N seconds\n");
         printf("      --auto-tune-interval N  auto-tune interval in seconds (default: 30)\n");
         printf("      --auto-tune-objective MODE  speed|balanced|quality (default: balanced)\n");
@@ -10522,6 +10899,13 @@ int main(int argc, char **argv) {
             cli_backscan_stat_sample = atoi(argv[++i]);
             if (cli_backscan_stat_sample < 0)
                 cli_backscan_stat_sample = 0;
+        }
+        else if (!strcmp(argv[i],"--backscan-parallel-forward") && i+1<argc) {
+            cli_backscan_parallel_forward = atoi(argv[++i]);
+            if (cli_backscan_parallel_forward < 0)
+                cli_backscan_parallel_forward = 0;
+            if (cli_backscan_parallel_forward > FORWARD_ASSIST_MAX_THREADS)
+                cli_backscan_parallel_forward = FORWARD_ASSIST_MAX_THREADS;
         }
         else if (!strcmp(argv[i],"--auto-tune")) {
             use_auto_tune = 1;
@@ -11411,9 +11795,24 @@ int main(int argc, char **argv) {
         if (cuda_ndevs > 0)
             (void)gpu_sieve_set_devices(cuda_devices, cuda_ndevs);
         /* Size device buffers from actual CLI-resolved values:
-           seg_cap  = sieve_size/2 + 1  (candidates per window, one byte each)
-           primes_cap = small_primes_count + 64  (Phase-2 primes after split) */
-        size_t gpu_seg_cap    = (size_t)(sieve_size / 2 + 1) + 64;
+           seg_cap  = window/2 + 1  (candidates per window, one byte each)
+           primes_cap = small_primes_count + 64  (Phase-2 primes after split)
+           CRT monolithic mode sieves the tiny per-nonce gap-scan window
+           (crt_gap_scan_template_window()), NOT the generic --sieve-size
+           default (33.5M candidates); using sieve_size here over-allocates
+           the pooled GPU sieve context by ~3 orders of magnitude (e.g.
+           seg=17MB reported for a shift=68 run whose actual window is only
+           ~12576 candidates/~6.3KB). */
+        size_t gpu_seg_candidates = (size_t)(sieve_size / 2 + 1);
+        if (g_crt_mode == CRT_MODE_SOLVER && g_crt_gap_target > 0) {
+            uint64_t crt_win = crt_gap_scan_template_window(
+                (uint64_t)g_crt_gap_target, shift,
+                g_crt_gap_scan_mode,
+                g_crt_gap_scan_floor);
+            if (crt_win > 0)
+                gpu_seg_candidates = (size_t)(crt_win / 2 + 1);
+        }
+        size_t gpu_seg_cap    = gpu_seg_candidates + 64;
         size_t gpu_primes_cap = (small_primes_count > 0 ? small_primes_count : 1200000) + 64;
         /* Allow GPU sieve only for CRT monolithic mode when the user has
          * explicitly requested it with --gpu-sieve.  Producer/consumer CRT
@@ -11444,6 +11843,54 @@ int main(int argc, char **argv) {
                 log_msg("GPU sieve: ready (pooled-per-device, seg=%zu MB, primes=%zu)\n",
                         (gpu_seg_cap + (1<<20) - 1) >> 20, gpu_primes_cap);
                 log_msg("GPU sieve: devices=[%s]\n", sieve_n > 0 ? dev_list : "none");
+                /* Diagnose whether Phase-2 will ever actually offload to the
+                 * GPU with the resolved --sieve-primes / window size, since
+                 * "enabled" above does not mean "active every window" — two
+                 * independent gates in gpu_sieve_should_offload() can leave
+                 * it permanently idle: (1) the per-window segment being
+                 * smaller than the min-segment floor (kernel-launch overhead
+                 * amortization; this floor is a hard physical constraint,
+                 * never bypassed even by explicit --gpu-sieve), and (2) the
+                 * Phase-1/2 split leaving zero Phase-2 primes when the
+                 * derived --sieve-primes limit stays below the fixed
+                 * block-size threshold (~131072). */
+                if (g_crt_mode == CRT_MODE_SOLVER && crt_fermat_threads == 0 &&
+                    cli_gpu_sieve_explicit_on && small_primes_cache) {
+                    size_t min_seg = gpu_sieve_offload_min_segment();
+                    if (gpu_seg_candidates < min_seg) {
+                        log_msg("GPU sieve: WARNING window segment (~%zu candidates) is below "
+                                "the min-segment floor (%zu) needed to amortize GPU kernel-launch "
+                                "overhead -- Phase-2 will NOT offload to GPU for any window at this "
+                                "shift/gap-scan size; --gpu-sieve has no effect here (set "
+                                "GPU_SIEVE_MIN_SEGMENT lower only if you have verified it is not "
+                                "a net loss; see docs/CRT_LOW_SHIFT_PERFORMANCE_PLAN.md section 7.4)\n",
+                                gpu_seg_candidates, min_seg);
+                    } else {
+                        size_t est_start = g_crt_solver_skip_to > 1 ? (size_t)g_crt_solver_skip_to : 1;
+                        size_t est_split = small_primes_count;
+                        for (size_t idx = est_start; idx < small_primes_count; idx++) {
+                            uint64_t p = small_primes_cache[idx];
+                            if (p > (uint64_t)cli_sieve_prime_limit) { est_split = idx; break; }
+                            if (2 * p >= 262144ULL) { est_split = idx; break; }
+                        }
+                        size_t est_ph2_end = est_split;
+                        while (est_ph2_end < small_primes_count &&
+                               small_primes_cache[est_ph2_end] <= (uint64_t)cli_sieve_prime_limit)
+                            est_ph2_end++;
+                        size_t est_n_ph2 = est_ph2_end - est_split;
+                        if (est_n_ph2 == 0) {
+                            log_msg("GPU sieve: WARNING 0 Phase-2 primes at current --sieve-primes "
+                                    "(limit=%llu); every prime in range is already covered by the "
+                                    "CPU Phase-1 bitmap, so GPU offload will be a no-op every window. "
+                                    "Raise --sieve-primes so the derived limit exceeds ~131072 if you "
+                                    "want GPU sieve to actually run (see docs/CRT_LOW_SHIFT_PERFORMANCE_PLAN.md section 7.4)\n",
+                                    (unsigned long long)cli_sieve_prime_limit);
+                        } else {
+                            log_msg("GPU sieve: Phase-2 will offload ~%zu primes/window to GPU\n",
+                                    est_n_ph2);
+                        }
+                    }
+                }
             } else {
                 log_msg("GPU sieve: init failed, using CPU presieve only\n");
             }
@@ -11473,8 +11920,12 @@ int main(int argc, char **argv) {
         log_msg("merit thresholds: submit=%.4f  scan=%.4f\n",
             target, scan_target_runtime);
         if (cli_backscan_stat_sample > 1) {
-            log_msg("backscan stat sample: N=%d (display-only probe for non-CRT CPU backscan best/last_gap)\n",
+            log_msg("backscan stat sample: N=%d (display-only probe for CPU backscan best/last_gap, non-CRT and CRT-mono/consumer)\n",
                     cli_backscan_stat_sample);
+        }
+        if (cli_backscan_parallel_forward > 0) {
+            log_msg("backscan parallel forward: N=%d assist threads/worker (EXPERIMENTAL, non-CRT only, forward gap-closing scan)\n",
+                    cli_backscan_parallel_forward);
         }
         if (use_one_sided_skip) {
             log_msg("one-sided skip: enabled (non-CRT CPU bkscan + GPU smart), merit>=%.2f on first side (%s)\n",
@@ -11695,7 +12146,7 @@ int main(int argc, char **argv) {
 
                 mpz_t crt_end;
                 mpz_init(crt_end);
-                mpz_ui_pow_ui(crt_end, 2, (unsigned long)shift);
+                crt_set_end_mpz(crt_end, shift);
 
                 /* Single-thread keeps explicit post-loop polling below at
                    st_rpc_poll, so disable in-loop tip polling for this call. */

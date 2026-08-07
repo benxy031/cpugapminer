@@ -25,6 +25,7 @@ struct crt_work_item {
     int      cand_odd;
     double   logbase;
     uint64_t generation;
+    uint64_t seq;      /* monotonic push order, used for FIFO eviction when full */
     uint8_t  hdr80[80];
     uint16_t nshift;
 };
@@ -52,8 +53,15 @@ void crt_heap_next_generation(void);
    when the new window would be immediately dropped. */
 size_t crt_heap_worst_surv_advisory(void);
 
-/* Advisory: if heap is full, return cramer_score of worst (lowest-score)
-   leaf; else -1.0.  Use to skip windows whose score can't beat the heap. */
+/* Deprecated no-op kept for API compatibility: always returns -1.0.
+ * The heap previously used cramer_score as an admission gate (reject a new
+ * window outright if it could not beat the worst-scoring leaf once full).
+ * Measurement (see cpugapminer-findings.md) showed cramer_score has ~0
+ * correlation with actual realized gap outcome, so that gate did nothing
+ * but starve an increasing fraction of candidates over a run's lifetime
+ * (the admission bar ratchets toward the historical max score as more
+ * windows are sampled). The heap now evicts the OLDEST item (FIFO) when
+ * full instead, so pushes always succeed and no scoring bias is applied. */
 double crt_heap_worst_score_advisory(void);
 
 #endif /* CRT_HEAP_H */

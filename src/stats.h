@@ -72,6 +72,7 @@ extern volatile uint64_t stats_noncrt_lane_qual_unexpected;
 extern volatile uint64_t stats_noncrt_onesided_intervals;      /* one-sided gate decisions in non-CRT bkscan */
 extern volatile uint64_t stats_noncrt_onesided_skipped;        /* intervals skipped by give-up/go-next */
 extern volatile uint64_t stats_noncrt_onesided_fullcheck;      /* intervals kept for full two-sided check */
+extern volatile uint64_t stats_noncrt_backscan_parallel_forward_hits; /* forward gap-closing scans done via --backscan-parallel-forward assist pool */
 extern volatile uint64_t stats_noncrt_needed_gap_samples;      /* non-CRT smart windows sampled for needed_gap */
 extern volatile uint64_t stats_noncrt_needed_gap_sum;          /* sum of non-CRT needed_gap values */
 extern volatile uint64_t stats_noncrt_needed_gap_max;          /* max non-CRT needed_gap value */
@@ -137,6 +138,7 @@ extern volatile uint64_t stats_crt_cuda_fb_add_fail;
 extern volatile uint64_t stats_cramer_scored;       /* windows whose score was computed */
 extern volatile uint64_t stats_cramer_skipped;      /* windows skipped by span<needed_gap (monolithic) */
 extern volatile uint64_t stats_cramer_heap_skip;    /* windows skipped by score<=worst (producer) */
+extern volatile uint64_t stats_cramer_mono_score_skip; /* windows skipped by EMA low-score gate (monolithic) */
 /* score sum stored as scaled integer (×1e9) to avoid atomic double */
 extern volatile uint64_t stats_cramer_score_sum_e9; /* sum of cramer_score×1e9 */
 

@@ -124,6 +124,9 @@ tests/test_replay_sievegap: $(SRCDIR)/sievegap.c $(SRCDIR)/uint256_utils.c tests
 tests/bench_sievegap: $(SRCDIR)/sievegap.c $(SRCDIR)/uint256_utils.c tests/bench_sievegap.c
 	$(CC) -O3 $(TEST_CFLAGS) -I$(SRCDIR) -o $@ $(SRCDIR)/sievegap.c $(SRCDIR)/uint256_utils.c tests/bench_sievegap.c -lcrypto -lm
 
+tests/bench_residue_setup: $(SRCDIR)/uint256_utils.c tests/bench_residue_setup.c
+	$(CC) -O3 $(TEST_CFLAGS) -I$(SRCDIR) -o $@ $(SRCDIR)/uint256_utils.c tests/bench_residue_setup.c -lcrypto -lgmp -lm
+
 $(BINDIR):
 	mkdir -p $(BINDIR)
 

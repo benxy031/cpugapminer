@@ -140,6 +140,90 @@ static inline void crt_runtime_observe_needed_gap(uint64_t needed_gap) {
     }
 }
 
+/* Monolithic CRT low-score gate.
+ *
+ * Uses a conservative floor against a thread-local EMA of the same
+ * normalised key used by the producer heap (cs/sqrt(surv_cnt+1)).
+ *
+ * Env override:
+ *   CPUGAP_CRT_MONO_SCORE_EMA_FLOOR=<float>
+ *     - default: 0.0 (disabled)
+ *     - measured `phase1: score_calib` correlation between cramer_score and
+ *       realized gap_ratio is within noise of zero (-0.05..+0.09 across
+ *       tested shifts), so this gate has no proven predictive benefit and
+ *       only risks silently dropping windows that could contain the true
+ *       best gap. Kept opt-in for experimentation only.
+ *     - 0.0 disables this gate entirely
+ */
+double crt_runtime_mono_score_ema_floor_mult_pub(void);
+double crt_runtime_mono_score_ema_floor_mult_pub(void)
+{
+    static int inited = 0;
+    static double v = 0.0;
+    if (!inited) {
+        const char *e = getenv("CPUGAP_CRT_MONO_SCORE_EMA_FLOOR");
+        if (e && *e) {
+            char *endp = NULL;
+            double t = strtod(e, &endp);
+            if (endp != e && isfinite(t)) {
+                if (t < 0.0) t = 0.0;
+                if (t > 1.0) t = 1.0;
+                v = t;
+            }
+        }
+        inited = 1;
+    }
+    return v;
+}
+
+/* Producer prefilter density-drop threshold (surv_per_needed).
+ *
+ * crt_runtime_should_drop_density() rejects a window (before it is ever
+ * scored/enqueued/Fermat-tested) when the local survivor density
+ * (surv_cnt * needed_gap / span) falls below this threshold, but only
+ * once the producer heap is already at least half full.
+ *
+ * This is mathematically backwards for this workload: a *qualifying*
+ * window is one where none of the surviving candidates turns out to be
+ * a real prime within needed_gap. Fewer survivors per needed_gap span
+ * (lower density) means fewer independent chances for a real prime to
+ * appear, which makes a genuine large gap *more* likely, not less -
+ * the same inverted-incentive class of bug as the score-based heap
+ * eviction gate (see cpugapminer-findings.md, CRT heap FIFO fix).
+ *
+ * Env override:
+ *   CPUGAP_CRT_DENSITY_DROP_MIN=<float>
+ *     - default: 0.0 (disabled - crt_runtime_should_drop_density() never
+ *       triggers, since surv_per_needed < 0.0 is never true)
+ *     - live smoke tests (shift=64/512, target=22/28, heap=32..2048,
+ *       single starved consumer thread) never observed this drop firing
+ *       even at 1.15 under sustained full-heap backpressure, because
+ *       real avg_surv per window (hundreds to low-thousands) vastly
+ *       exceeds the threshold in practice; kept opt-in only in case a
+ *       future extreme-merit CRT set drives survivor counts low enough
+ *       for it to matter, and even then it should probably be inverted
+ *       rather than enabled as-is.
+ *     - 0.0 disables this gate entirely
+ */
+double crt_runtime_density_drop_min_pub(void);
+double crt_runtime_density_drop_min_pub(void)
+{
+    static int inited = 0;
+    static double v = 0.0;
+    if (!inited) {
+        const char *e = getenv("CPUGAP_CRT_DENSITY_DROP_MIN");
+        if (e && *e) {
+            char *endp = NULL;
+            double t = strtod(e, &endp);
+            if (endp != e && isfinite(t) && t >= 0.0) {
+                v = t;
+            }
+        }
+        inited = 1;
+    }
+    return v;
+}
+
 static inline void crt_runtime_cleanup_tls_gmp(
     const struct crt_runtime_worker_ctx *ctx) {
     if (tls_gmp_inited) {
@@ -305,7 +389,7 @@ static void crt_runtime_process_solver_window(
                     needed_gap_cs,
                     (uint64_t)crt_heap_count(),
                     (uint64_t)crt_heap_cap,
-                    1.15)) {
+                    crt_runtime_density_drop_min_pub())) {
                 __atomic_fetch_add(&stats_crt_solver_prod_prefilter_density_drop,
                                    1, __ATOMIC_RELAXED);
                 mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
@@ -320,21 +404,14 @@ static void crt_runtime_process_solver_window(
         __atomic_fetch_add(&stats_cramer_score_sum_e9,
             (uint64_t)(cs * 1e9), __ATOMIC_RELAXED);
 
-        /* Compare using the same normalised key the heap uses:
-         * heap_key = cramer_score / sqrt(surv_cnt + 1). */
-        double cs_key = cs / sqrt((double)(surv_cnt + 1));
-        double heap_worst_sc = crt_heap_worst_score_advisory();
-        if (heap_worst_sc >= 0.0 && cs_key <= heap_worst_sc) {
-            __atomic_fetch_add(&stats_crt_heap_push_drop, 1,
-                               __ATOMIC_RELAXED);
-            __atomic_fetch_add(&stats_cramer_heap_skip, 1,
-                               __ATOMIC_RELAXED);
-            struct timespec bt = {0, 200000L}; /* 200 us */
-            nanosleep(&bt, NULL);
-            mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
-            return;
-        }
-
+        /* NOTE: a score-based pre-check against crt_heap_worst_score_advisory()
+         * used to live here, rejecting a window outright if it couldn't beat
+         * the heap's worst-scoring leaf. Removed: cramer_score has ~0 measured
+         * correlation with real gap outcome, so that gate only starved an
+         * increasing fraction of candidates over a run's lifetime as the
+         * admission bar ratcheted toward the historical max score (see
+         * cpugapminer-findings.md). crt_heap_push() now always accepts new
+         * windows, evicting the OLDEST (FIFO) entry once full instead. */
         struct crt_work_item *w = crt_work_alloc();
         if (w) {
             mpz_set(w->base, tls_base_mpz);
@@ -383,6 +460,39 @@ static void crt_runtime_process_solver_window(
         __atomic_fetch_add(&stats_cramer_scored, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&stats_cramer_score_sum_e9,
             (uint64_t)(cs * 1e9), __ATOMIC_RELAXED);
+
+        /* Reuse producer normalisation in mono mode too. */
+        double cs_key = cs / sqrt((double)(surv_cnt + 1));
+
+        /* Conservative EMA gate for mono CRT: skip only windows that are
+         * far below the current thread's rolling quality baseline. */
+        static __thread double tls_mono_cs_key_ema = 0.0;
+        static __thread uint64_t tls_mono_cs_seen = 0;
+        const double alpha = 0.05;
+        const double floor_mult = crt_runtime_mono_score_ema_floor_mult_pub();
+
+        int drop_low_score = 0;
+        if (floor_mult > 0.0 &&
+            tls_mono_cs_seen >= 64 &&
+            tls_mono_cs_key_ema > 0.0) {
+            double floor = tls_mono_cs_key_ema * floor_mult;
+            if (cs_key < floor)
+                drop_low_score = 1;
+        }
+
+        if (tls_mono_cs_seen == 0)
+            tls_mono_cs_key_ema = cs_key;
+        else
+            tls_mono_cs_key_ema = (1.0 - alpha) * tls_mono_cs_key_ema +
+                                  alpha * cs_key;
+        tls_mono_cs_seen++;
+
+        if (drop_low_score) {
+            __atomic_fetch_add(&stats_cramer_mono_score_skip, 1,
+                               __ATOMIC_RELAXED);
+            mpz_add(nAdd, nAdd, g_crt_primorial_mpz);
+            return;
+        }
     }
 
 #ifdef WITH_GPU_FERMAT

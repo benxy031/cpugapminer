@@ -57,6 +57,8 @@ void backward_scan_segment(const uint64_t *pr, size_t lo, size_t hi,
                            size_t needed_gap, size_t one_sided_min_gap,
                            double logbase, double target,
                            gap_prime_test_fn prime_test,
+                           gap_forward_scan_assist_fn forward_assist,
+                           void *forward_assist_ctx,
                            struct bkscan_result *res)
 {
     res->tested = 0;
@@ -71,6 +73,7 @@ void backward_scan_segment(const uint64_t *pr, size_t lo, size_t hi,
     res->one_sided_fullcheck_every_sum = 0;
     res->one_sided_fullcheck_every_min = 0;
     res->one_sided_fullcheck_every_max = 0;
+    res->forward_parallel_hits = 0;
     res->qual_cnt    = 0;
     if (lo >= hi || !prime_test) return;
 
@@ -257,30 +260,46 @@ void backward_scan_segment(const uint64_t *pr, size_t lo, size_t hi,
 
             if (!found) {
                 int have_next = 0;
-                for (size_t j = bhi; j < hi; j++) {
-                    res->tested++;
-                    if (prime_test(pr[j])) {
-                        uint64_t gap = pr[j] - start_nAdd;
-                        double merit = (double)gap / logbase;
+                size_t found_idx = hi;
 
-                        if (merit > res->best_merit) {
-                            res->best_merit = merit;
-                            res->best_gap   = gap;
-                        }
-
-                        if (merit >= target && res->qual_cnt < 64) {
-                            res->qual_pairs[res->qual_cnt][0] = start_nAdd;
-                            res->qual_pairs[res->qual_cnt][1] = pr[j];
-                            res->qual_cnt++;
-                        }
-
-                        start_nAdd = pr[j];
-                        scan_from  = j;
-                        res->primes_found++;
-                        res->last_prime = pr[j];
+                if (forward_assist) {
+                    size_t assist_tested = 0;
+                    if (forward_assist(forward_assist_ctx, pr, bhi, hi,
+                                       prime_test, &found_idx, &assist_tested)) {
                         have_next = 1;
-                        break;
+                        res->forward_parallel_hits++;
                     }
+                    res->tested += assist_tested;
+                } else {
+                    for (size_t j = bhi; j < hi; j++) {
+                        res->tested++;
+                        if (prime_test(pr[j])) {
+                            found_idx = j;
+                            have_next = 1;
+                            break;
+                        }
+                    }
+                }
+
+                if (have_next) {
+                    uint64_t gap = pr[found_idx] - start_nAdd;
+                    double merit = (double)gap / logbase;
+
+                    if (merit > res->best_merit) {
+                        res->best_merit = merit;
+                        res->best_gap   = gap;
+                    }
+
+                    if (merit >= target && res->qual_cnt < 64) {
+                        res->qual_pairs[res->qual_cnt][0] = start_nAdd;
+                        res->qual_pairs[res->qual_cnt][1] = pr[found_idx];
+                        res->qual_cnt++;
+                    }
+
+                    start_nAdd = pr[found_idx];
+                    scan_from  = found_idx;
+                    res->primes_found++;
+                    res->last_prime = pr[found_idx];
                 }
                 if (!have_next) break; /* end of segment */
             }
