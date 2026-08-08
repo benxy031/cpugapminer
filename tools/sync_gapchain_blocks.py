@@ -167,15 +167,59 @@ def fetch_block_with_retry(rpc, height, retries=5, delay=1):
             raise RuntimeError(f"failed to fetch height {height} after {retries} attempts: {exc}") from exc
 
 
-def sync_range(conn, rpc, start, end):
+class PrimespsCalibrator:
+    """Derives a per-block primesps estimate from that block's own
+    difficulty, instead of repeating one network-wide getnetworkminingpower()
+    reading across many consecutive blocks.
+
+    getnetworkminingpower() is itself a smoothed/lookback-window average on
+    the node side, so calling it once per block still returns an identical
+    value for long runs of blocks (confirmed via gapchain.sqlite3: primesps
+    stayed pinned to one of two values across 26 consecutive heights while
+    each block's own difficulty kept fluctuating). Scaling each block's own
+    difficulty by a ratio recalibrated every `every` blocks keeps primesps
+    varying per row while cutting RPC round-trips during bulk syncs.
+    """
+
+    def __init__(self, rpc, every=50):
+        self.rpc = rpc
+        self.every = max(1, every)
+        self.ratio = None
+        self.since_calibration = 0
+
+    def _recalibrate(self):
+        mining_power = self.rpc("getnetworkminingpower")
+        difficulty = self.rpc("getdifficulty")
+        if difficulty:
+            self.ratio = mining_power / difficulty
+        self.since_calibration = 0
+        return mining_power
+
+    def value_for(self, block_difficulty):
+        if self.ratio is None or self.since_calibration >= self.every:
+            mining_power = self._recalibrate()
+            if self.ratio is None:
+                # difficulty was falsy on the calibration sample; fall back
+                # to the raw network reading for this block only.
+                return mining_power
+        self.since_calibration += 1
+        if block_difficulty is None:
+            return None
+        return block_difficulty * self.ratio
+
+
+def sync_range(conn, rpc, start, end, primesps_mode="calibrated", recalibrate_every=50):
     total = 0
+    calibrator = PrimespsCalibrator(rpc, every=recalibrate_every) if primesps_mode == "calibrated" else None
     for height in range(start, end + 1):
         block = fetch_block_with_retry(rpc, height)
-        # Fetch network mining power per block so primesps reflects the
-        # network state at each height instead of one stale snapshot
-        # reused across the whole synced range.
-        mining_power = rpc("getnetworkminingpower")
-        store_block(conn, block, mining_power)
+        if calibrator is not None:
+            primesps_value = calibrator.value_for(block.get("difficulty"))
+        else:
+            # Legacy behavior: one raw getnetworkminingpower() RPC call per
+            # block. Kept for comparison via --primesps-mode network.
+            primesps_value = rpc("getnetworkminingpower")
+        store_block(conn, block, primesps_value)
         conn.commit()
         total += 1
         if total % 100 == 0 or height == end:
@@ -191,6 +235,23 @@ def parse_args():
     parser.add_argument("--to-height", type=int, default=None, help="Stop importing at this height")
     parser.add_argument("--watch", action="store_true", help="Keep watching for new blocks")
     parser.add_argument("--poll-seconds", type=int, default=10, help="Polling interval in seconds")
+    parser.add_argument(
+        "--primesps-mode",
+        choices=("calibrated", "network"),
+        default="calibrated",
+        help=(
+            "calibrated (default): scale each block's own difficulty by a ratio "
+            "recalibrated every --recalibrate-every blocks, so primesps varies per "
+            "row instead of repeating one getnetworkminingpower() reading. "
+            "network: legacy behavior, one getnetworkminingpower() RPC call per block."
+        ),
+    )
+    parser.add_argument(
+        "--recalibrate-every",
+        type=int,
+        default=50,
+        help="Blocks between getnetworkminingpower()/getdifficulty() recalibration samples in calibrated mode (default: 50)",
+    )
     return parser.parse_args()
 
 
@@ -231,7 +292,7 @@ def main():
         return 0
 
     print(f"Syncing heights {start}..{end} (tip={tip})")
-    sync_range(conn, rpc, start, end)
+    sync_range(conn, rpc, start, end, primesps_mode=args.primesps_mode, recalibrate_every=args.recalibrate_every)
 
     if args.watch:
         print("Watching for new blocks...")
@@ -244,7 +305,14 @@ def main():
                 continue
             if new_tip > end:
                 print(f"New tip detected: {new_tip}")
-                synced = sync_range(conn, rpc, end + 1, new_tip)
+                synced = sync_range(
+                    conn,
+                    rpc,
+                    end + 1,
+                    new_tip,
+                    primesps_mode=args.primesps_mode,
+                    recalibrate_every=args.recalibrate_every,
+                )
                 if synced:
                     end = new_tip
 

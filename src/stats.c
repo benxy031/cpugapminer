@@ -134,6 +134,7 @@ volatile uint64_t stats_crt_gpu_accum_batch_gt_4096 = 0;
 volatile uint64_t stats_crt_cuda_fb_no_accum = 0;
 volatile uint64_t stats_crt_cuda_fb_limb_mismatch = 0;
 volatile uint64_t stats_crt_cuda_fb_add_fail = 0;
+volatile uint64_t stats_crt_nadd_overflow_skip = 0;
 
 volatile uint64_t stats_cramer_scored       = 0;
 volatile uint64_t stats_cramer_skipped      = 0;

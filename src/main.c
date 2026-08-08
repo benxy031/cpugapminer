@@ -3525,6 +3525,10 @@ static void print_stats(void) {
                     (unsigned long long)stats_crt_cuda_fb_no_accum,
                     (unsigned long long)stats_crt_cuda_fb_limb_mismatch,
                     (unsigned long long)stats_crt_cuda_fb_add_fail);
+                if (stats_crt_nadd_overflow_skip > 0) {
+                    log_msg("  phase1: nAdd_overflow_skip=%llu (qualifying gaps with nAdd>=2^shift, submit refused -- see CRT_END_SHIFT_BONUS)",
+                        (unsigned long long)stats_crt_nadd_overflow_skip);
+                }
 #ifdef WITH_GPU_FERMAT
                 if (use_crt_gpu_batch_adaptive) {
                     log_msg("  phase1: accum adaptive up=%llu down=%llu hold=%llu last_threshold=%llu",
@@ -7729,8 +7733,28 @@ static size_t crt_bkscan_and_submit(
                 (unsigned long long)gap,
                 merit, target, shift_v,
                 (unsigned)nonce, nAdd_str);
+        /* nAdd must stay within [0, 2^shift) -- this is what makes the
+         * header's committed hash H = N >> shift well-defined per
+         * gapcoin2026.md section 11.1. CRT_END_SHIFT_BONUS intentionally
+         * lets the internal search range exceed 2^shift for extra windows
+         * per nonce; if a qualifying gap lands past that boundary, submitting
+         * it is a guaranteed-doomed submitblock call (node reconstructs a
+         * different candidate than what we verified), observed in practice
+         * as "short-gap" rejections with no real competing block. Refuse the
+         * submit and say so clearly instead of wasting an RPC round-trip. */
+        int nadd_overflow = (mpz_sizeinbase(nAdd_prime, 2) > (size_t)shift_v);
+        if (nadd_overflow) {
+            __atomic_fetch_add(&stats_crt_nadd_overflow_skip, 1, __ATOMIC_RELAXED);
+            log_msg(">>> SKIPPED SUBMIT: nAdd is %zu bits (> shift=%d), i.e. nAdd >= 2^shift.\n"
+                    "    This candidate is outside the network's valid nAdd range\n"
+                    "    (likely produced by CRT_END_SHIFT_BONUS); submitting would\n"
+                    "    almost certainly be rejected by the node (short-gap) even\n"
+                    "    though this gap is internally verified. Disable\n"
+                    "    CRT_END_SHIFT_BONUS for live-submission runs.\n",
+                    mpz_sizeinbase(nAdd_prime, 2), shift_v);
+        }
 #ifdef WITH_RPC
-        if (rpc_url && !g_abort_pass) {
+        if (rpc_url && !g_abort_pass && !nadd_overflow) {
             char blockhex[SUBMIT_BLOCK_HEX_CAP];
             uint64_t submit_expect_seq = 0;
             struct pass_state submit_snap;
@@ -7935,8 +7959,23 @@ static void scan_gap_results(uint64_t *primes, size_t prime_cnt,
                 (unsigned long long)gap,
                 merit, target, shift_v,
                 (unsigned)nonce, nAdd_str);
+        /* See matching comment in the CRT-CPU GAP FOUND site: nAdd must stay
+         * within [0, 2^shift) for the submitted block to decode to the same
+         * candidate we verified. CRT_END_SHIFT_BONUS can push nAdd past that
+         * boundary; refuse the doomed submit instead of wasting an RPC call. */
+        int nadd_overflow = (mpz_sizeinbase(nAdd_prime, 2) > (size_t)shift_v);
+        if (nadd_overflow) {
+            __atomic_fetch_add(&stats_crt_nadd_overflow_skip, 1, __ATOMIC_RELAXED);
+            log_msg(">>> SKIPPED SUBMIT: nAdd is %zu bits (> shift=%d), i.e. nAdd >= 2^shift.\n"
+                    "    This candidate is outside the network's valid nAdd range\n"
+                    "    (likely produced by CRT_END_SHIFT_BONUS); submitting would\n"
+                    "    almost certainly be rejected by the node (short-gap) even\n"
+                    "    though this gap is internally verified. Disable\n"
+                    "    CRT_END_SHIFT_BONUS for live-submission runs.\n",
+                    mpz_sizeinbase(nAdd_prime, 2), shift_v);
+        }
 #ifdef WITH_RPC
-        if (rpc_url && !g_abort_pass) {
+        if (rpc_url && !g_abort_pass && !nadd_overflow) {
             char blockhex[SUBMIT_BLOCK_HEX_CAP];
             uint64_t submit_expect_seq = 0;
             struct pass_state submit_snap;

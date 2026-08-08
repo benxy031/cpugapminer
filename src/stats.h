@@ -134,6 +134,12 @@ extern volatile uint64_t stats_crt_cuda_fb_no_accum;
 extern volatile uint64_t stats_crt_cuda_fb_limb_mismatch;
 extern volatile uint64_t stats_crt_cuda_fb_add_fail;
 
+/* Windows where a qualifying gap's nAdd (final value, including any
+ * CRT_END_SHIFT_BONUS extension) exceeded 2^shift and submission was
+ * refused to avoid a doomed submitblock call (node expects 0<=nAdd<2^shift,
+ * see gapcoin2026.md section 11.1). */
+extern volatile uint64_t stats_crt_nadd_overflow_skip;
+
 /* Cramér-model score stats (CRT paths only). */
 extern volatile uint64_t stats_cramer_scored;       /* windows whose score was computed */
 extern volatile uint64_t stats_cramer_skipped;      /* windows skipped by span<needed_gap (monolithic) */
