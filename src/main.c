@@ -1864,6 +1864,14 @@ static int load_crt_text_file(const char *path, int cmd_shift) {
         mpz_mul_ui(g_crt_primorial_mpz, g_crt_primorial_mpz,
                    (unsigned long)prime_list[i]);
     }
+    /* The solver always treats prime 2 as excluded from the offset/CRT
+       congruence system (odd-only sieve, dynamic per-nonce parity rebase --
+       see crt_solver.c), which requires the primorial to be even so that
+       stepping by it between windows never flips candidate parity mid-nonce.
+       Legacy CRT files that recorded prime 2 with offset=0 (excluded above)
+       left the primorial odd; force it even here regardless of the cause. */
+    if (mpz_odd_p(g_crt_primorial_mpz))
+        mpz_mul_ui(g_crt_primorial_mpz, g_crt_primorial_mpz, 2);
 
     g_crt_prime_list  = prime_list;
     g_crt_offsets     = offset_list;
@@ -10670,6 +10678,7 @@ int main(int argc, char **argv) {
         printf("      --crt-gpu-batch-min N  adaptive threshold floor (default: 512)\n");
         printf("      --crt-gpu-batch-max N  adaptive threshold ceiling (default: 32768)\n");
         printf("      --heap N          max pending CRT windows in heap (default: 4096)\n");
+        printf("      --crt-heap-pop-order MODE  CRT heap pop order: score|fifo|random (default: random)\n");
         printf("      --keep-going      continue after block found (default on)\n");
         printf("      --stop-after-block  exit after first valid block\n");
         printf("      --log-file FILE   append messages to FILE\n");
@@ -11048,6 +11057,16 @@ int main(int argc, char **argv) {
                 crt_heap_init((size_t)hv);
             }
         }
+        else if (!strcmp(argv[i],"--crt-heap-pop-order") && i+1<argc) {
+            const char *v = argv[++i];
+            if (!strcmp(v,"score")) crt_heap_pop_order = CRT_HEAP_POP_SCORE;
+            else if (!strcmp(v,"fifo")) crt_heap_pop_order = CRT_HEAP_POP_FIFO;
+            else if (!strcmp(v,"random")) crt_heap_pop_order = CRT_HEAP_POP_RANDOM;
+            else {
+                fprintf(stderr, "--crt-heap-pop-order expects score|fifo|random\n");
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i],"--p") && i+1<argc) build_p = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i],"--q") && i+1<argc) build_q = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i],"--keep-going")) {
@@ -11402,8 +11421,13 @@ int main(int argc, char **argv) {
                 crt_fermat_threads);
     }
     /* Ensure heap is allocated (crt_heap_init may not have been called yet) */
-    if (g_crt_mode == CRT_MODE_SOLVER && crt_fermat_threads > 0)
+    if (g_crt_mode == CRT_MODE_SOLVER && crt_fermat_threads > 0) {
         crt_heap_init(crt_heap_cap);
+        if (crt_heap_pop_order != CRT_HEAP_POP_RANDOM) {
+            log_msg("CRT heap: pop-order=%s (default: random)\n",
+                    crt_heap_pop_order == CRT_HEAP_POP_FIFO ? "fifo" : "score");
+        }
+    }
 
     /* ── Primorial alignment setup ──
        Compute P# = 2*3*5*...*P and snap sieve_size to a multiple of P#

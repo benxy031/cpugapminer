@@ -476,32 +476,393 @@ Practical effect: windows with structurally favorable gap divisibility still
 get a boost, but very aggressive high-gap targets are damped so queue ordering
 is less optimistic under the independence-only Cramér model.
 
-The same score family is now also used in monolithic CRT mode via a
+The same score family is also used in monolithic CRT mode via a
 conservative per-thread EMA floor gate on the normalised key
 `cramer_score / sqrt(survivors+1)`. Very low-score windows (well below each
 thread's rolling baseline after warmup) are skipped before expensive boundary
-testing.
-
-The same EMA score gate is now applied in non-CRT smart-scan mode for both
-CPU and GPU paths, using the same normalized key and warmup behavior.
+testing (both the CPU `crt_bkscan_and_submit` path and the GPU accumulator
+path, since the gate runs before either dispatch).
 
 Environment override:
 
-- `CPUGAP_CRT_MONO_SCORE_EMA_FLOOR` (default `0.20`)
-  - `0` disables mono low-score gating
+- `CPUGAP_CRT_MONO_SCORE_EMA_FLOOR` (default `0.0`, disabled)
+  - `0` disables mono low-score gating (default, as of Aug 2026)
   - valid range: `0..1`
-- `CPUGAP_NONCRT_SCORE_EMA_FLOOR` (default `0.20`)
-  - `0` disables non-CRT low-score gating (CPU + GPU smart paths)
-  - valid range: `0..1`
+  - This gate is opt-in only. Given the measured caveat below (the score has
+    ~0 measured correlation with realized gap outcome), enabling it (e.g.
+    `0.5..0.9`) trades Fermat-test volume for a skip decision that is not
+    shown to beat random selection — do not enable it expecting a quality
+    improvement without independently validating that at your configuration.
 
-Examples:
+**Measured caveat:** the `phase1: score_calib` STATS line reports a rolling
+Pearson correlation between `cramer_score` and a realized-outcome proxy
+(`gap_ratio = max_gap_in_window / needed_gap`). Across two different shifts
+(shift=1001, ~460k windows/obs; shift=256, ~14.5M obs), this correlation has
+consistently measured within noise of zero (`-0.05..+0.09`), even though
+`cramer_score` itself has real variance (`avg_score` observed ranging
+`~0.07..0.20`). In other words, the score does not currently predict which
+windows will realize a relatively larger gap. Raising the EMA floor therefore
+trades Fermat-test volume for a skip decision that is not measurably better
+than random with respect to this proxy — it is not yet a validated quality
+filter. `score_calib` itself is read-only telemetry (nothing consumes
+`corr`/`avg_score` to change behavior); only `cramer_score` itself feeds the
+EMA gate and the PC-mode heap ordering.
+
+Example:
 
 ```sh
-# Disable non-CRT score gating
-CPUGAP_NONCRT_SCORE_EMA_FLOOR=0 bin/gap_miner --shift 512 --threads 8
+# More selective CRT monolithic gating (skip windows scoring below 90% of
+# each thread's rolling EMA baseline)
+CPUGAP_CRT_MONO_SCORE_EMA_FLOOR=0.9 bin/gap_miner --shift 256 --threads 7 \
+  --cuda --crt-file crt/crt_s256_m28_exhaust.txt --target 28
+```
 
-# More selective non-CRT gating
-CPUGAP_NONCRT_SCORE_EMA_FLOOR=0.30 bin/gap_miner --shift 512 --threads 8
+Removed (Aug 2026): `CPUGAP_NONCRT_SCORE_EMA_FLOOR` and the non-CRT
+smart-scan score gating it controlled were removed from the codebase in a
+refactor (commit `69f6b8b`, "remove non-CRT score gating logic and related
+functions"). That refactor also accidentally deleted the CRT monolithic gate
+above; the CRT monolithic gate was restored in this change (Aug 2026) since
+its removal was unintentional scope creep from the non-CRT cleanup. The
+non-CRT env var and gating remain removed/unavailable.
+
+Changed default (Aug 2026): `CPUGAP_CRT_MONO_SCORE_EMA_FLOOR` default was
+lowered from `0.20` to `0.0` (disabled). Live A/B testing (shift=64,
+monolithic mode, 30s runs) showed the `0.20` default produced zero skips
+identical to `0.0` at that configuration, so the gate provided no measured
+benefit while still being an unproven behavioral risk (see caveat above);
+it remains available as an explicit opt-in for experimentation.
+
+### CRT producer prefilter density-drop threshold (Aug 2026)
+
+The PC-mode producer (`crt_runtime_process_solver_window` in
+`src/crt_runtime_cpu.c`) has a load-shedding prefilter,
+`crt_runtime_should_drop_density()`, that can reject a window (before it is
+ever scored/enqueued/Fermat-tested at all) once the producer heap is at
+least half full, based on local survivor density
+(`surv_cnt * needed_gap / span`).
+
+**This heuristic's direction is backwards for this workload and is now
+disabled by default.** A *qualifying* CRT window is one where none of its
+surviving candidates turns out to be a real prime within `needed_gap`; fewer
+survivors per `needed_gap` span (lower density) means fewer independent
+chances for a real prime to appear, which makes a genuine large gap *more*
+likely, not less - the same inverted-incentive class of issue as the
+already-disabled score-based heap eviction gate (see
+`CPUGAP_CRT_MONO_SCORE_EMA_FLOOR` above). The old hardcoded threshold
+(`1.15`) would have preferentially dropped exactly the sparse, most-promising
+windows under sustained producer backpressure.
+
+Environment override:
+
+- `CPUGAP_CRT_DENSITY_DROP_MIN` (default `0.0`, disabled)
+  - `0` disables this gate entirely (default)
+  - must be `>= 0`; any positive value re-enables the drop at that
+    `surv_per_needed` threshold
+  - Live smoke tests (shift=64/512, target=22/28, heap capacities
+    32/64/2048, single starved consumer thread to force sustained full-heap
+    backpressure) never observed this drop firing even at the old default
+    of `1.15`, because real per-window survivor counts (hundreds to
+    low-thousands) vastly exceed that threshold at practical shifts/merits
+    - so this change has no measured effect on existing runs. It is
+    disabled by default purely because its logic is backwards and could
+    matter (incorrectly) on some future, much sparser CRT configuration.
+
+Example:
+
+```sh
+# Re-enable the old (not recommended) density-drop behavior for comparison
+CPUGAP_CRT_DENSITY_DROP_MIN=1.15 bin/gap_miner --shift 512 --threads 8 \
+  --fermat-threads 2 --heap 64 --crt-file crt/crt_s512_m28.txt --target 28
+```
+
+### `crt_est` uncalibrated-estimate marker (Aug 2026)
+
+The periodic CRT STATS line's `crt_est=` field (estimated time to the next
+qualifying gap at the CRT file's target merit) uses two different models:
+
+- **Calibrated** (once at least one real qualifying gap has been observed at
+  the submit target, i.e. `qual>0`): `crt_est = avg_gap_sec * exp(crt_merit -
+  submit_target)`, anchored to this run's own observed gap rate.
+- **Uncalibrated fallback** (before any real qualifying gap has been seen,
+  the common case for high merit targets): a naive per-pair Cramér tail
+  model, `crt_est = 1 / (pairs_rate * exp(-crt_merit))`. This treats every
+  raw Fermat-tested candidate as an independent trial with probability
+  `exp(-merit)`, which ignores the CRT file's pre-selection boost and is
+  systematically too pessimistic — often by orders of magnitude (e.g.
+  `crt_est` reading multiple thousands of days at `merit=28` shift=256,
+  while `qual=0` simply reflects normal rare-event behavior, not a stuck or
+  broken estimator).
+
+`crt_est` now prefixes the value with `~` (e.g. `crt_est=~6888.2d`) whenever
+the uncalibrated fallback is in use, and the miner prints a one-time
+`crt_est note: ...` log line explaining this the first time it happens. Once
+a real qualifying gap is found, the marker disappears and `crt_est` switches
+to the calibrated, run-anchored estimate. Treat any `~`-prefixed `crt_est` as
+a rough, known-pessimistic placeholder, not a reliable ETA.
+
+### CRT producer-consumer heap eviction: FIFO, not score-based (fixed Aug 2026)
+
+**Bug:** in producer-consumer mode (`--fermat-threads N > 0`), the shared
+bounded work heap (`src/crt_heap.c`, capacity `crt_heap_cap`, e.g. 2048 at
+shift=64) used to reject a newly generated window outright once full, unless
+its `cramer_score`-derived key beat the heap's current worst-scoring leaf.
+Because the heap only ever *replaces* a leaf with a strictly higher-scoring
+new item, the admission bar (the worst leaf's score) creeps upward the
+longer a run continues — a basic order-statistics effect of maintaining a
+fixed-size "top-K by score" reservoir over a growing stream. Combined with
+the measured ~0 correlation between `cramer_score` and realized gap outcome
+(see the queue-scoring caveat above), this meant an increasing fraction of
+real candidate windows were silently discarded — never Fermat-tested at
+all — for no measurable quality benefit, and the fraction discarded grew
+worse the longer the run continued (matches user reports of runs finding a
+relatively better gap early, then weaker results as the run went on).
+
+Measured before the fix (`--fermat-threads 1 --cuda`, shift=64,
+`crt_s64_m22.txt`, `--target 22`): heap-drop percentage climbed
+33.0% -> 38.1% -> 40.2% -> 41.6% -> 42.5% -> 43.0% over 5s..60s of a single
+run, with enqueue-success rate falling 67.0% -> 58.4%; `phase1: score_calib`
+confirmed `corr(score,gap_ratio)=0.000` for the same run (the discarding
+criterion had no demonstrated value).
+
+**Fix:** `crt_heap_push()` now evicts the *oldest* item (FIFO, by insertion
+sequence) when full instead of the lowest-scoring one, so a push always
+succeeds — backpressure is still bounded (memory-safe), but no window is
+ever rejected based on an unproven score. `cramer_score`/`heap_key()` is
+still used to choose *pop order* (which queued window a consumer tests
+first), which is harmless since it does not discard anything. The producer's
+old score pre-check (`crt_heap_worst_score_advisory()`) is now a no-op
+(always returns `-1.0`); no CLI/env flag controls this since it was a pure
+bug fix, not a tunable policy.
+
+**Pop-order experiment (`--crt-heap-pop-order`, added 2026-08):** the
+old default pop order (`score`, max-heap on `heap_key()`) is a form of
+hazard-based prioritization — always take the highest `cramer_score`-derived
+key first — but given the measured `corr(score,gap_ratio)=0.000` above, it
+was not established that this actually improves throughput or found-gap
+quality over a simpler policy on this bounded queue. `--crt-heap-pop-order
+{score|fifo|random}` is an opt-in override to pick a different policy:
+`fifo` pops the oldest-`seq` item, `random` pops a uniformly random item
+(xorshift64, independent of the global `rand()` state). Push/eviction
+behavior (FIFO on overflow, as above) is unaffected by this flag in every
+mode — it only changes which already-admitted window a consumer takes
+next (see `scripts/bench_crt_heap_pop_order_ab.sh`).
+
+```sh
+./bin/gap_miner --crt-file crt/crt_s768_m23.txt --fermat-threads 2 \
+  --crt-heap-pop-order fifo
+```
+
+Measured after the FIFO-eviction fix (identical scenario, full 60s run):
+heap-drop percentage was `0.0%` at every STATS tick from 5s through 60s,
+enqueue success stayed at `100.0%`, and `false_gaps=0` was maintained
+throughout (no correctness regression). This is a pure bug fix with no new
+CLI flags.
+
+**`score` starves low-scoring windows indefinitely; default changed to
+`random` (Aug 2026):** a 3-rep, 1200s-per-rep A/B run of
+`bench_crt_heap_pop_order_ab.sh` (`crt_s768_m23.txt`, `--fermat-threads 2`,
+otherwise identical across modes) showed `score` never found the run's
+best window (`best=23.61, gap=16744`) in any of 3 reps, `fifo` found it in
+only 1 of 3 (barely, at `elapsed=850.6s` of a 1200s run), while `random`
+found it in all 3 reps, consistently around `elapsed=831-850s`. The heap
+was near its capacity (`hwm=8192`) for nearly the entire run in every mode
+(`drop_pct=0.0`, so nothing was evicted — items simply queue up). Under
+`score`, a window with a comparatively low `cramer_score` can be passed
+over at every single pop decision for as long as higher-scoring items keep
+arriving, i.e. it can be starved indefinitely rather than merely delayed;
+`fifo` bounds the wait by insertion age but is still marginal near a fixed
+time budget; `random` has no such starvation failure mode since every
+queued item has a uniform, non-zero chance of being picked each pop. Given
+`score` has no demonstrated benefit (`corr(score,gap_ratio)=0.000`) and this
+newly observed starvation risk, the default pop order is now `random`
+(`crt_heap_pop_order` in `src/crt_heap.c`); `--crt-heap-pop-order score` is
+still available for comparison but is no longer recommended.
+
+### CRT low-shift `crt_end` extension (experimental, Aug 2026)
+
+Two opt-in, env-gated diagnostics investigate whether the number of
+solver-mode windows scanned per nonce (`crt_end`, normally `2^shift`) can
+safely be extended on low-shift CRT files, per
+[docs/CRT_LOW_SHIFT_PERFORMANCE_PLAN.md](docs/CRT_LOW_SHIFT_PERFORMANCE_PLAN.md)
+section 4. Both default to off and produce byte-identical behavior to prior
+releases unless explicitly enabled — no default changed.
+
+- `CRT_END_SHIFT_BONUS=N` (default `0`, effective range `1..63`): sets
+  `crt_end = 2^(shift+N)` instead of `2^shift` in CRT solver mode, giving
+  `2^N` more windows per nonce. Logs one `EXPERIMENTAL: CRT_END_SHIFT_BONUS=N
+  active ...` line at startup when enabled. Measured at shift=64/merit=22
+  (single thread, `--no-gpu-sieve`, fixed header): `tested/s` improved by
+  roughly +6% (`N=1`) up to +11% (`N=5`), with diminishing returns beyond
+  `N=5`. Residue-tracking correctness was validated up to `N=8` (256x more
+  windows/nonce) with zero divergence (see `CRT_RESIDUE_SELFCHECK` below);
+  producer-consumer mode and high-shift profiles (512/768) were not tested
+  with this flag.
+  **WARNING (Aug 2026, live-network finding):** with `N>0`, the search
+  windows scanned per nonce can produce a qualifying gap whose `nAdd` is
+  `>= 2^shift`. The `nAdd < 2^shift` bound is required so the header's
+  committed hash `H = N >> shift` decodes to the same candidate the miner
+  verified (see `gapcoin2026.md` section 11.1); submitting a candidate with
+  `nAdd >= 2^shift` was observed to be deterministically rejected by the
+  real node as `short-gap`, with no competing/stale block involved (two
+  such rejections traced in a live shift=256 run with `N=4`). The miner now
+  refuses to submit any such candidate and logs
+  `>>> SKIPPED SUBMIT: nAdd is ... bits (> shift=...)` plus a
+  `phase1: nAdd_overflow_skip=...` STATS line (`stats_crt_nadd_overflow_skip`
+  counter) instead of wasting a doomed `submitblock` call. The internal
+  search space extension itself is otherwise unaffected (extra windows are
+  still explored; only submission of out-of-range candidates is blocked).
+  Recommendation: for live-submission mining, prefer `N=0` (default/off) — the
+  measured throughput gain above does not account for the fraction of
+  qualifying gaps that will now be silently skipped at submit time once
+  `nAdd` exceeds `2^shift`.
+- `CRT_RESIDUE_SELFCHECK=1` (default off): every CRT solver-mode window,
+  recomputes a small rotating sample of the incrementally-tracked
+  CRT-filter/sieve-prime residues fresh via GMP and logs a
+  `CRT-SELFCHECK MISMATCH` line on divergence, plus a periodic
+  `CRT-SELFCHECK: windows_checked=... mismatches=...` summary every 20000
+  windows. Adds a handful of extra GMP calls per window, so it is intended
+  for targeted correctness testing (e.g. alongside `CRT_END_SHIFT_BONUS`),
+  not for production mining runs.
+
+Example:
+
+```sh
+# Test 8x more solver windows per nonce with correctness self-check enabled
+CRT_END_SHIFT_BONUS=3 CRT_RESIDUE_SELFCHECK=1 \
+  bin/gap_miner --shift 64 --threads 4 --crt-file crt/crt_s64_m22.txt -e --stats-verbose
+```
+
+### CRT low-shift `--sieve-primes` auto-default lowered (Aug 2026)
+
+The CRT phase-1 profile table (`crt_phase1_pick_profile()` in `src/main.c`)
+picks a default `--sieve-primes` count by shift band when the user does not
+pass `--sieve-primes` explicitly. The lowest band (shift 0-127, used by e.g.
+`crt_s64_m22.txt`, `crt_s110_m21.txt`) previously defaulted to a flat
+`sieve-primes=1000` (~7900 as the derived prime-value limit). This has been
+lowered to **`sieve-primes=100`** (derived limit ~540-640) for the CPU path.
+
+Rationale: at these shifts the CRT solver's gap-scan window is small
+(`gap_scan_tmpl` ~10000), so Phase-1/2 direct bitmap marking of "medium"
+primes (roughly 50 to a few thousand) costs more per window than deferring
+that same composite elimination to the O(1)-per-prime-per-window Phase-3 CRT
+filter (which already covers primes up to a much higher, fixed limit
+regardless of `--sieve-primes`). Measured (CPU, monolithic, `--no-gpu-sieve`,
+fixed all-zero header, `false_gaps=0` at every tested level):
+
+| CRT file (shift) | old default (1000) tested/s | new default (100) tested/s | gain |
+|---|---|---|---|
+| `crt_s25_m21.txt` (26) | 78 851 | 91 848 | +16.5% |
+| `crt_s64_m22.txt` (64) | 104 380 | 119 190 | +14.2% |
+| `crt_s110_m21.txt` (110) | 96 951 | 108 691 | +12.1% |
+
+Throughput kept improving further below 100 (down to the CLI's own
+minimum-limit floor of ~25 primes / value 100), but `100` was kept as the new
+default to preserve a safety margin above every tested CRT file's own prime
+set (`g_crt_max_prime`) rather than pushing all the way to that floor. Explicit
+`--sieve-primes N` always overrides the profile default.
+
+The **GPU-sieve** default (`sieve_primes_gpu`, used when `--cuda`/`--opencl`
+is active) for the same shift 0-127 band was re-tested separately with
+`--cuda 0 --gpu-sieve` on `crt_s64_m22.txt` (shift=64) and also lowered from
+`1000` to **`100`**, matching the CPU value. Verification (`gpu_sieve_calls`
+STATS counter) showed that **the GPU Phase-2 sieve kernel never actually runs
+at any of these `--sieve-primes` values in the first place** — Phase-1 bitmap
+marking already covers the entire requested prime range whenever the derived
+prime-value limit stays under the fixed Phase-1/2 block-size threshold
+(~131072), which is true for every `--sieve-primes` value from 25 up to
+~13000 at this shift. So the earlier-measured GPU-path throughput curve
+(peaking near `sieve-primes=100`) reflects the *same* CPU Phase-1/Phase-3
+trade-off as the CPU-only case above, not a GPU kernel/occupancy effect —
+the previous changelog text attributing it to "GPU kernel launch/occupancy
+overhead" was incorrect and has been corrected here.
+
+A real GPU-sieve-specific issue *was* found and fixed during this
+verification: once `--sieve-primes` is pushed high enough (~13000+) for the
+Phase-2 GPU-eligible prime count to become nonzero, `--gpu-sieve` in CRT
+monolithic mode used to force-offload Phase-2 marking to the GPU
+unconditionally, even for the tiny (~10000-candidate) gap-scan windows used
+at low shift — `gpu_sieve_should_offload()` bypassed its own minimum-segment
+safety floor whenever `--gpu-sieve` was explicitly requested. Measured impact
+before the fix (`crt_s64_m22.txt`, shift=64, `--cuda 0 --gpu-sieve`,
+`--sieve-primes 15000`): tested/s collapsed from ~2.10M to ~1.25M (-41%) the
+moment GPU offload activated, purely from per-window kernel-launch/transfer
+overhead on a window far too small to amortize it. Fixed by making the
+minimum-segment-size check a hard floor that `--gpu-sieve` can no longer
+bypass (only the minimum-prime-count heuristic remains bypassable by the
+explicit flag); after the fix the same run stays on the CPU Phase-2 path and
+recovers to ~2.00M tested/s. `false_gaps=0` at every tested value, before and
+after the fix, on both CPU and GPU paths.
+
+```sh
+# Uses the new auto-default (sieve-primes=100) for shift<128 CRT files
+bin/gap_miner --shift 64 --threads 4 --crt-file crt/crt_s64_m22.txt -e
+
+# Same new default also applies to the GPU-sieve path
+bin/gap_miner --shift 64 --threads 4 --crt-file crt/crt_s64_m22.txt -e \
+  --cuda 0 --gpu-sieve
+
+
+# Explicit override still works exactly as before
+bin/gap_miner --shift 64 --threads 4 --crt-file crt/crt_s64_m22.txt -e --sieve-primes 5000
+```
+
+### GPU sieve pooled-context buffer sizing fixed for CRT monolithic mode (Aug 2026)
+
+The startup log line `GPU sieve: ready (pooled-per-device, seg=N MB,
+primes=M)` reports the per-context device buffer size allocated by
+`gpu_sieve_init()`. In CRT monolithic mode this used to be sized from the
+generic `--sieve-size` CLI default (33 554 432, i.e. the *non-CRT* sieve
+window) regardless of mode, instead of the actual CRT per-nonce gap-scan
+window (`crt_gap_scan_template_window()`, typically ~10 000-12 000
+candidates at low shift). This over-allocated every pooled GPU sieve
+context by ~3 orders of magnitude (e.g. `seg=17 MB` reported for a
+shift=68 CRT run whose real per-call segment is only ~6 KB), wasting VRAM
+across the per-device context pool (2-4 contexts/device by default). The
+GPU sieve kernel itself still worked correctly (the separate per-thread
+scratch buffer was already sized correctly), so this was a VRAM-efficiency
+bug, not a correctness bug.
+
+Fixed: `gpu_seg_cap` is now derived from `crt_gap_scan_template_window()`
+when `g_crt_mode == CRT_MODE_SOLVER`, falling back to `--sieve-size` for
+non-CRT mode (unchanged). Verified: shift=68 CRT run now reports `seg=1 MB`
+(ceil-rounded from ~6 KB) instead of `seg=17 MB`; non-CRT shift=512 run
+still reports `seg=17 MB` as before (no regression); `false_gaps=0` and
+`tested/s` unchanged in both cases.
+
+```sh
+# GPU sieve startup log now reports a correctly small seg=N for CRT files
+bin/gap_miner --shift 68 --threads 4 --crt-file crt/crt_s68_m22.txt -e \
+  --cuda 0 --gpu-sieve --stats-verbose
+```
+
+### `--gpu-sieve` is currently a no-op for CRT monolithic mode at typical shifts (Aug 2026)
+
+Live-mining feedback showed `--gpu-sieve` printing "enabled" but never
+actually offloading anything (GPU Fermat testing itself was fully active
+and fast; only the Phase-2 CPU→GPU sieve marking hand-off never ran). A
+new startup diagnostic now explains exactly why: `gpu_sieve_should_offload()`
+requires the per-window segment to be at least `GPU_SIEVE_MIN_SEGMENT`
+(default 262144 candidates) before it will ever offload, and this floor is
+a hard, unconditional requirement (previously bypassable by an explicit
+`--gpu-sieve`, until the Aug 2026 fix above removed that bypass after
+measuring a 41% throughput collapse from doing so on tiny windows). Typical
+CRT gap-scan windows at low/mid shift are only ~10 000-50 000 candidates
+(`crt_gap_scan_template_window()`), i.e. structurally well below that
+floor — so GPU sieve Phase-2 offload will not run for essentially any
+realistic CRT file today, **regardless of `--sieve-primes`**. This is not
+a bug to "just lower the threshold" for: directly measured evidence shows
+smaller windows really do collapse throughput when forced. Practical
+guidance: don't bother with `--gpu-sieve` on CRT monolithic mode at
+low/mid shift — it currently has no effect beyond a small extra VRAM
+allocation and an extra startup log line; GPU Fermat testing (`--cuda`)
+is unaffected and remains the actual GPU speedup path for CRT mining.
+
+```
+GPU sieve: WARNING window segment (~6289 candidates) is below the min-segment
+floor (262144) needed to amortize GPU kernel-launch overhead -- Phase-2 will
+NOT offload to GPU for any window at this shift/gap-scan size; --gpu-sieve
+has no effect here (set GPU_SIEVE_MIN_SEGMENT lower only if you have verified
+it is not a net loss; see docs/CRT_LOW_SHIFT_PERFORMANCE_PLAN.md section 7.4)
 ```
 
 ### CGBN cooperative Fermat kernel (May 2026)
@@ -1999,6 +2360,7 @@ presieve tile period, making it cache-neutral. All other P values
 | `--no-cpu-fermat`     | off           | Disable custom CPU Montgomery path and use default GMP-based path. |
 | `--mr-rounds N`       | 2             | Miller-Rabin rounds for `mpz_probab_prime_p` (default path, not `--fast-fermat`).  Old default was 10; 2 rounds gives false-positive rate < 2^-128 for sieve-filtered candidates. |
 | `--sample-stride K`   | 8             | Controls gap scanning strategy.  K > 1 enables backward-scan (CPU) or two-phase smart-scan (GPU).  Set to 1 for full-test (all survivors tested). |
+| `--backscan-stat-sample N` | 64            | Display-only telemetry probe (both non-CRT and CRT-mono/consumer CPU backscan): tests up to the first N survivors of each window *contiguously* (no stride skipping) and updates `best`/`last_gap` STATS from genuine consecutive-prime gaps found there. Backward-scan normally only records `best`/`last_gap` when it hits its rare forward-jump branch, so without this probe those fields can stay at `0` for a long time (especially at high-merit CRT targets). Testing contiguously (rather than a spread-out stride sample) avoids reporting inflated gaps caused by skipped, untested survivors that could themselves be prime. Only covers a prefix of each window, not the whole thing. Does not affect submit/qual counters or the real backscan path. `N<=1` disables it. Example: `--backscan-stat-sample 0` to disable, or a larger `--backscan-stat-sample 200` to cover more of each window. |
 | `--auto-tune` / `--no-auto-tune` | off | Non-CRT auto-tuner for `--sample-stride` + `--sieve-limit`.  Periodically explores and exploits profiles using STATS telemetry. |
 | `--auto-tune-interval N` | 30 | Auto-tune decision interval in seconds (non-CRT).  Lower reacts faster, higher is less noisy. |
 | `--auto-tune-objective MODE` | `balanced` | Auto-tune objective: `speed` (maximize tested/s), `quality` (favor stronger candidate stream + merit/gap events), `balanced` (mixed). |
@@ -2007,6 +2369,7 @@ presieve tile period, making it cache-neutral. All other P values
 | `--gpu-smart-telemetry` / `--no-gpu-smart-telemetry` | off | Enable/disable extra non-CRT GPU smart-scan coverage telemetry in log output. |
 | `--one-sided-skip` / `--no-one-sided-skip` | off | Enable/disable non-CRT first-side gating. CPU backward-scan skips second-side scan unless the first-side span is large enough; GPU smart path prunes weak regions before phase-2 verification. |
 | `--one-sided-skip-merit M` | auto | Merit gate for `--one-sided-skip` (`M * logbase` as minimum first-side span). If omitted, `M` is auto-derived from runtime scan merit. |
+| `--backscan-parallel-forward N` | 0 (disabled) | EXPERIMENTAL, non-CRT only. Uses `N` persistent assist threads per worker (max 4) to parallelize the rare forward gap-closing scan inside `backward_scan_segment()`'s plain two-sided branch via atomic work-stealing + CAS-min. Each worker owns a private copy of the mining base (h256/shift) that is kept in sync across the worker's initial nonce search and every subsequent nonce advance, so pool threads never test candidates against a stale base. STATS shows `backscan-parallel-forward(non-crt): hits=...` when active. Example: `--backscan-parallel-forward 2`. |
 | `--sievegap`          | off           | Enable standalone non-CRT sieve path (`src/sievegap.c`).  Bypasses legacy non-CRT presieve/wheel/adaptive path in `sieve_range()`.  Ignored when CRT mode is active (`--crt-file`). |
 | `--partial-sieve-auto` / `--partial-sieve` | off | Adaptive non-CRT sieve-prime limiting.  Adjusts sieve depth periodically based on runtime behavior. |
 | `--adaptive-presieve` | off           | Adaptive non-CRT presieve window skipping for dense windows after presieve. |
@@ -2028,6 +2391,7 @@ presieve tile period, making it cache-neutral. All other P values
 | `--crt-precision-rounds N` | 8 | Number of probable-prime rounds used by `--crt-precision` strict CRT checks (minimum 2). |
 | `--crt-auto-split`    | off           | Enable pass-level adaptive sieve/fermat thread split in CRT solver producer-consumer mode. |
 | `--heap N`            | 4096          | Maximum number of pending CRT windows in the producer-consumer gaplist heap.  Only relevant when `--fermat-threads N` is active.  Larger values allow the sieve producers to run further ahead of the Fermat consumers; useful if producers are significantly faster than consumers. |
+| `--crt-heap-pop-order MODE` | `score` | Experimental: CRT producer-consumer heap pop order — `score` (default, max-heap on `cramer_score`-derived key), `fifo` (oldest queued window first), or `random` (uniformly random queued window).  Only affects pop order, not push/eviction (still FIFO-on-overflow in every mode).  See "CRT producer-consumer heap eviction" above and `scripts/bench_crt_heap_pop_order_ab.sh`. |
 | `--crt-accum-soft-cap N` | 24576 | CRT GPU accumulator soft preflush cap (candidates).  Used by accumulator backpressure policy. |
 | `--crt-accum-hard-cap N` | 65536 | CRT GPU accumulator hard preflush cap (candidates).  Used by accumulator backpressure policy. |
 | `--crt-accum-backpressure` / `--no-crt-accum-backpressure` | on | Enable/disable CRT GPU accumulator preflush/backpressure controls. |
@@ -2347,6 +2711,22 @@ bin/gap_miner \
   (cheaper) and reduces primality-test load; a lower value speeds up the sieve
   at the cost of more Fermat/Miller-Rabin calls.  On slow machines start with
   100 000 and increase until the primality stage no longer dominates.
+
+### Legacy CRT files with prime=2 offset=0 removed (Aug 2026)
+
+Four pre-`eef5d5e` CRT files (`crt_s133_m30.txt`, `crt_s68_m26.txt`,
+`crt_s768_m22.txt`, `crt_s896_m22.txt`) recorded prime `2` with `offset=0`.
+The solver always excludes prime 2 from the offset/CRT congruence system
+(odd-only sieve), but still requires the primorial it steps windows by to
+be even; these files left it odd, so candidate parity silently flipped
+every other window within a nonce, wasting roughly half the scanned
+windows on even (always-composite) candidates. Submitted gaps were not
+affected (verified independently prime, per-nonce), only throughput. The
+solver now forces the primorial even unconditionally (`src/main.c`), and
+`gen_crt`/`gen_crt_exhaust` have forbidden `offset=0` for any prime since
+`eef5d5e` (2026-03-25), so newly generated files cannot reproduce this.
+The four affected files have been deleted; scripts and examples that
+defaulted to `crt_s768_m22.txt` now use `crt_s768_m23.txt`.
 
 ## CRT file generation
 

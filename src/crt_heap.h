@@ -35,6 +35,15 @@ extern volatile int crt_fermat_threads;
 extern int crt_fermat_explicit;
 extern _Atomic int crt_heap_shutdown;
 
+/* crt_heap_pop() selection policy: 0=score (max-heap on heap_key()),
+ * 1=fifo (oldest seq first), 2=random (runtime default, see README.md).
+ * Only affects which queued window a consumer takes next; push()/eviction
+ * behavior is unchanged. See --crt-heap-pop-order in README.md. */
+#define CRT_HEAP_POP_SCORE  0
+#define CRT_HEAP_POP_FIFO   1
+#define CRT_HEAP_POP_RANDOM 2
+extern int crt_heap_pop_order;
+
 void crt_heap_init(size_t cap);   /* call once before mining; 0 = use default */
 struct crt_work_item *crt_work_alloc(void);
 void crt_work_free(struct crt_work_item *w);

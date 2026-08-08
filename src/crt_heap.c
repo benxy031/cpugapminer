@@ -33,7 +33,21 @@ static pthread_cond_t crt_heap_cv = PTHREAD_COND_INITIALIZER;
 /* Monotonic push-order counter, used to pick the OLDEST item to evict
  * when the heap is full (FIFO eviction — see crt_heap_push()). */
 static _Atomic uint64_t g_crt_heap_seq_ctr = 0;
+/* random avoids the starvation observed with score: a low-cramer_score
+ * window can otherwise never be popped while higher-scored items keep
+ * arriving (see bench_crt_heap_pop_order_ab, Aug 2026 in README.md). */
+int crt_heap_pop_order = CRT_HEAP_POP_RANDOM;
 
+/* xorshift64 state for --crt-heap-pop-order=random. Only ever touched
+   while crt_heap_mtx is held (in crt_heap_pop()), so no separate lock. */
+static uint64_t g_heap_pop_rand_state = 0x9E3779B97F4A7C15ULL;
+
+static size_t heap_pop_rand_index(size_t n) {
+    uint64_t x = g_heap_pop_rand_state;
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    g_heap_pop_rand_state = x;
+    return (size_t)(x % (uint64_t)n);
+}
 volatile uint64_t crt_heap_gen = 0;
 volatile int crt_fermat_threads = 0;
 int crt_fermat_explicit = 0;
@@ -100,6 +114,21 @@ static void crt_heap_sift_down(size_t i, size_t n) {
     }
 }
 
+/* Remove and return the item at index idx, moving the last element into
+   its place and sifting both ways (the array is always heap_key()-ordered
+   regardless of pop policy, since push()/eviction rely on that invariant
+   for O(log n) admission). */
+static struct crt_work_item *crt_heap_remove_at(size_t idx) {
+    struct crt_work_item *victim = crt_heap[idx];
+    crt_heap_size--;
+    if (idx != crt_heap_size) {
+        crt_heap[idx] = crt_heap[crt_heap_size];
+        crt_heap_sift_down(idx, crt_heap_size);
+        crt_heap_sift_up(idx);
+    }
+    return victim;
+}
+
 int crt_heap_push(struct crt_work_item *w) {
     pthread_mutex_lock(&crt_heap_mtx);
     /* lazy init in case crt_heap_init() was never called */
@@ -164,12 +193,20 @@ struct crt_work_item *crt_heap_pop(void) {
         return NULL;
     }
 
-    struct crt_work_item *best = crt_heap[0];
-    crt_heap_size--;
-    if (crt_heap_size > 0) {
-        crt_heap[0] = crt_heap[crt_heap_size];
-        crt_heap_sift_down(0, crt_heap_size);
+    size_t idx = 0;
+    switch (crt_heap_pop_order) {
+    case CRT_HEAP_POP_FIFO:
+        for (size_t i = 1; i < crt_heap_size; i++)
+            if (crt_heap[i]->seq < crt_heap[idx]->seq) idx = i;
+        break;
+    case CRT_HEAP_POP_RANDOM:
+        idx = heap_pop_rand_index(crt_heap_size);
+        break;
+    default: /* CRT_HEAP_POP_SCORE: root of the max-heap is the best item */
+        idx = 0;
+        break;
     }
+    struct crt_work_item *best = crt_heap_remove_at(idx);
     __sync_fetch_and_add(&stats_crt_heap_pop_ok, 1);
     pthread_mutex_unlock(&crt_heap_mtx);
     return best;
