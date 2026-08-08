@@ -1530,7 +1530,8 @@ static void write_crt_file(const char *path, const Solution *sol,
     fprintf(f, "gap_target %d\n", sol->gap_size);
     fprintf(f, "n_candidates %d\n", sol->n_candidates);
     fprintf(f, "# fitness_mode %s\n",
-            fc->mode == FITNESS_PROBABILITY ? "probability" : "candidate");
+            fc->mode == FITNESS_PROBABILITY ? "probability" :
+            fc->mode == FITNESS_MAX_RUN     ? "max-run" : "candidate");
     if (fc->mode == FITNESS_PROBABILITY) {
         fprintf(f, "# probability_score %.9f\n", sol->opt_score);
         fprintf(f, "# candidate_weighted_score %.9f\n", sol->aux_score);
@@ -1539,6 +1540,9 @@ static void write_crt_file(const char *path, const Solution *sol,
         fprintf(f, "# fitness_kernel_a %.6f\n", fc->kernel_a);
         fprintf(f, "# fitness_kernel_b %.6f\n", fc->kernel_b);
         fprintf(f, "# fitness_candidate_guard %d\n", fc->candidate_guard);
+    } else if (fc->mode == FITNESS_MAX_RUN) {
+        fprintf(f, "# max_gap_spacing %d\n", (int)(-sol->opt_score));
+        fprintf(f, "# max_run_candidate_count %.9f\n", sol->aux_score);
     } else {
         fprintf(f, "# candidate_weighted_score %.9f\n", sol->opt_score);
         fprintf(f, "# candidate_raw_weight_sum %.9f\n", sol->aux_score);
@@ -1581,7 +1585,7 @@ static void usage(const char *prog) {
         "  --ctr-range  R        Percent deviation from n_primes (default: 0)\n"
         "  --ctr-file   FILE     Output CRT file path (required)\n"
         "  --threads    N        Parallel threads for greedy+ILS (default: CPU count)\n"
-        "  --fitness-mode MODE  Optimization objective: candidate|probability (default: candidate)\n"
+        "  --fitness-mode MODE  Optimization objective: candidate|probability|max-run (default: candidate)\n"
         "  --fitness-window-factor F  Probability mode window factor W=ceil(F*gap) (default: 2.0)\n"
         "  --fitness-window-cap N     Probability mode hard cap for W, 0=no cap (default: 0)\n"
         "  --fitness-kernel-a A       Probability mode kernel parameter a (default: 5.8)\n"

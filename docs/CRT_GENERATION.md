@@ -101,7 +101,7 @@ Where `N#` is the primorial (product of the first N primes).
 | `--ctr-fixed F` | Number of small primes frozen during evolution. Scale with prime count: 8 for ≤23, 10 for 24–33, 11 for 34–49, 12 for 50–73, 13 for 74–95, 14 for 96–118, 15 for 119+. |
 | `--ctr-ivs I` | Population size for evolution. Quick test: 20, production: **1 000**. |
 | `--ctr-range R` | Percent deviation from `--ctr-primes`. Explores nearby prime counts for potentially better results. |
-| `--fitness-mode MODE` | Optimisation objective. `candidate` keeps the existing behavior (`n_candidates` + weighted tie-break). `probability` minimises a kernel-weighted survivor mass over a wider window around the target gap. Default: `candidate`. |
+| `--fitness-mode MODE` | Optimisation objective. `candidate` keeps the existing behavior (`n_candidates` + weighted tie-break). `probability` minimises a kernel-weighted survivor mass over a wider window around the target gap. `max-run` maximises the single largest spacing between two consecutive uncovered positions (the best achievable prime gap in the window), tie-broken by fewer candidates. Default: `candidate`. |
 | `--fitness-window-factor F` | Probability mode only. Sets wide window `W = ceil(F * gap_target)`. Default: `2.0`. |
 | `--fitness-window-cap N` | Probability mode only. Optional hard cap for `W`; `0` means no cap. Default: `0`. |
 | `--fitness-kernel-a A` | Probability mode only. Kernel parameter `a` in `exp(-a * |x/scale|^b)`. Default: `5.8`. |
@@ -172,6 +172,51 @@ Example:
   --ctr-strength 10000 --ctr-evolution --ctr-fixed 8 --ctr-ivs 1000 \
   --fitness-mode probability --fitness-window-factor 2.0 \
   --ctr-file crt/crt_s64_m22_prob.txt
+```
+
+## Optional Max-Run Fitness Mode
+
+`gen_crt` also supports a third optimisation objective behind:
+
+```bash
+--fitness-mode max-run
+```
+
+This does not change the output file format or runtime loader. It only changes
+how the search ranks candidate CRT offset sets internally.
+
+Current behavior:
+
+- Collects all uncovered positions in `[1, gap_target]` and finds the largest
+  spacing between two consecutive uncovered positions (`max_spacing`). Both
+  endpoints are candidate primes and everything strictly between them is
+  definite composite, so `max_spacing` directly measures the largest
+  achievable prime gap produced by this offset set.
+- The optimizer maximises `max_spacing` (internally stored as
+  `opt_score = -max_spacing`, so minimising `opt_score` maximises spacing),
+  tie-broken by fewer `n_candidates`.
+- Unlike `candidate` and `probability` mode, this does **not** primarily
+  minimise total Fermat workload — it targets record-gap hunting where a
+  single very large qualifying window matters more than average candidate
+  density. Expect `n_candidates` to be higher than the `candidate`-mode best
+  for the same shift/merit.
+
+The CRT file header records the selected objective and its diagnostics:
+
+```text
+# fitness_mode max-run
+# max_gap_spacing 40
+# max_run_candidate_count 646.000000000
+```
+
+Example:
+
+```bash
+./bin/gen_crt --calc-ctr \
+  --ctr-primes 15 --ctr-merit 22 --ctr-bits 4 \
+  --ctr-strength 10000 --ctr-evolution --ctr-fixed 8 --ctr-ivs 1000 \
+  --fitness-mode max-run \
+  --ctr-file crt/crt_s64_m22_maxrun.txt
 ```
 
 ## How to Calculate ctr-bits
